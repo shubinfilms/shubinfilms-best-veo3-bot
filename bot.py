@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Best VEO3 Bot — PTB 20.7 + KIE Veo3 + Prompt-Master + авто-возврат видео (HTML-safe)
+# Best VEO3 Bot — PTB 21.6 + KIE Veo3 + Prompt-Master + авто-возврат видео (HTML-safe)
 # Версия: 2025-09-07
 
 import os
@@ -23,7 +23,7 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,              # ⬅️ PTB 21.x
     ContextTypes,
     CommandHandler,
     MessageHandler,
@@ -32,7 +32,7 @@ from telegram.ext import (
     AIORateLimiter,
 )
 
-import telegram  # ✅ ДОБАВЛЕНО: нужно для вывода версии PTB
+import telegram  # для лога версии PTB
 
 # ==========================
 #   Инициализация / ENV
@@ -55,7 +55,7 @@ KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()               # токен б
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai")   # https://api.kie.ai
 KIE_GEN_PATH = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate") # POST генерация
 KIE_STATUS_PATH = os.getenv("KIE_STATUS_PATH", "/api/v1/veo/record-info")  # GET статус
-KIE_HD_PATH = os.getenv("KIE_HD_PATH", "/api/v1/veo/get-1080p-video")      # GET 1080p (не для fallback)
+KIE_HD_PATH = os.getenv("KIE_HD_PATH", "/api/v1/veo/get-1080p-video")      # GET 1080п (не для fallback)
 
 PROMPTS_CHANNEL_URL = os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts").strip()
 TOPUP_URL = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts").strip()  # заглушка «Пополнить баланс»
@@ -71,8 +71,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("best-veo3-bot")
-
-# ✅ ДОБАВЛЕНО: лог реальной версии python-telegram-bot
 log.info("PTB version: %s", getattr(telegram, "__version__", "unknown"))
 
 # ==========================
@@ -127,7 +125,6 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     for k, v in DEFAULT_STATE.items():
         ud.setdefault(k, v)
     return ud
-
 
 # ==========================
 #   Кнопки / UI
@@ -211,7 +208,6 @@ def card_keyboard(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
     return InlineKeyboardMarkup(rows)
 
-
 # ==========================
 #   Prompt-Master / Chat
 # ==========================
@@ -241,7 +237,6 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
     except Exception as e:
         log.exception("Prompt-Master error: %s", e)
         return None
-
 
 # ==========================
 #   KIE API helpers
@@ -357,7 +352,6 @@ def get_kie_task_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str
         return True, flag, msg, _extract_result_url(data or {})
     return False, None, _kie_error_message(status, j), None
 
-
 # ==========================
 #   Отправка медиа
 # ==========================
@@ -389,7 +383,6 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 os.unlink(tmp_path)
             except Exception:
                 pass
-
 
 # ==========================
 #   Поллинг KIE
@@ -446,7 +439,6 @@ async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
-
 
 # ==========================
 #   Хэндлеры
@@ -690,7 +682,6 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("Get photo failed: %s", e)
         await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
 
-
 # ==========================
 #   Entry point
 # ==========================
@@ -701,7 +692,7 @@ def main():
         raise RuntimeError("KIE_* env vars are not properly set")
 
     app = (
-        ApplicationBuilder()
+        Application.builder()            # ⬅️ PTB 21.x
         .token(TELEGRAM_TOKEN)
         .rate_limiter(AIORateLimiter())
         .build()
@@ -721,8 +712,7 @@ def main():
     )
     app.run_polling(drop_pending_updates=True)
 
-
 if __name__ == "__main__":
-    # ВАЖНО: если когда-то был webhook — снимите:
+    # Если когда-то был webhook — снимите:
     # https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook
     main()
