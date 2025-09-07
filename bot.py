@@ -1,429 +1,706 @@
 # -*- coding: utf-8 -*-
-# SHUBIN AI VIDEO — Veo3 Fast + ChatGPT (Prompt-Master & Chat)
-# Stack: pyTelegramBotAPI (telebot) + requests + python-dotenv + openai
+# VEO3 bot — красивый UI + Fast/Quality + Prompt-Master + счётчик генераций
+# PTB 20.7 (async), требуется пакет: python-telegram-bot[rate-limiter]==20.7
 
-import os, json, time, tempfile, requests, traceback
-from typing import Optional, Tuple, Any, Iterable, List
+import os
+import json
+import time
+import uuid
+import asyncio
+import logging
+import tempfile
+from typing import Dict, Any, Optional, List, Tuple, Union
+
+import requests
 from dotenv import load_dotenv
-import telebot
-from telebot import types
 
-# ===== ENV =====
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    AIORateLimiter,
+)
+
+# ==========================
+#        ENV / CONFIG
+# ==========================
 load_dotenv()
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
-KIE_API_KEY        = os.getenv("KIE_API_KEY", "")
-KIE_BASE_URL       = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
-KIE_GEN_PATH       = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate")
-KIE_STATUS_PATH    = os.getenv("KIE_STATUS_PATH", "/api/v1/veo/record-info")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")  # опционально
-PROMPTS_CHANNEL_URL= os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN отсутствует")
-if not KIE_API_KEY:
-    raise RuntimeError("KIE_API_KEY отсутствует")
+TELEGRAM_TOKEN   = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+KIE_API_KEY      = (os.getenv("KIE_API_KEY") or "").strip()
+KIE_BASE_URL     = os.getenv("KIE_BASE_URL", "https://api.kie.ai").strip()
+KIE_GEN_PATH     = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate").strip()
+KIE_STATUS_PATH  = os.getenv("KIE_STATUS_PATH", "/api/v1/veo/record-info").strip()
+KIE_HD_PATH      = os.getenv("KIE_HD_PATH", "/api/v1/veo/get-1080p-video").strip()  # на будущее
 
-# ===== bot / storage =====
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
-USERS_FILE = "users.json"
-users = set()
-if os.path.exists(USERS_FILE):
-    try:
-        users = set(json.load(open(USERS_FILE, "r", encoding="utf-8")))
-    except Exception:
-        users = set()
+PROMPTS_CHANNEL_URL = os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts").strip()
+TOPUP_URL           = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts/1").strip()  # заглушка-линк
 
-# chat state
-STATE: dict[int, dict] = {}   # chat_id -> {...}
-
-# ===== KIE config =====
-HDRS = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type": "application/json"}
-MODEL = "veo3_fast"
-WAIT_MAX_SECS     = 30 * 60
-POLL_INTERVAL_SECS= 7
-TIMER_EDIT_STEP   = 3
-
-def _u(path: str) -> str:
-    return f"{KIE_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
-
-# ===== OpenAI (Prompt-Master & Chat) =====
+# OpenAI (legacy SDK 0.28.x; можно опционально отключить)
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 try:
-    from openai import OpenAI
-    oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    import openai  # type: ignore
+    if OPENAI_API_KEY:
+        openai.api_key = OPENAI_API_KEY
 except Exception:
-    oai = None
+    openai = None
 
-def _oai_model() -> str:
-    # можно заменить на более дешёвую, если нужно
-    return "gpt-5"
+# Параметры ожидания
+POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "6"))
+POLL_TIMEOUT_SECS  = int(os.getenv("POLL_TIMEOUT_SECS", str(20 * 60)))
 
-def _oai_chat(messages: List[dict]) -> str:
-    if not oai:
-        raise RuntimeError("OPENAI_API_KEY не задан — режим ChatGPT отключён")
-    model = _oai_model()
+# Баланс/кредиты
+FREE_CREDITS      = int(os.getenv("FREE_CREDITS", "2"))   # стартовые
+FAST_COST         = float(os.getenv("FAST_COST", "1.0"))  # стоимость «Fast»
+QUALITY_COST      = float(os.getenv("QUALITY_COST", "2.0"))
+
+# Логирование
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("veo3-bot")
+
+USERS_FILE = "users.json"   # храним кредиты и прочее
+# структура: { "<chat_id>": {"credits": 3 } }
+
+# ==========================
+#       Хранилище
+# ==========================
+def _load_users() -> Dict[str, Dict[str, Any]]:
     try:
-        r = oai.chat.completions.create(model=model, messages=messages, temperature=1)
-        return (r.choices[0].message.content or "").strip()
-    except Exception as e1:
-        # fallback — Responses API
-        r = oai.responses.create(model=model, input=messages)
-        text = getattr(r, "output_text", "") or ""
-        if text:
-            return text.strip()
-        raise RuntimeError(f"OpenAI error: {e1}")
-
-# ===== сетевые утилиты (ретраи) =====
-def _with_retries(fn, tries=4, delay=2, backoff=2):
-    last = None; d = delay
-    for _ in range(tries):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(d); d *= backoff
-    raise last or RuntimeError("retry failed")
-
-def _post_json(url: str, payload: dict, timeout=60) -> dict:
-    def run():
-        r = requests.post(url, headers=HDRS, json=payload, timeout=timeout)
-        j = {}
-        try: j = r.json()
-        except Exception: j = {"error": r.text}
-        return {"status": r.status_code, "json": j}
-    return _with_retries(run)
-
-def _get_json(url: str, params: dict, timeout=40) -> dict:
-    def run():
-        r = requests.get(url, headers=HDRS, params=params, timeout=timeout)
-        j = {}
-        try: j = r.json()
-        except Exception: j = {"error": r.text}
-        return {"status": r.status_code, "json": j}
-    return _with_retries(run)
-
-def _download_to_temp(url: str) -> str:
-    with requests.get(url, stream=True, timeout=180) as resp:
-        resp.raise_for_status()
-        suffix = ".mp4" if ".m3u8" not in url else ".ts"
-        f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        with f as fh:
-            for chunk in resp.iter_content(chunk_size=1_048_576):
-                if chunk: fh.write(chunk)
-        return f.name
-
-# ===== KIE endpoints =====
-def kie_generate(prompt: str, ratio: str, enable_fallback: bool = True) -> Tuple[Optional[str], Optional[str]]:
-    res = _post_json(_u(KIE_GEN_PATH), {
-        "prompt": prompt,
-        "model": MODEL,
-        "aspectRatio": ratio,
-        "enableFallback": enable_fallback
-    })
-    data = res.get("json") or {}
-    if res.get("status") == 200 and data.get("code") == 200:
-        d = data.get("data") or {}
-        task_id = d.get("taskId") or d.get("id") or data.get("taskId") or d.get("task_id")
-        if task_id: return str(task_id), None
-        return None, "taskId не найден в ответе"
-    return None, data.get("msg") or f"HTTP {res.get('status')}"
-
-def kie_status(task_id: str) -> Tuple[Optional[dict], Optional[str]]:
-    res = _get_json(_u(KIE_STATUS_PATH), {"taskId": task_id})
-    data = res.get("json") or {}
-    if res.get("status") == 200 and data.get("code") == 200:
-        return data.get("data") or {}, None
-    return None, data.get("msg") or f"HTTP {res.get('status')}"
-
-# ===== парсинг ответов KIE =====
-def _iter_values(obj: Any):
-    if isinstance(obj, dict):
-        for v in obj.values(): yield from _iter_values(v)
-    elif isinstance(obj, list):
-        for v in obj: yield from _iter_values(v)
-    else:
-        yield obj
-
-def _find_success_flag(data: dict) -> Optional[int]:
-    def _walk(d: Any) -> Optional[int]:
-        if isinstance(d, dict):
-            for k, v in d.items():
-                lk = str(k).lower()
-                if lk in ("successflag", "success_flag", "flag", "status"):
-                    try:
-                        iv = int(v)
-                        if iv in (0, 1, 2, 3): return iv
-                    except Exception:
-                        pass
-                ans = _walk(v)
-                if ans is not None: return ans
-        elif isinstance(d, list):
-            for it in d:
-                ans = _walk(it)
-                if ans is not None: return ans
-        return None
-    return _walk(data)
-
-def _extract_video_urls(data: dict) -> List[str]:
-    urls: List[str] = []
-    for v in _iter_values(data):
-        if isinstance(v, str):
-            s = v.strip()
-            # иногда ссылки приходят строкой-массивом: "[...]", распарсим
-            if s.startswith("[") and s.endswith("]"):
-                try:
-                    arr = json.loads(s)
-                    if isinstance(arr, list):
-                        for u in arr:
-                            if isinstance(u, str) and "http" in u and (u.endswith(".mp4") or u.endswith(".mov") or ".m3u8" in u):
-                                urls.append(u)
-                except Exception:
-                    pass
-            if "http" in s and (s.endswith(".mp4") or s.endswith(".mov") or ".m3u8" in s):
-                urls.append(s)
-    # unique, сохраняя порядок
-    seen, out = set(), []
-    for u in urls:
-        if u not in seen:
-            seen.add(u); out.append(u)
-    return out
-
-# ===== UI =====
-def _menu_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🎬 Сгенерировать видео по тексту", callback_data="go_text"))
-    kb.add(types.InlineKeyboardButton("📸 Сгенерировать по фото (скоро)", callback_data="photo_soon"))
-    kb.add(types.InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)", callback_data="prompt_master"))
-    kb.add(types.InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="free_chat"))
-    kb.add(types.InlineKeyboardButton("❓ FAQ", callback_data="faq"))
-    kb.add(types.InlineKeyboardButton("💡 Канал с промптами", url=PROMPTS_CHANNEL_URL))
-    return kb
-
-def _after_success_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🎬 Сгенерировать ещё", callback_data="go_text"),
-        types.InlineKeyboardButton("💡 Вдохновиться промптами", url=PROMPTS_CHANNEL_URL),
-    )
-    return kb
-
-def main_menu(chat_id: int):
-    bot.send_message(
-        chat_id,
-        "👋 Привет! Это *SHUBIN AI VIDEO* — генерируем видео через Veo3.\n"
-        f"С нами уже *{len(users)}* пользователей.\n\n"
-        f"Идеи и примеры здесь 👉 [Канал с промптами]({PROMPTS_CHANNEL_URL})",
-        reply_markup=_menu_kb(),
-        disable_web_page_preview=True,
-    )
-
-# ===== Handlers =====
-@bot.message_handler(commands=["start", "menu"])
-def start_cmd(m):
-    users.add(m.from_user.id)
-    try: json.dump(list(users), open(USERS_FILE, "w", encoding="utf-8"))
-    except Exception: pass
-    STATE[m.chat.id] = {"phase": None, "mode": None}
-    main_menu(m.chat.id)
-
-@bot.callback_query_handler(func=lambda c: True)
-def on_cb(c):
-    cid, data = c.message.chat.id, c.data
-    st = STATE.get(cid) or {}
-
-    if data == "go_text":
-        STATE[cid] = {"phase": "await_prompt", "mode": None}
-        bot.answer_callback_query(c.id)
-        bot.send_message(cid, "✍️ Напиши промпт (1–2 фразы).")
-        return
-
-    if data == "photo_soon":
-        bot.answer_callback_query(c.id)
-        bot.send_message(cid, "📸 Этот режим появится позже.")
-        return
-
-    if data == "prompt_master":
-        bot.answer_callback_query(c.id)
-        STATE[cid] = {"phase": "chat", "mode": "master"}
-        if not oai:
-            bot.send_message(cid, "❌ Ошибка ChatGPT: OPENAI_API_KEY не задан, режим недоступен.")
-        bot.send_message(cid, "🧠 Режим *Промпт-мастер*: опиши идею — верну английский промпт.\n`/exit` — выход.")
-        return
-
-    if data == "free_chat":
-        bot.answer_callback_query(c.id)
-        STATE[cid] = {"phase": "chat", "mode": "chat"}
-        if not oai:
-            bot.send_message(cid, "❌ Ошибка ChatGPT: OPENAI_API_KEY не задан, режим недоступен.")
-        bot.send_message(cid, "💬 Обычный чат. Пиши сообщения. `/exit` — выход.")
-        return
-
-    if data == "faq":
-        bot.answer_callback_query(c.id)
-        bot.send_message(cid,
-            "❓ *FAQ*\n"
-            "• Форматы: 16:9 и 9:16.\n"
-            "• Видео приходит сюда готовым файлом.\n"
-            "• Если долго нет видео — запусти ещё раз (ссылки иногда появляются с задержкой).",
-            disable_web_page_preview=True)
-        return
-
-    if data in ("ratio_16_9", "ratio_9_16"):
-        if st.get("phase") != "await_ratio": return
-        ratio = "16:9" if data == "ratio_16_9" else "9:16"
-        st.update({"ratio": ratio, "phase": "ready"}); STATE[cid] = st
-        try:
-            bot.edit_message_text(f"✅ Выбран формат: *{ratio}*. Нажми «🚀 Запустить генерацию».",
-                                  chat_id=cid, message_id=c.message.id)
-        except Exception: pass
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("🚀 Запустить генерацию", callback_data="run_generation"))
-        bot.send_message(cid, "Готово!", reply_markup=kb)
-        return
-
-    if data == "run_generation":
-        if st.get("phase") != "ready":
-            bot.answer_callback_query(c.id, "Сначала выбери формат.")
-            return
-        bot.answer_callback_query(c.id)
-        _run_generation(cid, st["prompt"], st["ratio"])
-        return
-
-@bot.message_handler(commands=["exit"])
-def exit_mode(m):
-    STATE[m.chat.id] = {"phase": None, "mode": None}
-    bot.send_message(m.chat.id, "Вышел из режима. Открываю меню.")
-    main_menu(m.chat.id)
-
-# — ввод промпта
-@bot.message_handler(func=lambda m: (STATE.get(m.chat.id) or {}).get("phase") == "await_prompt", content_types=["text"])
-def on_prompt(m):
-    prompt = (m.text or "").strip()
-    STATE[m.chat.id] = {"phase": "await_ratio", "prompt": prompt, "mode": None}
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🎞 16:9", callback_data="ratio_16_9"),
-           types.InlineKeyboardButton("📱 9:16", callback_data="ratio_9_16"))
-    bot.send_message(m.chat.id, "🎚 Выбери формат и запускай генерацию.", reply_markup=kb)
-    bot.send_message(m.chat.id, f"✅ Принял промпт:\n`{prompt}`")
-
-# — режимы ChatGPT
-@bot.message_handler(func=lambda m: (STATE.get(m.chat.id) or {}).get("phase") == "chat", content_types=["text"])
-def chat_modes(m):
-    mode = (STATE.get(m.chat.id) or {}).get("mode")
-    user_text = (m.text or "").strip()
-    try:
-        if not oai:
-            bot.send_message(m.chat.id, "❌ ChatGPT недоступен (нет OPENAI_API_KEY).")
-            return
-        if mode == "master":
-            sys = {"role": "system", "content":
-                   "Ты эксперт по написанию кинематографичных промптов для Google Veo 3. "
-                   "Верни только ОДИН промпт на английском, без комментариев. "
-                   "Укажи оптику/движение/свет/атмосферу/детали. Без текста в кадре."}
-            out = _oai_chat([sys, {"role": "user", "content": user_text}])
-            bot.send_message(m.chat.id, f"📝 Промпт для *Veo3*:\n```\n{out}\n```")
-        else:
-            sys = {"role": "system", "content": "Ты дружелюбный и краткий помощник."}
-            out = _oai_chat([sys, {"role": "user", "content": user_text}])
-            bot.send_message(m.chat.id, out or "…")
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
     except Exception as e:
-        bot.send_message(m.chat.id, f"❌ Ошибка ChatGPT: {e}")
+        log.warning("Load users.json failed: %s", e)
+    return {}
 
-# ===== Core: генерация Veo3 =====
-def _run_generation(chat_id: int, prompt: str, ratio: str):
-    t0 = time.time()
-    timer_msg = bot.send_message(chat_id, "⏳ Генерация идёт…")
-    shown_sec = 0
+def _save_users(data: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("Save users.json failed: %s", e)
 
-    def tick():
-        nonlocal shown_sec
-        sec = int(time.time() - t0)
-        if sec - shown_sec >= TIMER_EDIT_STEP:
-            shown_sec = sec
+USERS = _load_users()
+
+def _get_credits(chat_id: int) -> float:
+    u = USERS.get(str(chat_id)) or {}
+    if "credits" not in u:
+        u["credits"] = float(FREE_CREDITS)
+        USERS[str(chat_id)] = u
+        _save_users(USERS)
+    return float(u.get("credits", 0))
+
+def _add_credits(chat_id: int, amount: float) -> None:
+    u = USERS.get(str(chat_id)) or {"credits": 0}
+    u["credits"] = float(u.get("credits", 0)) + float(amount)
+    USERS[str(chat_id)] = u
+    _save_users(USERS)
+
+def _spend_credits(chat_id: int, amount: float) -> bool:
+    cur = _get_credits(chat_id)
+    if cur >= amount:
+        USERS[str(chat_id)]["credits"] = round(cur - amount, 3)
+        _save_users(USERS)
+        return True
+    return False
+
+# ==========================
+#     Вспомогательные
+# ==========================
+def join_url(base: str, path: str) -> str:
+    u = f"{base.rstrip('/')}/{path.lstrip('/')}"
+    return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
+
+def mask_secret(s: str, show: int = 8) -> str:
+    s = (s or "").strip()
+    return "*" * max(0, len(s) - show) + s[-show:]
+
+def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
+    if not value:
+        return None
+    if isinstance(value, str):
+        v = value.strip()
+        return v or None
+    for v in value:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def tg_file_direct_url(bot_token: str, file_path: str) -> str:
+    return f"https://api.telegram.org/file/bot{bot_token}/{file_path.lstrip('/')}"
+
+def _kie_headers() -> Dict[str, str]:
+    tok = KIE_API_KEY
+    if tok and not tok.lower().startswith("bearer "):
+        tok = f"Bearer {tok}"
+    return {"Content-Type": "application/json", "Authorization": tok or ""}
+
+def _post_json(url: str, payload: Dict[str, Any], timeout: int = 50) -> Tuple[int, Dict[str, Any]]:
+    r = requests.post(url, json=payload, headers=_kie_headers(), timeout=timeout)
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"error": r.text}
+
+def _get_json(url: str, params: Dict[str, Any], timeout: int = 40) -> Tuple[int, Dict[str, Any]]:
+    r = requests.get(url, params=params, headers=_kie_headers(), timeout=timeout)
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"error": r.text}
+
+def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
+    data = j.get("data") or {}
+    for k in ("taskId", "taskid", "id"):
+        if j.get(k): return str(j[k])
+        if data.get(k): return str(data[k])
+    return None
+
+def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
+    # часто приходит в data.response.resultUrls / originUrls
+    resp = data.get("response") or {}
+    for key in ("resultUrls", "originUrls", "resultUrl", "originUrl"):
+        url = pick_first_url(resp.get(key))
+        if url:
+            return url
+    for key in ("resultUrls", "originUrls", "resultUrl", "originUrl", "url"):
+        url = pick_first_url(data.get(key))
+        if url:
+            return url
+    return None
+
+def _parse_success_flag(j: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Dict[str, Any]]:
+    data = j.get("data") or {}
+    msg  = j.get("msg") or j.get("message")
+    # флаг: 0 — в работе, 1 — готово, 2/3 — ошибка
+    flag = None
+    for k in ("successFlag", "status", "state"):
+        if k in data:
             try:
-                bot.edit_message_text(f"⏳ Генерация идёт… *{sec} сек*",
-                                      chat_id=chat_id, message_id=timer_msg.id)
+                flag = int(data[k])
+                break
             except Exception:
                 pass
+    return flag, msg, data
 
-    # 1) создаём задачу
-    task_id, err = kie_generate(prompt, ratio, enable_fallback=True)
-    if err or not task_id:
-        try:
-            bot.edit_message_text(f"❌ Не удалось создать задачу: {err}", chat_id=chat_id, message_id=timer_msg.id)
-        except Exception:
-            bot.send_message(chat_id, f"❌ Не удалось создать задачу: {err}")
-        return
-    bot.send_message(chat_id, f"🧾 Задача создана. taskId={task_id}")
+def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
+    code = j.get("code", status_code)
+    msg = j.get("msg") or j.get("message") or j.get("error") or ""
+    if code in (401, 403):
+        base = "Доступ запрещён: проверь KIE_API_KEY (Bearer)."
+    elif code == 451:
+        base = "Ошибка загрузки изображения (451)."
+    elif code == 429:
+        base = "Превышен лимит запросов (429)."
+    elif code == 500:
+        base = "Внутренняя ошибка KIE (500)."
+    else:
+        base = f"KIE code {code}."
+    return f"{base} {('— ' + msg) if msg else ''}".strip()
 
-    # 2) опрос статуса
-    deadline = time.time() + WAIT_MAX_SECS
-    urls: List[str] = []
+# ==========================
+#        UI / клавиатуры
+# ==========================
+def top_menu_kb(credits: float) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎬 Сгенерировать видео по тексту", callback_data="mode:text")],
+        [InlineKeyboardButton("📷 Сгенерировать видео по фото",  callback_data="mode:photo")],
+        [InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)],
+        [InlineKeyboardButton("🤖 Бесплатный ChatGPT", callback_data="mode:chat")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
-    while time.time() < deadline:
-        info, serr = kie_status(task_id)
-        tick()
-        if serr:
-            time.sleep(POLL_INTERVAL_SECS); continue
+def aspect_row(cur: str) -> List[InlineKeyboardButton]:
+    if cur == "9:16":
+        return [InlineKeyboardButton("16:9", callback_data="aspect:16:9"),
+                InlineKeyboardButton("9:16 ✅", callback_data="aspect:9:16")]
+    return [InlineKeyboardButton("16:9 ✅", callback_data="aspect:16:9"),
+            InlineKeyboardButton("9:16", callback_data="aspect:9:16")]
 
-        flag = _find_success_flag(info or {})
-        if flag in (2, 3):
-            try:
-                bot.edit_message_text("❌ Генерация не удалась на стороне провайдера.",
-                                      chat_id=chat_id, message_id=timer_msg.id)
-            except Exception:
-                bot.send_message(chat_id, "❌ Генерация не удалась на стороне провайдера.")
-            return
+def speed_row(cur: str, quality_available: bool) -> List[InlineKeyboardButton]:
+    fast   = "⚡ Fast" + (" ✅" if cur == "fast" else "")
+    if not quality_available:
+        return [InlineKeyboardButton(fast, callback_data="speed:fast")]
+    qual   = "🎬 Quality" + (" ✅" if cur == "quality" else "")
+    return [InlineKeyboardButton(fast, callback_data="speed:fast"),
+            InlineKeyboardButton(qual, callback_data="speed:quality")]
 
-        urls = _extract_video_urls(info or {})
-        if urls:
-            break
+def card_keyboard(s: Dict[str, Any], quality_available: bool) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    rows.append([InlineKeyboardButton("🖼️ Добавить/Удалить фото", callback_data="card:toggle_photo"),
+                 InlineKeyboardButton("✍️ Изменить промпт", callback_data="card:edit_prompt")])
+    rows.append(aspect_row(s.get("aspect", "16:9")))
+    rows.append(speed_row(s.get("speed", "fast"), quality_available))
+    if s.get("prompt"):
+        rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
+    rows.append([InlineKeyboardButton("🔁 Начать заново", callback_data="card:reset"),
+                 InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
-        time.sleep(POLL_INTERVAL_SECS)
+def build_intro_text(credits: float) -> str:
+    return (
+        "👋 *Привет!* Это бот *Veo 3* — генератор видео с помощью ИИ.\n\n"
+        "📚 Смотри примеры роликов и правильные промпты — @veo3prompts\n"
+        "📖 *Инструкция* — как пользоваться ботом\n\n"
+        f"💎 *Осталось генераций:* {int(credits)}\n\n"
+        "Что хочешь сгенерировать сегодня?"
+    )
 
-    if not urls:
-        try:
-            bot.edit_message_text("⚠️ Видео готово, но ссылка ещё не появилась. Попробуйте позже.",
-                                  chat_id=chat_id, message_id=timer_msg.id)
-        except Exception:
-            bot.send_message(chat_id, "⚠️ Видео готово, но ссылка ещё не появилась. Попробуйте позже.")
-        return
+def build_card_text(s: Dict[str, Any], quality_available: bool) -> str:
+    prompt = (s.get("prompt") or "").strip()
+    if len(prompt) > 800:
+        prompt = prompt[:800] + "…"
+    has_ref = "есть" if s.get("image_url") else "нет"
 
-    # 3) скачиваем и отправляем
-    video_url = urls[0]
+    speed = s.get("speed", "fast")
+    speed_label = "Fast ⚡" if speed == "fast" else "Quality 🎬"
+    cost = FAST_COST if speed == "fast" else QUALITY_COST
+    qual_line = "" if not quality_available else f"\n• Режим: *{speed_label}* (стоимость: {cost:g})"
+
+    return (
+        "✍️ *Промпт:*\n"
+        f"`{prompt or '—'}`\n\n"
+        "📋 *Параметры генерации:*\n"
+        f"• Формат: *{s.get('aspect','16:9')}* 🎞"
+        f"{qual_line}\n"
+        f"• Промпт: *{'есть' if s.get('prompt') else 'нет'}* ✍️\n"
+        f"• Референс: *{has_ref}*\n"
+    )
+
+# ==========================
+#        Состояние
+# ==========================
+DEFAULT_STATE = {
+    "mode": None,            # 'text' | 'photo' | 'chat'
+    "aspect": "16:9",
+    "speed": "fast",         # 'fast' | 'quality'
+    "prompt": None,
+    "image_url": None,
+    "quality_available": True,  # будем динамически опускать, если придёт ошибка
+    "generating": False,
+    "current_task": None,
+    "ui_msg_id": None,
+}
+
+def user_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    ud = ctx.user_data
+    # init defaults
+    for k, v in DEFAULT_STATE.items():
+        ud.setdefault(k, v)
+    return ud
+
+# ==========================
+#     KIE API wrappers
+# ==========================
+def _payload_for_kie(prompt: str, aspect: str, speed: str, image_url: Optional[str]) -> Dict[str, Any]:
+    payload = {
+        "prompt": prompt,
+        "aspectRatio": aspect,
+        "model": "veo3_quality" if speed == "quality" else "veo3_fast",
+    }
+    if image_url:
+        payload["imageUrl"] = image_url
+    return payload
+
+def submit_generation(prompt: str, aspect: str, speed: str, image_url: Optional[str]) -> Tuple[bool, Optional[str], str]:
+    url = join_url(KIE_BASE_URL, KIE_GEN_PATH)
+    status, j = _post_json(url, _payload_for_kie(prompt, aspect, speed, image_url))
+    code = j.get("code", status)
+    if status == 200 and code == 200:
+        task_id = _extract_task_id(j)
+        if task_id:
+            return True, task_id, "ok"
+        return False, None, "Ответ KIE без taskId."
+    return False, None, _kie_error_message(status, j)
+
+def get_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
+    url = join_url(KIE_BASE_URL, KIE_STATUS_PATH)
+    status, j = _get_json(url, {"taskId": task_id})
+    code = j.get("code", status)
+    if status == 200 and code == 200:
+        flag, msg, data = _parse_success_flag(j)
+        return True, flag, msg, _extract_result_url(data or {})
+    return False, None, _kie_error_message(status, j), None
+
+# ==========================
+#      Отправка видео
+# ==========================
+async def send_video(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str) -> bool:
+    # 1) пробуем отдать прямую ссылку (телеграм сам скачает)
     try:
-        path = _download_to_temp(video_url)
-        try:
-            bot.edit_message_text("📥 Загружаю видео в Telegram…", chat_id=chat_id, message_id=timer_msg.id)
-        except Exception:
-            pass
+        await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
+        return True
+    except Exception as e:
+        log.info("Direct URL send failed, try file. %s", e)
+    # 2) скачиваем и отправляем файлом
+    tmp = None
+    try:
+        r = requests.get(url, stream=True, timeout=180)
+        r.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
+            for chunk in r.iter_content(chunk_size=512 * 1024):
+                if chunk:
+                    f.write(chunk)
+            tmp = f.name
+        with open(tmp, "rb") as f:
+            await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename="veo3.mp4"),
+                                     supports_streaming=True)
+        return True
+    except Exception as e:
+        log.exception("File send failed: %s", e)
+        return False
+    finally:
+        if tmp:
+            try: os.unlink(tmp)
+            except Exception: pass
 
-        with open(path, "rb") as f:
-            bot.send_video(chat_id, f, supports_streaming=True,
-                           caption=f"✅ Готово! Формат: *{ratio}*", reply_markup=_after_success_kb())
-        bot.send_message(chat_id, f"🔥 Больше идей промптов: {PROMPTS_CHANNEL_URL}", disable_web_page_preview=True)
-    except Exception:
+# ==========================
+#     Поллинг задачи
+# ==========================
+async def poll_and_deliver(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE):
+    s = user_state(ctx)
+    s["generating"] = True
+    start = time.time()
+    try:
+        while True:
+            ok, flag, msg, url = await asyncio.to_thread(get_status, task_id)
+            if not ok:
+                await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса: {msg or 'неизвестно'}")
+                break
+
+            if flag == 0:  # в обработке
+                if time.time() - start > POLL_TIMEOUT_SECS:
+                    await ctx.bot.send_message(chat_id, "⏳ Таймаут ожидания. Попробуйте позже.")
+                    break
+                await asyncio.sleep(POLL_INTERVAL_SECS)
+                continue
+
+            if flag == 1:  # готово
+                if not url:
+                    await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылка не найдена.")
+                    break
+                sent = await send_video(ctx, chat_id, url)
+                if sent:
+                    await ctx.bot.send_message(chat_id, "✅ Готово!")
+                else:
+                    await ctx.bot.send_message(chat_id, "⚠️ Видео не получилось отправить. Попробуйте ещё раз.")
+                break
+
+            if flag in (2, 3):
+                await ctx.bot.send_message(chat_id, f"❌ Генерация не удалась на стороне провайдера. {msg or ''}".strip())
+                break
+
+            await asyncio.sleep(POLL_INTERVAL_SECS)
+    except Exception as e:
+        log.exception("Poller crashed: %s", e)
         try:
-            bot.edit_message_text("✅ Видео готово, но не удалось отправить файл (сеть/лимиты).",
-                                  chat_id=chat_id, message_id=timer_msg.id)
+            await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе статуса.")
         except Exception:
             pass
     finally:
-        try:
-            if 'path' in locals() and os.path.exists(path): os.remove(path)
-        except Exception:
-            pass
+        s["generating"] = False
+        s["current_task"] = None
 
-# ===== Fallback =====
-@bot.message_handler(content_types=["text", "photo", "document", "video", "sticker", "audio", "voice"])
-def fallback(m):
-    st = STATE.get(m.chat.id) or {}
-    if st.get("phase") == "chat" and m.content_type != "text":
-        bot.send_message(m.chat.id, "Напиши текст. `/exit` — выход.")
+# ==========================
+#       Prompt-Master
+# ==========================
+async def prompt_master(idea: str) -> Optional[str]:
+    if not (openai and OPENAI_API_KEY):
+        return None
+    sys = (
+        "You are a world-class cinematic prompt writer for Google Veo 3. "
+        "Return ONE English prompt, 450–900 chars, no preface, no bullets, no brand names. "
+        "Include: subject, micro-actions, lens/optics (mm/anamorphic), camera movement, "
+        "lighting (time, color temp, key/fill/rim), mood/atmosphere, texture/particles, "
+        "composition, color palette, environment sound cues. "
+        "Optionally a short line of dialogue in quotes. No logos, no watermarks."
+    )
+    try:
+        resp = await asyncio.to_thread(
+            openai.ChatCompletion.create,
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": idea.strip()}],
+            temperature=0.95,
+            max_tokens=700,
+        )
+        out = resp["choices"][0]["message"]["content"].strip()
+        return out[:1200]
+    except Exception as e:
+        log.exception("PromptMaster error: %s", e)
+        return None
+
+# ==========================
+#        Хэндлеры
+# ==========================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # инициализация баланса
+    _get_credits(chat_id)
+    s = user_state(ctx)
+    # сброс состояния
+    for k, v in DEFAULT_STATE.items():
+        s[k] = v
+
+    credits = _get_credits(chat_id)
+    await update.message.reply_text(
+        build_intro_text(credits),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=top_menu_kb(credits),
+        disable_web_page_preview=True
+    )
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "").strip()
+    s = user_state(ctx)
+    chat_id = update.effective_chat.id
+
+    # режимы
+    if data.startswith("mode:"):
+        mode = data.split(":", 1)[1]
+        s["mode"] = mode
+        s["ui_msg_id"] = None  # новая карточка
+        if mode == "text":
+            await q.message.reply_text("✍️ Напиши идею/промпт. Хочешь — нажми «Промпт-мастер» и пришли только идею.")
+        elif mode == "photo":
+            await q.message.reply_text("📷 Пришли фото. Можно добавить подпись-промпт.")
+        elif mode == "chat":
+            await q.message.reply_text("🤖 Обычный чат: задавай вопросы. Для выхода — /start.")
+        # показываем пустую карточку
+        await show_card(update, ctx)
         return
-    bot.send_message(m.chat.id, "Открой меню: /menu")
 
-# ===== RUN =====
+    # аспект
+    if data.startswith("aspect:"):
+        s["aspect"] = "9:16" if data.endswith("9:16") else "16:9"
+        await show_card(update, ctx, edit_only_markup=True)
+        return
+
+    # скорость
+    if data.startswith("speed:"):
+        val = data.split(":", 1)[1]
+        if val in ("fast", "quality"):
+            s["speed"] = val
+        await show_card(update, ctx, edit_only_markup=True)
+        return
+
+    # карточка-кнопки
+    if data == "card:toggle_photo":
+        if s.get("image_url"):
+            s["image_url"] = None
+            await q.message.reply_text("🗑️ Референс удалён.")
+        else:
+            await q.message.reply_text("Пришли фото (или публичный URL картинки).")
+        await show_card(update, ctx)
+        return
+
+    if data == "card:edit_prompt":
+        await q.message.reply_text("Пришли новый текст промпта или идею для *Промпт-мастера*.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "card:reset":
+        keep_aspect = s.get("aspect", "16:9")
+        keep_quality_av = s.get("quality_available", True)
+        for k, v in DEFAULT_STATE.items():
+            s[k] = v
+        s["aspect"] = keep_aspect
+        s["quality_available"] = keep_quality_av
+        await q.message.reply_text("🧹 Карточка очищена.")
+        await show_card(update, ctx)
+        return
+
+    if data == "back":
+        credits = _get_credits(chat_id)
+        await q.message.reply_text(
+            build_intro_text(credits),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=top_menu_kb(credits),
+            disable_web_page_preview=True
+        )
+        return
+
+    if data == "card:generate":
+        if s.get("generating"):
+            await q.message.reply_text("⏳ Генерация уже идёт. Дождитесь завершения.")
+            return
+        if not s.get("prompt"):
+            await q.message.reply_text("Сначала укажите промпт.")
+            return
+
+        # проверим кредиты
+        cost = FAST_COST if s.get("speed") == "fast" else QUALITY_COST
+        if not _spend_credits(chat_id, cost):
+            await q.message.reply_text(
+                f"💳 Недостаточно генераций (нужно {cost:g}). Нажмите «Пополнить баланс».",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пополнить баланс", url=TOPUP_URL)]])
+            )
+            return
+
+        ok, task_id, msg = await asyncio.to_thread(
+            submit_generation, s["prompt"], s.get("aspect", "16:9"), s.get("speed", "fast"), s.get("image_url")
+        )
+        if not ok or not task_id:
+            # вернём списанные кредиты, чтобы не было обидно
+            _add_credits(chat_id, cost)
+            # если упало из-за «quality» — выключим его до рестарта
+            if "veo3_quality" in (msg or "").lower():
+                s["quality_available"] = False
+            await q.message.reply_text(f"❌ Не удалось создать задачу: {msg}")
+            await show_card(update, ctx, edit_only_markup=True)
+            return
+
+        s["generating"] = True
+        s["current_task"] = task_id
+        await q.message.reply_text(f"🚀 Отправил задачу в Veo3 ({'Quality' if s['speed']=='quality' else 'Fast'}). taskId={task_id}")
+        asyncio.create_task(poll_and_deliver(chat_id, task_id, ctx))
+        return
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = user_state(ctx)
+    text = (update.message.text or "").strip()
+
+    # если прислали публичный URL картинки
+    low = text.lower()
+    if low.startswith(("http://", "https://")) and low.split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
+        s["image_url"] = text.strip()
+        await update.message.reply_text("🖼️ Ссылка на изображение принята.")
+        await show_card(update, ctx)
+        return
+
+    # режимы
+    if s.get("mode") == "chat":
+        if not (openai and OPENAI_API_KEY):
+            await update.message.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY).")
+            return
+        try:
+            resp = await asyncio.to_thread(
+                openai.ChatCompletion.create,
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": "You are a helpful, concise assistant."},
+                          {"role": "user", "content": text}],
+                temperature=0.5,
+                max_tokens=600,
+            )
+            out = resp["choices"][0]["message"]["content"].strip()
+            await update.message.reply_text(out or "…")
+        except Exception as e:
+            log.exception("Chat error: %s", e)
+            await update.message.reply_text("⚠️ Ошибка ChatGPT.")
+        return
+
+    # кнопка «Промпт-мастер» нет как таковой — просто объясняем юзеру:
+    if text.strip().lower() in ("prompt", "prompt-master", "промпт", "промпт-мастер"):
+        await update.message.reply_text("Пришли коротко идею — верну готовый кинопромпт (EN).")
+        return
+
+    # если пользователь в любом режиме прислал обычный текст — считаем это идеей → прогоняем через Prompt-Master
+    # (можно отключить — тогда закомментируй блок ниже)
+    pm = await prompt_master(text)
+    if pm:
+        s["prompt"] = pm
+        await update.message.reply_text("🧠 Готово! Добавил кинопромпт в карточку.")
+    else:
+        s["prompt"] = text
+        await update.message.reply_text("✍️ Принял текст как промпт (Prompt-Master недоступен).")
+    await show_card(update, ctx)
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = user_state(ctx)
+    photos = update.message.photo
+    if not photos:
+        return
+    ph = photos[-1]
+    try:
+        f = await ctx.bot.get_file(ph.file_id)
+        if not f or not f.file_path:
+            await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram.")
+            return
+        url = tg_file_direct_url(TELEGRAM_TOKEN, f.file_path)
+        log.info("Got TG photo path: ...%s", mask_secret(url))
+        s["image_url"] = url
+        await update.message.reply_text("🖼️ Фото принято как референс.")
+        await show_card(update, ctx)
+    except Exception as e:
+        log.exception("Get photo failed: %s", e)
+        await update.message.reply_text("⚠️ Не удалось обработать фото. Пришли публичный URL картинки текстом.")
+
+async def error_handler(update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error: %s", ctx.error)
+    try:
+        if update and update.effective_chat:
+            await ctx.bot.send_message(update.effective_chat.id, "⚠️ Системная ошибка. Попробуйте ещё раз.")
+    except Exception:
+        pass
+
+# показать/обновить карточку
+async def show_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_markup: bool = False):
+    s = user_state(ctx)
+    chat_id = update.effective_chat.id
+    text = build_card_text(s, s.get("quality_available", True))
+    kb = card_keyboard(s, s.get("quality_available", True))
+
+    mid = s.get("ui_msg_id")
+    try:
+        if mid:
+            if edit_only_markup:
+                await ctx.bot.edit_message_reply_markup(chat_id, mid, reply_markup=kb)
+            else:
+                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text,
+                                                parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+                                                disable_web_page_preview=True)
+        else:
+            m = await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                                                reply_markup=kb, disable_web_page_preview=True)
+                       if update.callback_query else
+                       update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                                 reply_markup=kb, disable_web_page_preview=True))
+            s["ui_msg_id"] = m.message_id
+    except Exception as e:
+        log.warning("show_card failed: %s", e)
+        try:
+            m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+                                           reply_markup=kb, disable_web_page_preview=True)
+            s["ui_msg_id"] = m.message_id
+        except Exception as e2:
+            log.exception("show_card send failed: %s", e2)
+
+# ==========================
+#        Entry point
+# ==========================
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+    if not (KIE_API_KEY and KIE_BASE_URL and KIE_GEN_PATH and KIE_STATUS_PATH):
+        raise RuntimeError("KIE env vars are not properly set")
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(error_handler)
+
+    log.info("Bot starting… PTB 20.7 | KIE=%s", KIE_BASE_URL)
+    app.run_polling(drop_pending_updates=True)
+
 if __name__ == "__main__":
-    print("✅ Bot is running…")
-    # устойчивый polling (без PTB/Updater)
-    bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+    main()
