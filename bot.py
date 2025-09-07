@@ -32,6 +32,8 @@ from telegram.ext import (
     AIORateLimiter,
 )
 
+import telegram  # ✅ ДОБАВЛЕНО: нужно для вывода версии PTB
+
 # ==========================
 #   Инициализация / ENV
 # ==========================
@@ -70,6 +72,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("best-veo3-bot")
 
+# ✅ ДОБАВЛЕНО: лог реальной версии python-telegram-bot
+log.info("PTB version: %s", getattr(telegram, "__version__", "unknown"))
 
 # ==========================
 #   Утилиты
@@ -226,7 +230,7 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
     try:
         resp = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-4o-mini",  # старый SDK 0.28.1 поддерживает ChatCompletion.* — модель может быть любой доступной в аккаунте
+            model="gpt-4o-mini",
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": idea_text.strip()}],
             temperature=0.9,
@@ -275,7 +279,6 @@ def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
 def _parse_success_flag(j: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Dict[str, Any]]:
     data = j.get("data") or {}
     msg = j.get("msg") or j.get("message") or data.get("message")
-    # Пытаемся вытащить как int, иначе маппим строковые статусы
     flag = None
     for k in ("successFlag", "status", "state"):
         if k in data:
@@ -284,7 +287,6 @@ def _parse_success_flag(j: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]
                 flag = int(v)
                 break
             except Exception:
-                # маппинг строковых статусов
                 s = str(v).strip().lower()
                 if s in ("pending", "processing", "running", "queued"): flag = 0
                 elif s in ("success", "done", "finished", "1"): flag = 1
@@ -329,7 +331,7 @@ def _build_payload_for_kie(prompt: str, aspect: str, image_url: Optional[str], m
         "prompt": prompt,
         "aspectRatio": aspect,
         "model": "veo3" if model_key == "veo3" else "veo3_fast",
-        "enableFallback": aspect == "16:9",  # fallback доступен только в 16:9
+        "enableFallback": aspect == "16:9",
     }
     if image_url:
         payload["imageUrls"] = [image_url]
@@ -347,7 +349,6 @@ def submit_kie_generation(prompt: str, aspect: str, image_url: Optional[str], mo
     return False, None, _kie_error_message(status, j)
 
 def get_kie_task_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
-    """Возвращает (ok, success_flag, status_message, result_url)."""
     url = join_url(KIE_BASE_URL, KIE_STATUS_PATH)
     status, j = _get_json(url, {"taskId": task_id})
     code = j.get("code", status)
@@ -361,14 +362,12 @@ def get_kie_task_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str
 #   Отправка медиа
 # ==========================
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str) -> bool:
-    # 1) пробуем прислать по URL
     try:
         await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
         return True
     except Exception as e:
         log.warning("Direct URL send failed, try download. %s", e)
 
-    # 2) скачиваем и шлём файлом
     tmp_path = None
     try:
         r = requests.get(url, stream=True, timeout=180)
@@ -461,7 +460,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     info = {
-        "PTB": "20.7",
+        "PTB": getattr(telegram, "__version__", "unknown"),
         "KIE_BASE_URL": KIE_BASE_URL,
         "GEN": KIE_GEN_PATH,
         "STATUS": KIE_STATUS_PATH,
@@ -523,21 +522,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     s = state(ctx)
 
-    # Переключение аспектов
     if data.startswith("aspect:"):
         _, val = data.split(":", 1)
         s["aspect"] = "9:16" if val.strip() == "9:16" else "16:9"
         await show_card(update, ctx, edit_only_markup=True)
         return
 
-    # Переключение модели
     if data.startswith("model:"):
         _, val = data.split(":", 1)
         s["model"] = "veo3" if val.strip() == "veo3" else "veo3_fast"
         await show_card(update, ctx, edit_only_markup=True)
         return
 
-    # Режимы
     if data.startswith("mode:"):
         _, mode = data.split(":", 1)
         s["mode"] = mode
@@ -627,7 +623,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
 
-    # Публичный URL изображения?
     low = text.lower()
     if low.startswith(("http://", "https://")) and low.split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
         s["last_image_url"] = text.strip()
@@ -666,7 +661,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Ошибка запроса к ChatGPT.")
         return
 
-    # По умолчанию — считаем это промптом для генерации
     s["last_prompt"] = text
     await update.message.reply_text(
         "🟦 <b>Veo 3 — подготовка к рендеру</b>\n"
@@ -683,7 +677,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ph = photos[-1]
     try:
         file = await ctx.bot.get_file(ph.file_id)
-        file_path = file.file_path  # photos/file_123.jpg
+        file_path = file.file_path
         if not file_path:
             await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram.")
             return
@@ -721,7 +715,8 @@ def main():
     app.add_error_handler(error_handler)
 
     log.info(
-        "Bot starting. PTB=20.7 | KIE_BASE=%s GEN=%s STATUS=%s HD=%s",
+        "Bot starting. PTB=%s | KIE_BASE=%s GEN=%s STATUS=%s HD=%s",
+        getattr(telegram, "__version__", "unknown"),
         KIE_BASE_URL, KIE_GEN_PATH, KIE_STATUS_PATH, KIE_HD_PATH
     )
     app.run_polling(drop_pending_updates=True)
