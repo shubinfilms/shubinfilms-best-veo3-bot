@@ -3,8 +3,8 @@ services:
     name: best-veo3-bot
     env: python
     pythonVersion: 3.11.9
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -u bot.py   # <- -u, чтобы логи сразу писались
+    buildCommand: pip install --upgrade -r requirements.txt
+    startCommand: python -u bot.py
     plan: starter
     region: frankfurt
     autoDeploy: true
