@@ -2,8 +2,9 @@ services:
   - type: worker
     name: best-veo3-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    pythonVersion: 3.11.9
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python main.py
     plan: starter
     region: frankfurt
     autoDeploy: true
