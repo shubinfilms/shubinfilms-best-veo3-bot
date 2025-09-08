@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 + MJ Bot — PTB 20.7
-# Версия: 2025-09-09 (balance+ui)
+# Версия: 2025-09-08 (fix: TG->public upload + MJ-inline UI)
 
 import os
 import json
@@ -38,7 +38,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
-# OpenAI (старый SDK 0.28.1 — опционально для Prompt-Master/чата)
+# OpenAI (опционально для Prompt-Master/чата — можно оставить как было)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 try:
     import openai  # type: ignore
@@ -49,7 +49,7 @@ except Exception:
 
 # ---- KIE ----
 KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
-KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai").strip()
+KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
 
 # VEO endpoints
 KIE_VEO_GEN_PATH = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate")
@@ -61,9 +61,6 @@ KIE_MJ_STATUS_PATH = "/api/v1/mj/record-info"
 
 PROMPTS_CHANNEL_URL = os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts").strip()
 TOPUP_URL = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts").strip()
-
-# Баланс управления (локальный, на пользователя)
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
 
 # Паузы
 POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "6"))
@@ -92,7 +89,6 @@ def join_url(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
     return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
 
-
 def mask_secret(s: str, show: int = 6) -> str:
     if not s:
         return ""
@@ -100,7 +96,6 @@ def mask_secret(s: str, show: int = 6) -> str:
     if len(s) <= show:
         return "*" * len(s)
     return f"{'*' * (len(s) - show)}{s[-show:]}"
-
 
 def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
     if not value:
@@ -114,12 +109,10 @@ def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
                 return v.strip()
     return None
 
-
 def tg_file_direct_url(bot_token: str, file_path: str) -> str:
     # В URL присутствует токен — не логируем целиком
     return f"https://api.telegram.org/file/bot{bot_token}/{file_path.lstrip('/')}"
 
-# Проверка непустых строк
 def _nz(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
@@ -128,12 +121,61 @@ def _nz(s: Optional[str]) -> Optional[str]:
 
 
 # ==========================
+#   Публичная загрузка фото (фикс 400)
+# ==========================
+TELEGRAPH_UPLOAD = "https://telegra.ph/upload"
+
+def _upload_bytes_to_telegraph(data: bytes, filename: str) -> Optional[str]:
+    """Заливаем байты на telegra.ph и возвращаем публичную ссылку."""
+    files = {"file": (filename, data)}
+    try:
+        r = requests.post(TELEGRAPH_UPLOAD, files=files, timeout=60)
+        r.raise_for_status()
+        arr = r.json()
+        if isinstance(arr, list) and arr and "src" in arr[0]:
+            return "https://telegra.ph" + arr[0]["src"]
+    except Exception as e:
+        log.exception("Telegraph upload failed: %s", e)
+    return None
+
+def url_to_public_telegraph(url: str) -> Optional[str]:
+    """Скачать URL и перезалить на telegra.ph (чтобы KIE точно смог скачать)."""
+    try:
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        ext = ".jpg"
+        ctype = r.headers.get("Content-Type", "").lower()
+        if "png" in ctype:
+            ext = ".png"
+        elif "webp" in ctype:
+            ext = ".webp"
+        return _upload_bytes_to_telegraph(r.content, f"img{ext}")
+    except Exception as e:
+        log.exception("Fetch&reupload failed: %s", e)
+        return None
+
+async def telegram_file_to_public_url(ctx: ContextTypes.DEFAULT_TYPE, file_id: str) -> Optional[str]:
+    """Берём file_id, качаем из Telegram и заливаем на telegra.ph (безопасно для KIE)."""
+    try:
+        file = await ctx.bot.get_file(file_id)
+        file_path = file.file_path
+        if not file_path:
+            return None
+        # Скачиваем в память
+        by = await file.download_as_bytearray()
+        return _upload_bytes_to_telegraph(bytes(by), os.path.basename(file_path) or "photo.jpg")
+    except Exception as e:
+        log.exception("TG->Telegraph failed: %s", e)
+        return None
+
+
+# ==========================
 #   Состояние пользователя
 # ==========================
 DEFAULT_STATE = {
     "mode": None,              # 'veo_text' | 'veo_photo' | 'prompt_master' | 'chat' | 'mj_face'
     # VEO
-    "aspect": None,            # '16:9' | '9:16' (задаём после выбора режима)
+    "aspect": None,            # '16:9' | '9:16'
     "model": None,             # 'veo3_fast' | 'veo3'
     "last_prompt": None,
     "last_image_url": None,
@@ -155,8 +197,7 @@ DEFAULT_STATE = {
     "mj_generation_id": None,
     "mj_last_task_id": None,
     "mj_last_images": None,
-    # User stars balance
-    "stars_balance": 0,
+    "mj_ui_msg_id": None,      # <<< для редактирования карточки MJ в одном сообщении
 }
 
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -165,41 +206,23 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         ud.setdefault(k, v)
     return ud
 
-# ----- Баланс ⭐
-def get_user_balance(ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    s = state(ctx)
-    return int(s.get("stars_balance", 0))
-
-def set_user_balance(ctx: ContextTypes.DEFAULT_TYPE, value: int) -> None:
-    s = state(ctx)
-    s["stars_balance"] = max(0, int(value))
-
-def add_user_balance(ctx: ContextTypes.DEFAULT_TYPE, delta: int) -> int:
-    cur = get_user_balance(ctx)
-    newv = max(0, cur + int(delta))
-    set_user_balance(ctx, newv)
-    return newv
-
 
 # ==========================
 #   Кнопки / UI
 # ==========================
-def build_welcome_text(ctx: ContextTypes.DEFAULT_TYPE) -> str:
-    balance = get_user_balance(ctx)
-    return (
-        "🎬 VEO Опиши идею - получишь готовый клип!\n"
-        "🧑‍🎨 MJ - Генерация фото с вашим лицом , отправь ему селфи, опиши сцену и получи результат прямо в чат.\n"
-        "🧠 ChatGPT - мастер создает кинематографичный промпт, просто напиши ему свою идею, опиши персонажа, текст озвучки, локацию и получи видео.\n\n"
-        f"💳 Баланс токенов: {balance}⭐\n\n"
-        f"• Больше идей: {PROMPTS_CHANNEL_URL}\n"
-        "Выберите режим ниже:"
-    )
+WELCOME = (
+    "🎬 VEO Опиши идею - получишь готовый клип!\n"
+    "🧑‍🎨 MJ - Генерация фото с вашим лицом , отправь ему селфи, опиши сцену и получи результат прямо в чат.\n"
+    "🧠 ChatGPT - мастер создает кинематографичный промпт, просто напиши ему свою идею, опиши персонажа, текст озвучки, локацию и получи видео.\n"
+    f"• Больше идей: {PROMPTS_CHANNEL_URL}\n"
+    "Выберите режим ниже:"
+)
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎬 Сгенерировать по тексту (VEO)", callback_data="mode:veo_text")],
         [InlineKeyboardButton("🖼️ Сгенерировать по фото (VEO)",  callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧑‍🎨 Фото с вашим лицом (MJ)",    callback_data="mode:mj_face")],
+        [InlineKeyboardButton("🧑‍🦰 Фото с вашим лицом (MJ)",    callback_data="mode:mj_face")],
         [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)",       callback_data="mode:prompt_master")],
         [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",         callback_data="mode:chat")],
         [
@@ -219,7 +242,7 @@ def aspect_row(current: str) -> List[InlineKeyboardButton]:
 
 def model_row(current: str) -> List[InlineKeyboardButton]:
     if current == "veo3":
-        return [InlineKeyboardButton("⚡ Fast",        callback_data="model:veo3_fast"),
+        return [InlineKeyboardButton("⚡ Fast",    callback_data="model:veo3_fast"),
                 InlineKeyboardButton("💎 Quality ✅", callback_data="model:veo3")]
     return [InlineKeyboardButton("⚡ Fast ✅", callback_data="model:veo3_fast"),
             InlineKeyboardButton("💎 Quality", callback_data="model:veo3")]
@@ -290,10 +313,7 @@ def card_keyboard_veo(s: Dict[str, Any]) -> InlineKeyboardMarkup:
                  InlineKeyboardButton("✍️ Изменить промпт",       callback_data="card:edit_prompt")])
     rows.append(aspect_row(s.get("aspect") or "16:9"))
     rows.append(model_row(s.get("model") or "veo3_fast"))
-    if s.get("last_prompt"):
-        rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
-    if s.get("last_result_url"):
-        rows.append([InlineKeyboardButton("🔁 Отправить ещё раз", callback_data="card:resend")])
+    rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
     rows.append([InlineKeyboardButton("🔁 Начать заново", callback_data="card:reset"),
                  InlineKeyboardButton("⬅️ Назад",             callback_data="back")])
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
@@ -312,7 +332,7 @@ def card_keyboard_mj(s: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 # ==========================
-#   Prompt-Master / Chat
+#   Prompt-Master / Chat (как было)
 # ==========================
 async def oai_prompt_master(idea_text: str) -> Optional[str]:
     if openai is None or not OPENAI_API_KEY:
@@ -321,10 +341,8 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
         "You are Prompt-Master for cinematic AI video generation. "
         "Respond with EXACTLY ONE English prompt, 500–900 characters. "
         "No prefaces, no lists, no brand names or logos. "
-        "Include: lens/optics (mm/anamorphic), camera movement (dolly, push-in, glide, rack focus), "
-        "lighting/palette/atmosphere, tiny sensory details (dust, steam, lens flares, wind), "
-        "subtle audio cues (music/ambience). Optionally one short hero line in quotes. "
-        "Never add JSON or metadata. Output only the prompt text."
+        "Include: lens/optics, camera movement, lighting/palette, tiny sensory details, subtle audio cues. "
+        "Optionally one short hero line in quotes."
     )
     try:
         resp = await asyncio.to_thread(
@@ -398,7 +416,6 @@ def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
     return pick_first_url(data.get("url"))
 
 def _extract_result_urls_list(data: Dict[str, Any]) -> List[str]:
-    # для MJ: data.resultInfoJson.resultUrls может быть list[str] или list[dict{resultUrl}]
     urls: List[str] = []
     ri = (data or {}).get("resultInfoJson") or {}
     arr = ri.get("resultUrls") or []
@@ -439,13 +456,13 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
         "prompt": prompt,
         "aspectRatio": "9:16" if aspect == "9:16" else "16:9",
         "model": "veo3" if model_key == "veo3" else "veo3_fast",
-        "enableFallback": aspect == "16:9",  # fallback доступен только в 16:9
+        "enableFallback": aspect == "16:9",
     }
     if image_url:
         payload["imageUrls"] = [image_url]
     return payload
 
-# ---------- MJ payload (строгая валидация, чтобы не было 400)
+# ---------- MJ payload
 ALLOWED_MJ_ASPECTS = {"1:1", "16:9", "9:16", "3:4"}
 ALLOWED_MJ_SPEEDS = {"relaxed", "fast", "turbo"}
 
@@ -470,7 +487,6 @@ def build_payload_for_mj_img2img(prompt: str, selfie_url: str, s: Dict[str, Any]
 
     version = str(s.get("mj_version") or "7").strip() or "7"
 
-    # числовые параметры
     styl = _clamp_int(s.get("mj_stylization", 50), 0, 1000, 50)
     weird = _clamp_int(s.get("mj_weirdness", 0), 0, 3000, 0)
     var = _clamp_int(s.get("mj_variety", 5), 0, 100, 5)
@@ -478,7 +494,7 @@ def build_payload_for_mj_img2img(prompt: str, selfie_url: str, s: Dict[str, Any]
     payload: Dict[str, Any] = {
         "taskType": "mj_img2img",
         "prompt": prompt,
-        "fileUrls": [selfie_url],
+        "fileUrls": [selfie_url],   # <<< даём публичный URL (telegra.ph)
         "aspectRatio": aspect,
         "version": version,
         "speed": speed,
@@ -545,14 +561,11 @@ def get_kie_mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str],
 #   Отправка медиа
 # ==========================
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str) -> bool:
-    # 1) пробуем прислать по URL
     try:
         await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
         return True
     except Exception as e:
         log.warning("Direct URL send failed, try download. %s", e)
-
-    # 2) скачиваем и шлём файлом
     tmp_path = None
     try:
         r = requests.get(url, stream=True, timeout=180)
@@ -653,11 +666,6 @@ async def poll_mj_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Context
 
             ok, flag, msg, data = await asyncio.to_thread(get_kie_mj_status, task_id)
 
-            try:
-                log.debug("MJ status raw | ok=%s flag=%s msg=%s | %s", ok, flag, msg, json.dumps(data, ensure_ascii=False)[:1500])
-            except Exception:
-                pass
-
             if not ok:
                 await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса MJ: {msg or 'неизвестно'}")
                 break
@@ -687,7 +695,7 @@ async def poll_mj_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Context
                     "✅ *Готово!*",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("🖼️ Сгенерировать ещё фото", callback_data="mode:mj_face")]]
+                        [[InlineKeyboardButton("🚀 Сгенерировать ещё фото", callback_data="mode:mj_face")]]
                     ),
                 )
                 break
@@ -705,6 +713,10 @@ async def poll_mj_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Context
 
     except Exception as e:
         log.exception("MJ poller crashed: %s", e)
+        try:
+            await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе MJ.")
+        except Exception:
+            pass
     finally:
         if s.get("mj_generation_id") == gen_id:
             s["mj_generating"] = False
@@ -716,28 +728,8 @@ async def poll_mj_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Context
 # ==========================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
-    # не затираем баланс при старте
-    prev_balance = s.get("stars_balance", 0)
     s.update({**DEFAULT_STATE})
-    s["stars_balance"] = prev_balance
-    await update.message.reply_text(build_welcome_text(ctx), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
-
-async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"💳 Ваш баланс: {get_user_balance(ctx)}⭐")
-
-async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Админ тестовая команда: /grant 100 или /grant -50
-    user_id = update.effective_user.id if update.effective_user else 0
-    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
-        try:
-            delta = int((update.message.text or "").split(maxsplit=1)[1])
-        except Exception:
-            await update.message.reply_text("Использование: /grant <число>")
-            return
-        newv = add_user_balance(ctx, delta)
-        await update.message.reply_text(f"Готово. Новый баланс: {newv}⭐")
-    else:
-        await update.message.reply_text("Недостаточно прав.")
+    await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
@@ -791,18 +783,41 @@ async def show_card_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_onl
         except Exception as e2:
             log.exception("show_card_veo send failed: %s", e2)
 
-async def show_card_mj(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def show_card_mj(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_markup: bool = False):
+    """Редактируем карточку MJ в одном сообщении — как VEO."""
     s = state(ctx)
     text = build_card_text_mj(s)
     kb = card_keyboard_mj(s)
+    chat_id = update.effective_chat.id
+    last_id = s.get("mj_ui_msg_id")
     try:
-        await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                                        reply_markup=kb, disable_web_page_preview=True)
-               if update.callback_query else
-               update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                         reply_markup=kb, disable_web_page_preview=True))
+        if last_id:
+            if edit_only_markup:
+                await ctx.bot.edit_message_reply_markup(chat_id, last_id, reply_markup=kb)
+            else:
+                await ctx.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=last_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+        else:
+            m = await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                                               reply_markup=kb, disable_web_page_preview=True)
+                       if update.callback_query else
+                       update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                                 reply_markup=kb, disable_web_page_preview=True))
+            s["mj_ui_msg_id"] = m.message_id
     except Exception as e:
-        log.exception("show_card_mj failed: %s", e)
+        log.warning("show_card_mj edit failed: %s", e)
+        try:
+            m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+                                           reply_markup=kb, disable_web_page_preview=True)
+            s["mj_ui_msg_id"] = m.message_id
+        except Exception as e2:
+            log.exception("show_card_mj send failed: %s", e2)
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -823,18 +838,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "back":
-        # сохраняем баланс при сбросе
-        cur_balance = s.get("stars_balance", 0)
         s.update({**DEFAULT_STATE})
-        s["stars_balance"] = cur_balance
-        await query.message.reply_text(build_welcome_text(ctx), reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text("Главное меню:", reply_markup=main_menu_kb())
         return
 
     if data == "start_new_cycle":
-        # сохраняем баланс
-        cur_balance = s.get("stars_balance", 0)
         s.update({**DEFAULT_STATE})
-        s["stars_balance"] = cur_balance
         await query.message.reply_text("Выберите режим:", reply_markup=main_menu_kb())
         return
 
@@ -844,7 +853,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["mode"] = mode
 
         if mode in ("veo_text", "veo_photo"):
-            # инициализируем дефолты только после выбора режима
             s["aspect"] = "16:9"
             s["model"] = "veo3_fast"
             if mode == "veo_text":
@@ -891,8 +899,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show_card_veo(update, ctx)
         else:
             await query.message.reply_text(
-                "Пришлите фото. Я возьму прямую ссылку Telegram (если KIE примет) "
-                "или пришлите публичный URL картинки текстом."
+                "Пришлите фото. Я перезалью его на публичный хостинг (безопасно для KIE) "
+                "или пришлите уже публичный URL."
             )
         return
 
@@ -903,22 +911,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "card:reset":
         keep_aspect = s.get("aspect") or "16:9"
         keep_model = s.get("model") or "veo3_fast"
-        # сохраняем баланс
-        cur_balance = s.get("stars_balance", 0)
         s.update({**DEFAULT_STATE})
         s["aspect"] = keep_aspect
         s["model"] = keep_model
-        s["stars_balance"] = cur_balance
         await query.message.reply_text("Карточка очищена.")
         await show_card_veo(update, ctx)
-        return
-
-    if data == "card:resend":
-        if not s.get("last_result_url"):
-            await query.message.reply_text("Нет последнего результата для повторной отправки.")
-            return
-        ok = await send_video_with_fallback(ctx, update.effective_chat.id, s["last_result_url"])
-        await query.message.reply_text("✅ Готово!" if ok else "⚠️ Не получилось отправить видео.")
         return
 
     if data == "card:generate":
@@ -947,19 +944,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx))
         return
 
-    # ===== MJ параметры
+    # ===== MJ параметры (редактируем в одном сообщении)
     if data.startswith("mj_aspect:"):
         _, val = data.split(":", 1)
         if val in ALLOWED_MJ_ASPECTS:
             s["mj_aspect"] = val
-        await show_card_mj(update, ctx)
+        await show_card_mj(update, ctx, edit_only_markup=True)
         return
 
     if data.startswith("mj_speed:"):
         _, val = data.split(":", 1)
         if val in ALLOWED_MJ_SPEEDS:
             s["mj_speed"] = val
-        await show_card_mj(update, ctx)
+        await show_card_mj(update, ctx, edit_only_markup=True)
         return
 
     if data == "mj:toggle_selfie":
@@ -968,7 +965,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Селфи удалено.")
             await show_card_mj(update, ctx)
         else:
-            await query.message.reply_text("Пришлите селфи как фото или публичный URL изображения.")
+            await query.message.reply_text("Пришлите селфи как фото (я перезалью его публично) или публичный URL.")
         return
 
     if data == "mj:edit_prompt":
@@ -1008,16 +1005,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
 
-    # Публичный URL изображения?
+    # Публичный URL изображения? Перезальём на telegra.ph, чтобы KIE точно достал.
     low = text.lower()
     if low.startswith(("http://", "https://")) and any(low.split("?")[0].endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+        pub = url_to_public_telegraph(text)
+        if not pub:
+            await update.message.reply_text("⚠️ Не удалось подготовить изображение. Пришлите фото файлом.")
+            return
         if s.get("mode") == "mj_face":
-            s["mj_selfie_url"] = text.strip()
+            s["mj_selfie_url"] = pub
             await update.message.reply_text("✅ Селфи-URL принят (MJ).")
             await show_card_mj(update, ctx)
             return
         else:
-            s["last_image_url"] = text.strip()
+            s["last_image_url"] = pub
             await update.message.reply_text("✅ Ссылка на изображение принята.")
             await show_card_veo(update, ctx)
             return
@@ -1031,7 +1032,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         s["last_prompt"] = prompt
         await update.message.reply_text("🧠 Готово! Промпт добавлен в карточку.")
-        # Показываем VEO-карточку, т.к. промпт применим к VEO
         await show_card_veo(update, ctx)
         return
 
@@ -1056,7 +1056,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "mj_face":
-        # Текст — это промпт
         s["mj_prompt"] = text
         await update.message.reply_text(
             "🟣 *MJ — подготовка к рендеру*\nНужны селфи и промпт.",
@@ -1080,19 +1079,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ph = photos[-1]
     try:
-        file = await ctx.bot.get_file(ph.file_id)
-        file_path = file.file_path  # photos/file_123.jpg
-        if not file_path:
-            await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram.")
+        # <<< новый путь: берём файл из TG и перезаливаем на telegra.ph
+        public_url = await telegram_file_to_public_url(ctx, ph.file_id)
+        if not public_url:
+            await update.message.reply_text("⚠️ Не удалось подготовить фото. Попробуйте ещё раз.")
             return
-        url = tg_file_direct_url(TELEGRAM_TOKEN, file_path)
-        log.info("Photo via TG path: ...%s", mask_secret(url, show=10))
+
         if s.get("mode") == "mj_face":
-            s["mj_selfie_url"] = url
+            s["mj_selfie_url"] = public_url
             await update.message.reply_text("🖼️ Селфи принято как референс (MJ).")
             await show_card_mj(update, ctx)
         else:
-            s["last_image_url"] = url
+            s["last_image_url"] = public_url
             await update.message.reply_text("🖼️ Фото принято как референс.")
             await show_card_veo(update, ctx)
     except Exception as e:
@@ -1117,8 +1115,6 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("grant", cmd_grant))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
