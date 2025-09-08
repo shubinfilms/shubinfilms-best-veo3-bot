@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.6 + KIE Veo3 + Prompt-Master + авто-возврат видео (HTML-safe)
-# Версия: 2025-09-07
+# Версия: 2025-09-07 (status+resend+double-click)
 
 import os
 import json
@@ -23,7 +23,7 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,              # ⬅️ PTB 21.x
+    Application,              # PTB 21.x
     ContextTypes,
     CommandHandler,
     MessageHandler,
@@ -118,6 +118,9 @@ DEFAULT_STATE = {
     "generating": False,
     "generation_id": None,
     "last_ui_msg_id": None,
+    # ДОБАВЛЕНО:
+    "last_result_url": None,   # ссылка готового видео (для кнопки 🔁)
+    "progress_msg_id": None,   # сообщение «идёт рендеринг…»
 }
 
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -203,6 +206,9 @@ def card_keyboard(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append(model_row(s["model"]))
     if s.get("last_prompt"):
         rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
+    # кнопка пересылки готового видео
+    if s.get("last_result_url"):
+        rows.append([InlineKeyboardButton("🔁 Отправить ещё раз", callback_data="card:resend")])
     rows.append([InlineKeyboardButton("🔁 Начать заново", callback_data="card:reset"),
                  InlineKeyboardButton("⬅️ Назад",         callback_data="back")])
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
@@ -334,14 +340,23 @@ def _build_payload_for_kie(prompt: str, aspect: str, image_url: Optional[str], m
 
 def submit_kie_generation(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     url = join_url(KIE_BASE_URL, KIE_GEN_PATH)
-    status, j = _post_json(url, _build_payload_for_kie(prompt, aspect, image_url, model_key))
-    code = j.get("code", status)
-    if status == 200 and code == 200:
-        task_id = _extract_task_id(j)
-        if task_id:
-            return True, task_id, "Задача создана."
-        return False, None, "Ответ KIE без taskId."
-    return False, None, _kie_error_message(status, j)
+    payload = _build_payload_for_kie(prompt, aspect, image_url, model_key)
+    # мягкие ретраи на сетевые/429/5xx
+    last_status, last_json = 0, {}
+    for attempt in range(3):
+        status, j = _post_json(url, payload)
+        last_status, last_json = status, j
+        code = j.get("code", status)
+        if status == 200 and code == 200:
+            task_id = _extract_task_id(j)
+            if task_id:
+                return True, task_id, "Задача создана."
+            return False, None, "Ответ KIE без taskId."
+        if status in (408, 429) or status >= 500:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
+    return False, None, _kie_error_message(last_status, last_json)
 
 def get_kie_task_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
     url = join_url(KIE_BASE_URL, KIE_STATUS_PATH)
@@ -364,10 +379,10 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
     tmp_path = None
     try:
-        r = requests.get(url, stream=True, timeout=180)
+        r = requests.get(url, stream=True, timeout=300)
         r.raise_for_status()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
-            for chunk in r.iter_content(chunk_size=256 * 1024):
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
             tmp_path = f.name
@@ -385,12 +400,19 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 pass
 
 # ==========================
-#   Поллинг KIE
+#   Поллинг KIE (со статусами и кнопкой 🔁)
 # ==========================
 async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     s["generating"] = True
     s["generation_id"] = gen_id
+
+    # стартовое сообщение о прогрессе
+    try:
+        msg = await ctx.bot.send_message(chat_id, "⏳ Идёт рендеринг…")
+        s["progress_msg_id"] = msg.message_id
+    except Exception:
+        s["progress_msg_id"] = None
 
     start_ts = time.time()
     log.info("Polling start: chat=%s task=%s gen=%s", chat_id, task_id, gen_id)
@@ -403,42 +425,104 @@ async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
 
             ok, flag, msg, res_url = await asyncio.to_thread(get_kie_task_status, task_id)
             if not ok:
-                await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса: {esc(msg or 'неизвестно')}", parse_mode=ParseMode.HTML)
+                if s.get("progress_msg_id"):
+                    try:
+                        await ctx.bot.edit_message_text(
+                            chat_id=chat_id, message_id=s["progress_msg_id"],
+                            text=f"❌ Ошибка KIE: {esc(msg or 'неизвестно')}", parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await ctx.bot.send_message(chat_id, f"❌ Ошибка KIE: {esc(msg or 'неизвестно')}", parse_mode=ParseMode.HTML)
                 break
 
             if flag == 0 or flag is None:
                 if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
-                    await ctx.bot.send_message(chat_id, "⏳ Таймаут ожидания результата. Попробуйте позже.")
+                    if s.get("progress_msg_id"):
+                        try:
+                            await ctx.bot.edit_message_text(
+                                chat_id=chat_id, message_id=s["progress_msg_id"],
+                                text="❌ Таймаут ожидания результата. Попробуйте позже."
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        await ctx.bot.send_message(chat_id, "❌ Таймаут ожидания результата. Попробуйте позже.")
                     break
                 await asyncio.sleep(POLL_INTERVAL_SECS)
                 continue
 
             if flag == 1:
                 if not res_url:
-                    await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылка не найдена (ответ KIE без URL).")
+                    if s.get("progress_msg_id"):
+                        try:
+                            await ctx.bot.edit_message_text(
+                                chat_id=chat_id, message_id=s["progress_msg_id"],
+                                text="⚠️ Готово, но ссылка не найдена (ответ KIE без URL)."
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылка не найдена (ответ KIE без URL).")
                     break
+
                 if s.get("generation_id") != gen_id:
                     log.info("Ready but superseded — skip send.")
                     return
+
                 sent = await send_video_with_fallback(ctx, chat_id, res_url)
-                await ctx.bot.send_message(chat_id, "✅ Готово!" if sent else "⚠️ Не получилось отправить видео.")
+
+                # сохраним ссылку и обновим статус
+                s["last_result_url"] = res_url
+                if s.get("progress_msg_id"):
+                    try:
+                        await ctx.bot.edit_message_text(
+                            chat_id=chat_id, message_id=s["progress_msg_id"],
+                            text="✅ Готово!" if sent else "⚠️ Не получилось отправить видео."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await ctx.bot.send_message(chat_id, "✅ Готово!" if sent else "⚠️ Не получилось отправить видео.")
+
+                # обновим клавиатуру карточки (добавится кнопка 🔁)
+                try:
+                    if s.get("last_ui_msg_id"):
+                        await ctx.bot.edit_message_reply_markup(
+                            chat_id, s["last_ui_msg_id"], reply_markup=card_keyboard(s)
+                        )
+                except Exception:
+                    pass
                 break
 
             if flag in (2, 3):
-                await ctx.bot.send_message(chat_id, f"❌ Ошибка KIE: {esc(msg or 'без сообщения')}", parse_mode=ParseMode.HTML)
+                if s.get("progress_msg_id"):
+                    try:
+                        await ctx.bot.edit_message_text(
+                            chat_id=chat_id, message_id=s["progress_msg_id"],
+                            text=f"❌ Ошибка KIE: {esc(msg or 'без сообщения')}", parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await ctx.bot.send_message(chat_id, f"❌ Ошибка KIE: {esc(msg or 'без сообщения')}", parse_mode=ParseMode.HTML)
                 break
-
-            await asyncio.sleep(POLL_INTERVAL_SECS)
     except Exception as e:
         log.exception("Poller crashed: %s", e)
         try:
-            await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе статуса.")
+            if s.get("progress_msg_id"):
+                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"],
+                                                text="❌ Внутренняя ошибка при опросе статуса.")
+            else:
+                await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе статуса.")
         except Exception:
             pass
     finally:
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
+            s["progress_msg_id"] = None
 
 # ==========================
 #   Хэндлеры
@@ -451,8 +535,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    def tail(x, n=6): 
+        return ("*"*(len(x)-n))+x[-n:] if x and len(x)>n else (x or "")
     info = {
         "PTB": getattr(telegram, "__version__", "unknown"),
+        "TELEGRAM_TOKEN": tail(TELEGRAM_TOKEN),
+        "KIE_API_KEY": tail(KIE_API_KEY),
         "KIE_BASE_URL": KIE_BASE_URL,
         "GEN": KIE_GEN_PATH,
         "STATUS": KIE_STATUS_PATH,
@@ -476,6 +564,7 @@ async def show_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_ma
     kb = card_keyboard(s)
     chat_id = update.effective_chat.id
     last_id = s.get("last_ui_msg_id")
+
     try:
         if last_id:
             if edit_only_markup:
@@ -489,24 +578,14 @@ async def show_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_ma
                     reply_markup=kb,
                     disable_web_page_preview=True,
                 )
-        else:
-            if update.callback_query:
-                m = await update.callback_query.message.reply_text(
-                    text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
-                )
-            else:
-                m = await update.message.reply_text(
-                    text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
-                )
-            s["last_ui_msg_id"] = m.message_id
-    except Exception as e:
-        log.warning("show_card edit failed: %s", e)
-        try:
-            m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
-                                           reply_markup=kb, disable_web_page_preview=True)
-            s["last_ui_msg_id"] = m.message_id
-        except Exception as e2:
-            log.exception("show_card send failed: %s", e2)
+            return
+    except Exception:
+        s["last_ui_msg_id"] = None
+
+    m = await (update.callback_query.message.reply_text if update.callback_query else update.message.reply_text)(
+        text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
+    )
+    s["last_ui_msg_id"] = m.message_id
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -584,24 +663,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_card(update, ctx)
         return
 
-    if data == "card:generate":
-        if not s.get("last_prompt"):
-            await query.message.reply_text("Сначала укажите текст промпта.")
+    if data == "card:resend":
+        url = s.get("last_result_url")
+        if not url:
+            await query.message.reply_text("Пока нечего пересылать.")
             return
+        sent = await send_video_with_fallback(ctx, update.effective_chat.id, url)
+        await query.message.reply_text("✅ Отправлено ещё раз." if sent else "⚠️ Не удалось переслать видео.")
+        return
+
+    if data == "card:generate":
         if s.get("generating"):
             await query.message.reply_text("⏳ Генерация уже идёт. Дождитесь завершения.")
             return
+        if not s.get("last_prompt"):
+            await query.message.reply_text("Сначала укажите текст промпта.")
+            return
+
+        # ставим флаг сразу, чтобы отсечь двойной клик
+        s["generating"] = True
 
         ok, task_id, msg = await asyncio.to_thread(
             submit_kie_generation, s["last_prompt"].strip(), s.get("aspect", "16:9"),
             s.get("last_image_url"), s.get("model", "veo3_fast")
         )
         if not ok or not task_id:
+            s["generating"] = False  # откат флага при провале
             await query.message.reply_text(f"❌ Не удалось создать задачу: {msg}")
             return
 
         gen_id = uuid.uuid4().hex[:12]
-        s["generating"] = True
         s["generation_id"] = gen_id
         log.info("Submitted: chat=%s task=%s gen=%s model=%s", update.effective_chat.id, task_id, gen_id, s.get("model"))
         await query.message.reply_text(
@@ -692,7 +783,7 @@ def main():
         raise RuntimeError("KIE_* env vars are not properly set")
 
     app = (
-        Application.builder()            # ⬅️ PTB 21.x
+        Application.builder()
         .token(TELEGRAM_TOKEN)
         .rate_limiter(AIORateLimiter())
         .build()
