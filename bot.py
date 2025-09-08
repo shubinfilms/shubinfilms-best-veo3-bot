@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.6 + KIE Veo3 + Prompt-Master + авто-возврат видео (HTML-safe)
-# Версия: 2025-09-07 (status+resend+double-click)
+# Версия: 2025-09-07 (start menu cleaned, statuses, double-click, "new" button)
 
 import os
 import json
@@ -52,13 +52,13 @@ except Exception:
 
 # ---- KIE ----
 KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()               # токен без/с Bearer
-KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai")   # https://api.kie.ai
-KIE_GEN_PATH = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate") # POST генерация
-KIE_STATUS_PATH = os.getenv("KIE_STATUS_PATH", "/api/v1/veo/record-info")  # GET статус
-KIE_HD_PATH = os.getenv("KIE_HD_PATH", "/api/v1/veo/get-1080p-video")      # GET 1080п (не для fallback)
+KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
+KIE_GEN_PATH = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate")
+KIE_STATUS_PATH = os.getenv("KIE_STATUS_PATH", "/api/v1/veo/record-info")
+KIE_HD_PATH = os.getenv("KIE_HD_PATH", "/api/v1/veo/get-1080p-video")
 
 PROMPTS_CHANNEL_URL = os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts").strip()
-TOPUP_URL = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts").strip()  # заглушка «Пополнить баланс»
+TOPUP_URL = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts").strip()
 
 # Паузы
 POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "6"))
@@ -112,14 +112,13 @@ def esc(t: Optional[str]) -> str:
 DEFAULT_STATE = {
     "mode": None,              # 'gen_text' | 'gen_photo' | 'prompt_master' | 'chat'
     "aspect": "16:9",
-    "model": "veo3_fast",      # 'veo3_fast' | 'veo3' (Quality)
+    "model": "veo3_fast",      # 'veo3_fast' | 'veo3'
     "last_prompt": None,
     "last_image_url": None,
     "generating": False,
     "generation_id": None,
     "last_ui_msg_id": None,
-    # ДОБАВЛЕНО:
-    "last_result_url": None,   # ссылка готового видео (для кнопки 🔁)
+    "last_result_url": None,   # ссылка готового видео (для показа кнопки "ещё видео")
     "progress_msg_id": None,   # сообщение «идёт рендеринг…»
 }
 
@@ -136,10 +135,12 @@ WELCOME = (
     "🎬 <b>Veo 3 — супер-генерация видео</b>\n"
     "Опиши идею — получишь готовый клип. Поддерживаются 16:9 и 9:16, Fast/Quality, фото-референс.\n\n"
     "• Промпт-мастер создаёт кинематографичный EN-промпт (500–900 знаков)\n"
-    f"• Больше идей: <a href=\"{esc(PROMPTS_CHANNEL_URL)}\">канал с промптами</a>"
+    f"• Больше идей: <a href=\"{esc(PROMPTS_CHANNEL_URL)}\">канал с промптами</a>\n\n"
+    "Выберите режим ниже 👇"
 )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    # На стартовом экране НЕТ 16:9/9:16 и Fast/Quality — только выбор режима
     rows = [
         [InlineKeyboardButton("🎬 Сгенерировать по тексту", callback_data="mode:gen_text")],
         [InlineKeyboardButton("🖼️ Сгенерировать по фото",  callback_data="mode:gen_photo")],
@@ -149,18 +150,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
         ],
+        [InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)],
     ]
-    rows.append([
-        InlineKeyboardButton("16:9 ✅", callback_data="aspect:16:9"),
-        InlineKeyboardButton("9:16",    callback_data="aspect:9:16"),
-    ])
-    rows.append([
-        InlineKeyboardButton("⚡ Fast ✅", callback_data="model:veo3_fast"),
-        InlineKeyboardButton("💎 Quality", callback_data="model:veo3"),
-    ])
-    rows.append([
-        InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL),
-    ])
     return InlineKeyboardMarkup(rows)
 
 def aspect_row(current: str) -> List[InlineKeyboardButton]:
@@ -206,9 +197,9 @@ def card_keyboard(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append(model_row(s["model"]))
     if s.get("last_prompt"):
         rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
-    # кнопка пересылки готового видео
+    # после готовности показываем только кнопку "ещё видео"
     if s.get("last_result_url"):
-        rows.append([InlineKeyboardButton("🔁 Отправить ещё раз", callback_data="card:resend")])
+        rows.append([InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="card:new")])
     rows.append([InlineKeyboardButton("🔁 Начать заново", callback_data="card:reset"),
                  InlineKeyboardButton("⬅️ Назад",         callback_data="back")])
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
@@ -341,9 +332,8 @@ def _build_payload_for_kie(prompt: str, aspect: str, image_url: Optional[str], m
 def submit_kie_generation(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     url = join_url(KIE_BASE_URL, KIE_GEN_PATH)
     payload = _build_payload_for_kie(prompt, aspect, image_url, model_key)
-    # мягкие ретраи на сетевые/429/5xx
     last_status, last_json = 0, {}
-    for attempt in range(3):
+    for attempt in range(3):  # мягкие ретраи на сетевые/429/5xx
         status, j = _post_json(url, payload)
         last_status, last_json = status, j
         code = j.get("code", status)
@@ -400,7 +390,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 pass
 
 # ==========================
-#   Поллинг KIE (со статусами и кнопкой 🔁)
+#   Поллинг KIE (со статусами и "ещё видео")
 # ==========================
 async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
@@ -486,7 +476,7 @@ async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                 else:
                     await ctx.bot.send_message(chat_id, "✅ Готово!" if sent else "⚠️ Не получилось отправить видео.")
 
-                # обновим клавиатуру карточки (добавится кнопка 🔁)
+                # обновим клавиатуру карточки (появится кнопка «ещё видео»)
                 try:
                     if s.get("last_ui_msg_id"):
                         await ctx.bot.edit_message_reply_markup(
@@ -663,13 +653,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_card(update, ctx)
         return
 
-    if data == "card:resend":
-        url = s.get("last_result_url")
-        if not url:
-            await query.message.reply_text("Пока нечего пересылать.")
-            return
-        sent = await send_video_with_fallback(ctx, update.effective_chat.id, url)
-        await query.message.reply_text("✅ Отправлено ещё раз." if sent else "⚠️ Не удалось переслать видео.")
+    if data == "card:new":
+        # начать новый цикл, сохранив формат/модель
+        keep_aspect = s.get("aspect", "16:9")
+        keep_model = s.get("model", "veo3_fast")
+        s.update({**DEFAULT_STATE})
+        s["aspect"] = keep_aspect
+        s["model"] = keep_model
+        await query.message.reply_text("Начнём заново! Пришлите новый промпт или фото.")
+        await show_card(update, ctx)
         return
 
     if data == "card:generate":
