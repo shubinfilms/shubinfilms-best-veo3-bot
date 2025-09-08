@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-# Best VEO3 + Midjourney Bot — PTB 20.7
+# Best VEO3 + Midjourney Face Bot — PTB 20.7
 # Версия: 2025-09-08
 
 import os
+import json
 import time
 import uuid
 import asyncio
@@ -37,7 +38,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
-# OpenAI (старый SDK 0.28.1 — опционально для Prompt-Master/чата)
+# OpenAI (старый SDK 0.28.1 — опционально)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 try:
     import openai  # type: ignore
@@ -46,16 +47,15 @@ try:
 except Exception:
     openai = None
 
-# ---- KIE (Veo3 видео) ----
-KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
+# ---- KIE ----
+KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()               # токен без/с Bearer
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
+# VEO
 KIE_GEN_PATH = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate")
 KIE_STATUS_PATH = os.getenv("KIE_STATUS_PATH", "/api/v1/veo/record-info")
-KIE_HD_PATH = os.getenv("KIE_HD_PATH", "/api/v1/veo/get-1080p-video")
-
-# ---- KIE (Midjourney) ----
-KIE_MJ_GEN_PATH = os.getenv("KIE_MJ_GEN_PATH", "/api/v1/mj/generate")
-KIE_MJ_STATUS_PATH = os.getenv("KIE_MJ_STATUS_PATH", "/api/v1/mj/record-info")
+# MJ
+MJ_GEN_PATH = "/api/v1/mj/generate"
+MJ_STATUS_PATH = "/api/v1/mj/record-info"
 
 PROMPTS_CHANNEL_URL = os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts").strip()
 TOPUP_URL = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts").strip()
@@ -72,13 +72,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("best-veo3-bot")
 
-# 👇 покажем в логах версию PTB — полезно в дебаге
+# Версия PTB в лог
 try:
-    import telegram  # type: ignore
+    import telegram
     log.info("PTB version: %s", getattr(telegram, "__version__", "unknown"))
 except Exception:
     pass
-
 
 # ==========================
 #   Утилиты
@@ -87,7 +86,6 @@ def join_url(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
     return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
 
-
 def mask_secret(s: str, show: int = 6) -> str:
     if not s:
         return ""
@@ -95,7 +93,6 @@ def mask_secret(s: str, show: int = 6) -> str:
     if len(s) <= show:
         return "*" * len(s)
     return f"{'*' * (len(s) - show)}{s[-show:]}"
-
 
 def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
     if not value:
@@ -111,34 +108,40 @@ def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
                 return v.strip()
     return None
 
-
 def tg_file_direct_url(bot_token: str, file_path: str) -> str:
     return f"https://api.telegram.org/file/bot{bot_token}/{file_path.lstrip('/')}"
 
-
-def esc(s: str) -> str:
-    return (s or "").replace("<", "&lt;").replace(">", "&gt;")
-
+def _clamp_int(val: Optional[int], lo: int, hi: int, default: int) -> int:
+    try:
+        v = int(val if val is not None else default)
+        return max(lo, min(hi, v))
+    except Exception:
+        return default
 
 # ==========================
 #   Состояние пользователя
 # ==========================
 DEFAULT_STATE = {
-    "mode": None,              # 'gen_text' | 'gen_photo' | 'prompt_master' | 'chat' | 'mj_face'
+    # общий
+    "mode": None,              # 'gen_text'|'gen_photo'|'prompt_master'|'chat'|'mj_face'
+    "last_ui_msg_id": None,
+
+    # VEO
     "aspect": "16:9",
     "model": "veo3_fast",      # 'veo3_fast' | 'veo3'
     "last_prompt": None,
-    "last_image_url": None,
-    "last_result_url": None,   # для кнопки «Отправить ещё раз»
+    "last_image_url": None,    # референс для VEO / селфи для MJ (в режиме зависит)
     "generating": False,
     "generation_id": None,
-    "progress_msg_id": None,
-    "last_ui_msg_id": None,
+    "last_task_id": None,
+    "last_result_url": None,
 
-    # Midjourney default params
+    # MJ (Face/Image)
+    "mj_aspect": "1:1",        # только 1:1,16:9,9:16,3:4
     "mj_speed": "fast",        # relaxed | fast | turbo
-    "mj_aspect": "1:1",        # 1:1 | 16:9 | 9:16 | ...
-    "mj_version": "7",         # "7" | "6.1" | "6" | "5.2" | "5.1" | "niji6"
+    "mj_version": "7",
+    "mj_stylization": 500,     # 0..1000
+    "mj_weirdness": 0,         # 0..3000
 }
 
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -147,25 +150,24 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         ud.setdefault(k, v)
     return ud
 
-
 # ==========================
 #   Кнопки / UI
 # ==========================
 WELCOME = (
-    "🎬 <b>Veo 3 — супер-генерация видео</b>\n"
+    "🎬 *Veo 3 — супер-генерация видео*\n"
     "Опиши идею — получишь готовый клип. Поддерживаются 16:9 и 9:16, Fast/Quality, фото-референс.\n\n"
     "• Промпт-мастер создаёт кинематографичный EN-промпт (500–900 знаков)\n"
-    f"• Больше идей: <a href='{esc(PROMPTS_CHANNEL_URL)}'>канал с промптами</a>\n\n"
+    f"• Больше идей: {PROMPTS_CHANNEL_URL}\n\n"
     "Выберите режим ниже 👇"
 )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🎬 Сгенерировать по тексту", callback_data="mode:gen_text")],
-        [InlineKeyboardButton("🖼️ Сгенерировать по фото",  callback_data="mode:gen_photo")],
-        [InlineKeyboardButton("🧑‍🎨 Фото с вашим лицом (MJ)", callback_data="mode:mj_face")],
-        [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)", callback_data="mode:prompt_master")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",   callback_data="mode:chat")],
+        [InlineKeyboardButton("🎬 Сгенерировать по тексту (VEO)", callback_data="mode:gen_text")],
+        [InlineKeyboardButton("🖼️ Сгенерировать по фото (VEO)",  callback_data="mode:gen_photo")],
+        [InlineKeyboardButton("🧑‍🎨 Фото с вашим лицом (MJ)",    callback_data="mode:mj_face")],
+        [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)",       callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",         callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
@@ -183,92 +185,88 @@ def aspect_row(current: str) -> List[InlineKeyboardButton]:
 
 def model_row(current: str) -> List[InlineKeyboardButton]:
     if current == "veo3":
-        return [InlineKeyboardButton("⚡ Fast",    callback_data="model:veo3_fast"),
-                InlineKeyboardButton("💎 Quality ✅", callback_data="model:veo3")]
+        return [InlineKeyboardButton("⚡ Fast",         callback_data="model:veo3_fast"),
+                InlineKeyboardButton("💎 Quality ✅",   callback_data="model:veo3")]
     return [InlineKeyboardButton("⚡ Fast ✅", callback_data="model:veo3_fast"),
             InlineKeyboardButton("💎 Quality", callback_data="model:veo3")]
 
 def mj_aspect_row(current: str) -> List[InlineKeyboardButton]:
-    opts = ["1:1","16:9","9:16","4:3","3:2"]
-    return [InlineKeyboardButton(f"{o}{' ✅' if current==o else ''}", callback_data=f"mj_aspect:{o}") for o in opts]
-
-def mj_aspect_row2(current: str) -> List[InlineKeyboardButton]:
-    opts = ["3:4","5:6","6:5","2:1","2:3","1:2"]
-    return [InlineKeyboardButton(f"{o}{' ✅' if current==o else ''}", callback_data=f"mj_aspect:{o}") for o in opts]
+    allowed = ["1:1", "16:9", "9:16", "3:4"]
+    if current not in allowed:
+        current = "1:1"
+    return [
+        InlineKeyboardButton(f"1:1{' ✅' if current=='1:1' else ''}",   callback_data="mj_aspect:1:1"),
+        InlineKeyboardButton(f"16:9{' ✅' if current=='16:9' else ''}", callback_data="mj_aspect:16:9"),
+        InlineKeyboardButton(f"9:16{' ✅' if current=='9:16' else ''}", callback_data="mj_aspect:9:16"),
+        InlineKeyboardButton(f"3:4{' ✅' if current=='3:4' else ''}",   callback_data="mj_aspect:3:4"),
+    ]
 
 def mj_speed_row(current: str) -> List[InlineKeyboardButton]:
-    order = ["relaxed","fast","turbo"]
-    label = {"relaxed":"🕰️ relaxed","fast":"⚡ fast","turbo":"🚀 turbo"}
-    return [InlineKeyboardButton(f"{label[o]}{' ✅' if current==o else ''}", callback_data=f"mj_speed:{o}") for o in order]
+    return [
+        InlineKeyboardButton(f"🐢 relaxed{' ✅' if current=='relaxed' else ''}", callback_data="mj_speed:relaxed"),
+        InlineKeyboardButton(f"⚡ fast{' ✅' if current=='fast' else ''}",        callback_data="mj_speed:fast"),
+        InlineKeyboardButton(f"🚀 turbo{' ✅' if current=='turbo' else ''}",      callback_data="mj_speed:turbo"),
+    ]
 
 def build_card_text(s: Dict[str, Any]) -> str:
     prompt_preview = (s.get("last_prompt") or "").strip()
     if len(prompt_preview) > 900:
         prompt_preview = prompt_preview[:900] + "…"
+    has_prompt = "есть" if s.get("last_prompt") else "нет"
+    has_ref = "есть" if s.get("last_image_url") else "нет"
 
-    mode = s.get("mode")
-
-    if mode == "mj_face":
+    if s.get("mode") == "mj_face":
         lines = [
-            "🪄 <b>Midjourney — Фото с вашим лицом</b>",
+            "🪄 *Промпт:*",
+            f"`{prompt_preview or '—'}`",
             "",
-            "✍️ <b>Промпт:</b>",
-            f"<code>{esc(prompt_preview) or '—'}</code>",
-            "",
-            "<b>📋 Параметры:</b>",
-            f"• Aspect: <b>{esc(s.get('mj_aspect','1:1'))}</b>",
-            f"• Speed: <b>{esc(s.get('mj_speed','fast'))}</b>",
-            f"• Version: <b>{esc(s.get('mj_version','7'))}</b>",
-            f"• Референс: <b>{'есть' if s.get('last_image_url') else 'нет'}</b>",
+            "*📋 Параметры:*",
+            f"• Aspect: *{s.get('mj_aspect','1:1')}*",
+            f"• Speed: *{s.get('mj_speed','fast')}*",
+            f"• Version: *{s.get('mj_version','7')}*",
+            f"• Референс: *{has_ref}*",
         ]
         return "\n".join(lines)
 
-    # Veo3 карточка
     model = "Fast" if s.get("model") == "veo3_fast" else "Quality"
     lines = [
-        "📑 <b>Параметры:</b>",
-        f"• Формат: <b>{esc(s.get('aspect','16:9'))}</b>",
-        f"• Режим: <b>{model}</b>",
-        f"• Промпт: <b>{'есть' if s.get('last_prompt') else 'нет'}</b>",
-        f"• Референс: <b>{'есть' if s.get('last_image_url') else 'нет'}</b>",
+        "🪄 *Промпт:*",
+        f"`{prompt_preview or '—'}`",
         "",
-        "✍️ <b>Промпт:</b>",
-        f"<code>{esc(prompt_preview) or '—'}</code>",
+        "*📋 Параметры:*",
+        f"• Aspect: *{s.get('aspect','16:9')}*",
+        f"• Speed: *{model}*",
+        f"• Промпт: *{has_prompt}*",
+        f"• Референс: *{has_ref}*",
     ]
     return "\n".join(lines)
 
 def card_keyboard(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     if s.get("mode") == "mj_face":
-        rows.append([InlineKeyboardButton("🖼️ Добавить/Удалить селфи", callback_data="card:toggle_photo"),
-                     InlineKeyboardButton("✍️ Изменить промпт",          callback_data="card:edit_prompt")])
+        rows.append([InlineKeyboardButton("🧑‍🦱 Добавить/Удалить селфи", callback_data="card:toggle_photo"),
+                     InlineKeyboardButton("✍️ Изменить промпт",            callback_data="card:edit_prompt")])
         rows.append(mj_aspect_row(s.get("mj_aspect","1:1")))
-        rows.append(mj_aspect_row2(s.get("mj_aspect","1:1")))
         rows.append(mj_speed_row(s.get("mj_speed","fast")))
-        if s.get("last_prompt") and s.get("last_image_url") and not s.get("generating"):
+        if s.get("last_prompt") and s.get("last_image_url"):
             rows.append([InlineKeyboardButton("🖼️ Сгенерировать фото", callback_data="mj:generate")])
-        if s.get("last_result_url") and not s.get("generating"):
-            rows.append([InlineKeyboardButton("🚀 Сгенерировать ещё фото", callback_data="card:new")])
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
         rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
         return InlineKeyboardMarkup(rows)
 
-    # Veo3
+    # VEO
     rows.append([InlineKeyboardButton("🖼️ Добавить/Удалить фото", callback_data="card:toggle_photo"),
                  InlineKeyboardButton("✍️ Изменить промпт",       callback_data="card:edit_prompt")])
     rows.append(aspect_row(s["aspect"]))
     rows.append(model_row(s["model"]))
-    # anti-double-click: если уже идёт генерация — кнопку не показываем
-    if s.get("last_prompt") and not s.get("generating"):
+    if s.get("last_prompt"):
         rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
-    if s.get("last_result_url") and not s.get("generating"):
-        rows.append([InlineKeyboardButton("📩 Отправить ещё раз", callback_data="card:resend")])
-        rows.append([InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="card:new")])
+        if s.get("last_task_id"):
+            rows.append([InlineKeyboardButton("📦 Отправить ещё раз", callback_data="card:resend")])
     rows.append([InlineKeyboardButton("🔁 Начать заново", callback_data="card:reset"),
                  InlineKeyboardButton("⬅️ Назад",         callback_data="back")])
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
     return InlineKeyboardMarkup(rows)
-
 
 # ==========================
 #   Prompt-Master / Chat
@@ -300,9 +298,8 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
         log.exception("Prompt-Master error: %s", e)
         return None
 
-
 # ==========================
-#   KIE helpers
+#   HTTP helpers
 # ==========================
 def _kie_headers() -> Dict[str, str]:
     token = KIE_API_KEY
@@ -331,37 +328,6 @@ def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
         if data.get(k): return str(data[k])
     return None
 
-def _parse_success_flag(j: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Dict[str, Any]]:
-    data = j.get("data") or {}
-    msg = j.get("msg") or j.get("message")
-    flag = None
-    for k in ("successFlag", "status", "state"):
-        if k in data:
-            try:
-                flag = int(data[k])
-                break
-            except Exception:
-                pass
-    return flag, msg, data
-
-def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
-    # Veo и MJ могут возвращать по-разному
-    resp = data.get("response") or {}
-    for key in ("resultUrls", "originUrls", "resultUrl", "originUrl"):
-        url = pick_first_url(resp.get(key))
-        if url:
-            return url
-    for key in ("resultInfoJson",):
-        info = data.get(key) or {}
-        url = pick_first_url(info.get("resultUrls"))
-        if url:
-            return url
-    for key in ("resultUrls", "originUrls", "resultUrl", "originUrl"):
-        url = pick_first_url(data.get(key))
-        if url:
-            return url
-    return pick_first_url(data.get("url"))
-
 def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     code = j.get("code", status_code)
     msg = j.get("msg") or j.get("message") or j.get("error") or ""
@@ -376,12 +342,27 @@ def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     elif code == 500:
         base = "Внутренняя ошибка KIE (500)."
     elif code == 422:
-        base = "Запрос отклонён модерацией."
+        base = "Запрос отклонён модерацией / enableFallback (422)."
     else:
         base = f"KIE code {code}."
     return f"{base} {('Сообщение: ' + msg) if msg else ''}".strip()
 
-def _build_payload_for_kie_video(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Dict[str, Any]:
+# ==========================
+#   VEO helpers
+# ==========================
+def _extract_result_url_from_data(data: Dict[str, Any]) -> Optional[str]:
+    resp = data.get("response") or {}
+    for key in ("resultUrls", "originUrls", "resultUrl", "originUrl"):
+        url = pick_first_url(resp.get(key))
+        if url:
+            return url
+    for key in ("resultUrls", "originUrls", "resultUrl", "originUrl"):
+        url = pick_first_url(data.get(key))
+        if url:
+            return url
+    return pick_first_url(data.get("url"))
+
+def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "prompt": prompt,
         "aspectRatio": aspect,
@@ -392,10 +373,9 @@ def _build_payload_for_kie_video(prompt: str, aspect: str, image_url: Optional[s
         payload["imageUrls"] = [image_url]
     return payload
 
-# ---- Veo3 submit/status ----
 def submit_kie_generation(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     url = join_url(KIE_BASE_URL, KIE_GEN_PATH)
-    status, j = _post_json(url, _build_payload_for_kie_video(prompt, aspect, image_url, model_key))
+    status, j = _post_json(url, _build_payload_for_veo(prompt, aspect, image_url, model_key))
     code = j.get("code", status)
     if status == 200 and code == 200:
         task_id = _extract_task_id(j)
@@ -409,39 +389,95 @@ def get_kie_task_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str
     status, j = _get_json(url, {"taskId": task_id})
     code = j.get("code", status)
     if status == 200 and code == 200:
-        flag, msg, data = _parse_success_flag(j)
-        return True, flag, msg, _extract_result_url(data or {})
+        data = j.get("data") or {}
+        flag = None
+        for k in ("successFlag", "status", "state"):
+            if k in data:
+                try:
+                    flag = int(data[k]); break
+                except Exception:
+                    pass
+        msg = j.get("msg") or j.get("message")
+        return True, flag, msg, _extract_result_url_from_data(data)
     return False, None, _kie_error_message(status, j), None
 
-# ---- Midjourney submit/status (img2img для лица) ----
-def submit_kie_mj_image(prompt: str, ref_url: str, aspect: str, speed: str, version: str) -> Tuple[bool, Optional[str], str]:
-    url = join_url(KIE_BASE_URL, KIE_MJ_GEN_PATH)
-    payload = {
-        "taskType": "mj_img2img",
+# ==========================
+#   MJ helpers
+# ==========================
+def _build_payload_for_mj(prompt: str,
+                          aspect: str,
+                          file_url: Optional[str],
+                          speed: str,
+                          version: str,
+                          stylization_opt: Optional[int] = None,
+                          weirdness_opt: Optional[int] = None,
+                          enable_translation: bool = False) -> Dict[str, Any]:
+    aspect_allowed = {"1:1", "16:9", "9:16", "3:4"}
+    if aspect not in aspect_allowed:
+        aspect = "1:1"
+    speed = speed if speed in ("relaxed", "fast", "turbo") else "fast"
+    version = version if version in ("7", "6.1", "6", "5.2", "5.1", "niji6") else "7"
+
+    stylization = _clamp_int(stylization_opt, 0, 1000, 500)
+    weirdness   = _clamp_int(weirdness_opt,   0, 3000, 0)
+
+    payload: Dict[str, Any] = {
+        "taskType": "mj_txt2img" if not file_url else "mj_img2img",
         "prompt": prompt,
-        "fileUrl": ref_url,
-        "speed": speed,               # relaxed | fast | turbo
-        "aspectRatio": aspect,        # '1:1','16:9','9:16', ...
-        "version": version            # '7','6.1','6','5.2','5.1','niji6'
+        "speed": speed,
+        "aspectRatio": aspect,
+        "version": version,
+        "stylization": stylization,
+        "weirdness": weirdness,
+        "enableTranslation": bool(enable_translation),
     }
+    if file_url:
+        payload["fileUrls"] = [file_url]
+    return payload
+
+def submit_mj_generation(prompt: str,
+                         aspect: str,
+                         selfie_url: Optional[str],
+                         speed: str,
+                         version: str,
+                         stylization_opt: Optional[int],
+                         weirdness_opt: Optional[int]) -> Tuple[bool, Optional[str], str]:
+    url = join_url(KIE_BASE_URL, MJ_GEN_PATH)
+    payload = _build_payload_for_mj(
+        prompt=prompt,
+        aspect=aspect,
+        file_url=selfie_url,
+        speed=speed,
+        version=version,
+        stylization_opt=stylization_opt,
+        weirdness_opt=weirdness_opt,
+        enable_translation=False,
+    )
     status, j = _post_json(url, payload)
     code = j.get("code", status)
     if status == 200 and code == 200:
         task_id = _extract_task_id(j)
         if task_id:
             return True, task_id, "Задача создана."
-        return False, None, "Ответ KIE без taskId."
+        return False, None, "Ответ MJ без taskId."
     return False, None, _kie_error_message(status, j)
 
-def get_kie_mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
-    url = join_url(KIE_BASE_URL, KIE_MJ_STATUS_PATH)
+def get_mj_task_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[List[str]]]:
+    url = join_url(KIE_BASE_URL, MJ_STATUS_PATH)
     status, j = _get_json(url, {"taskId": task_id})
     code = j.get("code", status)
     if status == 200 and code == 200:
-        flag, msg, data = _parse_success_flag(j)
-        return True, flag, msg, _extract_result_url(data or {})
+        data = j.get("data") or {}
+        flag = data.get("successFlag")
+        msg = j.get("msg") or j.get("message")
+        res = []
+        info = data.get("resultInfoJson") or {}
+        for item in info.get("resultUrls") or []:
+            url = item.get("resultUrl")
+            if url:
+                res.append(url)
+        return True, flag, msg, res
     return False, None, _kie_error_message(status, j), None
-
 
 # ==========================
 #   Отправка медиа
@@ -452,7 +488,6 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
         return True
     except Exception as e:
         log.warning("Direct URL send failed, try download. %s", e)
-
     tmp_path = None
     try:
         r = requests.get(url, stream=True, timeout=180)
@@ -473,24 +508,17 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             try: os.unlink(tmp_path)
             except Exception: pass
 
-
 # ==========================
-#   Поллеры
+#   Поллинг VEO
 # ==========================
 async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     s["generating"] = True
     s["generation_id"] = gen_id
-
-    # статусное сообщение
-    try:
-        m = await ctx.bot.send_message(chat_id, "⏳ Идёт рендеринг…")
-        s["progress_msg_id"] = m.message_id
-    except Exception:
-        s["progress_msg_id"] = None
+    s["last_task_id"] = task_id
 
     start_ts = time.time()
-    log.info("Polling start: chat=%s task=%s gen=%s", chat_id, task_id, gen_id)
+    log.info("VEO Polling start: chat=%s task=%s gen=%s", chat_id, task_id, gen_id)
 
     try:
         while True:
@@ -500,170 +528,108 @@ async def poll_kie_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
 
             ok, flag, msg, res_url = await asyncio.to_thread(get_kie_task_status, task_id)
             if not ok:
-                txt = f"❌ Ошибка статуса: {esc(msg or 'неизвестно')}"
-                if s.get("progress_msg_id"):
-                    try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt, parse_mode=ParseMode.HTML)
-                    except Exception: pass
-                else:
-                    await ctx.bot.send_message(chat_id, txt, parse_mode=ParseMode.HTML)
+                await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса: {msg or 'неизвестно'}")
                 break
 
             if flag == 0:
                 if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
-                    txt = "❌ Таймаут ожидания результата. Попробуйте позже."
-                    if s.get("progress_msg_id"):
-                        try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt)
-                        except Exception: pass
-                    else:
-                        await ctx.bot.send_message(chat_id, txt)
+                    await ctx.bot.send_message(chat_id, "⏳ Таймаут ожидания результата. Попробуйте позже.")
                     break
                 await asyncio.sleep(POLL_INTERVAL_SECS)
                 continue
 
             if flag == 1:
                 if not res_url:
-                    txt = "⚠️ Готово, но ссылка не найдена (ответ KIE без URL)."
-                    if s.get("progress_msg_id"):
-                        try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt)
-                        except Exception: pass
-                    else:
-                        await ctx.bot.send_message(chat_id, txt)
+                    await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылка не найдена (ответ KIE без URL).")
                     break
                 if s.get("generation_id") != gen_id:
                     log.info("Ready but superseded — skip send.")
                     return
                 sent = await send_video_with_fallback(ctx, chat_id, res_url)
                 s["last_result_url"] = res_url
-                txt = "✅ Готово!" if sent else "⚠️ Не получилось отправить видео."
-                if s.get("progress_msg_id"):
-                    try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt)
-                    except Exception: pass
-                else:
-                    await ctx.bot.send_message(chat_id, txt)
-                # обновим карточку — появятся кнопки resend/ещё
-                try:
-                    if s.get("last_ui_msg_id"):
-                        await ctx.bot.edit_message_reply_markup(chat_id, s["last_ui_msg_id"], reply_markup=card_keyboard(s))
-                except Exception:
-                    pass
+                await ctx.bot.send_message(chat_id, "✅ Готово!" if sent else "⚠️ Не получилось отправить видео.")
+                await ctx.bot.send_message(chat_id, "🚀 Сгенерировать ещё видео", reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new")]]
+                ))
                 break
 
             if flag in (2, 3):
-                txt = f"❌ Ошибка KIE: {esc(msg or 'без сообщения')}"
-                if s.get("progress_msg_id"):
-                    try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt, parse_mode=ParseMode.HTML)
-                    except Exception: pass
-                else:
-                    await ctx.bot.send_message(chat_id, txt, parse_mode=ParseMode.HTML)
+                await ctx.bot.send_message(chat_id, f"❌ Ошибка KIE: {msg or 'без сообщения'}")
                 break
 
             await asyncio.sleep(POLL_INTERVAL_SECS)
+    except Exception as e:
+        log.exception("Poller crashed: %s", e)
+        try:
+            await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе статуса.")
+        except Exception:
+            pass
     finally:
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
-            s["progress_msg_id"] = None
 
-
+# ==========================
+#   Поллинг MJ
+# ==========================
 async def poll_mj_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     s["generating"] = True
     s["generation_id"] = gen_id
-    try:
-        m = await ctx.bot.send_message(chat_id, "⏳ Генерация фото…")
-        s["progress_msg_id"] = m.message_id
-    except Exception:
-        s["progress_msg_id"] = None
+    s["last_task_id"] = task_id
 
     start_ts = time.time()
+    log.info("MJ Polling start: chat=%s task=%s gen=%s", chat_id, task_id, gen_id)
+
     try:
         while True:
             if s.get("generation_id") != gen_id:
+                log.info("MJ Poll cancelled — superseded.")
                 return
-            ok, flag, msg, res_url = await asyncio.to_thread(get_kie_mj_status, task_id)
+
+            ok, flag, msg, urls = await asyncio.to_thread(get_mj_task_status, task_id)
             if not ok:
-                txt = f"❌ Ошибка KIE (MJ): {esc(msg or 'неизвестно')}"
-                if s.get("progress_msg_id"):
-                    try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt, parse_mode=ParseMode.HTML)
-                    except Exception: pass
-                else:
-                    await ctx.bot.send_message(chat_id, txt, parse_mode=ParseMode.HTML)
+                await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса MJ: {msg or 'неизвестно'}")
                 break
 
-            if flag == 0 or flag is None:
+            if flag == 0:
                 if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
-                    txt = "❌ Таймаут ожидания изображения. Попробуйте позже."
-                    if s.get("progress_msg_id"):
-                        try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt)
-                        except Exception: pass
-                    else:
-                        await ctx.bot.send_message(chat_id, txt)
+                    await ctx.bot.send_message(chat_id, "⏳ Таймаут ожидания MJ. Попробуйте позже.")
                     break
                 await asyncio.sleep(POLL_INTERVAL_SECS)
                 continue
 
             if flag == 1:
-                if not res_url:
-                    txt = "⚠️ Готово, но ссылка не найдена (ответ KIE без URL)."
-                    if s.get("progress_msg_id"):
-                        try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt)
-                        except Exception: pass
-                    else:
-                        await ctx.bot.send_message(chat_id, txt)
+                if not urls:
+                    await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены.")
                     break
-
-                # попытка отправить фото по URL
-                ok_send = True
-                try:
-                    await ctx.bot.send_photo(chat_id=chat_id, photo=res_url)
-                except Exception:
-                    ok_send = False
-                    tmp_path = None
+                # отправим все изображения
+                for u in urls:
                     try:
-                        r = requests.get(res_url, stream=True, timeout=180)
-                        r.raise_for_status()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-                            for chunk in r.iter_content(chunk_size=256*1024):
-                                if chunk: f.write(chunk)
-                            tmp_path = f.name
-                        with open(tmp_path, "rb") as f:
-                            await ctx.bot.send_photo(chat_id=chat_id, photo=f)
-                        ok_send = True
-                    finally:
-                        if tmp_path:
-                            try: os.unlink(tmp_path)
-                            except Exception: pass
-
-                s["last_result_url"] = res_url
-                txt = "✅ Готово!" if ok_send else "⚠️ Не получилось отправить изображение."
-                if s.get("progress_msg_id"):
-                    try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt)
-                    except Exception: pass
-                else:
-                    await ctx.bot.send_message(chat_id, txt)
-
-                # обновим карточку — появится «ещё фото»
-                try:
-                    if s.get("last_ui_msg_id"):
-                        await ctx.bot.edit_message_reply_markup(chat_id, s["last_ui_msg_id"], reply_markup=card_keyboard(s))
-                except Exception:
-                    pass
+                        await ctx.bot.send_photo(chat_id=chat_id, photo=u)
+                    except Exception:
+                        pass
+                await ctx.bot.send_message(chat_id, "✅ Готово!")
+                await ctx.bot.send_message(chat_id, "🚀 Сгенерировать ещё фото (MJ)", reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🚀 Сгенерировать ещё фото (MJ)", callback_data="start_new_mj")]]
+                ))
                 break
 
             if flag in (2, 3):
-                txt = f"❌ Ошибка KIE (MJ): {esc(msg or 'без сообщения')}"
-                if s.get("progress_msg_id"):
-                    try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=s["progress_msg_id"], text=txt, parse_mode=ParseMode.HTML)
-                    except Exception: pass
-                else:
-                    await ctx.bot.send_message(chat_id, txt, parse_mode=ParseMode.HTML)
+                await ctx.bot.send_message(chat_id, f"❌ Ошибка MJ: {msg or 'без сообщения'}")
                 break
+
+            await asyncio.sleep(POLL_INTERVAL_SECS)
+    except Exception as e:
+        log.exception("MJ Poller crashed: %s", e)
+        try:
+            await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе MJ статуса.")
+        except Exception:
+            pass
     finally:
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
-            s["progress_msg_id"] = None
-
 
 # ==========================
 #   Хэндлеры
@@ -671,21 +637,16 @@ async def poll_mj_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Context
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     s.update({**DEFAULT_STATE})
-    await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+    await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # быстрая диагностика
     parts = [
         f"PTB: {getattr(telegram, '__version__', 'unknown')}",
         f"KIE_BASE_URL: {KIE_BASE_URL}",
-        f"KIE_API_KEY: {mask_secret(KIE_API_KEY)}",
-        f"VEO GEN: {KIE_GEN_PATH}",
-        f"VEO STATUS: {KIE_STATUS_PATH}",
-        f"MJ GEN: {KIE_MJ_GEN_PATH}",
-        f"MJ STATUS: {KIE_MJ_STATUS_PATH}",
-        f"OPENAI_API_KEY: {mask_secret(OPENAI_API_KEY)}",
+        f"KIE key: {('ok ' + mask_secret(KIE_API_KEY)) if KIE_API_KEY else '—'}",
+        f"OPENAI key: {('ok ' + mask_secret(OPENAI_API_KEY)) if OPENAI_API_KEY else '—'}",
     ]
-    await update.message.reply_text("🩺 <b>Health</b>\n" + "\n".join(parts), parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🩺 /health\n" + "\n".join(parts))
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
@@ -710,21 +671,21 @@ async def show_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_ma
                     chat_id=chat_id,
                     message_id=last_id,
                     text=text,
-                    parse_mode=ParseMode.HTML,
+                    parse_mode=ParseMode.MARKDOWN,
                     reply_markup=kb,
                     disable_web_page_preview=True,
                 )
         else:
-            m = await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.HTML,
+            m = await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
                                                                reply_markup=kb, disable_web_page_preview=True)
                        if update.callback_query else
-                       update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                       update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
                                                  reply_markup=kb, disable_web_page_preview=True))
             s["last_ui_msg_id"] = m.message_id
     except Exception as e:
         log.warning("show_card edit failed: %s", e)
         try:
-            m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+            m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
                                            reply_markup=kb, disable_web_page_preview=True)
             s["last_ui_msg_id"] = m.message_id
         except Exception as e2:
@@ -734,64 +695,81 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = (query.data or "").strip()
     await query.answer()
-
     s = state(ctx)
 
-    # Переключение аспектов (Veo)
+    # Старт нового круга после готовности
+    if data == "start_new":
+        keep_aspect = s.get("aspect", "16:9")
+        keep_model = s.get("model", "veo3_fast")
+        s.update({**DEFAULT_STATE})
+        s["aspect"] = keep_aspect
+        s["model"] = keep_model
+        s["mode"] = "gen_text"
+        await query.message.reply_text("Новый цикл VEO. Пришлите идею или готовый промпт.")
+        await show_card(update, ctx)
+        return
+
+    if data == "start_new_mj":
+        s.update({**DEFAULT_STATE})
+        s["mode"] = "mj_face"
+        await query.message.reply_text("Новый цикл MJ. Пришлите селфи и промпт.")
+        await show_card(update, ctx)
+        return
+
+    # Переключение аспектов VEO
     if data.startswith("aspect:"):
         _, val = data.split(":", 1)
         s["aspect"] = "9:16" if val.strip() == "9:16" else "16:9"
         await show_card(update, ctx, edit_only_markup=True)
         return
 
-    # Переключение модели (Veo)
+    # Переключение модели VEO
     if data.startswith("model:"):
         _, val = data.split(":", 1)
         s["model"] = "veo3" if val.strip() == "veo3" else "veo3_fast"
         await show_card(update, ctx, edit_only_markup=True)
         return
 
-    # MJ параметры
+    # Переключения MJ
     if data.startswith("mj_aspect:"):
         _, val = data.split(":", 1)
-        s["mj_aspect"] = val.strip()
+        s["mj_aspect"] = val if val in ("1:1","16:9","9:16","3:4") else "1:1"
         await show_card(update, ctx, edit_only_markup=True)
         return
 
     if data.startswith("mj_speed:"):
         _, val = data.split(":", 1)
-        s["mj_speed"] = val.strip()
+        s["mj_speed"] = val if val in ("relaxed","fast","turbo") else "fast"
         await show_card(update, ctx, edit_only_markup=True)
         return
 
     # Режимы
     if data.startswith("mode:"):
         _, mode = data.split(":", 1)
-        s.update({**DEFAULT_STATE, "mode": mode})  # сброс карточки под новый режим
+        s["mode"] = mode
         if mode == "gen_text":
-            await query.message.reply_text("Режим: генерация по тексту. Пришлите идею или готовый промпт.")
+            await query.message.reply_text("Режим: VEO — генерация по тексту. Пришлите идею или готовый промпт.")
         elif mode == "gen_photo":
-            await query.message.reply_text("Режим: генерация по фото. Пришлите фото (и при желании — подпись-промпт).")
+            await query.message.reply_text("Режим: VEO — генерация по фото. Пришлите фото (и при желании — подпись-промпт).")
+        elif mode == "mj_face":
+            await query.message.reply_text(
+                "Режим: Midjourney — фото с вашим лицом.\n"
+                "1) Пришлите селфи (или ссылку на фото)\n"
+                "2) Пришлите короткий промпт\n"
+                "3) Проверьте параметры и жмите «Сгенерировать фото»"
+            )
         elif mode == "prompt_master":
             await query.message.reply_text("Промпт-мастер: пришлите идею (1–2 фразы). Верну EN-кинопромпт.")
         elif mode == "chat":
             await query.message.reply_text("Обычный чат: напишите вопрос — отвечу через ChatGPT.")
-        elif mode == "mj_face":
-            await query.message.reply_text(
-                "Режим: <b>Фото с вашим лицом</b>.\n"
-                "1) Пришлите <u>своё</u> селфи (один человек, хороший свет).\n"
-                "2) Затем опишите, «во что» превратить (например, «кинопостер 80-х»).",
-                parse_mode=ParseMode.HTML
-            )
         await show_card(update, ctx)
         return
 
     if data == "faq":
         await query.message.reply_text(
             "FAQ:\n"
-            "• Veo 3 Fast / Quality, форматы 16:9 и 9:16.\n"
-            "• «Фото с вашим лицом» — Midjourney (img2img).\n"
-            "• Видео/фото придут сюда. Если URL не стримится — пришлю файлом.\n"
+            "• VEO: Fast/Quality, 16:9 / 9:16. Видео придёт сюда.\n"
+            "• MJ: Фото по селфи. Форматы 1:1 / 16:9 / 9:16 / 3:4. Stylization 0–1000.\n"
             "• Ошибки 401/403/422/451/500 — проверь ключ и права KIE.",
             reply_markup=main_menu_kb(),
         )
@@ -808,10 +786,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Фото-референс удалён.")
             await show_card(update, ctx)
         else:
-            await query.message.reply_text(
-                "Пришлите фото. Я возьму прямую ссылку Telegram (если KIE примет) "
-                "или пришлите публичный URL картинки текстом."
-            )
+            if s.get("mode") == "mj_face":
+                await query.message.reply_text("Пришлите селфи. Я возьму прямую ссылку Telegram (если KIE примет) или пришлите публичный URL.")
+            else:
+                await query.message.reply_text("Пришлите фото. Я возьму прямую ссылку Telegram (если KIE примет) или пришлите публичный URL.")
         return
 
     if data == "card:edit_prompt":
@@ -819,39 +797,43 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "card:reset":
-        keep_mode = s.get("mode")
+        keep = {
+            "aspect": s.get("aspect","16:9"),
+            "model": s.get("model","veo3_fast"),
+            "mj_aspect": s.get("mj_aspect","1:1"),
+            "mj_speed": s.get("mj_speed","fast"),
+            "mj_version": s.get("mj_version","7"),
+            "mode": s.get("mode"),
+        }
         s.update({**DEFAULT_STATE})
-        s["mode"] = keep_mode
+        s.update(keep)
         await query.message.reply_text("Карточка очищена.")
         await show_card(update, ctx)
         return
 
-    if data == "card:new":
-        # начать новый цикл — очистить карточку, но оставить режим
-        keep_mode = s.get("mode")
-        s.update({**DEFAULT_STATE})
-        s["mode"] = keep_mode
-        await query.message.reply_text("Новый цикл. Введите промпт/добавьте фото и жмите «Сгенерировать».")
-        await show_card(update, ctx)
-        return
-
     if data == "card:resend":
-        if not s.get("last_result_url"):
-            await query.message.reply_text("Результат отсутствует.")
+        if not s.get("last_prompt"):
+            await query.message.reply_text("Сначала укажите текст промпта.")
             return
-        # повторно отправить последний результат
-        if s.get("mode") == "mj_face":
-            try:
-                await ctx.bot.send_photo(update.effective_chat.id, s["last_result_url"])
-                await query.message.replyText("📩 Отправлено ещё раз.")
-            except Exception:
-                await query.message.reply_text("⚠️ Не получилось отправить ещё раз.")
-        else:
-            ok = await send_video_with_fallback(ctx, update.effective_chat.id, s["last_result_url"])
-            await query.message.reply_text("📩 Отправлено ещё раз." if ok else "⚠️ Не получилось отправить ещё раз.")
+        if s.get("generating"):
+            await query.message.reply_text("⏳ Генерация уже идёт. Дождитесь завершения.")
+            return
+        ok, task_id, msg = await asyncio.to_thread(
+            submit_kie_generation, s["last_prompt"].strip(), s.get("aspect", "16:9"),
+            s.get("last_image_url"), s.get("model", "veo3_fast")
+        )
+        if not ok or not task_id:
+            await query.message.reply_text(f"❌ Не удалось создать задачу: {msg}")
+            return
+        gen_id = uuid.uuid4().hex[:12]
+        s["generating"] = True
+        s["generation_id"] = gen_id
+        s["last_task_id"] = task_id
+        log.info("Re-Submitted: chat=%s task=%s gen=%s", update.effective_chat.id, task_id, gen_id)
+        await query.message.reply_text(f"🚀 Задача отправлена (Fast/Quality). taskId={task_id}\n⏳ Идёт рендеринг…")
+        asyncio.create_task(poll_kie_and_send(update.effective_chat.id, task_id, gen_id, ctx))
         return
 
-    # Запуск Veo3 генерации
     if data == "card:generate":
         if not s.get("last_prompt"):
             await query.message.reply_text("Сначала укажите текст промпта.")
@@ -871,38 +853,44 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         gen_id = uuid.uuid4().hex[:12]
         s["generating"] = True
         s["generation_id"] = gen_id
-        log.info("Submitted Veo3: chat=%s task=%s gen=%s model=%s", update.effective_chat.id, task_id, gen_id, s.get("model"))
-        await query.message.reply_text(f"🚀 Задача отправлена ({'Fast' if s.get('model')=='veo3_fast' else 'Quality'}). taskId={task_id}")
+        s["last_task_id"] = task_id
+        log.info("Submitted: chat=%s task=%s gen=%s model=%s", update.effective_chat.id, task_id, gen_id, s.get("model"))
+        await query.message.reply_text(f"🚀 Задача отправлена ({'Fast' if s.get('model')=='veo3_fast' else 'Quality'}). taskId={task_id}\n⏳ Идёт рендеринг…")
+
         asyncio.create_task(poll_kie_and_send(update.effective_chat.id, task_id, gen_id, ctx))
         return
 
-    # Запуск MJ (face img2img)
     if data == "mj:generate":
+        if not s.get("last_image_url") or not s.get("last_prompt"):
+            await query.message.reply_text("Нужны селфи и промпт.")
+            return
         if s.get("generating"):
             await query.message.reply_text("⏳ Генерация уже идёт. Дождитесь завершения.")
             return
-        if not s.get("last_image_url") or not s.get("last_prompt"):
-            await query.message.reply_text("Нужны и селфи, и промпт.")
-            return
+
         ok, task_id, msg = await asyncio.to_thread(
-            submit_kie_mj_image,
-            s["last_prompt"].strip(),
-            s["last_image_url"],
+            submit_mj_generation,
+            s.get("last_prompt") or "",
             s.get("mj_aspect","1:1"),
+            s.get("last_image_url"),
             s.get("mj_speed","fast"),
             s.get("mj_version","7"),
+            s.get("mj_stylization",500),
+            s.get("mj_weirdness",0),
         )
         if not ok or not task_id:
             await query.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}")
             return
+
         gen_id = uuid.uuid4().hex[:12]
         s["generating"] = True
         s["generation_id"] = gen_id
-        log.info("Submitted MJ img2img: chat=%s task=%s gen=%s", update.effective_chat.id, task_id, gen_id)
-        await query.message.reply_text(f"🖼️ MJ задача отправлена. taskId={task_id}")
+        s["last_task_id"] = task_id
+        log.info("MJ Submitted: chat=%s task=%s gen=%s", update.effective_chat.id, task_id, gen_id)
+        await query.message.reply_text(f"🖼️ MJ задача отправлена. taskId={task_id}\n⏳ Идёт рендеринг…")
+
         asyncio.create_task(poll_mj_and_send(update.effective_chat.id, task_id, gen_id, ctx))
         return
-
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
@@ -947,13 +935,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Ошибка запроса к ChatGPT.")
         return
 
-    # По умолчанию — это промпт для активного режима
+    # По умолчанию — считаем это промптом для текущего режима
     s["last_prompt"] = text
-    await update.message.reply_text(
-        "🟦 <b>Подготовка к рендеру</b>\n"
-        "Проверь карточку ниже и жми «Сгенерировать».",
-        parse_mode=ParseMode.HTML,
-    )
+    if mode == "mj_face" and not s.get("last_image_url"):
+        await update.message.reply_text("🟪 *Подготовка к рендеру (MJ)*\nНужны селфи и промпт.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(
+            "🟦 *VEO — подготовка к рендеру*\nПроверь карточку ниже и жми «Сгенерировать».",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     await show_card(update, ctx)
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -977,14 +967,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("Get photo failed: %s", e)
         await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
 
-
 # ==========================
 #   Entry point
 # ==========================
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is not set")
-    if not (KIE_BASE_URL and KIE_GEN_PATH and KIE_STATUS_PATH and KIE_MJ_GEN_PATH and KIE_MJ_STATUS_PATH):
+    if not (KIE_BASE_URL and KIE_GEN_PATH and KIE_STATUS_PATH):
         raise RuntimeError("KIE_* env vars are not properly set")
 
     app = (
@@ -1003,7 +992,7 @@ def main():
 
     log.info(
         "Bot starting. PTB=20.7 | KIE_BASE=%s VEO_GEN=%s VEO_STATUS=%s MJ_GEN=%s MJ_STATUS=%s",
-        KIE_BASE_URL, KIE_GEN_PATH, KIE_STATUS_PATH, KIE_MJ_GEN_PATH, KIE_MJ_STATUS_PATH
+        KIE_BASE_URL, KIE_GEN_PATH, KIE_STATUS_PATH, MJ_GEN_PATH, MJ_STATUS_PATH
     )
     app.run_polling(drop_pending_updates=True)
 
