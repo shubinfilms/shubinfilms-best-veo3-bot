@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Best VEO3 Bot — PTB 20.x
-# Версия: 2025-09-10 (vertical-safe, HQ-1080p-retry, tg-size-guard, no-photo-button)
+# Best VEO3 Bot — PTB 20.x / 21.x совместим
+# Версия: 2025-09-10 (vertical-safe, HQ-1080p-retry, tg-size-guard, photo button renamed)
 
 import os
 import json
@@ -41,11 +41,11 @@ def _env(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return (v if v is not None else default).strip()
 
-TELEGRAM_TOKEN       = _env("TELEGRAM_TOKEN")
-PROMPTS_CHANNEL_URL  = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
-TOPUP_URL            = _env("TOPUP_URL", "https://t.me/bestveo3promts")
+TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
+PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
+TOPUP_URL           = _env("TOPUP_URL", "https://t.me/bestveo3promts")
 
-# OpenAI (опционально)
+# OpenAI (опционально для Prompt-Master/чата)
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
     import openai  # type: ignore
@@ -55,28 +55,28 @@ except Exception:
     openai = None
 
 # ---- KIE core ----
-KIE_API_KEY = _env("KIE_API_KEY")
+KIE_API_KEY  = _env("KIE_API_KEY")
 KIE_BASE_URL = _env("KIE_BASE_URL", "https://api.kie.ai")
 
-# --- Поддержка и новых, и старых имён env для путей
-KIE_VEO_GEN_PATH     = _env("KIE_VEO_GEN_PATH",     _env("KIE_GEN_PATH", "/api/v1/veo/generate"))
-KIE_VEO_STATUS_PATH  = _env("KIE_VEO_STATUS_PATH",  _env("KIE_STATUS_PATH", "/api/v1/veo/record-info"))
-KIE_VEO_1080_PATH    = _env("KIE_VEO_1080_PATH",    _env("KIE_HD_PATH", "/api/v1/veo/get-1080p-video"))
+# Пути: поддерживаем новые и «старые» имена
+KIE_VEO_GEN_PATH    = _env("KIE_VEO_GEN_PATH",    _env("KIE_GEN_PATH",    "/api/v1/veo/generate"))
+KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", _env("KIE_STATUS_PATH", "/api/v1/veo/record-info"))
+KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   _env("KIE_HD_PATH",     "/api/v1/veo/get-1080p-video"))  # буква 'p'!
 
-# Вертикальная нормализация (и перекод HQ под лимит)
+# Вертикальная нормализация и лимит размера для TG
 ENABLE_VERTICAL_NORMALIZE = _env("ENABLE_VERTICAL_NORMALIZE", "true").lower() == "true"
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
-MAX_TG_VIDEO_MB           = int(os.getenv("MAX_TG_VIDEO_MB", "48"))  # мягкий лимит
+MAX_TG_VIDEO_MB           = int(_env("MAX_TG_VIDEO_MB", "48"))  # мягкий лимит
 
-POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "6"))
-POLL_TIMEOUT_SECS  = int(os.getenv("POLL_TIMEOUT_SECS", str(20 * 60)))
+POLL_INTERVAL_SECS = int(_env("POLL_INTERVAL_SECS", "6"))
+POLL_TIMEOUT_SECS  = int(_env("POLL_TIMEOUT_SECS", str(20 * 60)))
 
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("veo3-bot")
 
 try:
-    import telegram as _tg
+    import telegram as _tg  # для /health PTB версии
     log.info("PTB version: %s", getattr(_tg, "__version__", "unknown"))
 except Exception:
     pass
@@ -89,7 +89,8 @@ def join_url(base: str, path: str) -> str:
     return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
 
 def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
-    if not value: return None
+    if not value:
+        return None
     if isinstance(value, str):
         v = value.strip()
         return v or None
@@ -100,7 +101,8 @@ def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
     return None
 
 def _nz(s: Optional[str]) -> Optional[str]:
-    if s is None: return None
+    if s is None:
+        return None
     s2 = s.strip()
     return s2 if s2 else None
 
@@ -117,7 +119,7 @@ def event(tag: str, **kw):
 #   State
 # ==========================
 DEFAULT_STATE = {
-    "mode": None,          # 'veo_text' | 'prompt_master' | 'chat'
+    "mode": None,          # 'veo_text' | 'veo_photo' | 'prompt_master' | 'chat'
     # VEO
     "aspect": None,        # '16:9' | '9:16'
     "model": None,         # 'veo3_fast' | 'veo3'
@@ -142,18 +144,17 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 WELCOME = (
     "🎬 *Veo 3 — супер-генерация видео*\n"
     "Опиши идею — получишь готовый клип!\n\n"
-    "🧠 *ChatGPT* — сценарист: опиши идею/персонажа, текст озвучки, локацию — вернёт кинопромпт.\n"
+    "🧠 *ChatGPT* — сценарист: опиши идею/персонажа, локацию — вернёт кинопромпт.\n"
     "🖌️ *MJ* — художник по тексту (режим скоро).\n\n"
-    "💎 *Ваш баланс токенов:* …\n\n"
     "Выберите режим 👇"
 )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎬 Сгенерировать по тексту (VEO)", callback_data="mode:veo_text")],
-        # Кнопку «по фото» убрали по просьбе
-        [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)",       callback_data="mode:prompt_master")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",         callback_data="mode:chat")],
+        [InlineKeyboardButton("📸 Оживление фотографии (VEO)",    callback_data="mode:veo_photo")],  # ← переименовано
+        [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)",        callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",          callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
@@ -171,14 +172,15 @@ def aspect_row(current: str) -> List[InlineKeyboardButton]:
 
 def model_row(current: str) -> List[InlineKeyboardButton]:
     if current == "veo3":
-        return [InlineKeyboardButton("⚡ Fast",    callback_data="model:veo3_fast"),
+        return [InlineKeyboardButton("⚡ Fast",       callback_data="model:veo3_fast"),
                 InlineKeyboardButton("💎 Quality ✅", callback_data="model:veo3")]
     return [InlineKeyboardButton("⚡ Fast ✅", callback_data="model:veo3_fast"),
             InlineKeyboardButton("💎 Quality", callback_data="model:veo3")]
 
 def build_card_text_veo(s: Dict[str, Any]) -> str:
     prompt_preview = (s.get("last_prompt") or "").strip()
-    if len(prompt_preview) > 900: prompt_preview = prompt_preview[:900] + "…"
+    if len(prompt_preview) > 900:
+        prompt_preview = prompt_preview[:900] + "…"
     has_prompt = "есть" if s.get("last_prompt") else "нет"
     has_ref = "есть" if s.get("last_image_url") else "нет"
     model = "Fast" if s.get("model") == "veo3_fast" else ("Quality" if s.get("model") else "—")
@@ -204,7 +206,7 @@ def card_keyboard_veo(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append(model_row(s.get("model") or "veo3_fast"))
     rows.append([InlineKeyboardButton("🚀 Сгенерировать", callback_data="card:generate")])
     rows.append([InlineKeyboardButton("🔁 Начать заново", callback_data="card:reset"),
-                 InlineKeyboardButton("⬅️ Назад",             callback_data="back")])
+                 InlineKeyboardButton("⬅️ Назад",         callback_data="back")])
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
     return InlineKeyboardMarkup(rows)
 
@@ -217,7 +219,7 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
     system = (
         "You are Prompt-Master for cinematic AI video generation. "
         "Return EXACTLY ONE English prompt, 500–900 characters. "
-        "Include lens/optics, camera movement, lighting/palette, sensory details, subtle audio cues. "
+        "Include lens, camera moves, lighting/palette, sensory details, subtle audio cues. "
         "No lists, no preface, no metadata."
     )
     try:
@@ -249,28 +251,39 @@ def _kie_headers_json() -> Dict[str, str]:
 
 def _post_json(url: str, payload: Dict[str, Any], timeout: int = 40) -> Tuple[int, Dict[str, Any]]:
     r = requests.post(url, json=payload, headers=_kie_headers_json(), timeout=timeout)
-    try: return r.status_code, r.json()
-    except Exception: return r.status_code, {"error": r.text}
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"error": r.text}
 
 def _get_json(url: str, params: Dict[str, Any], timeout: int = 40) -> Tuple[int, Dict[str, Any]]:
     r = requests.get(url, params=params, headers=_kie_headers_json(), timeout=timeout)
-    try: return r.status_code, r.json()
-    except Exception: return r.status_code, {"error": r.text}
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"error": r.text}
 
 def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
     data = j.get("data") or {}
     for k in ("taskId", "taskid", "id"):
-        if j.get(k): return str(j[k])
-        if data.get(k): return str(data[k])
+        if j.get(k):
+            return str(j[k])
+        if data.get(k):
+            return str(data[k])
     return None
 
 def _coerce_url_list(value) -> List[str]:
     urls: List[str] = []
+
     def add(u: str):
         if isinstance(u, str):
             s = u.strip()
-            if s.startswith("http"): urls.append(s)
-    if not value: return urls
+            if s.startswith("http"):
+                urls.append(s)
+
+    if not value:
+        return urls
+
     if isinstance(value, str):
         s = value.strip()
         if s.startswith("["):
@@ -278,58 +291,80 @@ def _coerce_url_list(value) -> List[str]:
                 arr = json.loads(s)
                 if isinstance(arr, list):
                     for v in arr:
-                        if isinstance(v, str): add(v)
+                        if isinstance(v, str):
+                            add(v)
                 return urls
             except Exception:
-                add(s); return urls
+                add(s)
+                return urls
         else:
-            add(s); return urls
+            add(s)
+            return urls
+
     if isinstance(value, list):
         for v in value:
-            if isinstance(v, str): add(v)
+            if isinstance(v, str):
+                add(v)
             elif isinstance(v, dict):
                 u = v.get("resultUrl") or v.get("originUrl") or v.get("url")
-                if isinstance(u, str): add(u)
+                if isinstance(u, str):
+                    add(u)
         return urls
+
     if isinstance(value, dict):
         for k in ("resultUrl", "originUrl", "url"):
             u = value.get(k)
-            if isinstance(u, str): add(u)
+            if isinstance(u, str):
+                add(u)
         return urls
+
     return urls
 
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
-    # приоритет: originUrls → resultUrls
+    # 1) приоритет: originUrls → resultUrls
     for key in ("originUrls", "resultUrls"):
         urls = _coerce_url_list(data.get(key))
-        if urls: return urls[0]
-    # иногда лежит глубже
+        if urls:
+            return urls[0]
+
+    # 2) иногда глубже: info/response/resultInfoJson
     for container in ("info", "response", "resultInfoJson"):
         v = data.get(container)
         if isinstance(v, dict):
             for key in ("originUrls", "resultUrls", "videoUrls"):
                 urls = _coerce_url_list(v.get(key))
-                if urls: return urls[0]
-    # fallback: выковыриваем любой http*.mp4/mov/webm
+                if urls:
+                    return urls[0]
+
+    # 3) глубокий обход: ищем любую http*.mp4/mov/webm
     def walk(x):
         if isinstance(x, dict):
             for vv in x.values():
-                r = walk(vv);  if r: return r
+                r = walk(vv)
+                if r:
+                    return r
         elif isinstance(x, list):
             for vv in x:
-                r = walk(vv);  if r: return r
+                r = walk(vv)
+                if r:
+                    return r
         elif isinstance(x, str):
             s = x.strip().split("?")[0].lower()
             if s.startswith("http") and s.endswith((".mp4", ".mov", ".webm")):
                 return x.strip()
         return None
+
     return walk(data)
 
 def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     code = j.get("code", status_code)
     msg = j.get("msg") or j.get("message") or j.get("error") or ""
-    mapping = {401:"Доступ запрещён (Bearer).",402:"Недостаточно кредитов.",429:"Превышен лимит запросов.",
-               500:"Внутренняя ошибка KIE.",422:"Запрос отклонён модерацией.",400:"Неверный запрос (400)."}
+    mapping = {401: "Доступ запрещён (Bearer).",
+               402: "Недостаточно кредитов.",
+               429: "Превышен лимит запросов.",
+               500: "Внутренняя ошибка KIE.",
+               422: "Запрос отклонён модерацией.",
+               400: "Неверный запрос (400)."}
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {('Сообщение: ' + msg) if msg else ''}".strip()
 
@@ -338,9 +373,11 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
         "prompt": prompt,
         "aspectRatio": "9:16" if aspect == "9:16" else "16:9",
         "model": "veo3" if model_key == "veo3" else "veo3_fast",
-        "enableFallback": aspect == "16:9",  # по доке fallback = 1080p для 16:9
+        # fallback у KIE для 16:9 даёт 1080p
+        "enableFallback": aspect == "16:9",
     }
-    if image_url: payload["imageUrls"] = [image_url]
+    if image_url:
+        payload["imageUrls"] = [image_url]
     return payload
 
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
@@ -349,7 +386,8 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
     code = j.get("code", status)
     if status == 200 and code == 200:
         task_id = _extract_task_id(j)
-        if task_id: return True, task_id, "Задача создана."
+        if task_id:
+            return True, task_id, "Задача создана."
         return False, None, "Ответ KIE без taskId."
     return False, None, _kie_error_message(status, j)
 
@@ -360,13 +398,15 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
     if status == 200 and code == 200:
         data = (j.get("data") or {})
         flag = data.get("successFlag")
-        try: flag = int(flag)
-        except Exception: flag = None
+        try:
+            flag = int(flag)
+        except Exception:
+            flag = None
         msg = j.get("msg") or j.get("message")
         return True, flag, msg, _extract_result_url(data)
     return False, None, _kie_error_message(status, j), None
 
-# «неубиваемый» фетч 1080p: ретраи + быстрый откат на исходный URL
+# 1080p fetch — ретраи + быстрый откат
 def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15) -> Optional[str]:
     url = join_url(KIE_BASE_URL, KIE_VEO_1080_PATH)
     last_err = None
@@ -377,13 +417,14 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
             if status == 200 and code == 200:
                 data = j.get("data") or {}
                 u = pick_first_url(data.get("url")) or _extract_result_url(data)
-                if _nz(u): return u
+                if _nz(u):
+                    return u
                 last_err = "empty_1080_response"
             else:
                 last_err = f"status={status}, code={code}, msg={j.get('msg') or j.get('message') or j.get('error')}"
         except Exception as e:
             last_err = str(e)
-        time.sleep(1.0 + i)  # простейший backoff
+        time.sleep(1.0 + i)  # backoff
     log.warning("1080p fetch failed after retries: %s", last_err)
     return None
 
@@ -443,7 +484,7 @@ def _ffmpeg_transcode_16x9(inp: str, outp: str, target_mb: int) -> bool:
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, expect_vertical: bool = False) -> bool:
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
 
-    # Для вертикали: никогда не шлём прямой URL — всегда готовим локальный MP4 1080x1920
+    # Для вертикали никогда не шлём прямой URL — всегда готовим локальный MP4 1080x1920
     if not expect_vertical:
         try:
             await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
@@ -464,12 +505,15 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
         ext = ".mp4"
         lu = url.lower()
-        if ".mov" in lu or "quicktime" in ct: ext = ".mov"
-        elif ".webm" in lu or "webm" in ct:   ext = ".webm"
+        if ".mov" in lu or "quicktime" in ct:
+            ext = ".mov"
+        elif ".webm" in lu or "webm" in ct:
+            ext = ".webm"
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
             for chunk in r.iter_content(chunk_size=256 * 1024):
-                if chunk: f.write(chunk)
+                if chunk:
+                    f.write(chunk)
             tmp_path = f.name
 
         # 9:16 — нормализация (если ffmpeg доступен)
@@ -497,8 +541,10 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                     event("VERT_NORM_FAIL")
             finally:
                 if 'norm_path' in locals() and norm_path:
-                    try: os.unlink(norm_path)
-                    except Exception: pass
+                    try:
+                        os.unlink(norm_path)
+                    except Exception:
+                        pass
 
         # 16:9 HQ — если файл превышает лимит TG, пережмём под MAX_TG_VIDEO_MB
         try:
@@ -530,8 +576,10 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                     event("HQ_16x9_TRANSCODE_FAIL")
             finally:
                 if t_path:
-                    try: os.unlink(t_path)
-                    except Exception: pass
+                    try:
+                        os.unlink(t_path)
+                    except Exception:
+                        pass
 
         # Обычная отправка скачанного файла
         try:
@@ -559,8 +607,10 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             return False
     finally:
         if tmp_path:
-            try: os.unlink(tmp_path)
-            except Exception: pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 # ==========================
 #   Polling VEO
@@ -630,8 +680,10 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             await asyncio.sleep(POLL_INTERVAL_SECS)
     except Exception as e:
         log.exception("[VEO_POLL] crash: %s", e)
-        try: await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе VEO.")
-        except Exception: pass
+        try:
+            await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе VEO.")
+        except Exception:
+            pass
     finally:
         if s.get("generation_id") == gen_id:
             s["generating"] = False
@@ -641,7 +693,8 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
 #   Handlers
 # ==========================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    s = state(ctx); s.update({**DEFAULT_STATE})
+    s = state(ctx)
+    s.update({**DEFAULT_STATE})
     await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -653,8 +706,8 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"1080PATH: `{KIE_VEO_1080_PATH}`",
         f"KIE key: `{'set' if KIE_API_KEY else 'missing'}`",
         f"OPENAI key: `{'set' if OPENAI_API_KEY else 'missing'}`",
-        f"ENABLEVERTICALNORMALIZE: `{ENABLE_VERTICAL_NORMALIZE}`",
-        f"FFMPEGBIN: `{FFMPEG_BIN}`",
+        f"ENABLE_VERTICAL_NORMALIZE: `{ENABLE_VERTICAL_NORMALIZE}`",
+        f"FFMPEG_BIN: `{FFMPEG_BIN}`",
         f"MAX_TG_VIDEO_MB: `{MAX_TG_VIDEO_MB}`",
     ]
     await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
@@ -708,7 +761,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "faq":
         await query.message.reply_text(
             "FAQ:\n"
-            "• VEO: Fast/Quality, 16:9/9:16, фото-референс (можно прислать картинку сообщением).\n"
+            "• Режимы: по тексту / оживление фото / Prompt-Master / чат.\n"
             "• 1080p автоматически для Quality+16:9 (с ретраями).\n"
             "• Вертикаль 9:16 всегда нормализуется в 1080×1920 MP4.",
             reply_markup=main_menu_kb(),
@@ -723,10 +776,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Выберите режим:", reply_markup=main_menu_kb()); return
 
     if data.startswith("mode:"):
-        _, mode = data.split(":", 1); s["mode"] = mode; event("UI_SET", mode=mode)
-        if mode == "veo_text":
-            s["aspect"] = "16:9"; s["model"] = "veo3_fast"
-            await query.message.reply_text("VEO: пришлите идею/промпт (при желании добавьте ссылку на референс-картинку).")
+        _, mode = data.split(":", 1)
+        s["mode"] = mode
+        event("UI_SET", mode=mode)
+        if mode in ("veo_text", "veo_photo"):
+            s["aspect"] = "16:9" if mode == "veo_text" else "9:16"
+            s["model"]  = "veo3_fast"
+            await query.message.reply_text(
+                "VEO (текст): пришлите идею/промпт."
+                if mode == "veo_text" else
+                "VEO (оживление фото): пришлите фото (и при желании — подпись-промпт)."
+            )
             await show_card_veo(update, ctx); return
         if mode == "prompt_master":
             await query.message.reply_text("Промпт-мастер: пришлите идею (1–2 фразы). Верну EN-кинопромпт."); return
@@ -837,10 +897,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_card_veo(update, ctx)
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Кнопки «по фото» нет, но если пользователь пришлёт фото — используем как референс.
+    # Режим «Оживление фотографии (VEO)» — фото как референс
     s = state(ctx)
     photos = update.message.photo
-    if not photos: return
+    if not photos:
+        return
     ph = photos[-1]
     try:
         file = await ctx.bot.get_file(ph.file_id)
@@ -876,7 +937,7 @@ def main():
              KIE_BASE_URL, KIE_VEO_GEN_PATH, KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH,
              ENABLE_VERTICAL_NORMALIZE, MAX_TG_VIDEO_MB)
 
-    # Убедись, что выключен webhook:
+    # На всякий случай: убедись, что снят webhook:
     # https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook
     app.run_polling(drop_pending_updates=True)
 
