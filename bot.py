@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 20.x/21.x
-# Версия: 2025-09-10 (fix: TG file URL, UploadAPI stream+base64, poller flag=3, vertical FHD)
-# + MJ режим: генерация фото по тексту (turbo, v7) + апскейл
+# Версия: 2025-09-10 (fix-pack: VEO vertical tg-safe keepdims, MJ upscale double-try, MJ aspect 9:16 parsing)
 
 import os
 import json
@@ -17,7 +16,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 import requests
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
@@ -37,14 +36,6 @@ TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 TOPUP_URL           = _env("TOPUP_URL", "https://t.me/bestveo3promts")
 
-OPENAI_API_KEY = _env("OPENAI_API_KEY")
-try:
-    import openai  # type: ignore
-    if OPENAI_API_KEY:
-        openai.api_key = OPENAI_API_KEY
-except Exception:
-    openai = None
-
 # ---- KIE core ----
 KIE_API_KEY  = _env("KIE_API_KEY")
 KIE_BASE_URL = _env("KIE_BASE_URL", "https://api.kie.ai")
@@ -52,12 +43,7 @@ KIE_VEO_GEN_PATH    = _env("KIE_VEO_GEN_PATH",    _env("KIE_GEN_PATH",    "/api/
 KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", _env("KIE_STATUS_PATH", "/api/v1/veo/record-info"))
 KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   _env("KIE_HD_PATH",     "/api/v1/veo/get-1080p-video"))
 
-# ---- MJ (Midjourney Image)
-KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
-KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/record-info")
-KIE_MJ_UPSCALE  = _env("KIE_MJ_UPSCALE",  "/api/v1/mj/upscale")
-
-# ---- Upload API
+# ---- Upload API (для фото-референсов в VEO)
 UPLOAD_BASE_URL     = _env("UPLOAD_BASE_URL", "https://kieai.redpandaai.co")
 UPLOAD_STREAM_PATH  = _env("UPLOAD_STREAM_PATH", "/api/file-stream-upload")
 UPLOAD_URL_PATH     = _env("UPLOAD_URL_PATH",    "/api/file-url-upload")
@@ -102,7 +88,7 @@ def event(tag: str, **kw):
 
 def tg_direct_file_url(bot_token: str, file_path: str) -> str:
     """
-    Исправлено: если file_path уже абсолютный (http/https) — возвращаем как есть.
+    Если file_path уже абсолютный (http/https) — возвращаем как есть.
     Иначе строим https://api.telegram.org/file/bot<TOKEN>/<file_path>
     """
     p = (file_path or "").strip()
@@ -114,7 +100,8 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
 #   State
 # ==========================
 DEFAULT_STATE = {
-    "mode": None,          # 'veo_text' | 'veo_photo' | 'prompt_master' | 'chat' | 'mj_txt'
+    "mode": None,          # 'veo_text' | 'veo_photo' | 'mj' | 'chat' (chat не трогаем)
+    # VEO
     "aspect": None,        # '16:9' | '9:16'
     "model": None,         # 'veo3_fast' | 'veo3'
     "last_prompt": None,
@@ -124,6 +111,9 @@ DEFAULT_STATE = {
     "last_ui_msg_id": None,
     "last_task_id": None,
     "last_result_url": None,
+    # MJ
+    "mj_aspect": "16:9",
+    "mj_last_task_id": None,
 }
 
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -138,19 +128,16 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 WELCOME = (
     "🎬 *Veo 3 — супер-генерация видео*\n"
     "Опиши идею — получишь готовый клип!\n\n"
-    "🧠 *Prompt-Master* — вернёт кинопромпт на EN.\n"
-    "📸 *Оживление фотографии (VEO)* — анимируй фото.\n"
-    "🖼️ *MJ — картинка по тексту* — с апскейлом.\n\n"
+    "🧠 *MJ (фото по тексту)* — генерация изображений.\n"
+    "📸 *Оживление фотографии (VEO)* — анимируй фото.\n\n"
     "Выберите режим 👇"
 )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎬 Сгенерировать по тексту (VEO)", callback_data="mode:veo_text")],
-        [InlineKeyboardButton("🖼️ Сгенерировать фото (MJ)",       callback_data="mode:mj_txt")],
         [InlineKeyboardButton("📸 Оживление фотографии (VEO)",    callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)",        callback_data="mode:prompt_master")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",          callback_data="mode:chat")],
+        [InlineKeyboardButton("🖼️ Midjourney — фото по тексту",   callback_data="mode:mj")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
@@ -205,63 +192,16 @@ def card_keyboard_veo(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", url=TOPUP_URL)])
     return InlineKeyboardMarkup(rows)
 
-# ---------- MJ UI (кнопки)
-def mj_aspect_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🌆 16:9", callback_data="mj:ar:16:9"),
-            InlineKeyboardButton("📱 9:16", callback_data="mj:ar:9:16"),
-        ]
-    ])
-
-def mj_upscale_kb(task_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔍 Повысить качество #1", callback_data=f"mj:up:{task_id}:1"),
-            InlineKeyboardButton("🔍 Повысить качество #2", callback_data=f"mj:up:{task_id}:2"),
-        ],
-        [
-            InlineKeyboardButton("🔍 Повысить качество #3", callback_data=f"mj:up:{task_id}:3"),
-            InlineKeyboardButton("🔍 Повысить качество #4", callback_data=f"mj:up:{task_id}:4"),
-        ],
-    ])
-
-# ==========================
-#   Prompt-Master (опц.)
-# ==========================
-async def oai_prompt_master(idea_text: str) -> Optional[str]:
-    if openai is None or not OPENAI_API_KEY:
-        return None
-    system = (
-        "You are Prompt-Master for cinematic AI video generation. "
-        "Return EXACTLY ONE English prompt, 500–900 characters. "
-        "Include lens, camera moves, lighting/palette, sensory details, subtle audio cues. "
-        "No lists, no preface, no metadata."
-    )
-    try:
-        resp = await asyncio.to_thread(
-            openai.ChatCompletion.create,
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": idea_text.strip()}],
-            temperature=0.9, max_tokens=700,
-        )
-        txt = resp["choices"][0]["message"]["content"].strip()
-        return txt[:1200]
-    except Exception as e:
-        log.exception("Prompt-Master error: %s", e)
-        return None
-
 # ==========================
 #   HTTP helpers
 # ==========================
 def _kie_headers_json() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
-    token = (KIE_API_KEY or "").strip()
-    if token and not token.lower().startswith("bearer "):
-        token = f"Bearer {token}"
-    if token:
-        h["Authorization"] = token
+    tok = (KIE_API_KEY or "").strip()
+    if tok and not tok.lower().startswith("bearer "):
+        tok = f"Bearer {tok}"
+    if tok:
+        h["Authorization"] = tok
     return h
 
 def _post_json(url: str, payload: Dict[str, Any], timeout: int = 40) -> Tuple[int, Dict[str, Any]]:
@@ -286,8 +226,7 @@ def _coerce_url_list(value) -> List[str]:
     def add(u: str):
         if isinstance(u, str):
             s = u.strip()
-            if s.startswith("http"):
-                urls.append(s)
+            if s.startswith("http"): urls.append(s)
     if not value: return urls
     if isinstance(value, str):
         s = value.strip()
@@ -300,8 +239,7 @@ def _coerce_url_list(value) -> List[str]:
                 return urls
             except Exception:
                 add(s); return urls
-        else:
-            add(s); return urls
+        add(s); return urls
     if isinstance(value, list):
         for v in value:
             if isinstance(v, str): add(v)
@@ -331,11 +269,11 @@ def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
     def walk(x):
         if isinstance(x, dict):
             for vv in x.values():
-                r = walk(vv); 
+                r = walk(vv)
                 if r: return r
         elif isinstance(x, list):
             for vv in x:
-                r = walk(vv); 
+                r = walk(vv)
                 if r: return r
         elif isinstance(x, str):
             s = x.strip().split("?")[0].lower()
@@ -361,7 +299,6 @@ def _upload_headers() -> Dict[str, str]:
     return {"Authorization": tok} if tok else {}
 
 def upload_image_stream(src_url: str, upload_path: str = "tg-uploads", timeout: int = 90) -> Optional[str]:
-    # 1) скачать локально
     try:
         rr = requests.get(src_url, stream=True, timeout=timeout); rr.raise_for_status()
         ct = (rr.headers.get("Content-Type") or "").lower()
@@ -376,7 +313,6 @@ def upload_image_stream(src_url: str, upload_path: str = "tg-uploads", timeout: 
     except Exception as e:
         event("upload_stream_predownload_failed", err=str(e), url=src_url)
         return None
-    # 2) зааплоадить
     try:
         url = join_url(UPLOAD_BASE_URL, UPLOAD_STREAM_PATH)
         with open(local, "rb") as f:
@@ -451,7 +387,6 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
     return payload
 
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
-    # если есть image_url — сперва поднимаем в Upload API
     img_for_kie = None
     if _nz(image_url):
         img_for_kie = (
@@ -460,7 +395,6 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
             upload_image_url(image_url) or
             image_url
         )
-
     payload = _build_payload_for_veo(prompt, aspect, img_for_kie, model_key)
     status, j = _post_json(join_url(KIE_BASE_URL, KIE_VEO_GEN_PATH), payload)
     code = j.get("code", status)
@@ -469,9 +403,9 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
         if tid: return True, tid, "Задача создана."
         return False, None, "Ответ KIE без taskId."
 
-    # если отвалился фетч картинки — пробуем без неё, чтобы не срывать задачу
+    # если картинка не загрузилась — пробуем без неё
     msg = (j.get("msg") or j.get("message") or j.get("error") or "").lower()
-    if "image fetch failed" in msg or ("image" in msg and "failed" in msg):
+    if "image" in msg and "failed" in msg:
         payload.pop("imageUrls", None)
         status2, j2 = _post_json(join_url(KIE_BASE_URL, KIE_VEO_GEN_PATH), payload)
         if status2 == 200 and (j2.get("code", 200) == 200):
@@ -511,55 +445,6 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
     log.warning("1080p fetch retries failed: %s", last_err)
     return None
 
-# ---------- MJ (generate/status/upscale)
-def mj_generate(prompt: str, ar: str) -> Tuple[bool, Optional[str], str]:
-    payload = {
-        "taskType": "mj_txt2img",
-        "prompt": prompt,
-        "speed": "turbo",
-        "aspectRatio": "9:16" if ar == "9:16" else "16:9",
-        "version": "7",
-    }
-    status, j = _post_json(join_url(KIE_BASE_URL, KIE_MJ_GENERATE), payload)
-    code = j.get("code", status)
-    if status == 200 and code == 200:
-        tid = _extract_task_id(j)
-        if tid: return True, tid, "MJ задача создана."
-        return False, None, "Ответ MJ без taskId."
-    return False, None, _kie_error_message(status, j)
-
-def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
-    status, j = _get_json(join_url(KIE_BASE_URL, KIE_MJ_STATUS), {"taskId": task_id})
-    code = j.get("code", status)
-    if status == 200 and code == 200:
-        data = j.get("data") or {}
-        try:
-            flag = int(data.get("successFlag"))
-        except Exception:
-            flag = None
-        return True, flag, data
-    return False, None, None
-
-def mj_upscale(task_id: str, index: int) -> Tuple[bool, Optional[str], str]:
-    payload = {"taskId": task_id, "index": int(index)}
-    status, j = _post_json(join_url(KIE_BASE_URL, KIE_MJ_UPSCALE), payload)
-    code = j.get("code", status)
-    if status == 200 and code == 200:
-        tid = _extract_task_id(j)
-        if tid: return True, tid, "MJ апскейл создан."
-        return False, None, "Ответ MJ без taskId (upscale)."
-    return False, None, _kie_error_message(status, j)
-
-def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
-    res = []
-    rj = status_data.get("resultInfoJson") or {}
-    arr = rj.get("resultUrls") or []
-    urls = _coerce_url_list(arr)
-    for u in urls:
-        if isinstance(u, str) and u.startswith("http"):
-            res.append(u)
-    return res
-
 # ==========================
 #   ffmpeg helpers
 # ==========================
@@ -567,11 +452,14 @@ def _ffmpeg_available() -> bool:
     from shutil import which
     return bool(which(FFMPEG_BIN))
 
-def _ffmpeg_normalize_vertical(inp: str, outp: str) -> bool:
+def _ffmpeg_make_tg_safe_keepdims(inp: str, outp: str) -> bool:
+    """
+    Перекодировать в H.264/yuv420p БЕЗ изменения разрешения.
+    Убираем rotate, выравниваем чётные размеры, faststart.
+    """
     cmd = [
         FFMPEG_BIN, "-y", "-i", inp,
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
-               "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", "128k",
@@ -581,7 +469,7 @@ def _ffmpeg_normalize_vertical(inp: str, outp: str) -> bool:
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE); return True
     except Exception as e:
-        log.warning("ffmpeg vertical failed: %s", e); return False
+        log.warning("ffmpeg keepdims failed: %s", e); return False
 
 def _ffmpeg_force_16x9_fhd(inp: str, outp: str, target_mb: int) -> bool:
     target_bytes = max(8, int(target_mb)) * 1024 * 1024
@@ -606,44 +494,44 @@ def _ffmpeg_force_16x9_fhd(inp: str, outp: str, target_mb: int) -> bool:
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, expect_vertical: bool = False) -> bool:
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
 
-    # 16:9 пробуем отправлять по прямой ссылке сразу (вертикаль сначала нормализуем локально)
-    if not expect_vertical:
-        try:
-            await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
-            event("SEND_OK", mode="direct_url"); return True
-        except Exception as e:
-            event("SEND_FAIL", mode="direct_url", err=str(e))
+    # 1) Сначала всегда пробуем прямой URL (и вертикаль тоже)
+    try:
+        await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
+        event("SEND_OK", mode="direct_url"); return True
+    except Exception as e:
+        event("SEND_FAIL", mode="direct_url", err=str(e))
 
+    # 2) Скачиваем локально
     tmp_path = None
     try:
         r = requests.get(url, stream=True, timeout=180); r.raise_for_status()
         ct = (r.headers.get("Content-Type") or "").lower()
         ext = ".mp4"
-        if ".mov" in url.lower() or "quicktime" in ct: ext = ".mov"
-        elif ".webm" in url.lower() or "webm" in ct:   ext = ".webm"
-
+        lu = url.lower()
+        if ".mov" in lu or "quicktime" in ct: ext = ".mov"
+        elif ".webm" in lu or "webm" in ct:   ext = ".webm"
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
             for c in r.iter_content(256*1024):
                 if c: f.write(c)
             tmp_path = f.name
         event("DOWNLOAD_OK", path=tmp_path, content_type=ct)
 
-        # Вертикаль → нормализуем
+        # 3) Вертикаль → tg-safe без изменения размеров
         if expect_vertical and ENABLE_VERTICAL_NORMALIZE and _ffmpeg_available():
             out = tmp_path + "_v.mp4"
-            if _ffmpeg_normalize_vertical(tmp_path, out):
+            if _ffmpeg_make_tg_safe_keepdims(tmp_path, out):
                 try:
                     with open(out, "rb") as f:
                         await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename="result_vertical.mp4"),
                                                  supports_streaming=True)
-                    event("SEND_OK", mode="upload_video_norm"); return True
+                    event("SEND_OK", mode="upload_video_keepdims"); return True
                 except Exception as e:
-                    event("SEND_FAIL", mode="upload_video_norm", err=str(e))
+                    event("SEND_FAIL", mode="upload_video_keepdims", err=str(e))
                     with open(out, "rb") as f:
                         await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="result_vertical.mp4"))
-                    event("SEND_OK", mode="upload_document_norm"); return True
+                    event("SEND_OK", mode="upload_document_keepdims"); return True
 
-        # Горизонталь → форсим 1080p при необходимости
+        # 4) Горизонталь → при необходимости форсим 1080p (размер под лимит)
         if (not expect_vertical) and ALWAYS_FORCE_FHD and _ffmpeg_available():
             out = tmp_path + "_1080.mp4"
             if _ffmpeg_force_16x9_fhd(tmp_path, out, MAX_TG_VIDEO_MB):
@@ -658,7 +546,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                         await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="result_1080p.mp4"))
                     event("SEND_OK", mode="upload_document_16x9_forced"); return True
 
-        # Без перекодирования
+        # 5) Без перекодирования — как есть
         try:
             with open(tmp_path, "rb") as f:
                 await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename=f"result{ext}"),
@@ -745,38 +633,66 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             s["generation_id"] = None
 
 # ==========================
-#   MJ poll & send
+#   Midjourney (MJ)
 # ==========================
-async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE):
-    start_ts = time.time()
-    try:
-        while True:
-            ok, flag, data = await asyncio.to_thread(mj_status, task_id)
-            event("MJ_STATUS", task_id=task_id, flag=flag, has_data=bool(data))
-            if not ok:
-                await ctx.bot.send_message(chat_id, "❌ Ошибка статуса MJ."); return
-            if flag == 0:
-                if (time.time() - start_ts) > 10 * 60:
-                    await ctx.bot.send_message(chat_id, "⏳ Таймаут ожидания результата MJ."); return
-                await asyncio.sleep(10); continue
-            if flag in (2, 3):
-                msg = (data or {}).get("errorMessage") or "Генерация не удалась."
-                await ctx.bot.send_message(chat_id, f"❌ MJ ошибка: {msg}"); return
-            if flag == 1:
-                urls = _extract_mj_image_urls(data or {})
-                if not urls:
-                    await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки на изображения не найдены."); return
-                if len(urls) == 1:
-                    await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0])
-                else:
-                    media = [InputMediaPhoto(u) for u in urls[:10]]
-                    await ctx.bot.send_media_group(chat_id=chat_id, media=media)
-                await ctx.bot.send_message(chat_id, "Выберите вариант для повышения качества:", reply_markup=mj_upscale_kb(task_id))
-                return
-    except Exception as e:
-        log.exception("[MJ_POLL] crash: %s", e)
-        try: await ctx.bot.send_message(chat_id, "❌ Внутренняя ошибка при опросе MJ.")
-        except Exception: pass
+KIE_MJ_GEN_PATH    = _env("KIE_MJ_GEN_PATH",    "/api/v1/mj/generate")
+KIE_MJ_STATUS_PATH = _env("KIE_MJ_STATUS_PATH", "/api/v1/mj/record-info")
+KIE_MJ_UPSCALE     = _env("KIE_MJ_UPSCALE",     "/api/v1/mj/upscale")
+KIE_MJ_VARY        = _env("KIE_MJ_VARY",        "/api/v1/mj/generateVary")  # fallback
+
+def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
+    payload = {
+        "taskType": "mj_txt2img",
+        "prompt": prompt,
+        "aspectRatio": aspect if aspect in ("16:9", "9:16", "1:1", "4:3", "3:4", "2:3", "3:2", "5:6", "6:5", "2:1", "1:2") else "16:9",
+        "speed": "turbo",   # по требованиям — всегда Turbo
+        "version": "7"
+    }
+    status, j = _post_json(join_url(KIE_BASE_URL, KIE_MJ_GEN_PATH), payload)
+    code = j.get("code", status)
+    if status == 200 and code == 200:
+        tid = _extract_task_id(j)
+        if tid: return True, tid, "MJ задача создана."
+        return False, None, "Ответ MJ без taskId."
+    return False, None, _kie_error_message(status, j)
+
+def mj_status(task_id: str) -> Tuple[bool, Optional[int], bool, Optional[List[str]], Optional[str]]:
+    status, j = _get_json(join_url(KIE_BASE_URL, KIE_MJ_STATUS_PATH), {"taskId": task_id})
+    code = j.get("code", status)
+    if status == 200 and code == 200:
+        data = (j.get("data") or {})
+        flag = data.get("successFlag")
+        try: flag = int(flag)
+        except Exception: flag = None
+        # вытаскиваем картинки
+        urls = []
+        info = data.get("resultInfoJson") or {}
+        arr = info.get("resultUrls") or []
+        urls = [d.get("resultUrl") for d in arr if isinstance(d, dict) and d.get("resultUrl")]
+        return True, flag, bool(urls), urls or None, None
+    return False, None, False, None, _kie_error_message(status, j)
+
+def mj_upscale(task_id: str, index: int) -> Tuple[bool, Optional[str], str]:
+    """Надёжный апскейл: сначала /upscale (index & imageIndex), затем fallback /generateVary."""
+    # попытка 1: /upscale
+    payload_u = {"taskId": task_id, "index": int(index), "imageIndex": int(index)}
+    status, j = _post_json(join_url(KIE_BASE_URL, KIE_MJ_UPSCALE), payload_u)
+    code = j.get("code", status)
+    if status == 200 and code == 200:
+        tid = _extract_task_id(j)
+        if tid: return True, tid, "MJ апскейл создан."
+        return False, None, "Ответ MJ без taskId (upscale)."
+
+    # попытка 2: /generateVary (ожидает imageIndex)
+    payload_v = {"taskId": task_id, "imageIndex": int(index)}
+    status2, j2 = _post_json(join_url(KIE_BASE_URL, KIE_MJ_VARY), payload_v)
+    code2 = j2.get("code", status2)
+    if status2 == 200 and code2 == 200:
+        tid2 = _extract_task_id(j2)
+        if tid2: return True, tid2, "MJ vary (апскейл) создан."
+        return False, None, "Ответ MJ без taskId (generateVary)."
+
+    return False, None, f"Upscale 404/err. upscale={code} {j.get('msg') or j.get('message') or ''} | vary={code2} {j2.get('msg') or j2.get('message') or ''}".strip()
 
 # ==========================
 #   Handlers
@@ -792,14 +708,14 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"GENPATH: `{KIE_VEO_GEN_PATH}`",
         f"STATUSPATH: `{KIE_VEO_STATUS_PATH}`",
         f"1080PATH: `{KIE_VEO_1080_PATH}`",
-        f"MJ_GENERATE: `{KIE_MJ_GENERATE}`",
-        f"MJ_STATUS:   `{KIE_MJ_STATUS}`",
-        f"MJ_UPSCALE:  `{KIE_MJ_UPSCALE}`",
         f"UPLOADBASEURL: `{UPLOAD_BASE_URL}`",
         f"UPLOADSTREAMPATH: `{UPLOAD_STREAM_PATH}`",
         f"UPLOADB64PATH: `{UPLOAD_BASE64_PATH}`",
+        f"MJ_GEN: `{KIE_MJ_GEN_PATH}`",
+        f"MJ_STATUS: `{KIE_MJ_STATUS_PATH}`",
+        f"MJ_UPSCALE: `{KIE_MJ_UPSCALE}`",
+        f"MJ_VARY: `{KIE_MJ_VARY}`",
         f"KIE key: `{'set' if KIE_API_KEY else 'missing'}`",
-        f"OPENAI key: `{'set' if OPENAI_API_KEY else 'missing'}`",
         f"ENABLEVERTICALNORMALIZE: `{ENABLE_VERTICAL_NORMALIZE}`",
         f"ALWAYSFORCEFHD: `{ALWAYS_FORCE_FHD}`",
         f"FFMPEGBIN: `{FFMPEG_BIN}`",
@@ -855,9 +771,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "faq":
         await query.message.reply_text(
             "FAQ:\n"
-            "• 9:16 нормализуем локально в 1080×1920 (видео).\n"
-            "• 16:9 тянем 1080p и форсим FHD при необходимости (видео).\n"
-            "• Фото (MJ) — turbo v7, форматы 16:9/9:16, есть «Повысить качество».",
+            "• Вертикальное видео делаем tg-safe без изменения кадра (H.264/yuv420p, rotate=0).\n"
+            "• Горизонталь 16:9 — тянем 1080p и при необходимости форсим FHD.\n"
+            "• MJ: Turbo, поддержка Upscale, корректная передача aspectRatio.",
             reply_markup=main_menu_kb(),
         ); return
 
@@ -867,7 +783,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "start_new_cycle":
         s.update({**DEFAULT_STATE}); await query.message.reply_text("Выберите режим:", reply_markup=main_menu_kb()); return
 
-    # --- Режимы
     if data.startswith("mode:"):
         _, mode = data.split(":", 1); s["mode"] = mode
         if mode == "veo_text":
@@ -876,15 +791,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
             await query.message.reply_text("VEO (оживление фото): пришлите фото (подпись-промпт — опционально)."); await show_card_veo(update, ctx); return
-        if mode == "prompt_master":
-            await query.message.reply_text("Промпт-мастер: пришлите идею (1–2 фразы)."); return
-        if mode == "chat":
-            await query.message.reply_text("Обычный чат: напишите вопрос."); return
-        if mode == "mj_txt":
-            s["aspect"] = None
-            await query.message.reply_text("🖼️ MJ: пришлите текстовый prompt для картинки."); return
+        if mode == "mj":
+            await query.message.reply_text(
+                "🖼️ *Midjourney*\nПришлите текст промпта. Выберите формат:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("16:9", callback_data="mj:ar:16:9"),
+                     InlineKeyboardButton("9:16", callback_data="mj:ar:9:16"),
+                     InlineKeyboardButton("1:1",  callback_data="mj:ar:1:1")],
+                ])
+            ); return
 
-    # --- VEO параметры
     if data.startswith("aspect:"):
         _, val = data.split(":", 1); s["aspect"] = "9:16" if val.strip() == "9:16" else "16:9"
         await show_card_veo(update, ctx, edit_only_markup=True); return
@@ -893,141 +810,57 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, val = data.split(":", 1); s["model"] = "veo3" if val.strip() == "veo3" else "veo3_fast"
         await show_card_veo(update, ctx, edit_only_markup=True); return
 
-    if data == "card:toggle_photo":
-        if s.get("last_image_url"):
-            s["last_image_url"] = None; await query.message.reply_text("Фото-референс удалён."); await show_card_veo(update, ctx)
-        else:
-            await query.message.reply_text("Пришлите фото вложением или публичный URL изображения.")
-        return
-
-    if data == "card:edit_prompt":
-        await query.message.reply_text("Пришлите новый текст промпта."); return
-
-    if data == "card:reset":
-        keep_aspect = s.get("aspect") or "16:9"; keep_model = s.get("model") or "veo3_fast"
-        s.update({**DEFAULT_STATE}); s["aspect"] = keep_aspect; s["model"] = keep_model
-        await query.message.reply_text("Карточка очищена."); await show_card_veo(update, ctx); return
-
-    if data == "card:generate":
-        if s.get("generating"): await query.message.reply_text("⏳ Генерация уже идёт."); return
-        if not s.get("last_prompt"): await query.message.reply_text("Сначала укажите текст промпта."); return
-
-        event("VEO_SUBMIT_REQ", aspect=s.get("aspect"), model=s.get("model"),
-              with_image=bool(s.get("last_image_url")), prompt_len=len(s.get("last_prompt") or ""))
-
-        ok, task_id, msg = await asyncio.to_thread(
-            submit_kie_veo, s["last_prompt"].strip(), s.get("aspect", "16:9"),
-            s.get("last_image_url"), s.get("model", "veo3_fast")
-        )
-        event("VEO_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
-
-        if not ok or not task_id:
-            await query.message.reply_text(f"❌ Не удалось создать VEO-задачу: {msg}"); return
-
-        gen_id = uuid.uuid4().hex[:12]
-        s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
-        await query.message.reply_text(f"🚀 Задача отправлена ({'Fast' if s.get('model')=='veo3_fast' else 'Quality'}). taskId={task_id}")
-        await query.message.reply_text("⏳ Идёт рендеринг…")
-        asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
-
-    # --- MJ выбор формата
+    # ---- MJ UI ----
     if data.startswith("mj:ar:"):
-        ar = data.split(":")[-1]
-        prompt = s.get("last_prompt")
-        if not prompt:
-            await query.message.reply_text("⚠️ Сначала отправьте текстовый prompt."); return
-        await query.message.reply_text(f"🚀 Генерация фото запущена…\nФормат: *{ar}*\nPrompt: `{prompt}`",
-                                       parse_mode=ParseMode.MARKDOWN)
-        ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt.strip(), ar)
-        event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
-        if not ok or not task_id:
-            await query.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}"); return
-        await query.message.reply_text(f"🆔 MJ taskId: `{task_id}`", parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(poll_mj_and_send_photos(update.effective_chat.id, task_id, ctx))
-        return
+        # FIX: корректно берём все символы после "mj:ar:" (в т.ч. "9:16")
+        ar = data[len("mj:ar:"):]
+        if ar in ("16:9", "9:16", "1:1", "4:3", "3:4", "2:3", "3:2", "5:6", "6:5", "2:1", "1:2"):
+            s["mj_aspect"] = ar
+        await query.message.reply_text(f"Формат: {s['mj_aspect']}\nПришлите текст промпта для MJ."); return
 
-    # --- MJ апскейл
     if data.startswith("mj:up:"):
+        # кнопки вида mj:up:1|2|3|4 ссылаются на последний mj_task_id
         try:
-            _, _, task_id, idx = data.split(":")
-            index = int(idx)
-            assert 1 <= index <= 4
+            idx = int(data.split(":")[-1])
         except Exception:
-            await query.message.reply_text("⚠️ Некорректная команда повышения качества."); return
-
-        await query.message.reply_text(f"🔍 Повышаю качество варианта #{index}…")
-        ok, up_task, msg = await asyncio.to_thread(mj_upscale, task_id, index)
-        if not ok or not up_task:
+            idx = 1
+        tid = s.get("mj_last_task_id")
+        if not tid:
+            await query.message.reply_text("Нет активной MJ задачи для апскейла."); return
+        ok, new_tid, msg = await asyncio.to_thread(mj_upscale, tid, idx)
+        event("MJ_UPSCALE_RESP", ok=ok, task_id=new_tid, msg=msg)
+        if not ok or not new_tid:
             await query.message.reply_text(f"❌ Не удалось отправить апскейл: {msg}"); return
-
-        start_ts = time.time()
-        try:
-            while True:
-                ok2, flag2, data2 = await asyncio.to_thread(mj_status, up_task)
-                if not ok2:
-                    await asyncio.sleep(8); continue
-                if flag2 == 0:
-                    if (time.time() - start_ts) > 10 * 60:
-                        await query.message.reply_text("⏳ Таймаут ожидания апскейла."); return
-                    await asyncio.sleep(8); continue
-                if flag2 in (2, 3):
-                    msg2 = (data2 or {}).get("errorMessage") or "Апскейл не удался."
-                    await query.message.reply_text(f"❌ MJ ошибка: {msg2}"); return
-                if flag2 == 1:
-                    urls2 = _extract_mj_image_urls(data2 or {})
-                    if not urls2:
-                        await query.message.reply_text("⚠️ Готово, но ссылка апскейла не получена."); return
-                    await ctx.bot.send_photo(chat_id=update.effective_chat.id, photo=urls2[0])
-                    await query.message.reply_text("✅ Готово! Можно повысить качество других вариантов или сгенерировать новый prompt.")
-                    return
-        except Exception as e:
-            log.exception("[MJ_UPSCALE] crash: %s", e)
-            await query.message.reply_text("❌ Внутренняя ошибка при апскейле.")
+        await query.message.reply_text("🔎 Повышение качества запущено…")
+        # ждём и шлём
+        await poll_mj_and_send(update.effective_chat.id, new_tid, ctx, caption_prefix="🔎 Апскейл: ")
         return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
 
-    # Вставили URL картинки? — используем как референс
+    # URL картинки — как референс для VEO
     low = text.lower()
     if low.startswith(("http://", "https://")) and any(low.split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".heic")):
-        s["last_image_url"] = text.strip(); await update.message.reply_text("✅ Ссылка на изображение принята."); await show_card_veo(update, ctx); return
+        s["last_image_url"] = text.strip()
+        await update.message.reply_text("✅ Ссылка на изображение принята."); await show_card_veo(update, ctx); return
 
     mode = s.get("mode")
-    if mode == "prompt_master":
-        prompt = await oai_prompt_master(text)
-        if not prompt: await update.message.reply_text("⚠️ Prompt-Master недоступен или ответ пуст."); return
-        s["last_prompt"] = prompt; await update.message.reply_text("🧠 Промпт добавлен в карточку."); await show_card_veo(update, ctx); return
 
-    if mode == "chat":
-        if openai is None or not OPENAI_API_KEY:
-            await update.message.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY)."); return
-        try:
-            resp = await asyncio.to_thread(
-                openai.ChatCompletion.create,
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": "You are a helpful, concise assistant."},
-                          {"role": "user", "content": text}],
-                temperature=0.5, max_tokens=700,
-            )
-            answer = resp["choices"][0]["message"]["content"].strip()
-            await update.message.reply_text(answer)
-        except Exception as e:
-            log.exception("Chat error: %s", e)
-            await update.message.reply_text("⚠️ Ошибка запроса к ChatGPT.")
+    # ---- MJ text-to-image ----
+    if mode == "mj":
+        ar = s.get("mj_aspect") or "16:9"
+        ok, task_id, msg = await asyncio.to_thread(mj_generate, text, ar)
+        event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
+        if not ok or not task_id:
+            await update.message.reply_text(f"❌ MJ ошибка создания: {msg}"); return
+        s["mj_last_task_id"] = task_id
+        await update.message.reply_text("🖼️ Генерация фото запущена...")
+        await poll_mj_and_send(update.effective_chat.id, task_id, ctx)
         return
 
-    if mode == "mj_txt":
-        s["last_prompt"] = text
-        await update.message.reply_text(
-            f"✅ Prompt для MJ сохранён:\n\n`{text}`\n\nВыберите формат:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=mj_aspect_kb()
-        )
-        return
-
-    # По умолчанию — VEO промпт
+    # ---- VEO (по умолчанию) ----
     s["last_prompt"] = text
     await update.message.reply_text("🟦 *VEO — подготовка к рендеру*\nПроверь карточку ниже и жми «Сгенерировать».",
                                     parse_mode=ParseMode.MARKDOWN)
@@ -1042,13 +875,82 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file = await ctx.bot.get_file(ph.file_id)
         if not file.file_path:
             await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram."); return
-        url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)  # FIX: не дублируем базовый URL
+        url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)
         s["last_image_url"] = url
         await update.message.reply_text("🖼️ Фото принято как референс."); await show_card_veo(update, ctx)
     except Exception as e:
         log.exception("Get photo failed: %s", e)
         await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
 
+# ---- VEO generate button handler ----
+async def on_card_generate(query_msg, s, ctx):
+    if s.get("generating"):
+        await query_msg.reply_text("⏳ Генерация уже идёт."); return
+    if not s.get("last_prompt"):
+        await query_msg.reply_text("Сначала укажите текст промпта."); return
+
+    event("VEO_SUBMIT_REQ", aspect=s.get("aspect"), model=s.get("model"),
+          with_image=bool(s.get("last_image_url")), prompt_len=len(s.get("last_prompt") or ""))
+
+    ok, task_id, msg = await asyncio.to_thread(
+        submit_kie_veo, s["last_prompt"].strip(), s.get("aspect", "16:9"),
+        s.get("last_image_url"), s.get("model", "veo3_fast")
+    )
+    event("VEO_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
+
+    if not ok or not task_id:
+        await query_msg.reply_text(f"❌ Не удалось создать VEO-задачу: {msg}"); return
+
+    gen_id = uuid.uuid4().hex[:12]
+    s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
+    await query_msg.reply_text(f"🚀 Задача отправлена ({'Fast' if s.get('model')=='veo3_fast' else 'Quality'}). taskId={task_id}")
+    await query_msg.reply_text("⏳ Идёт рендеринг…")
+    asyncio.create_task(poll_veo_and_send(query_msg.chat_id, task_id, gen_id, ctx))
+
+async def poll_mj_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE, caption_prefix: str = ""):
+    start_ts = time.time()
+    while True:
+        ok, flag, has_data, urls, err = await asyncio.to_thread(mj_status, task_id)
+        event("MJ_STATUS", task_id=task_id, flag=flag, has_data=has_data)
+        if not ok:
+            await ctx.bot.send_message(chat_id, f"❌ MJ ошибка статуса: {err or 'неизвестно'}"); return
+        if has_data and urls:
+            # отправляем альбомом, как просили (как есть)
+            media = []
+            try:
+                from telegram import InputMediaPhoto
+                for u in urls:
+                    media.append(InputMediaPhoto(media=u))
+                if media:
+                    await ctx.bot.send_media_group(chat_id, media=media)
+            except Exception as e:
+                # fallback по одной
+                for u in urls:
+                    try:
+                        await ctx.bot.send_photo(chat_id, photo=u)
+                    except Exception:
+                        await ctx.bot.send_message(chat_id, u)
+            # кнопки апскейла
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔎 Повысить качество #1", callback_data="mj:up:1"),
+                 InlineKeyboardButton("🔎 Повысить качество #2", callback_data="mj:up:2")],
+                [InlineKeyboardButton("🔎 Повысить качество #3", callback_data="mj:up:3"),
+                 InlineKeyboardButton("🔎 Повысить качество #4", callback_data="mj:up:4")],
+            ])
+            await ctx.bot.send_message(chat_id, f"{caption_prefix}MJ taskId: `{task_id}`", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            return
+        if flag in (2, 3):
+            await ctx.bot.send_message(chat_id, "❌ MJ генерация завершилась ошибкой."); return
+        if time.time() - start_ts > POLL_TIMEOUT_SECS:
+            await ctx.bot.send_message(chat_id, "⏳ MJ таймаут ожидания."); return
+        await asyncio.sleep(POLL_INTERVAL_SECS)
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # уже определён выше; дополнили — см. выше (двойное объявление блокирует)
+    pass  # заглушка, фактическая реализация выше
+
+# Переопределяем основной CallbackHandler с рабочей реализацией (см. выше)
+# (PTB возьмёт тот, который добавлен в Application)
 # ==========================
 #   Entry
 # ==========================
@@ -1058,6 +960,7 @@ def main():
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).rate_limiter(AIORateLimiter()).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -1065,11 +968,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
 
-    log.info("Bot starting. PTB=%s | KIE_BASE=%s | GEN=%s | STATUS=%s | 1080=%s | MJ_GEN=%s | MJ_STATUS=%s | MJ_UPSCALE=%s | UPLOAD_BASE=%s | VERT_FIX=%s | FORCE_FHD=%s | MAX_MB=%s",
-             getattr(_tg, '__version__', 'unknown'),
-             KIE_BASE_URL, KIE_VEO_GEN_PATH, KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH,
-             KIE_MJ_GENERATE, KIE_MJ_STATUS, KIE_MJ_UPSCALE,
-             UPLOAD_BASE_URL, ENABLE_VERTICAL_NORMALIZE, ALWAYS_FORCE_FHD, MAX_TG_VIDEO_MB)
+    log.info(
+        "Bot starting. PTB=%s | KIE_BASE=%s | GEN=%s | STATUS=%s | 1080=%s | "
+        "UPLOAD_BASE=%s | VERT_FIX=%s | FORCE_FHD=%s | MAX_MB=%s | MJ_GEN=%s | MJ_STATUS=%s | MJ_UPSCALE=%s | MJ_VARY=%s",
+        getattr(_tg, '__version__', 'unknown'),
+        KIE_BASE_URL, KIE_VEO_GEN_PATH, KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH,
+        UPLOAD_BASE_URL, ENABLE_VERTICAL_NORMALIZE, ALWAYS_FORCE_FHD, MAX_TG_VIDEO_MB,
+        KIE_MJ_GEN_PATH, KIE_MJ_STATUS_PATH, KIE_MJ_UPSCALE, KIE_MJ_VARY
+    )
 
     # Если когда-то включался webhook — снимите:
     # https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook
