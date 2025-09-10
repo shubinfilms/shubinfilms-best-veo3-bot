@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 20.x/21.x
-# Версия: 2025-09-10 (vertical+horizontal delivery fix, Upload API, 1080p, photo-mode rename)
+# Версия: 2025-09-10 (fix: TG file URL, UploadAPI stream+base64, poller flag=3, vertical FHD)
 
 import os
 import json
 import time
 import uuid
+import base64
 import asyncio
 import logging
 import tempfile
@@ -35,7 +36,6 @@ TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 TOPUP_URL           = _env("TOPUP_URL", "https://t.me/bestveo3promts")
 
-# OpenAI (опционально)
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
     import openai  # type: ignore
@@ -47,19 +47,19 @@ except Exception:
 # ---- KIE core ----
 KIE_API_KEY  = _env("KIE_API_KEY")
 KIE_BASE_URL = _env("KIE_BASE_URL", "https://api.kie.ai")
-# поддерживаем старые имена путей
 KIE_VEO_GEN_PATH    = _env("KIE_VEO_GEN_PATH",    _env("KIE_GEN_PATH",    "/api/v1/veo/generate"))
 KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", _env("KIE_STATUS_PATH", "/api/v1/veo/record-info"))
 KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   _env("KIE_HD_PATH",     "/api/v1/veo/get-1080p-video"))
 
-# ---- Upload API (для фото-референсов)
-UPLOAD_BASE_URL    = _env("UPLOAD_BASE_URL", "https://kieai.redpandaai.co")
-UPLOAD_STREAM_PATH = _env("UPLOAD_STREAM_PATH", "/api/file-stream-upload")
-UPLOAD_URL_PATH    = _env("UPLOAD_URL_PATH", "/api/file-url-upload")
+# ---- Upload API
+UPLOAD_BASE_URL     = _env("UPLOAD_BASE_URL", "https://kieai.redpandaai.co")
+UPLOAD_STREAM_PATH  = _env("UPLOAD_STREAM_PATH", "/api/file-stream-upload")
+UPLOAD_URL_PATH     = _env("UPLOAD_URL_PATH",    "/api/file-url-upload")
+UPLOAD_BASE64_PATH  = _env("UPLOAD_BASE64_PATH", "/api/file-base64-upload")
 
 # ---- Видео-доставка
 ENABLE_VERTICAL_NORMALIZE = _env("ENABLE_VERTICAL_NORMALIZE", "true").lower() == "true"
-ALWAYS_FORCE_FHD          = _env("ALWAYS_FORCE_FHD", "true").lower() == "true"  # 16:9 всегда приводим к 1080p
+ALWAYS_FORCE_FHD          = _env("ALWAYS_FORCE_FHD", "true").lower() == "true"
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
 MAX_TG_VIDEO_MB           = int(_env("MAX_TG_VIDEO_MB", "48"))
 
@@ -88,14 +88,21 @@ def _nz(s: Optional[str]) -> Optional[str]:
     s2 = s.strip()
     return s2 if s2 else None
 
-def tg_file_direct_url(bot_token: str, file_path: str) -> str:
-    return f"https://api.telegram.org/file/bot{bot_token}/{file_path.lstrip('/')}"
-
 def event(tag: str, **kw):
     try:
         log.info("EVT %s | %s", tag, json.dumps(kw, ensure_ascii=False))
     except Exception:
         log.info("EVT %s | %s", tag, kw)
+
+def tg_direct_file_url(bot_token: str, file_path: str) -> str:
+    """
+    Исправлено: если file_path уже абсолютный (http/https) — возвращаем как есть.
+    Иначе строим https://api.telegram.org/file/bot<TOKEN>/<file_path>
+    """
+    p = (file_path or "").strip()
+    if p.startswith("http://") or p.startswith("https://"):
+        return p
+    return f"https://api.telegram.org/file/bot{bot_token}/{p.lstrip('/')}"
 
 # ==========================
 #   State
@@ -317,7 +324,7 @@ def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {('Сообщение: ' + msg) if msg else ''}".strip()
 
-# ---------- Upload API (для фото) ----------
+# ---------- Upload API (stream + base64 + url) ----------
 def _upload_headers() -> Dict[str, str]:
     tok = (KIE_API_KEY or "").strip()
     if tok and not tok.lower().startswith("bearer "):
@@ -338,7 +345,8 @@ def upload_image_stream(src_url: str, upload_path: str = "tg-uploads", timeout: 
                 if ch: f.write(ch)
             local = f.name
     except Exception as e:
-        log.warning("pre-download failed: %s", e); return None
+        event("upload_stream_predownload_failed", err=str(e), url=src_url)
+        return None
     # 2) зааплоадить
     try:
         url = join_url(UPLOAD_BASE_URL, UPLOAD_STREAM_PATH)
@@ -352,14 +360,36 @@ def upload_image_stream(src_url: str, upload_path: str = "tg-uploads", timeout: 
             d = j.get("data") or {}
             u = d.get("downloadUrl") or d.get("fileUrl")
             if _nz(u):
-                event("KIE_UPLOAD_STREAM_OK", url=u)
-                return u
-        log.warning("upload_stream resp: %s %s", r.status_code, j)
+                event("KIE_UPLOAD_STREAM_OK", url=u); return u
+        event("upload_stream_failed", status=r.status_code, resp=j)
     except Exception as e:
-        log.warning("upload_stream err: %s", e)
+        event("upload_stream_err", err=str(e))
     finally:
         try: os.unlink(local)
         except Exception: pass
+    return None
+
+def upload_image_base64(src_url: str, upload_path: str = "tg-uploads", timeout: int = 90) -> Optional[str]:
+    try:
+        rr = requests.get(src_url, stream=True, timeout=timeout); rr.raise_for_status()
+        ct = (rr.headers.get("Content-Type") or "image/jpeg")
+        data_url = f"data:{ct};base64,{base64.b64encode(rr.content).decode('utf-8')}"
+    except Exception as e:
+        event("upload_b64_predownload_failed", err=str(e)); return None
+    try:
+        url = join_url(UPLOAD_BASE_URL, UPLOAD_BASE64_PATH)
+        payload = {"base64Data": data_url, "uploadPath": upload_path, "fileName": "tg-upload.jpg"}
+        r = requests.post(url, json=payload, headers={**_upload_headers(), "Content-Type":"application/json"}, timeout=timeout)
+        try: j = r.json()
+        except Exception: j = {"error": r.text}
+        if r.status_code == 200 and (j.get("code", 200) == 200):
+            d = j.get("data") or {}
+            u = d.get("downloadUrl") or d.get("fileUrl")
+            if _nz(u):
+                event("KIE_UPLOAD_B64_OK", url=u); return u
+        event("upload_b64_failed", status=r.status_code, resp=j)
+    except Exception as e:
+        event("upload_b64_err", err=str(e))
     return None
 
 def upload_image_url(file_url: str, upload_path: str = "tg-uploads", timeout: int = 60) -> Optional[str]:
@@ -367,19 +397,17 @@ def upload_image_url(file_url: str, upload_path: str = "tg-uploads", timeout: in
         url = join_url(UPLOAD_BASE_URL, UPLOAD_URL_PATH)
         payload = {"fileUrl": file_url, "uploadPath": upload_path,
                    "fileName": os.path.basename(file_url.split("?")[0]) or "image.jpg"}
-        r = requests.post(url, json=payload, headers={**_upload_headers(), "Content-Type": "application/json"},
-                          timeout=timeout)
+        r = requests.post(url, json=payload, headers={**_upload_headers(), "Content-Type":"application/json"}, timeout=timeout)
         try: j = r.json()
         except Exception: j = {"error": r.text}
         if r.status_code == 200 and (j.get("code", 200) == 200):
             d = j.get("data") or {}
             u = d.get("downloadUrl") or d.get("fileUrl")
             if _nz(u):
-                event("KIE_UPLOAD_URL_OK", url=u)
-                return u
-        log.warning("upload_url resp: %s %s", r.status_code, j)
+                event("KIE_UPLOAD_URL_OK", url=u); return u
+        event("upload_url_failed", status=r.status_code, resp=j)
     except Exception as e:
-        log.warning("upload_url err: %s", e)
+        event("upload_url_err", err=str(e))
     return None
 
 # ---------- VEO ----------
@@ -394,10 +422,15 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
     return payload
 
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
-    # если есть image_url — сперва аплоад в Upload API (stream самый надёжный для Telegram)
+    # если есть image_url — сперва поднимаем в Upload API
     img_for_kie = None
     if _nz(image_url):
-        img_for_kie = upload_image_stream(image_url) or upload_image_url(image_url) or image_url
+        img_for_kie = (
+            upload_image_stream(image_url) or
+            upload_image_base64(image_url) or
+            upload_image_url(image_url) or
+            image_url
+        )
 
     payload = _build_payload_for_veo(prompt, aspect, img_for_kie, model_key)
     status, j = _post_json(join_url(KIE_BASE_URL, KIE_VEO_GEN_PATH), payload)
@@ -407,7 +440,7 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
         if tid: return True, tid, "Задача создана."
         return False, None, "Ответ KIE без taskId."
 
-    # если отвалился фетч картинки — повторим без неё (чтобы задача не срывалась)
+    # если отвалился фетч картинки — пробуем без неё, чтобы не срывать задачу
     msg = (j.get("msg") or j.get("message") or j.get("error") or "").lower()
     if "image fetch failed" in msg or ("image" in msg and "failed" in msg):
         payload.pop("imageUrls", None)
@@ -495,7 +528,7 @@ def _ffmpeg_force_16x9_fhd(inp: str, outp: str, target_mb: int) -> bool:
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, expect_vertical: bool = False) -> bool:
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
 
-    # для вертикали всегда локальная нормализация → не шлём прямой URL
+    # 16:9 пробуем отправлять по прямой ссылке сразу (вертикаль сначала нормализуем локально)
     if not expect_vertical:
         try:
             await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
@@ -517,7 +550,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             tmp_path = f.name
         event("DOWNLOAD_OK", path=tmp_path, content_type=ct)
 
-        # 9:16 — нормализация
+        # Вертикаль → нормализуем
         if expect_vertical and ENABLE_VERTICAL_NORMALIZE and _ffmpeg_available():
             out = tmp_path + "_v.mp4"
             if _ffmpeg_normalize_vertical(tmp_path, out):
@@ -532,7 +565,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                         await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="result_vertical.mp4"))
                     event("SEND_OK", mode="upload_document_norm"); return True
 
-        # 16:9 — форсим FHD при необходимости
+        # Горизонталь → форсим 1080p при необходимости
         if (not expect_vertical) and ALWAYS_FORCE_FHD and _ffmpeg_available():
             out = tmp_path + "_1080.mp4"
             if _ffmpeg_force_16x9_fhd(tmp_path, out, MAX_TG_VIDEO_MB):
@@ -547,7 +580,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                         await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="result_1080p.mp4"))
                     event("SEND_OK", mode="upload_document_16x9_forced"); return True
 
-        # raw upload
+        # Без перекодирования
         try:
             with open(tmp_path, "rb") as f:
                 await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename=f"result{ext}"),
@@ -587,12 +620,12 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                 return
 
             ok, flag, msg, res_url = await asyncio.to_thread(get_kie_veo_status, task_id)
-            event("VEO_STATUS", task_id=task_id, flag=flag, has_url=bool(res_url))
+            event("VEO_STATUS", task_id=task_id, flag=flag, has_url=bool(res_url), msg=msg)
 
             if not ok:
                 await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса: {msg or 'неизвестно'}"); break
 
-            # КРИТЕРИЙ ГОТОВНОСТИ: как только появился URL — забираем (даже если flag!=1)
+            # как только появился URL — отправляем
             if _nz(res_url):
                 final_url = res_url
                 if (s.get("aspect") or "16:9") == "16:9":
@@ -614,8 +647,14 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                 )
                 break
 
+            # если KIE завершил без URL — прекращаем ожидание
+            if flag in (2, 3):
+                await ctx.bot.send_message(chat_id, f"❌ KIE не вернул ссылку на видео. Сообщение: {msg or 'нет сообщения'}")
+                break
+
             if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
                 await ctx.bot.send_message(chat_id, "⏳ Таймаут ожидания результата VEO."); break
+
             await asyncio.sleep(POLL_INTERVAL_SECS)
 
     except Exception as e:
@@ -641,14 +680,15 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"GENPATH: `{KIE_VEO_GEN_PATH}`",
         f"STATUSPATH: `{KIE_VEO_STATUS_PATH}`",
         f"1080PATH: `{KIE_VEO_1080_PATH}`",
-        f"UPLOAD_BASE_URL: `{UPLOAD_BASE_URL}`",
-        f"UPLOAD_STREAM_PATH: `{UPLOAD_STREAM_PATH}`",
+        f"UPLOADBASEURL: `{UPLOAD_BASE_URL}`",
+        f"UPLOADSTREAMPATH: `{UPLOAD_STREAM_PATH}`",
+        f"UPLOADB64PATH: `{UPLOAD_BASE64_PATH}`",
         f"KIE key: `{'set' if KIE_API_KEY else 'missing'}`",
         f"OPENAI key: `{'set' if OPENAI_API_KEY else 'missing'}`",
-        f"ENABLE_VERTICAL_NORMALIZE: `{ENABLE_VERTICAL_NORMALIZE}`",
-        f"ALWAYS_FORCE_FHD: `{ALWAYS_FORCE_FHD}`",
-        f"FFMPEG_BIN: `{FFMPEG_BIN}`",
-        f"MAX_TG_VIDEO_MB: `{MAX_TG_VIDEO_MB}`",
+        f"ENABLEVERTICALNORMALIZE: `{ENABLE_VERTICAL_NORMALIZE}`",
+        f"ALWAYSFORCEFHD: `{ALWAYS_FORCE_FHD}`",
+        f"FFMPEGBIN: `{FFMPEG_BIN}`",
+        f"MAXTGVIDEOMB: `{MAX_TG_VIDEO_MB}`",
     ]
     await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
 
@@ -700,9 +740,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "faq":
         await query.message.reply_text(
             "FAQ:\n"
-            "• 9:16 всегда нормализуем → 1080×1920 MP4.\n"
-            "• 16:9 тянем 1080p и при необходимости форсим FHD.\n"
-            "• Фото сначала грузим в Upload API, затем VEO.",
+            "• 9:16 нормализуем локально в 1080×1920.\n"
+            "• 16:9 тянем 1080p и форсим FHD при необходимости.\n"
+            "• Фото загружаем в Upload API (stream→base64→url).",
             reply_markup=main_menu_kb(),
         ); return
 
@@ -810,7 +850,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_card_veo(update, ctx)
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Режим «Оживление фотографии»
     s = state(ctx)
     photos = update.message.photo
     if not photos: return
@@ -819,7 +858,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file = await ctx.bot.get_file(ph.file_id)
         if not file.file_path:
             await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram."); return
-        url = tg_file_direct_url(TELEGRAM_TOKEN, file.file_path)
+        url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)  # FIX: не дублируем базовый URL
         s["last_image_url"] = url
         await update.message.reply_text("🖼️ Фото принято как референс."); await show_card_veo(update, ctx)
     except Exception as e:
