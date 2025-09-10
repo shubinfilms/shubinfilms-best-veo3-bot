@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 20.7
-# Версия: 2025-09-10 (stable, vertical fix, 1080p fetch, MJ=Скоро)
+# Версия: 2025-09-10 (stable • vertical-safe • 1080p fetch • MJ=скоро)
 
 import os
 import json
@@ -41,7 +41,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 PROMPTS_CHANNEL_URL = os.getenv("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts").strip()
 TOPUP_URL = os.getenv("TOPUP_URL", "https://t.me/bestveo3promts").strip()
 
-# OpenAI (опционально для Prompt-Master/чата)
+# OpenAI (опционально)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 try:
     import openai  # type: ignore
@@ -55,13 +55,12 @@ KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai").strip()
 
 # VEO endpoints
-KIE_VEO_GEN_PATH = os.getenv("KIE_VEO_GEN_PATH", "/api/v1/veo/generate")
-KIE_VEO_STATUS_PATH = os.getenv("KIE_VEO_STATUS_PATH", "/api/v1/veo/record-info")
-# >>> фикс: правильный HD-эндпоинт с буквой 'p'
-KIE_VEO_1080_PATH = os.getenv("KIE_VEO_1080_PATH", "/api/v1/veo/get-1080p-video").strip()
+KIE_VEO_GEN_PATH = os.getenv("KIE_VEO_GEN_PATH", "/api/v1/veo/generate").strip()
+KIE_VEO_STATUS_PATH = os.getenv("KIE_VEO_STATUS_PATH", "/api/v1/veo/record-info").strip()
+KIE_VEO_1080_PATH = os.getenv("KIE_VEO_1080_PATH", "/api/v1/veo/get-1080p-video").strip()  # буква 'p'!
 
-# Вертикальная нормализация (опционально, но крайне полезно)
-ENABLE_VERTICAL_NORMALIZE = os.getenv("ENABLE_VERTICAL_NORMALIZE", "false").strip().lower() == "true"
+# Вертикальная нормализация (строгий режим)
+ENABLE_VERTICAL_NORMALIZE = os.getenv("ENABLE_VERTICAL_NORMALIZE", "true").strip().lower() == "true"
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip()
 
 POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "6"))
@@ -86,8 +85,7 @@ def join_url(base: str, path: str) -> str:
     return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
 
 def pick_first_url(value: Union[str, List[str], None]) -> Optional[str]:
-    if not value:
-        return None
+    if not value: return None
     if isinstance(value, str):
         v = value.strip()
         return v or None
@@ -106,10 +104,8 @@ def tg_file_direct_url(bot_token: str, file_path: str) -> str:
     return f"https://api.telegram.org/file/bot{bot_token}/{file_path.lstrip('/')}"
 
 def event(tag: str, **kw):
-    try:
-        log.info("EVT %s | %s", tag, json.dumps(kw, ensure_ascii=False))
-    except Exception:
-        log.info("EVT %s | %s", tag, kw)
+    try: log.info("EVT %s | %s", tag, json.dumps(kw, ensure_ascii=False))
+    except Exception: log.info("EVT %s | %s", tag, kw)
 
 
 # ==========================
@@ -247,8 +243,7 @@ def _kie_headers_json() -> Dict[str, str]:
     token = (KIE_API_KEY or "").strip()
     if token and not token.lower().startswith("bearer "):
         token = f"Bearer {token}"
-    if token:
-        h["Authorization"] = token
+    if token: h["Authorization"] = token
     return h
 
 def _post_json(url: str, payload: Dict[str, Any], timeout: int = 40) -> Tuple[int, Dict[str, Any]]:
@@ -268,19 +263,13 @@ def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
         if data.get(k): return str(data[k])
     return None
 
-# ----- корректное извлечение URL (даже для вертикали)
 def _coerce_url_list(value) -> List[str]:
     urls: List[str] = []
-
     def add(u: str):
         if isinstance(u, str):
             s = u.strip()
-            if s.startswith("http"):
-                urls.append(s)
-
-    if not value:
-        return urls
-
+            if s.startswith("http"): urls.append(s)
+    if not value: return urls
     if isinstance(value, str):
         s = value.strip()
         if s.startswith("["):
@@ -294,7 +283,6 @@ def _coerce_url_list(value) -> List[str]:
                 add(s); return urls
         else:
             add(s); return urls
-
     if isinstance(value, list):
         for v in value:
             if isinstance(v, str): add(v)
@@ -302,79 +290,57 @@ def _coerce_url_list(value) -> List[str]:
                 u = v.get("resultUrl") or v.get("originUrl") or v.get("url")
                 if isinstance(u, str): add(u)
         return urls
-
     if isinstance(value, dict):
         for k in ("resultUrl", "originUrl", "url"):
             u = value.get(k)
             if isinstance(u, str): add(u)
         return urls
-
     return urls
 
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
-    # 1) приоритетно originUrls (обычно хранит правильную ориентацию), затем resultUrls
     for key in ("originUrls", "resultUrls"):
         urls = _coerce_url_list(data.get(key))
-        if urls:
-            return urls[0]
-
-    # 2) иногда внутри info/response/resultInfoJson
+        if urls: return urls[0]
     for container in ("info", "response", "resultInfoJson"):
         v = data.get(container)
         if isinstance(v, dict):
             for key in ("originUrls", "resultUrls", "videoUrls"):
                 urls = _coerce_url_list(v.get(key))
-                if urls:
-                    return urls[0]
-
-    # 3) глубокий обход: ищем любую http*.mp4/mov/webm
+                if urls: return urls[0]
     def walk(x):
         if isinstance(x, dict):
             for vv in x.values():
                 r = walk(vv)
-                if r:
-                    return r
+                if r: return r
         elif isinstance(x, list):
             for vv in x:
                 r = walk(vv)
-                if r:
-                    return r
+                if r: return r
         elif isinstance(x, str):
             s = x.strip().split("?")[0].lower()
             if s.startswith("http") and s.endswith((".mp4", ".mov", ".webm")):
                 return x.strip()
         return None
-
     return walk(data)
 
 def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     code = j.get("code", status_code)
     msg = j.get("msg") or j.get("message") or j.get("error") or ""
-    mapping = {
-        401: "Доступ запрещён (Bearer).",
-        402: "Недостаточно кредитов.",
-        429: "Превышен лимит запросов.",
-        500: "Внутренняя ошибка KIE.",
-        422: "Запрос отклонён модерацией.",
-        400: "Неверный запрос (400).",
-    }
+    mapping = {401:"Доступ запрещён (Bearer).",402:"Недостаточно кредитов.",429:"Превышен лимит запросов.",
+               500:"Внутренняя ошибка KIE.",422:"Запрос отклонён модерацией.",400:"Неверный запрос (400)."}
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {('Сообщение: ' + msg) if msg else ''}".strip()
 
-# ---------- VEO payload
 def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "prompt": prompt,
         "aspectRatio": "9:16" if aspect == "9:16" else "16:9",
         "model": "veo3" if model_key == "veo3" else "veo3_fast",
-        # >>> fallback разрешаем только для 16:9 (по доке он отдает 1080p)
         "enableFallback": aspect == "16:9",
     }
-    if image_url:
-        payload["imageUrls"] = [image_url]
+    if image_url: payload["imageUrls"] = [image_url]
     return payload
 
-# ---------- VEO API
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     url = join_url(KIE_BASE_URL, KIE_VEO_GEN_PATH)
     status, j = _post_json(url, _build_payload_for_veo(prompt, aspect, image_url, model_key))
@@ -398,37 +364,35 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
         return True, flag, msg, _extract_result_url(data)
     return False, None, _kie_error_message(status, j), None
 
-# >>> 1080p fetch для Quality + 16:9
 def try_get_1080_url(task_id: str) -> Optional[str]:
     try:
         url = join_url(KIE_BASE_URL, KIE_VEO_1080_PATH)
         status, j = _get_json(url, {"taskId": task_id}, timeout=60)
         if status == 200 and (j.get("code", 200) == 200):
             data = j.get("data") or {}
-            u = pick_first_url(data.get("url")) or _extract_result_url(data)
-            return u
+            return pick_first_url(data.get("url")) or _extract_result_url(data)
     except Exception as e:
         log.warning("1080p fetch failed: %s", e)
     return None
 
 
 # ==========================
-#   ffmpeg: нормализация вертикали
+#   ffmpeg: строгая вертикальная нормализация
 # ==========================
 def _ffmpeg_normalize_vertical(inp: str, outp: str) -> bool:
     """
-    Делает истинный портрет 1080x1920 без rotate-метаданных.
-    - Автоповорот при наличии метаданных
-    - Масштаб с сохранением пропорций
-    - Пэддинг до ровно 1080x1920
-    - Сброс rotate
+    Любой вход -> истинный вертикальный 1080x1920 MP4 (H.264/AAC), без rotate, friendly-to-Telegram.
+    Без насильного поворота (никаких transpose).
     """
     cmd = [
         FFMPEG_BIN, "-y", "-i", inp,
-        "-vf", "transpose=1,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-        "-metadata:s:v:0", "rotate=0",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
+               "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", "128k",
+        "-metadata:s:v:0", "rotate=0",
         outp
     ]
     try:
@@ -440,19 +404,22 @@ def _ffmpeg_normalize_vertical(inp: str, outp: str) -> bool:
 
 
 # ==========================
-#   Sending video (robust + vertical safety)
+#   Sending video (robust + vertical-safe)
 # ==========================
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, expect_vertical: bool = False) -> bool:
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
-    # 1) пробуем стримить по URL
-    try:
-        await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
-        event("SEND_OK", mode="direct_url")
-        return True
-    except Exception as e:
-        log.warning("Direct URL send failed: %s", e)
 
-    # 2) скачиваем → (опц.) нормализуем вертикаль → отправляем файл
+    # Для вертикали никогда не шлём прямой URL — всегда локальная нормализация.
+    if not expect_vertical:
+        try:
+            await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
+            event("SEND_OK", mode="direct_url")
+            return True
+        except Exception as e:
+            log.warning("Direct URL send failed: %s", e)
+            event("SEND_FAIL", mode="direct_url", err=str(e))
+
+    # Скачиваем файл
     tmp_path = None
     try:
         r = requests.get(url, stream=True, timeout=180)
@@ -471,34 +438,39 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 if chunk: f.write(chunk)
             tmp_path = f.name
 
-        # >>> Нормализация вертикали (если 9:16 и флаг включён)
-        norm_path = None
+        # Вертикаль: всегда нормализуем (если флаг включён и ffmpeg доступен)
         if expect_vertical and ENABLE_VERTICAL_NORMALIZE:
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as nf:
-                    norm_path = nf.name
-                if _ffmpeg_normalize_vertical(tmp_path, norm_path):
-                    event("VERT_NORM_OK", src=tmp_path, out=norm_path)
-                    try:
-                        with open(norm_path, "rb") as f:
-                            await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename="result_vertical.mp4"),
-                                                     supports_streaming=True)
-                        event("SEND_OK", mode="upload_video_norm")
-                        return True
-                    except Exception as e:
-                        log.warning("Send normalized video failed, try document. %s", e)
-                        with open(norm_path, "rb") as f:
-                            await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="result_vertical.mp4"))
-                        event("SEND_OK", mode="upload_document_norm")
-                        return True
-                else:
-                    event("VERT_NORM_FAIL")
-            finally:
-                if norm_path:
-                    try: os.unlink(norm_path)
-                    except Exception: pass
+            from shutil import which
+            if which(FFMPEG_BIN):
+                norm_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as nf:
+                        norm_path = nf.name
+                    if _ffmpeg_normalize_vertical(tmp_path, norm_path):
+                        event("VERT_NORM_OK", src=tmp_path, out=norm_path)
+                        try:
+                            with open(norm_path, "rb") as f:
+                                await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename="result_vertical.mp4"),
+                                                         supports_streaming=True)
+                            event("SEND_OK", mode="upload_video_norm")
+                            return True
+                        except Exception as e:
+                            log.warning("Send normalized video failed, try document. %s", e)
+                            event("SEND_FAIL", mode="upload_video_norm", err=str(e))
+                            with open(norm_path, "rb") as f:
+                                await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="result_vertical.mp4"))
+                            event("SEND_OK", mode="upload_document_norm")
+                            return True
+                    else:
+                        event("VERT_NORM_FAIL")
+                finally:
+                    if 'norm_path' in locals() and norm_path:
+                        try: os.unlink(norm_path)
+                        except Exception: pass
+            else:
+                event("VERT_NORM_SKIP", reason="ffmpeg_not_found", bin=FFMPEG_BIN)
 
-        # 3) Обычная отправка скачанного файла
+        # Если нормализацию пропустили — отправляем скачанный файл как есть
         try:
             with open(tmp_path, "rb") as f:
                 await ctx.bot.send_video(chat_id=chat_id, video=InputFile(f, filename=f"result{ext}"),
@@ -507,14 +479,21 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             return True
         except Exception as e:
             log.warning("Send as video failed, try document. %s", e)
+            event("SEND_FAIL", mode="upload_video_raw", err=str(e))
+            with open(tmp_path, "rb") as f:
+                await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename=f"result{ext}"))
+            event("SEND_OK", mode="upload_document_raw")
+            return True
 
-        with open(tmp_path, "rb") as f:
-            await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename=f"result{ext}"))
-        event("SEND_OK", mode="upload_document_raw")
-        return True
     except Exception as e:
         log.exception("File send failed: %s", e)
-        return False
+        event("SEND_FAIL", mode="download_or_send", err=str(e))
+        try:
+            await ctx.bot.send_message(chat_id, f"🔗 Результат готов, но вложить файл не удалось. Ссылка:\n{url}")
+            event("SEND_OK", mode="link_fallback_on_error")
+            return True
+        except Exception:
+            return False
     finally:
         if tmp_path:
             try: os.unlink(tmp_path)
@@ -555,13 +534,11 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылка не найдена (ответ KIE без URL).")
                     break
 
-                # >>> если Quality + 16:9 — пробуем получить 1080p
                 final_url = res_url
                 if s.get("model") == "veo3" and (s.get("aspect") or "16:9") == "16:9":
                     u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
                     if _nz(u1080):
-                        final_url = u1080
-                        event("VEO_1080_OK", task_id=task_id, url=final_url)
+                        final_url = u1080; event("VEO_1080_OK", task_id=task_id, url=final_url)
                     else:
                         event("VEO_1080_MISS", task_id=task_id)
 
@@ -609,6 +586,9 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
         f"PTB: `{getattr(_tg, '__version__', 'unknown')}`",
         f"KIE_BASE_URL: `{KIE_BASE_URL}`",
+        f"GEN_PATH: `{KIE_VEO_GEN_PATH}`",
+        f"STATUS_PATH: `{KIE_VEO_STATUS_PATH}`",
+        f"1080_PATH: `{KIE_VEO_1080_PATH}`",
         f"KIE key: `{'set' if KIE_API_KEY else 'missing'}`",
         f"OPENAI key: `{'set' if OPENAI_API_KEY else 'missing'}`",
         f"ENABLE_VERTICAL_NORMALIZE: `{ENABLE_VERTICAL_NORMALIZE}`",
@@ -667,7 +647,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "FAQ:\n"
             "• VEO: Fast/Quality, 16:9/9:16, фото-референс.\n"
             "• 1080p автоматически для Quality+16:9.\n"
-            "• Если Telegram не принимает контейнер — отправлю как документ.",
+            "• Вертикаль 9:16 всегда нормализуется в 1080×1920 MP4.",
             reply_markup=main_menu_kb(),
         ); return
 
@@ -683,15 +663,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🖌️ MJ-режим скоро. Сейчас доступен VEO и ChatGPT."); return
 
     if data.startswith("mode:"):
-        _, mode = data.split(":", 1); s["mode"] = mode
-        event("UI_SET", mode=mode)
+        _, mode = data.split(":", 1); s["mode"] = mode; event("UI_SET", mode=mode)
         if mode in ("veo_text", "veo_photo"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast"
-            await query.message.reply_text(
-                "VEO: пришлите идею/промпт"
-                if mode == "veo_text"
-                else "VEO: пришлите фото (и при желании — подпись-промпт)."
-            )
+            await query.message.reply_text("VEO: пришлите идею/промпт" if mode == "veo_text"
+                                           else "VEO: пришлите фото (и при желании — подпись-промпт).")
             await show_card_veo(update, ctx); return
         if mode == "prompt_master":
             await query.message.reply_text("Промпт-мастер: пришлите идею (1–2 фразы). Верну EN-кинопромпт."); return
@@ -840,7 +816,7 @@ def main():
     log.info("Bot starting. PTB=20.7 | KIE_BASE=%s | GEN=%s | STATUS=%s | 1080=%s | VERT_FIX=%s",
              KIE_BASE_URL, KIE_VEO_GEN_PATH, KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH, ENABLE_VERTICAL_NORMALIZE)
 
-    # Если где-то был webhook — снимите, чтобы long-polling работал:
+    # Убедись, что выключен webhook:
     # https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook
     app.run_polling(drop_pending_updates=True)
 
