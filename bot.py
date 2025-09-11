@@ -1231,7 +1231,8 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).rate_limiter(AIORateLimiter()).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
-    app.add_handler(CommandHandler(["topup","пополнить"], topup))
+    # ✅ ВАЖНО: только латиница и одно имя — иначе PTB бросает ValueError
+    app.add_handler(CommandHandler("topup", topup))
     app.add_handler(CommandHandler("refund_last", refund_last))  # тестовая команда
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
