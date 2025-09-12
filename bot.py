@@ -205,7 +205,7 @@ def render_welcome_for(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🎬 Генерация видео (Veo) 💎1", callback_data="mode:veo_text")],
+        [InlineKeyboardButton("🎬 Генерация видео (Veo) 💎10", callback_data="mode:veo_text")],
         [InlineKeyboardButton("🖼️ Генерация изображений (MJ) 💎1", callback_data="mode:mj_txt")],
         [InlineKeyboardButton("🍌 Редактор изображений (Banana) 💎1", callback_data="mode:banana")],
         [InlineKeyboardButton("📸 Оживить изображение (Veo) 💎1", callback_data="mode:veo_photo")],
