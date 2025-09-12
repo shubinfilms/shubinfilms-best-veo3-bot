@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-# kie_banana.py — KIE wrapper for google/nano-banana-edit
-# Версия: 2025-09-11
+# kie_banana.py — KIE wrapper for google/nano-banana-edit (multi-image up to 4)
+# Версия: 2025-09-12
 #
-# Использование из bot.py:
-#   from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
+# Функции:
+#   create_banana_task(prompt, image_urls, ... ) -> taskId (str)
+#   wait_for_banana_result(taskId, ...) -> List[str] (result urls)
 #
-# Требуемые ENV (используются совместно с основным ботом):
+# ENV обязательные:
 #   KIE_BASE_URL (по умолчанию https://api.kie.ai)
 #   KIE_API_KEY  (Bearer ...)
-#
-# Задаёт задачу для модели google/nano-banana-edit и опрашивает её статус через /api/v1/jobs/recordInfo
 
 from __future__ import annotations
 import os
@@ -50,16 +49,17 @@ def create_banana_task(
     extra_input: Optional[Dict[str, Any]] = None,
     timeout: int = 60,
 ) -> str:
-    """
-    Создаёт задачу nano-banana-edit. Возвращает taskId (str).
-    """
+    """Создаёт задачу nano-banana-edit. Поддерживает до 4 image_urls."""
     if not KIE_API_KEY:
         raise KieBananaError("KIE_API_KEY is missing")
+    imgs = [u for u in (image_urls or []) if isinstance(u, str) and u.startswith("http")]
+    if not imgs:
+        raise KieBananaError("image_urls is empty")
     payload: Dict[str, Any] = {
         "model": MODEL_BANANA,
         "input": {
-            "prompt": prompt,
-            "image_urls": image_urls,
+            "prompt": prompt or "",
+            "image_urls": imgs[:4],
             "output_format": output_format,
             "image_size": image_size,
         },
@@ -96,9 +96,7 @@ def get_banana_record(task_id: str, timeout: int = 60) -> Dict[str, Any]:
     return j
 
 def parse_banana_result_urls(record_json: Dict[str, Any]) -> Tuple[Optional[List[str]], Optional[str]]:
-    """
-    Возвращает (urls, state). urls=None — результата нет.
-    """
+    """Возвращает (urls, state). urls=None — результата нет."""
     data = record_json.get("data") or {}
     state = data.get("state")
     rj = data.get("resultJson")
@@ -114,9 +112,7 @@ def parse_banana_result_urls(record_json: Dict[str, Any]) -> Tuple[Optional[List
     return (urls if urls else None), state
 
 def wait_for_banana_result(task_id: str, timeout_sec: int = 300, poll_sec: int = 3) -> List[str]:
-    """
-    Ждём success/fail/таймаут. Возвращаем список URL'ов изображений.
-    """
+    """Ждём success/fail/таймаут. Возвращаем список URL'ов изображений."""
     deadline = time.time() + timeout_sec
     last_state = None
     while time.time() < deadline:
