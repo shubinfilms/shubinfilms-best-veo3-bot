@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-# Best VEO3 Bot — PTB 20.x/21.x
-# Версия: 2025-09-12 (Banana multi-image + MJ anti-spam 40s + Chat free + new prices)
+# Best VEO3 Bot — PTB 21.x
+# Версия: 2025-09-12 (Redis balance + signup bonus + Banana 4 imgs + MJ anti-spam 40s)
 #
-# Что внутри:
-# • Banana: до 4 фото, кнопка «🚀 Начать генерацию (Banana)», отправка только после подтверждения.
-# • MJ: сообщение «Рисую…» не чаще 40 сек; нет текста про апскейл.
-# • ChatGPT: бесплатно (без токенов).
-# • Цены: VEO Fast 50, VEO Quality 250, MJ 15, Banana 10.
-# • Prompt-Master: улучшенная подсказка для пользователя.
-# • VEO: фиксы текста (Fast/Quality).
+# Ключевые моменты:
+# • Redis-хранилище баланса/флагов → токены не теряются при деплоях.
+# • Бонус новичка: +10💎 при первом /start (проверка по Redis).
+# • VEO: Fast = 50💎, Quality = 200💎. Сообщения Fast/Quality корректные.
+# • MJ: антиспам «Рисую…» — не чаще 1 раза в 40 сек. Без упоминания апскейла.
+# • Banana: до 4 фото, генерация только по кнопке «🚀 Начать генерацию (Banana)».
+# • Удаление вебхука на старте (safety), polling «залипает» корректно.
 #
 import os
 import json
@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, InputMediaPhoto, LabeledPrice
+    InputFile, InputMediaPhoto, LabeledPrice, Bot
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -35,6 +35,9 @@ from telegram.ext import (
 
 # === Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
+
+# === Redis (надёжное хранилище баланса/флагов) ===
+import redis
 
 # ==========================
 #   ENV / INIT
@@ -48,7 +51,7 @@ def _env(k: str, d: str = "") -> str:
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
-DEV_MODE            = _env("DEV_MODE", "true").lower() == "true"
+DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -85,7 +88,7 @@ POLL_INTERVAL_SECS = int(_env("POLL_INTERVAL_SECS", "6"))
 POLL_TIMEOUT_SECS  = int(_env("POLL_TIMEOUT_SECS", str(20 * 60)))
 
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s) | %(name)s | %(message)s")
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("veo3-bot")
 
 try:
@@ -94,12 +97,20 @@ try:
 except Exception:
     _tg = None
 
+# ---- Redis
+REDIS_URL    = _env("REDIS_URL")
+REDIS_PREFIX = _env("REDIS_PREFIX", "veo3:prod")
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
+def _rk(*parts: str) -> str:
+    return ":".join([REDIS_PREFIX, *parts])
+
 # ==========================
 #   Tokens / Pricing
 # ==========================
 TOKEN_COSTS = {
     "veo_fast": 50,
-    "veo_quality": 250,
+    "veo_quality": 200,   # фиксировано по вашему решению
     "veo_photo": 50,
     "mj": 15,
     "banana": 10,
@@ -108,11 +119,29 @@ TOKEN_COSTS = {
 
 CHAT_UNLOCK_PRICE = 0  # чат бесплатный
 
+# ---------------- Redis-backed balance helpers ----------------
+def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    # PTB 21: безопасно доставать user_id из контекста
+    try:
+        return ctx._user_id_and_data[0]  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
 def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = get_user_id(ctx)
+    if redis_client and uid:
+        v = redis_client.get(_rk("balance", str(uid)))
+        if v is not None:
+            try: return int(v)
+            except: return 0
     return int(ctx.user_data.get("balance", 0))
 
 def set_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, v: int):
-    ctx.user_data["balance"] = max(0, int(v))
+    v = max(0, int(v))
+    ctx.user_data["balance"] = v
+    uid = get_user_id(ctx)
+    if redis_client and uid:
+        redis_client.set(_rk("balance", str(uid)), v)
 
 def add_tokens(ctx: ContextTypes.DEFAULT_TYPE, add: int):
     set_user_balance_value(ctx, get_user_balance_value(ctx) + int(add))
@@ -124,17 +153,18 @@ def try_charge(ctx: ContextTypes.DEFAULT_TYPE, need: int) -> Tuple[bool, int]:
     set_user_balance_value(ctx, bal - need)
     return True, bal - need
 
-STARS_PACKS: Dict[int, int] = {100:100, 200:200, 300:300, 400:400, 500:500}
-if DEV_MODE:
-    STARS_PACKS = {1:1, **STARS_PACKS}
+def has_signup_bonus(uid: int) -> bool:
+    if not redis_client:  # без Redis — не выдаём бонус «навсегда», чтобы не дублировать
+        return uid in {}  # всегда False
+    return bool(redis_client.get(_rk("signup_bonus", str(uid))))
 
-def tokens_for_stars(total_stars: int) -> int:
-    return int(STARS_PACKS.get(int(total_stars), 0))
-
-LAST_STAR_CHARGE_BY_USER: Dict[int, str] = {}
+def set_signup_bonus(uid: int):
+    if redis_client:
+        # хранить флаг бесконечно
+        redis_client.set(_rk("signup_bonus", str(uid)), "1")
 
 # ==========================
-#   Utils
+#   Utils / State
 # ==========================
 def join_url(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
@@ -157,9 +187,6 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
         return p
     return f"https://api.telegram.org/file/bot{bot_token}/{p.lstrip('/')}"
 
-# ==========================
-#   State
-# ==========================
 DEFAULT_STATE = {
     "mode": None,          # 'veo_text' | 'veo_photo' | 'prompt_master' | 'chat' | 'mj_txt' | 'banana'
     "aspect": None,        # '16:9' | '9:16'
@@ -182,7 +209,6 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     for k, v in DEFAULT_STATE.items():
         if k not in ud:
             ud[k] = [] if isinstance(v, list) else v
-    # гарантия типов
     if not isinstance(ud.get("banana_images"), list):
         ud["banana_images"] = []
     return ud
@@ -327,7 +353,7 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
         return None
 
 # ==========================
-#   HTTP helpers (VEO/MJ)
+#   HTTP helpers (KIE)
 # ==========================
 def _kie_headers_json() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
@@ -476,8 +502,7 @@ def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     msg = j.get("msg") or j.get("message") or j.get("error") or ""
     mapping = {401: "Доступ запрещён (Bearer).", 402: "Недостаточно кредитов.",
                429: "Превышен лимит запросов.", 500: "Внутренняя ошибка KIE.",
-               422: "Запрос отклонён модерацией.", 400: "Неверный запрос (400)."
-               }
+               422: "Запрос отклонён модерацией.", 400: "Неверный запрос (400)."}
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {('Сообщение: ' + msg) if msg else ''}".strip()
 
@@ -521,7 +546,7 @@ def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
     return res
 
 # ==========================
-#   ffmpeg helpers
+#   ffmpeg helpers (для видео)
 # ==========================
 def _ffmpeg_available() -> bool:
     from shutil import which
@@ -767,8 +792,10 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
 # ==========================
 def stars_topup_kb() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    for stars in sorted(STARS_PACKS.keys()):
-        tokens = STARS_PACKS[stars]
+    packs = {100:100, 200:200, 300:300, 400:400, 500:500}
+    if DEV_MODE:
+        packs = {1:1, **packs}
+    for stars, tokens in sorted(packs.items()):
         cap = f"⭐ {stars} → 💎 {tokens}" + ("  (DEV)" if DEV_MODE and stars == 1 else "")
         rows.append([InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}")])
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
@@ -777,7 +804,17 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx); s.update({**DEFAULT_STATE})
-    await update.message.reply_text(render_welcome_for(update.effective_user.id, ctx),
+    uid = update.effective_user.id
+
+    # Бонус новичка (проверяем в Redis, чтобы не повторялся)
+    if redis_client and not has_signup_bonus(uid):
+        # если у пользователя уже был баланс >0 (например, перенос) — не затираем, а лишь добавим при нуле
+        if get_user_balance_value(ctx) == 0:
+            set_user_balance_value(ctx, 10)
+            await update.message.reply_text("🎁 Добро пожаловать! На баланс зачислено 10 бесплатных токенов 💎")
+        set_signup_bonus(uid)
+
+    await update.message.reply_text(render_welcome_for(uid, ctx),
                                     parse_mode=ParseMode.MARKDOWN,
                                     reply_markup=main_menu_kb())
 
@@ -795,6 +832,7 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"KIEBASEURL: `{KIE_BASE_URL}`",
         f"OPENAI key: `{'set' if OPENAI_API_KEY else 'missing'}`",
         f"KIE key: `{'set' if KIE_API_KEY else 'missing'}`",
+        f"REDIS: `{'set' if REDIS_URL else 'missing'}`",
         f"DEV_MODE: `{DEV_MODE}`",
         f"FFMPEGBIN: `{FFMPEG_BIN}`",
         f"MAXTGVIDEOMB: `{MAX_TG_VIDEO_MB}`",
@@ -871,7 +909,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Покупка Stars пакета
     if data.startswith("buy:stars:"):
         stars = int(data.split(":")[-1])
-        tokens = tokens_for_stars(stars)
+        # отображаемые пакеты совпадают с меню (без логики на сервере)
+        tokens = {1:1,100:100,200:200,300:300,400:400,500:500}.get(stars, 0) if DEV_MODE else {100:100,200:200,300:300,400:400,500:500}.get(stars,0)
         if tokens <= 0:
             await query.message.reply_text("⚠️ Такой пакет недоступен."); return
 
@@ -893,7 +932,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             event("STARS_INVOICE_ERR", err=str(e))
             await query.message.reply_text(
                 f"Если счёт не открылся — у аккаунта могут быть не активированы Stars.\n"
-                f"Купите 1⭐ в {STARS_BUY_URL} и попробуйте снова."
+                f"Купите 1⭐ в {STARS_BUY_URL} и попробуйте снова.",
+                reply_markup=stars_topup_kb()
             )
         return
 
@@ -1090,7 +1130,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "banana":
-        # текст без фото — считаем промптом
         s["last_prompt"] = text
         await update.message.reply_text("✍️ Промпт сохранён. Пришлите фото или нажмите «🚀 Начать генерацию (Banana)».", reply_markup=banana_kb(s))
         return
@@ -1102,7 +1141,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_card_veo(update, ctx)
 
 async def _banana_run_and_send(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, src_urls: List[str], prompt: str):
-    """Отправка задачи Banana и доставка результата."""
     try:
         task_id = await asyncio.to_thread(create_banana_task, prompt, src_urls, "png", "auto", None, None, 60)
         event("BANANA_SUBMIT_OK", task_id=task_id, imgs=len(src_urls))
@@ -1114,7 +1152,6 @@ async def _banana_run_and_send(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, src
             await ctx.bot.send_message(chat_id, "⚠️ Banana вернула пустой результат. 💎 Токены возвращены.")
             add_tokens(ctx, TOKEN_COSTS["banana"]); return
 
-        # отправляем первый URL
         u0 = urls[0]
         try:
             await ctx.bot.send_photo(chat_id=chat_id, photo=u0, caption="✅ Banana готово")
@@ -1164,7 +1201,6 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # VEO reference
         s["last_image_url"] = url
         await update.message.reply_text("🖼️ Фото принято как референс."); await show_card_veo(update, ctx)
     except Exception as e:
@@ -1191,38 +1227,23 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
     stars = int(sp.total_amount)
     charge_id = getattr(sp, "telegram_payment_charge_id", None)
     if charge_id:
-        LAST_STAR_CHARGE_BY_USER[update.effective_user.id] = charge_id
+        # можно хранить последний charge_id в Redis при желании
+        pass
 
     if meta.get("kind") == "stars_pack":
-        tokens = int(meta.get("tokens") or tokens_for_stars(stars))
+        tokens = int(meta.get("tokens", 0))
+        if tokens <= 0:
+            # safety — рассчитать по звёздам
+            map_dev = {1:1,100:100,200:200,300:300,400:400,500:500}
+            map_prod = {100:100,200:200,300:300,400:400,500:500}
+            tokens = (map_dev if DEV_MODE else map_prod).get(stars, 0)
         add_tokens(ctx, tokens)
         await update.message.reply_text(
             f"✅ Оплата получена: +{tokens} токенов.\nБаланс: {get_user_balance_value(ctx)} 💎"
         )
-        event("STARS_TOPUP_OK", user=update.effective_user.id, stars=stars, tokens=tokens, charge_id=charge_id)
         return
 
     await update.message.reply_text("✅ Оплата получена. Баланс обновлён.")
-
-async def refund_last(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    charge_id = LAST_STAR_CHARGE_BY_USER.get(uid)
-    if not charge_id:
-        await update.message.reply_text("Нет последнего платежа для возврата.")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/refundStarPayment"
-        r = requests.post(url, json={"user_id": uid, "telegram_payment_charge_id": charge_id}, timeout=20)
-        j = r.json()
-        if j.get("ok"):
-            await update.message.reply_text("🔄 Возврат Stars инициирован. Проверьте баланс звёзд.")
-            event("STARS_REFUND_OK", user=uid, charge_id=charge_id)
-        else:
-            await update.message.reply_text(f"⚠️ Не удалось вернуть Stars: {j.get('description') or 'ошибка'}")
-            event("STARS_REFUND_FAIL", user=uid, charge_id=charge_id, resp=j)
-    except Exception as e:
-        await update.message.reply_text("⚠️ Ошибка при возврате Stars.")
-        event("STARS_REFUND_ERR", err=str(e))
 
 # ==========================
 #   Entry
@@ -1232,11 +1253,21 @@ def main():
     if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).rate_limiter(AIORateLimiter()).build()
+    # ВАЖНО: удаляем вебхук перед polling — частая причина «бот не отвечает»
+    try:
+        Bot(TELEGRAM_TOKEN).delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (drop_pending_updates=True)")
+    except Exception as e:
+        log.warning("Delete webhook failed: %s", e)
+
+    app = (ApplicationBuilder()
+           .token(TELEGRAM_TOKEN)
+           .rate_limiter(AIORateLimiter())
+           .build())
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("topup", topup))
-    app.add_handler(CommandHandler("refund_last", refund_last))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -1244,11 +1275,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
 
-    log.info("Bot starting with Banana multi-image, MJ anti-spam (40s), Chat free, new prices.")
+    log.info("Bot starting… (PTB polling, Redis=%s)", "on" if redis_client else "off")
 
-    # Если когда-то включался webhook — снимите:
-    # https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook
-    app.run_polling(drop_pending_updates=True)
+    # run_polling блокирует поток до SIGTERM/SIGINT
+    # stop_signals=None — не обязательно, но помогает на некоторых платформах.
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        stop_signals=None
+    )
 
 if __name__ == "__main__":
-    main
+    main()
