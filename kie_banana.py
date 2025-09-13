@@ -1,6 +1,3 @@
-\# kie_banana.py - KIE wrapper for google/nano-banana-edit (multi-image up to 4)
-# Version: 2025-09-12 (clean)
-
 from __future__ import annotations
 import os
 import json
@@ -11,7 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import requests
 
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai").strip()
-KIE_API_KEY  = os.getenv("KIE_API_KEY", "").strip()
+KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
 MODEL_BANANA = (os.getenv("KIE_BANANA_MODEL", "google/nano-banana-edit").strip()
                 or "google/nano-banana-edit")
 
@@ -33,10 +30,11 @@ def _headers_json() -> Dict[str, str]:
 
 def _join(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
-    return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
+    # keep it ASCII-safe
+    return u.replace("://", "__SCHEME__").replace("//", "/").replace("__SCHEME__", "://")
 
 
-def _req_json_post(url: str, payload: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
+def _post(url: str, payload: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
     r = requests.post(url, headers=_headers_json(), data=json.dumps(payload), timeout=timeout)
     try:
         j = r.json()
@@ -45,7 +43,7 @@ def _req_json_post(url: str, payload: Dict[str, Any], timeout: int = 60) -> Tupl
     return r.status_code, j
 
 
-def _req_json_get(url: str, params: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
+def _get(url: str, params: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
     r = requests.get(url, headers=_auth_header(), params=params, timeout=timeout)
     try:
         j = r.json()
@@ -108,8 +106,6 @@ def _coerce_url_list(value) -> List[str]:
     return urls
 
 
-# Public API
-
 def create_banana_task(
     prompt: str,
     image_urls: List[str],
@@ -119,9 +115,6 @@ def create_banana_task(
     extra_input: Optional[Dict[str, Any]] = None,
     timeout: int = 60,
 ) -> str:
-    """
-    Create nano-banana-edit task. Tries multiple routes and snake/camel inputs.
-    """
     if not KIE_API_KEY:
         raise KieBananaError("KIE_API_KEY is missing")
 
@@ -152,7 +145,7 @@ def create_banana_task(
             payload["callBackUrl"] = callback_url
         for r in routes:
             url = _join(KIE_BASE_URL, r)
-            status, j = _req_json_post(url, payload, timeout=timeout)
+            status, j = _post(url, payload, timeout=timeout)
             code = j.get("code", status)
             if status == 200 and code == 200:
                 tid = _extract_task_id(j)
@@ -166,7 +159,7 @@ def create_banana_task(
 def get_banana_record(task_id: str, timeout: int = 60) -> Dict[str, Any]:
     for r in ("/api/v1/jobs/recordInfo", "/api/v1/banana/record-info"):
         url = _join(KIE_BASE_URL, r)
-        status, j = _req_json_get(url, {"taskId": task_id}, timeout=timeout)
+        status, j = _get(url, {"taskId": task_id}, timeout=timeout)
         if status == 200:
             return j
     raise KieBananaError("recordInfo: no 200 responses")
