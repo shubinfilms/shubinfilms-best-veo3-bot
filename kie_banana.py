@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-# kie_banana.py — KIE wrapper for Nano Banana (edit / text) with robust JSON/route fallbacks
+# kie_banana.py — обёртка для KIE google/nano-banana-edit
+# Совместимо с официальными docs:
+#   POST /api/v1/jobs/createTask
+#   GET  /api/v1/jobs/recordInfo
 
 from __future__ import annotations
 import os
@@ -12,14 +15,11 @@ import requests
 
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai").strip()
 KIE_API_KEY  = os.getenv("KIE_API_KEY", "").strip()
-# По умолчанию редактирование по фото. Если фото нет — в bot.py используем текстовую модель.
 MODEL_BANANA = (os.getenv("KIE_BANANA_MODEL", "google/nano-banana-edit").strip()
                 or "google/nano-banana-edit")
 
-
 class KieBananaError(Exception):
     pass
-
 
 def _auth_header() -> Dict[str, str]:
     tok = KIE_API_KEY
@@ -27,87 +27,12 @@ def _auth_header() -> Dict[str, str]:
         tok = f"Bearer {tok}"
     return {"Authorization": tok} if tok else {}
 
-
 def _headers_json() -> Dict[str, str]:
     return {**_auth_header(), "Content-Type": "application/json"}
-
 
 def _join(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
     return u.replace("://", "__SCHEME__").replace("//", "/").replace("__SCHEME__", "://")
-
-
-def _post(url: str, payload: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
-    r = requests.post(url, headers=_headers_json(), data=json.dumps(payload), timeout=timeout)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"error": r.text}
-    return r.status_code, j
-
-
-def _get(url: str, params: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
-    r = requests.get(url, headers=_auth_header(), params=params, timeout=timeout)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"error": r.text}
-    return r.status_code, j
-
-
-def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
-    data = j.get("data") or {}
-    for k in ("taskId", "taskid", "id"):
-        if j.get(k):
-            return str(j[k])
-        if data.get(k):
-            return str(data[k])
-    return None
-
-
-def _coerce_url_list(value) -> List[str]:
-    urls: List[str] = []
-
-    def add(u: str):
-        if isinstance(u, str):
-            s = u.strip()
-            if s.startswith("http"):
-                urls.append(s)
-
-    if not value:
-        return urls
-    if isinstance(value, str):
-        s = value.strip()
-        if s.startswith("["):
-            try:
-                arr = json.loads(s)
-                for v in arr:
-                    if isinstance(v, str):
-                        add(v)
-                return urls
-            except Exception:
-                add(s)
-                return urls
-        else:
-            add(s)
-            return urls
-    if isinstance(value, list):
-        for v in value:
-            if isinstance(v, str):
-                add(v)
-            elif isinstance(v, dict):
-                u = v.get("resultUrl") or v.get("originUrl") or v.get("url")
-                if isinstance(u, str):
-                    add(u)
-        return urls
-    if isinstance(value, dict):
-        for k in ("resultUrl", "originUrl", "url"):
-            u = value.get(k)
-            if isinstance(u, str):
-                add(u)
-        return urls
-    return urls
-
 
 def create_banana_task(
     prompt: str,
@@ -118,7 +43,7 @@ def create_banana_task(
     extra_input: Optional[Dict[str, Any]] = None,
     timeout: int = 60,
 ) -> str:
-    """Создаёт задачу nano-banana (edit). Требует публичные image_urls."""
+    """Создаёт задачу google/nano-banana-edit (до 4 изображений)."""
     if not KIE_API_KEY:
         raise KieBananaError("KIE_API_KEY is missing")
 
@@ -126,101 +51,116 @@ def create_banana_task(
     if not imgs:
         raise KieBananaError("image_urls is empty")
 
-    # Две схемы ключей: snake_case и camelCase — на случай разных ревизий API
-    inputs = [
-        {"prompt": prompt or "", "image_urls": imgs[:4], "output_format": output_format, "image_size": image_size},
-        {"prompt": prompt or "", "imageUrls":  imgs[:4], "outputFormat":  output_format, "imageSize":  image_size},
-    ]
+    payload: Dict[str, Any] = {
+        "model": MODEL_BANANA,
+        "input": {
+            "prompt": prompt or "",
+            "image_urls": imgs[:4],
+            "output_format": output_format,
+            "image_size": image_size,
+        }
+    }
+    if callback_url:
+        payload["callBackUrl"] = callback_url
     if extra_input:
-        for i in inputs:
-            i.update(extra_input)
+        payload["input"].update(extra_input)
 
-    # Рабочие роуты в разных релизах
-    routes = [
-        "/api/v1/jobs/createTask",
-        "/api/v1/jobs/generate",
-        "/api/v1/banana/edit",
-        "/api/v1/banana/generate",
-    ]
+    url = _join(KIE_BASE_URL, "/api/v1/jobs/createTask")
+    r = requests.post(url, headers=_headers_json(), data=json.dumps(payload), timeout=timeout)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"error": r.text}
+    if r.status_code != 200 or (j.get("code", r.status_code) != 200):
+        raise KieBananaError(f"createTask failed: status={r.status_code}, resp={j}")
 
-    last_err = None
-    for inp in inputs:
-        payload = {"model": MODEL_BANANA, "input": inp}
-        if callback_url:
-            payload["callBackUrl"] = callback_url
-        for r in routes:
-            status, j = _post(_join(KIE_BASE_URL, r), payload, timeout=timeout)
-            code = j.get("code", status)
-            if status == 200 and code == 200:
-                tid = _extract_task_id(j)
-                if tid:
-                    return tid
-            last_err = f"route={r}, status={status}, resp={j}"
-
-    raise KieBananaError(f"create task failed: {last_err}")
-
+    task_id = (j.get("data") or {}).get("taskId")
+    if not task_id:
+        raise KieBananaError(f"createTask: empty taskId in resp={j}")
+    return str(task_id)
 
 def get_banana_record(task_id: str, timeout: int = 60) -> Dict[str, Any]:
-    for r in ("/api/v1/jobs/recordInfo", "/api/v1/banana/record-info"):
-        status, j = _get(_join(KIE_BASE_URL, r), {"taskId": task_id}, timeout=timeout)
-        if status == 200:
-            return j
-    raise KieBananaError("recordInfo: no 200 responses")
+    url = _join(KIE_BASE_URL, "/api/v1/jobs/recordInfo")
+    r = requests.get(url, headers=_auth_header(), params={"taskId": task_id}, timeout=timeout)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"error": r.text}
+    if r.status_code != 200:
+        raise KieBananaError(f"recordInfo http {r.status_code}: {j}")
+    return j
 
+def _coerce_url_list(value) -> List[str]:
+    urls: List[str] = []
+    def add(u: str):
+        if isinstance(u, str):
+            s = u.strip()
+            if s.startswith("http"):
+                urls.append(s)
+    if not value:
+        return urls
+    if isinstance(value, str):
+        try:
+            arr = json.loads(value) if value.strip().startswith("[") else None
+        except Exception:
+            arr = None
+        if arr and isinstance(arr, list):
+            for v in arr:
+                if isinstance(v, str): add(v)
+            return urls
+        add(value); return urls
+    if isinstance(value, list):
+        for v in value:
+            if isinstance(v, str): add(v)
+            elif isinstance(v, dict):
+                u = v.get("resultUrl") or v.get("originUrl") or v.get("url")
+                if isinstance(u, str): add(u)
+        return urls
+    if isinstance(value, dict):
+        for k in ("resultUrl", "originUrl", "url"):
+            u = value.get(k)
+            if isinstance(u, str): add(u)
+        return urls
+    return urls
 
 def parse_banana_result_urls(record_json: Dict[str, Any]) -> Tuple[Optional[List[str]], Optional[str]]:
     data = record_json.get("data") or {}
-    state = data.get("state") or data.get("successFlag")
-
-    for k in ("resultUrls", "originUrls", "videoUrls"):
-        if k in data:
-            urls = _coerce_url_list(data.get(k))
-            if urls:
-                return urls, str(state) if state is not None else None
-
-    for cont in ("resultJson", "resultInfoJson", "info", "response"):
-        v = data.get(cont)
-        if not v:
-            continue
-        try:
-            if isinstance(v, str):
-                v = json.loads(v)
-        except Exception:
-            pass
-        if isinstance(v, dict):
-            for k in ("resultUrls", "originUrls", "videoUrls", "urls"):
-                urls = _coerce_url_list(v.get(k))
-                if urls:
-                    return urls, str(state) if state is not None else None
-
-    return None, str(state) if state is not None else None
-
+    state = data.get("state")
+    rj = data.get("resultJson")
+    if not rj:
+        return None, state
+    try:
+        parsed = json.loads(rj) if isinstance(rj, str) else (rj or {})
+    except Exception:
+        logging.exception("banana: failed to parse resultJson")
+        return None, state
+    urls = _coerce_url_list(parsed.get("resultUrls") or parsed.get("urls") or [])
+    return (urls if urls else None), state
 
 def wait_for_banana_result(task_id: str, timeout_sec: int = 300, poll_sec: int = 3) -> List[str]:
+    """Ожидаем завершения и возвращаем список URL."""
     deadline = time.time() + timeout_sec
     last_state = None
     while time.time() < deadline:
         j = get_banana_record(task_id)
         code = j.get("code", 200)
         data = j.get("data") or {}
-        state = data.get("state") or data.get("successFlag")
+        state = data.get("state")
         last_state = state or last_state
 
         if code != 200:
-            logging.warning("banana record non-200: %s", j)
-            time.sleep(poll_sec)
-            continue
-
-        if state in ("waiting", "queuing", "generating", None) or str(state) == "0":
             time.sleep(poll_sec); continue
 
-        if state in ("success", "1"):
+        if state in (None, "waiting", "queuing", "generating"):
+            time.sleep(poll_sec); continue
+
+        if state == "success":
             urls, _ = parse_banana_result_urls(j)
             if not urls:
                 raise KieBananaError(f"success without resultUrls: {j}")
             return urls
 
-        if state in ("fail", "2", "3"):
+        if state == "fail":
             raise KieBananaError(f"banana fail: code={data.get('failCode')} msg={data.get('failMsg')}")
 
         time.sleep(poll_sec)
