@@ -62,7 +62,8 @@ KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
 KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/record-info")
 
 # ---- Banana (Nano-Banana)
-KIE_BANANA_GENERATE = _env("KIE_BANANA_GENERATE", "/api/v1/jobs/generate")
+# Важно: createTask — правильная точка (404 на /generate)
+KIE_BANANA_GENERATE = _env("KIE_BANANA_GENERATE", "/api/v1/jobs/createTask")
 KIE_BANANA_STATUS   = _env("KIE_BANANA_STATUS",   "/api/v1/jobs/recordInfo")
 KIE_BANANA_MODEL    = _env("KIE_BANANA_MODEL",    "google/nano-banana-edit")
 
@@ -306,24 +307,17 @@ def build_card_text_veo(s: Dict[str, Any]) -> str:
 def build_card_text_banana(s: Dict[str, Any]) -> str:
     imgs = s.get("banana_images") or []
     prompt = (s.get("banana_prompt") or "").strip()
-    if len(prompt) > 900: prompt = prompt[:900] + "…"
+    if len(prompt) > 400: prompt = prompt[:400] + "…"
     have_prompt = "есть" if prompt else "нет"
     return "\n".join([
         "🍌 *Карточка Banana*",
         "",
-        "🧩 *Статус:*",
-        f"• Фото: *{len(imgs)}/4*",
-        f"• Промпт: *{have_prompt}*",
+        f"🧩 Фото: *{len(imgs)}/4*   •   Промпт: *{have_prompt}*",
         "",
         "✍️ *Промпт:*",
         f"`{prompt or '—'}`",
         "",
-        "💡 *Примеры запросов:*",
-        "• поменяй фон на городской вечер",
-        "• смени одежду на чёрный пиджак",
-        "• добавь лёгкий макияж, подчеркни глаза",
-        "• убери лишние предметы со стола",
-        "• осветли лицо, тёплый тёплый тон кожи",
+        "💡 Примеры: *поменяй фон на вечер*, *смени одежду на чёрный пиджак*, *добавь лёгкий макияж*",
     ])
 
 def card_keyboard_veo(s: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -676,7 +670,9 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 s["mj_wait_last_ts"] = now
                 await ctx.bot.send_message(chat_id, f"🌀 Идёт генерация… ✨")
             if (now - start_ts) > 15*60:
-                await ctx.bot.send_message(chat_id, "⌛ MJ долго не отвечает. Попробуйте позже."); return
+                await ctx.bot.send_message(chat_id, "⌛ MJ долго не отвечает. Попробуйте позже.")
+                add_tokens(ctx, TOKEN_COSTS["mj"])
+                return
             await asyncio.sleep(6)
             continue
         if flag in (2, 3):
@@ -687,7 +683,9 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
         if flag == 1:
             urls = _extract_mj_image_urls(data or {})
             if not urls:
-                await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены."); return
+                await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены.\n💎 Токены возвращены.")
+                add_tokens(ctx, TOKEN_COSTS["mj"])
+                return
             if len(urls) == 1:
                 await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0])
             else:
@@ -775,6 +773,47 @@ async def poll_banana_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEF
             await ctx.bot.send_message(chat_id, "⌛ Banana долго не отвечает. Попробуйте позже.\n💎 Токены возвращены.")
             add_tokens(ctx, TOKEN_COSTS["banana"])
             return
+
+# ==========================
+#   Prompt-Master helper
+# ==========================
+async def run_prompt_master(raw: str) -> str:
+    """Генерирует профессиональный кинопромпт для VEO из краткого описания."""
+    base = (raw or "").strip()
+    if not base:
+        return ""
+
+    sys_msg = (
+        "You are a senior cinematic prompt writer for Google Veo 3. "
+        "Rewrite the user's idea into ONE compact, production-ready, English prompt. "
+        "Include: setting/location & time, mood, lighting, camera movement, composition, lens/focal length, "
+        "color grading, key action/beat, and optional one short line of dialogue in quotes if helpful. "
+        "Avoid meta-instructions, avoid placeholders, no bullet lists — return a single paragraph (3–6 sentences)."
+    )
+    if openai and OPENAI_API_KEY:
+        try:
+            resp = await asyncio.to_thread(
+                openai.ChatCompletion.create,
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": base},
+                ],
+                temperature=0.7,
+                max_tokens=500,
+            )
+            out = (resp["choices"][0]["message"]["content"] or "").strip()
+            if out:
+                return out
+        except Exception as e:
+            log.warning("PromptMaster OpenAI error: %s", e)
+
+    # Fallback
+    return (
+        f"Cinematic scene: {base}. Moody, natural light with soft contrast. "
+        "Wide establishing push-in, 35mm lens, shallow depth of field, balanced composition, "
+        "subtle handheld energy, teal-and-orange grade, 4K, filmic grain."
+    )
 
 # ==========================
 #   Handlers: UI / Commands
@@ -914,30 +953,40 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("🖼️ Пришлите текстовый prompt для картинки (16:9)."); return
         if mode == "banana":
             s["banana_images"] = []; s["banana_prompt"] = None; s["banana_task_id"] = None; s["banana_wait_prompt"] = False
-            await query.message.reply_text(
-                "🍌 *Banana включён*\n"
-                "Сначала пришлите *до 4 фото* одним сообщением (можно по одному). Я посчитаю: *Фото n/4*.\n"
-                "Когда фото будут готовы — пришлите *текст-промпт*, что изменить.\n\n"
-                "💡 *Примеры промпта:*\n"
-                "• поменяй фон на городской вечер\n"
-                "• смени одежду на чёрный пиджак\n"
-                "• добавь лёгкий макияж, подчеркни глаза\n"
-                "• убери лишние предметы со стола\n",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            await show_card_banana(update, ctx)
-            return
+            await show_card_banana(update, ctx); return
         if mode == "prompt_master":
             await query.message.reply_text(
-                "🧠 *Prompt-Master готов!* Напишите в одном сообщении:\n"
-                "• Идею сцены (1–2 предложения) и локацию.\n"
-                "• Стиль/настроение, свет, ключевые предметы.\n"
-                "• Действие в кадре и динамику камеры.\n"
-                "• Реплики (если есть) — в кавычках.",
+                "🧠 *Prompt-Master готов!* Коротко опишите идею сцены — я превращу её в проф. кинопромпт.",
                 parse_mode=ParseMode.MARKDOWN
             ); return
         if mode == "chat":
             await query.message.reply_text("✍️ Напишите вопрос для ChatGPT."); return
+
+    # --- MJ start (кнопка из mj_start_kb)
+    if data == "mj:ar:16:9":
+        if not s.get("last_prompt"):
+            await query.message.reply_text("✍️ Сначала пришлите текстовый prompt для картинки (16:9).")
+            return
+        price = TOKEN_COSTS["mj"]
+        ok_balance, rest = try_charge(ctx, price)
+        if not ok_balance:
+            await query.message.reply_text(
+                f"💎 Недостаточно токенов: нужно {price}, на балансе *{rest}*.\n"
+                f"Пополните через Stars: {STARS_BUY_URL}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=stars_topup_kb()
+            )
+            return
+
+        ok, task_id, msg = await asyncio.to_thread(mj_generate, s["last_prompt"].strip())
+        if not ok or not task_id:
+            add_tokens(ctx, price)
+            await query.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены.")
+            return
+
+        await query.message.reply_text("🖼️ MJ запущен\n🌀 Идёт генерация… ✨")
+        asyncio.create_task(poll_mj_and_send_photos(update.effective_chat.id, task_id, ctx))
+        return
 
     # --- карточка VEO
     if data.startswith("aspect:"):
@@ -1006,7 +1055,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             add_tokens(ctx, price)
             await query.message.reply_text(f"❌ Не удалось создать Banana-задачу: {msg}\n💎 Токены возвращены."); return
         s["banana_task_id"] = task_id
-        await query.message.reply_text("🍌 MJ Banana запущен\n🌀 Идёт генерация… ✨")
+        await query.message.reply_text("🍌 Banana запущен\n🌀 Идёт генерация… ✨")
         asyncio.create_task(poll_banana_and_send(update.effective_chat.id, task_id, ctx))
         return
     if data == "banana:clear":
@@ -1044,8 +1093,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "prompt_master":
-        s["last_prompt"] = text[:1000]
-        await update.message.reply_text("🧠 Готово! Промпт добавлен в карточку."); await show_card_veo(update, ctx); return
+        await update.message.reply_text("🧠 Генерирую кинопромпт…")
+        pm = await run_prompt_master(text)
+        if not pm:
+            await update.message.reply_text("⚠️ Не получилось сформировать промпт. Напишите идею ещё раз.")
+            return
+        s["last_prompt"] = pm[:2000]
+        await update.message.reply_text(
+            "✅ Готово! Вот кинопромпт, я добавил его в карточку:\n\n"
+            f"`{s['last_prompt']}`",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        await show_card_veo(update, ctx)
+        return
 
     if mode == "mj_txt":
         s["last_prompt"] = text[:1000]
@@ -1098,11 +1159,10 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not (s.get("banana_prompt") or "").strip() and not (update.message.caption or "").strip():
                 await update.message.reply_text(
                     "✍️ Теперь пришлите *текст-промпт*, что сделать с фото "
-                    "(например: «поменяй фон на городской вечер», «смени одежду на чёрный пиджак», "
+                    "(например: «поменяй фон на вечер», «смени одежду на чёрный пиджак», "
                     "«добавь лёгкий макияж»).",
                     parse_mode=ParseMode.MARKDOWN
                 )
-            # если добавили подпись к фото — используем как промпт, если его ещё нет
             if (update.message.caption or "").strip() and not (s.get("banana_prompt") or "").strip():
                 s["banana_prompt"] = (update.message.caption or "").strip()[:1000]
                 await update.message.reply_text("✅ Промпт для Banana сохранён из подписи.", reply_markup=banana_ready_kb(s))
@@ -1203,6 +1263,7 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
 # ==========================
 def main():
     if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
+    # гарантированно снимаем вебхук для polling
     try:
         Bot(TELEGRAM_TOKEN).delete_webhook(drop_pending_updates=True)
     except Exception:
