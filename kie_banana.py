@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# kie_banana.py — KIE wrapper for Nano Banana (edit / text) with robust JSON/route fallbacks
+
 from __future__ import annotations
 import os
 import json
@@ -8,7 +11,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import requests
 
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai").strip()
-KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
+KIE_API_KEY  = os.getenv("KIE_API_KEY", "").strip()
+# По умолчанию редактирование по фото. Если фото нет — в bot.py используем текстовую модель.
 MODEL_BANANA = (os.getenv("KIE_BANANA_MODEL", "google/nano-banana-edit").strip()
                 or "google/nano-banana-edit")
 
@@ -30,7 +34,6 @@ def _headers_json() -> Dict[str, str]:
 
 def _join(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
-    # keep it ASCII-safe
     return u.replace("://", "__SCHEME__").replace("//", "/").replace("__SCHEME__", "://")
 
 
@@ -115,6 +118,7 @@ def create_banana_task(
     extra_input: Optional[Dict[str, Any]] = None,
     timeout: int = 60,
 ) -> str:
+    """Создаёт задачу nano-banana (edit). Требует публичные image_urls."""
     if not KIE_API_KEY:
         raise KieBananaError("KIE_API_KEY is missing")
 
@@ -122,20 +126,21 @@ def create_banana_task(
     if not imgs:
         raise KieBananaError("image_urls is empty")
 
+    # Две схемы ключей: snake_case и camelCase — на случай разных ревизий API
     inputs = [
         {"prompt": prompt or "", "image_urls": imgs[:4], "output_format": output_format, "image_size": image_size},
-        {"prompt": prompt or "", "imageUrls": imgs[:4], "outputFormat": output_format, "imageSize": image_size},
+        {"prompt": prompt or "", "imageUrls":  imgs[:4], "outputFormat":  output_format, "imageSize":  image_size},
     ]
     if extra_input:
         for i in inputs:
             i.update(extra_input)
 
+    # Рабочие роуты в разных релизах
     routes = [
-        "/api/v1/jobs/generate",
         "/api/v1/jobs/createTask",
-        "/api/v1/banana/generate",
+        "/api/v1/jobs/generate",
         "/api/v1/banana/edit",
-        "/api/v1/jobs/create",
+        "/api/v1/banana/generate",
     ]
 
     last_err = None
@@ -144,8 +149,7 @@ def create_banana_task(
         if callback_url:
             payload["callBackUrl"] = callback_url
         for r in routes:
-            url = _join(KIE_BASE_URL, r)
-            status, j = _post(url, payload, timeout=timeout)
+            status, j = _post(_join(KIE_BASE_URL, r), payload, timeout=timeout)
             code = j.get("code", status)
             if status == 200 and code == 200:
                 tid = _extract_task_id(j)
@@ -158,8 +162,7 @@ def create_banana_task(
 
 def get_banana_record(task_id: str, timeout: int = 60) -> Dict[str, Any]:
     for r in ("/api/v1/jobs/recordInfo", "/api/v1/banana/record-info"):
-        url = _join(KIE_BASE_URL, r)
-        status, j = _get(url, {"taskId": task_id}, timeout=timeout)
+        status, j = _get(_join(KIE_BASE_URL, r), {"taskId": task_id}, timeout=timeout)
         if status == 200:
             return j
     raise KieBananaError("recordInfo: no 200 responses")
@@ -209,8 +212,7 @@ def wait_for_banana_result(task_id: str, timeout_sec: int = 300, poll_sec: int =
             continue
 
         if state in ("waiting", "queuing", "generating", None) or str(state) == "0":
-            time.sleep(poll_sec)
-            continue
+            time.sleep(poll_sec); continue
 
         if state in ("success", "1"):
             urls, _ = parse_banana_result_urls(j)
