@@ -62,10 +62,11 @@ KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
 KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/record-info")
 
 # ---- Banana (Nano-Banana)
-# Важно: createTask — правильная точка (404 на /generate)
+# По докам createTask — правильная точка
 KIE_BANANA_GENERATE = _env("KIE_BANANA_GENERATE", "/api/v1/jobs/createTask")
 KIE_BANANA_STATUS   = _env("KIE_BANANA_STATUS",   "/api/v1/jobs/recordInfo")
-KIE_BANANA_MODEL    = _env("KIE_BANANA_MODEL",    "google/nano-banana-edit")
+# Значение по умолчанию не критично — модель выбирается автоматически в banana_generate(...)
+KIE_BANANA_MODEL    = _env("KIE_BANANA_MODEL",    "google/nano-banana")
 
 # ---- Upload API (опционально)
 UPLOAD_BASE_URL     = _env("UPLOAD_BASE_URL", "https://kieai.redpandaai.co")
@@ -699,24 +700,49 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
 #   Banana
 # ==========================
 def banana_generate(prompt: str, image_urls: List[str]) -> Tuple[bool, Optional[str], str]:
-    # Перезаливаем TG-фото на публичный хост (чинит 422 в KIE)
+    """
+    Автовыбор модели по докам KIE:
+      - если есть фото -> 'google/nano-banana-edit' и передаём image_urls
+      - если фото нет -> 'google/nano-banana' (без image_urls)
+    Дополнительно: перезаливаем TG-URL на внешний хост (чинит 422/404 на стороне KIE).
+    """
+    prompt = (prompt or "").strip()
+
+    # оставляем только http(s) URL
+    src_urls: List[str] = [u for u in (image_urls or []) if isinstance(u, str) and u.startswith("http")]
+
+    # Перезалив на публичный хост — снижает шанс 422/404
     safe_urls: List[str] = []
-    for u in (image_urls or []):
-        if isinstance(u, str) and u.startswith("http"):
-            reu = upload_image_stream(u)
+    if src_urls:
+        for u in src_urls:
+            reu = upload_image_stream(u)  # вернёт https://... либо None
             safe_urls.append(reu or u)
 
-    payload = {
-        "model": KIE_BANANA_MODEL,
-        "input": {"prompt": prompt, "image_urls": safe_urls, "output_format": "png", "image_size": "auto"}
+    # Выбор модели
+    use_model = "google/nano-banana-edit" if safe_urls else "google/nano-banana"
+
+    # Формируем input
+    input_obj: Dict[str, Any] = {
+        "prompt": prompt,
+        "output_format": "png",
+        "image_size": "auto",
     }
+    if safe_urls:
+        input_obj["image_urls"] = safe_urls[:4]  # до 4 фото
+
+    payload = {"model": use_model, "input": input_obj}
+
     status, j = _post_json(join_url(KIE_BASE_URL, KIE_BANANA_GENERATE), payload)
     code = j.get("code", status)
+
     if status == 200 and code == 200:
         tid = _extract_task_id(j)
-        if tid: return True, tid, "Banana задача создана."
+        if tid:
+            return True, tid, f"Banana ({use_model}) задача создана."
         return False, None, "Ответ без taskId."
-    return False, None, f"Banana error code={code}"
+
+    msg = j.get("msg") or j.get("message") or j.get("error") or ""
+    return False, None, f"Banana error code={code}: {msg}"
 
 def banana_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
     status, j = _get_json(join_url(KIE_BASE_URL, KIE_BANANA_STATUS), {"taskId": task_id})
@@ -778,11 +804,9 @@ async def poll_banana_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEF
 #   Prompt-Master helper
 # ==========================
 async def run_prompt_master(raw: str) -> str:
-    """Генерирует профессиональный кинопромпт для VEO из краткого описания."""
     base = (raw or "").strip()
     if not base:
         return ""
-
     sys_msg = (
         "You are a senior cinematic prompt writer for Google Veo 3. "
         "Rewrite the user's idea into ONE compact, production-ready, English prompt. "
@@ -807,8 +831,6 @@ async def run_prompt_master(raw: str) -> str:
                 return out
         except Exception as e:
             log.warning("PromptMaster OpenAI error: %s", e)
-
-    # Fallback
     return (
         f"Cinematic scene: {base}. Moody, natural light with soft contrast. "
         "Wide establishing push-in, 35mm lens, shallow depth of field, balanced composition, "
