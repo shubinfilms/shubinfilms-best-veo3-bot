@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.x
-# Версия: 2025-09-12 (FULL, Banana & MJ fixed)
+# Версия: 2025-09-12 (FULL) — Banana=5, PromoCodes, Bonus Packs, Quality-50, Bold Balance, FAQ, PM button, progress pings
 
 import os
 import json
 import time
+import uuid
+import base64
 import asyncio
 import logging
 import tempfile
+import subprocess
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -16,17 +19,12 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, LabeledPrice, Bot
+    InputFile, InputMediaPhoto, LabeledPrice, Bot
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
-)
-
-# ---- Banana helper module ----
-from kie_banana import (
-    create_banana_task, get_banana_record, parse_banana_result_urls, KieBananaError
 )
 
 # ==========================
@@ -63,7 +61,10 @@ KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   "/api/v1/veo/get-1080p-video")
 KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
 KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/record-info")
 
-# ---- Banana (параметры в обёртке kie_banana.py)
+# ---- Banana (Nano-Banana)
+KIE_BANANA_GENERATE = _env("KIE_BANANA_GENERATE", "/api/v1/jobs/generate")
+KIE_BANANA_STATUS   = _env("KIE_BANANA_STATUS",   "/api/v1/jobs/recordInfo")
+KIE_BANANA_MODEL    = _env("KIE_BANANA_MODEL",    "google/nano-banana-edit")
 
 # ---- Upload API (опционально)
 UPLOAD_BASE_URL     = _env("UPLOAD_BASE_URL", "https://kieai.redpandaai.co")
@@ -116,6 +117,7 @@ TOKEN_COSTS = {
 }
 SIGNUP_BONUS = int(_env("SIGNUP_BONUS", "10"))
 
+# Stars → Diamonds (final credited diamonds)
 STAR_PACKS = [
     (50, 50,  ""),
     (100,110, "+10💎 бонус"),
@@ -123,7 +125,7 @@ STAR_PACKS = [
     (300,330, "+30💎 бонус"),
     (400,440, "+40💎 бонус"),
     (500,550, "+50💎 бонус"),
-    (1000,1100,"+100💎 бонус"),
+    (1000,1100, "+100💎 бонус"),
 ]
 if DEV_MODE:
     STAR_PACKS = [(1,1,"DEV"), *STAR_PACKS]
@@ -161,11 +163,11 @@ DEFAULT_STATE = {
     "last_ui_msg_id": None,
     "last_task_id": None,
     "last_result_url": None,
-    "chat_unlocked": True,
+    "chat_unlocked": True,     # чат бесплатный
     "mj_wait_sent": False,
-    "mj_wait_last_ts": 0.0,
+    "mj_wait_last_ts": 0.0,    # throttle 40s
     # Banana session
-    "banana_images": [],
+    "banana_images": [],       # list[str]
     "banana_prompt": None,
     "banana_task_id": None,
     "banana_wait_prompt": False,
@@ -243,8 +245,11 @@ def render_welcome_for(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
     return WELCOME.format(balance=get_user_balance_value(ctx), prompts_url=PROMPTS_CHANNEL_URL)
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-    vf = TOKEN_COSTS["veo_fast"]; vq = TOKEN_COSTS["veo_quality"]
-    vp = TOKEN_COSTS["veo_photo"]; mj = TOKEN_COSTS["mj"]; bn = TOKEN_COSTS["banana"]
+    vf = TOKEN_COSTS["veo_fast"]
+    vq = TOKEN_COSTS["veo_quality"]
+    vp = TOKEN_COSTS["veo_photo"]
+    mj = TOKEN_COSTS["mj"]
+    bn = TOKEN_COSTS["banana"]
     rows = [
         [InlineKeyboardButton(f"🎬 Генерация видео (Veo Fast) 💎{vf}", callback_data="mode:veo_text_fast")],
         [InlineKeyboardButton(f"🎬 Генерация видео (Veo Quality) 💎{vq}", callback_data="mode:veo_text_quality")],
@@ -263,8 +268,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 def aspect_row(current: str) -> List[InlineKeyboardButton]:
     if current == "9:16":
-        return [InlineKeyboardButton("16:9 ✅", callback_data="aspect:16:9"),
-                InlineKeyboardButton("9:16", callback_data="aspect:9:16")]
+        return [InlineKeyboardButton("16:9", callback_data="aspect:16:9"),
+                InlineKeyboardButton("9:16 ✅", callback_data="aspect:9:16")]
     return [InlineKeyboardButton("16:9 ✅", callback_data="aspect:16:9"),
             InlineKeyboardButton("9:16",     callback_data="aspect:9:16")]
 
@@ -298,6 +303,29 @@ def build_card_text_veo(s: Dict[str, Any]) -> str:
     ]
     return "\n".join(lines)
 
+def build_card_text_banana(s: Dict[str, Any]) -> str:
+    imgs = s.get("banana_images") or []
+    prompt = (s.get("banana_prompt") or "").strip()
+    if len(prompt) > 900: prompt = prompt[:900] + "…"
+    have_prompt = "есть" if prompt else "нет"
+    return "\n".join([
+        "🍌 *Карточка Banana*",
+        "",
+        "🧩 *Статус:*",
+        f"• Фото: *{len(imgs)}/4*",
+        f"• Промпт: *{have_prompt}*",
+        "",
+        "✍️ *Промпт:*",
+        f"`{prompt or '—'}`",
+        "",
+        "💡 *Примеры запросов:*",
+        "• поменяй фон на городской вечер",
+        "• смени одежду на чёрный пиджак",
+        "• добавь лёгкий макияж, подчеркни глаза",
+        "• убери лишние предметы со стола",
+        "• осветли лицо, тёплый тёплый тон кожи",
+    ])
+
 def card_keyboard_veo(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     rows.append([InlineKeyboardButton("🖼️ Добавить/Удалить фото", callback_data="card:toggle_photo"),
@@ -311,18 +339,59 @@ def card_keyboard_veo(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")])
     return InlineKeyboardMarkup(rows)
 
+def banana_ready_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
+    imgs = s.get("banana_images") or []
+    has_prompt = bool((s.get("banana_prompt") or "").strip())
+    rows: List[List[InlineKeyboardButton]] = []
+    if len(imgs) < 4:
+        rows.append([InlineKeyboardButton("➕ Добавить ещё фото", callback_data="banana:hint_addphoto")])
+    else:
+        rows.append([InlineKeyboardButton("🧰 Фото загружены (4/4)", callback_data="noop")])
+    rows.append([InlineKeyboardButton("🧹 Очистить фото", callback_data="banana:clear")])
+    rows.append([InlineKeyboardButton("✍️ " + ("Добавить промпт" if not has_prompt else "Изменить промпт"),
+                                      callback_data="banana:askprompt")])
+    rows.append([InlineKeyboardButton("🚀 Начать генерацию Banana", callback_data="banana:start")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
 def mj_start_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🌆 Сгенерировать 16:9", callback_data="mj:ar:16:9")]])
 
-def banana_ready_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Начать генерацию Banana", callback_data="banana:start")],
-        [InlineKeyboardButton("✍️ Добавить промпт", callback_data="banana:askprompt")],
-        [InlineKeyboardButton("🧹 Очистить фото", callback_data="banana:clear")]
-    ])
+async def show_card_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_markup: bool = False):
+    s = state(ctx)
+    text = build_card_text_veo(s)
+    kb = card_keyboard_veo(s)
+    chat_id = update.effective_chat.id
+    last_id = s.get("last_ui_msg_id")
+    try:
+        if last_id:
+            if edit_only_markup:
+                await ctx.bot.edit_message_reply_markup(chat_id, last_id, reply_markup=kb)
+            else:
+                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=last_id, text=text,
+                                                parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+                                                disable_web_page_preview=True)
+        else:
+            m = await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                                               reply_markup=kb, disable_web_page_preview=True)
+                       if update.callback_query else
+                       update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                                 reply_markup=kb, disable_web_page_preview=True))
+            s["last_ui_msg_id"] = m.message_id
+    except Exception as e:
+        log.warning("show_card_veo failed: %s", e)
+
+async def show_card_banana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = state(ctx)
+    text = build_card_text_banana(s)
+    kb = banana_ready_kb(s)
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 # ==========================
-#   HTTP helpers (VEO/MJ/Upload)
+#   HTTP helpers
 # ==========================
 def join_url(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
@@ -453,6 +522,9 @@ def upload_image_stream(src_url: str, upload_path: str = "tg-uploads", timeout: 
             if u: return u
     except Exception as e:
         log.warning("upload_stream_err: %s", e)
+    finally:
+        try: os.unlink(local)
+        except Exception: pass
     return None
 
 # ==========================
@@ -522,12 +594,6 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     await ctx.bot.send_message(chat_id, f"🔗 Результат готов: {url}")
     return True
 
-async def send_animating(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, label: str):
-    try:
-        await ctx.bot.send_message(chat_id, f"{label}\n\n🔄 *Идёт генерация…* ✨", parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
-
 async def poll_veo_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE, expect_vertical: bool):
     s = state(ctx)
     s["generating"] = True
@@ -596,39 +662,32 @@ def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
             res.append(u)
     return res
 
-async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE, refund_amount: int = 0):
+async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     start_ts = time.time()
     while True:
         ok, flag, data = await asyncio.to_thread(mj_status, task_id)
         if not ok:
-            if refund_amount: add_tokens(ctx, refund_amount)
-            await ctx.bot.send_message(chat_id, "❌ MJ сейчас недоступен. 💎 Токены возвращены.")
-            return
+            await ctx.bot.send_message(chat_id, "❌ MJ сейчас недоступен."); return
         if flag == 0:
-            # статус не чаще 40 секунд
             now = time.time()
             if not s.get("mj_wait_sent") or (now - s.get("mj_wait_last_ts", 0)) >= 40:
                 s["mj_wait_sent"] = True
                 s["mj_wait_last_ts"] = now
-                await ctx.bot.send_message(chat_id, "🖼️✨ Рисую…")
+                await ctx.bot.send_message(chat_id, f"🌀 Идёт генерация… ✨")
             if (now - start_ts) > 15*60:
-                if refund_amount: add_tokens(ctx, refund_amount)
-                await ctx.bot.send_message(chat_id, "⌛ MJ долго не отвечает. 💎 Токены возвращены.")
-                return
+                await ctx.bot.send_message(chat_id, "⌛ MJ долго не отвечает. Попробуйте позже."); return
             await asyncio.sleep(6)
             continue
         if flag in (2, 3):
             msg = (data or {}).get("errorMessage") or "No response from MidJourney."
-            if refund_amount: add_tokens(ctx, refund_amount)
-            await ctx.bot.send_message(chat_id, f"❌ MJ: {msg} 💎 Токены возвращены.")
+            await ctx.bot.send_message(chat_id, f"❌ MJ: {msg}\n💎 Токены возвращены.")
+            add_tokens(ctx, TOKEN_COSTS["mj"])
             return
         if flag == 1:
             urls = _extract_mj_image_urls(data or {})
             if not urls:
-                if refund_amount: add_tokens(ctx, refund_amount)
-                await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены. 💎 Токены возвращены.")
-                return
+                await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены."); return
             if len(urls) == 1:
                 await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0])
             else:
@@ -639,53 +698,70 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
             return
 
 # ==========================
-#   Banana (обёртка на kie_banana.py)
+#   Banana
 # ==========================
 def banana_generate(prompt: str, image_urls: List[str]) -> Tuple[bool, Optional[str], str]:
-    try:
-        tid = create_banana_task(prompt=prompt, image_urls=image_urls)
-        return True, tid, "Banana задача создана."
-    except KieBananaError as e:
-        return False, None, f"{e}"
+    # Перезаливаем TG-фото на публичный хост (чинит 422 в KIE)
+    safe_urls: List[str] = []
+    for u in (image_urls or []):
+        if isinstance(u, str) and u.startswith("http"):
+            reu = upload_image_stream(u)
+            safe_urls.append(reu or u)
+
+    payload = {
+        "model": KIE_BANANA_MODEL,
+        "input": {"prompt": prompt, "image_urls": safe_urls, "output_format": "png", "image_size": "auto"}
+    }
+    status, j = _post_json(join_url(KIE_BASE_URL, KIE_BANANA_GENERATE), payload)
+    code = j.get("code", status)
+    if status == 200 and code == 200:
+        tid = _extract_task_id(j)
+        if tid: return True, tid, "Banana задача создана."
+        return False, None, "Ответ без taskId."
+    return False, None, f"Banana error code={code}"
 
 def banana_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
-    try:
-        j = get_banana_record(task_id)
+    status, j = _get_json(join_url(KIE_BASE_URL, KIE_BANANA_STATUS), {"taskId": task_id})
+    code = j.get("code", status)
+    if status == 200 and code == 200:
         data = j.get("data") or {}
-        flag = data.get("successFlag")
-        try: flag = int(flag)
-        except Exception: pass
-        return True, flag, j
-    except KieBananaError:
-        return False, None, None
+        try: flag = int(data.get("successFlag"))
+        except Exception: flag = None
+        return True, flag, data
+    return False, None, None
 
 def _banana_result_urls(data: Dict[str, Any]) -> List[str]:
-    urls, _ = parse_banana_result_urls(data)
-    return urls or []
+    urls = []
+    d = data.get("data") or data
+    rj = d.get("resultJson") or d.get("resultInfoJson") or {}
+    try:
+        if isinstance(rj, str):
+            rj = json.loads(rj)
+    except Exception:
+        rj = {}
+    arr = (rj.get("resultUrls") or [])
+    return _coerce_url_list(arr)
 
-async def poll_banana_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE, refund_amount: int = 0):
+async def poll_banana_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     start_ts = time.time()
     while True:
         ok, flag, data = await asyncio.to_thread(banana_status, task_id)
         if not ok:
-            if refund_amount: add_tokens(ctx, refund_amount)
-            await ctx.bot.send_message(chat_id, "❌ Banana сейчас недоступен. 💎 Токены возвращены.",
-                                       reply_markup=banana_ready_kb())
+            await ctx.bot.send_message(chat_id, "❌ Banana сейчас недоступен.")
+            add_tokens(ctx, TOKEN_COSTS["banana"])
             return
-        if flag in (None, 0):
+        if flag == 0:
             await asyncio.sleep(6)
             continue
         if flag in (2, 3):
-            if refund_amount: add_tokens(ctx, refund_amount)
-            await ctx.bot.send_message(chat_id, "❌ Banana: ошибка генерации. 💎 Токены возвращены.",
-                                       reply_markup=banana_ready_kb())
+            await ctx.bot.send_message(chat_id, "❌ Banana: ошибка генерации.\n💎 Токены возвращены.")
+            add_tokens(ctx, TOKEN_COSTS["banana"])
             return
         if flag == 1:
-            urls = _banana_result_urls(data or {})
+            urls = _banana_result_urls({"data": data})
             if not urls:
-                if refund_amount: add_tokens(ctx, refund_amount)
-                await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены. 💎 Токены возвращены.",
-                                           reply_markup=banana_ready_kb())
+                await ctx.bot.send_message(chat_id, "⚠️ Готово, но ссылки не найдены.\n💎 Токены возвращены.")
+                add_tokens(ctx, TOKEN_COSTS["banana"])
                 return
             if len(urls) == 1:
                 await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0])
@@ -696,86 +772,50 @@ async def poll_banana_and_send(chat_id: int, task_id: str, ctx: ContextTypes.DEF
                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Сгенерировать ещё", callback_data="start_new_cycle")]]))
             return
         if (time.time() - start_ts) > 15*60:
-            if refund_amount: add_tokens(ctx, refund_amount)
-            await ctx.bot.send_message(chat_id, "⌛ Banana долго не отвечает. 💎 Токены возвращены.",
-                                       reply_markup=banana_ready_kb())
+            await ctx.bot.send_message(chat_id, "⌛ Banana долго не отвечает. Попробуйте позже.\n💎 Токены возвращены.")
+            add_tokens(ctx, TOKEN_COSTS["banana"])
             return
 
 # ==========================
-#   Prompt-Master helper (как было)
-# ==========================
-import html as _html
-async def make_prompt_master(user_text: str) -> str:
-    guide = (
-        "Ты — старший креативный продюсер и режиссёр. Преврати идею "
-        "в ПРОИЗВОДСТВЕННЫЙ кинопромпт для Google Veo 3 на русском языке.\n\n"
-        "Требования к промпту:\n"
-        "• Естественный текст, без тег-листов.\n"
-        "• Обязательно: Локация/сцена; Время суток/свет; Визуальный стиль; "
-        "  Камера (планы, движения, фокусное, ракурс); Действие; Детали/реквизит; Атмосфера/цветокор.\n"
-        "• Конкретика вместо слов «красиво/качественно».\n"
-        "• До 1200 символов. Верни ТОЛЬКО готовый промпт."
-    )
-    if openai and OPENAI_API_KEY:
-        try:
-            resp = await asyncio.to_thread(
-                openai.ChatCompletion.create,
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": guide},
-                          {"role": "user", "content": user_text}],
-                temperature=0.6, max_tokens=900,
-            )
-            out = (resp["choices"][0]["message"]["content"] or "").strip()
-            if out.lower().startswith(("промпт:", "готовый промпт:", "итог:")):
-                out = out.split(":", 1)[1].strip()
-            return out if out else user_text
-        except Exception as e:
-            log.warning("Prompt-Master OpenAI error: %s", e)
-    idea = user_text.strip()
-    return (f"{idea}\n"
-            "Камера работает динамично и передаёт эмоции героя; свет подчёркивает объём и фактуру; "
-            "цветокор выразительный, но естественный.")
-
-# ==========================
-#   Handlers / Commands (не менялись, кроме Banana/MJ колбэков)
+#   Handlers: UI / Commands
 # ==========================
 FAQ_TEXT = (
-    "📖 FAQ — Вопросы и ответы\n\n"
-    "⭐ Общая инфа\n"
+    "📖 *FAQ — Вопросы и ответы*\n\n"
+    "⭐ *Общая инфа*\n"
     "Что умеет бот?\n"
     "Генерация видео (VEO), картинок (MJ), редактирование фото (Banana), подсказки для идей (Prompt-Master) и чат (ChatGPT).\n\n"
     "Звёзды (💎) — внутренняя валюта бота. Баланс видно в меню. Покупаются через Telegram.\n\n"
-    "— Нужна ли регистрация/VPN? Нет, всё работает прямо в Telegram.\n"
+    "— Нужна ли регистрация/VPN? *Нет*, всё работает прямо в Telegram.\n"
     "— Если бот молчит: проверьте баланс, нажмите /start и попробуйте снова.\n"
     "— Можно ли использовать результаты в коммерции? Обычно да, вы автор промпта.\n\n"
     "⸻\n\n"
-    "🎬 VEO (Видео)\n"
-    "• Fast — быстрый ролик, 2–5 мин. Стоимость: 💎50.\n"
-    "• Quality — высокое качество, 5–10 мин. Стоимость: 💎150.\n"
-    "• Animate — оживление фото. Стоимость: 💎50.\n"
+    "🎬 *VEO (Видео)*\n"
+    f"• *Fast* — быстрый ролик, 2–5 мин. Стоимость: 💎{TOKEN_COSTS['veo_fast']}.\n"
+    f"• *Quality* — высокое качество, 5–10 мин. Стоимость: 💎{TOKEN_COSTS['veo_quality']}.\n"
+    f"• *Animate* — оживление фото. Стоимость: 💎{TOKEN_COSTS['veo_photo']}.\n"
     "👉 Опишите идею (локация, стиль, настроение) и ждите готовый клип.\n\n"
     "⸻\n\n"
-    "🖼️ MJ (Картинки)\n"
-    "• Стоимость: 💎15.\n"
+    "🖼️ *MJ (Картинки)*\n"
+    f"• Стоимость: 💎{TOKEN_COSTS['mj']}.\n"
     "• Время: 30–90 сек.\n"
-    "• Формат: только 16:9.\n"
+    "• Формат: *только 16:9*.\n"
     "👉 Чем детальнее промпт (цвет, свет, стиль), тем лучше результат.\n\n"
     "⸻\n\n"
-    "🍌 Banana (Редактор фото)\n"
-    "• Стоимость: 💎5.\n"
-    "• До 4 фото + промпт.\n"
+    "🍌 *Banana (Редактор фото)*\n"
+    f"• Стоимость: 💎{TOKEN_COSTS['banana']}.\n"
+    "• Сначала пришлите *до 4 фото*, потом текст-промпт.\n"
     "• После загрузки фото бот пишет «📸 Фото принято (n/4)».\n"
     "• Генерация только после нажатия «🚀 Начать».\n\n"
     "⸻\n\n"
-    "🧠 Prompt-Master\n"
+    "🧠 *Prompt-Master*\n"
     "• Бесплатно.\n"
     "• Опишите идею: локация, стиль/настроение, свет, камера, действие, реплики в кавычках.\n"
     "• Получите готовый кинопромпт.\n\n"
     "⸻\n\n"
-    "💬 ChatGPT\n"
+    "💬 *ChatGPT*\n"
     "• Бесплатно. Общение и ответы на вопросы.\n\n"
     "⸻\n\n"
-    "❓ Частые вопросы\n"
+    "❓ *Частые вопросы*\n"
     "Сколько ждать?\n"
     "• Картинки / Banana — до 2 минут.\n"
     "• Видео Fast — 2–5 минут.\n"
@@ -829,6 +869,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"💳 Пополнение через Telegram Stars. Если звёзд не хватает — купите в {STARS_BUY_URL}",
             reply_markup=stars_topup_kb()
         ); return
+    if data == "noop":
+        return
 
     if data.startswith("buy:stars:"):
         parts = data.split(":")
@@ -847,7 +889,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 need_name=False, need_phone_number=False, need_email=False,
                 need_shipping_address=False, is_flexible=False
             )
-        except Exception:
+        except Exception as e:
             await query.message.reply_text(
                 f"Если счёт не открылся — у аккаунта могут быть не активированы Stars.\n"
                 f"Купите 1⭐ в {STARS_BUY_URL} и попробуйте снова.",
@@ -873,11 +915,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if mode == "banana":
             s["banana_images"] = []; s["banana_prompt"] = None; s["banana_task_id"] = None; s["banana_wait_prompt"] = False
             await query.message.reply_text(
-                "🍌 Banana включён\nПришлите *до 4 фото одним сообщением* с подписью-промптом.\n"
-                "После приёма появится кнопка «🚀 Начать генерацию».",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=banana_ready_kb()
-            ); return
+                "🍌 *Banana включён*\n"
+                "Сначала пришлите *до 4 фото* одним сообщением (можно по одному). Я посчитаю: *Фото n/4*.\n"
+                "Когда фото будут готовы — пришлите *текст-промпт*, что изменить.\n\n"
+                "💡 *Примеры промпта:*\n"
+                "• поменяй фон на городской вечер\n"
+                "• смени одежду на чёрный пиджак\n"
+                "• добавь лёгкий макияж, подчеркни глаза\n"
+                "• убери лишние предметы со стола\n",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await show_card_banana(update, ctx)
+            return
         if mode == "prompt_master":
             await query.message.reply_text(
                 "🧠 *Prompt-Master готов!* Напишите в одном сообщении:\n"
@@ -889,26 +938,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ); return
         if mode == "chat":
             await query.message.reply_text("✍️ Напишите вопрос для ChatGPT."); return
-
-    # --- запуск MJ по кнопке
-    if data == "mj:ar:16:9":
-        prompt = (s.get("last_prompt") or "").strip()
-        if not prompt:
-            await query.message.reply_text("✍️ Сначала пришлите текстовый prompt для MJ (16:9)."); return
-        price = TOKEN_COSTS["mj"]
-        ok_balance, rest = try_charge(ctx, price)
-        if not ok_balance:
-            await query.message.reply_text(
-                f"💎 Недостаточно токенов: нужно {price}, на балансе *{rest}*.\nПополните через Stars: {STARS_BUY_URL}",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
-            ); return
-        ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt)
-        if not ok or not task_id:
-            add_tokens(ctx, price)
-            await query.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены."); return
-        await send_animating(ctx, update.effective_chat.id, "🖼️ MJ запущен")
-        asyncio.create_task(poll_mj_and_send_photos(update.effective_chat.id, task_id, ctx, refund_amount=price))
-        return
 
     # --- карточка VEO
     if data.startswith("aspect:"):
@@ -946,25 +975,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             add_tokens(ctx, price)
             await query.message.reply_text(f"❌ Не удалось создать VEO-задачу: {msg}\n💎 Токены возвращены."); return
         s["generating"] = True; s["last_task_id"] = task_id
-        await send_animating(ctx, update.effective_chat.id, "🎥 VEO запущен")
+        await query.message.reply_text(f"🚀 Задача отправлена. ⏳ Идёт процесс… {datetime.now().strftime('%H:%M:%S')}")
+        await query.message.reply_text("🎥 Рендер запущен…")
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, ctx, expect_vertical=(s.get("aspect") == "9:16")))
         return
 
     # --- Banana controls
     if data == "banana:askprompt":
         s["banana_wait_prompt"] = True
-        await query.message.reply_text("✍️ Введите короткий промпт для Banana одним сообщением.",
-                                       reply_markup=banana_ready_kb()); return
+        await query.message.reply_text("✍️ Пришлите текст-промпт для Banana (что изменить на фото)."); return
+    if data == "banana:hint_addphoto":
+        await query.message.reply_text("➕ Пришлите до 4 фото одним сообщением. Я покажу счётчик после загрузки."); return
 
     if data == "banana:start":
         imgs = s.get("banana_images") or []
         prompt = (s.get("banana_prompt") or "").strip()
         if not imgs:
-            await query.message.reply_text("⚠️ Нужно добавить фото (до 4).", reply_markup=banana_ready_kb()); return
+            await query.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото (до 4).", reply_markup=banana_ready_kb(s)); return
         if not prompt:
-            s["banana_wait_prompt"] = True
-            await query.message.reply_text("✍️ Добавьте промпт для Banana одним сообщением.",
-                                           reply_markup=banana_ready_kb()); return
+            await query.message.reply_text("⚠️ Добавьте текст-промпт (что изменить на фото).", reply_markup=banana_ready_kb(s)); return
         price = TOKEN_COSTS["banana"]
         ok_balance, rest = try_charge(ctx, price)
         if not ok_balance:
@@ -975,44 +1004,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok, task_id, msg = await asyncio.to_thread(banana_generate, prompt, imgs)
         if not ok or not task_id:
             add_tokens(ctx, price)
-            await query.message.reply_text(f"❌ Не удалось создать Banana-задачу: {msg}\n💎 Токены возвращены.",
-                                           reply_markup=banana_ready_kb()); return
+            await query.message.reply_text(f"❌ Не удалось создать Banana-задачу: {msg}\n💎 Токены возвращены."); return
         s["banana_task_id"] = task_id
-        await send_animating(ctx, update.effective_chat.id, "🍌 Banana запущен")
-        asyncio.create_task(poll_banana_and_send(update.effective_chat.id, task_id, ctx, refund_amount=price))
+        await query.message.reply_text("🍌 MJ Banana запущен\n🌀 Идёт генерация… ✨")
+        asyncio.create_task(poll_banana_and_send(update.effective_chat.id, task_id, ctx))
         return
-
     if data == "banana:clear":
-        s["banana_images"] = []; s["banana_prompt"] = None; s["banana_task_id"] = None; s["banana_wait_prompt"] = False
-        await query.message.reply_text("🧹 Сессия Banana очищена.", reply_markup=banana_ready_kb()); return
+        s["banana_images"] = []; s["banana_prompt"] = None; s["banana_task_id"] = None
+        await query.message.reply_text("🧹 Сессия Banana очищена.", reply_markup=banana_ready_kb(s)); return
 
-async def show_card_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit_only_markup: bool = False):
-    s = state(ctx)
-    text = build_card_text_veo(s)
-    kb = card_keyboard_veo(s)
-    chat_id = update.effective_chat.id
-    last_id = s.get("last_ui_msg_id")
-    try:
-        if last_id:
-            if edit_only_markup:
-                await ctx.bot.edit_message_reply_markup(chat_id, last_id, reply_markup=kb)
-            else:
-                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=last_id, text=text,
-                                                parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
-                                                disable_web_page_preview=True)
-        else:
-            m = await (update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                                               reply_markup=kb, disable_web_page_preview=True)
-                       if update.callback_query else
-                       update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                                 reply_markup=kb, disable_web_page_preview=True))
-            s["last_ui_msg_id"] = m.message_id
-    except Exception as e:
-        log.warning("show_card_veo failed: %s", e)
-
-# ==========================
-#   Message Handlers
-# ==========================
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
@@ -1024,28 +1024,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     mode = s.get("mode")
 
-    # Banana: принять промпт по кнопке/если его нет
+    # BANANA: текст после фото — записываем промпт
     if mode == "banana":
-        if s.get("banana_wait_prompt") or not s.get("banana_prompt"):
-            txt = text.strip()
-            if txt:
+        txt = text
+        if txt:
+            if (s.get("banana_images") or []) and not (s.get("banana_prompt") or "").strip():
                 s["banana_prompt"] = txt[:1000]
                 s["banana_wait_prompt"] = False
-                await update.message.reply_text("✅ Промпт для Banana сохранён.", reply_markup=banana_ready_kb())
+                await update.message.reply_text("✅ Промпт для Banana сохранён.", reply_markup=banana_ready_kb(s))
+                await show_card_banana(update, ctx)
                 return
+            if s.get("banana_wait_prompt"):
+                s["banana_prompt"] = txt[:1000]
+                s["banana_wait_prompt"] = False
+                await update.message.reply_text("✅ Промпт обновлён.", reply_markup=banana_ready_kb(s))
+                await show_card_banana(update, ctx)
+                return
+        await show_card_banana(update, ctx)
+        return
 
     if mode == "prompt_master":
-        await update.message.reply_text("🧠 Создаю кинопромпт…")
-        improved = await make_prompt_master(text[:1500])
-        s["last_prompt"] = improved[:2000]
-        try:
-            await update.message.reply_text(
-                "🧠 Prompt-Master — готовый промпт для VEO:\n<pre>{}</pre>".format(_html.escape(improved)),
-                parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            await update.message.reply_text(f"🧠 Prompt-Master — готово:\n\n{improved}")
-        await show_card_veo(update, ctx); return
+        s["last_prompt"] = text[:1000]
+        await update.message.reply_text("🧠 Готово! Промпт добавлен в карточку."); await show_card_veo(update, ctx); return
 
     if mode == "mj_txt":
         s["last_prompt"] = text[:1000]
@@ -1092,13 +1092,22 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s.get("mode") == "banana":
             imgs = s.get("banana_images") or []
             if len(imgs) >= 4:
-                await update.message.reply_text("⚠️ Принято уже 4 фото. Нажмите «🚀 Начать генерацию».",
-                                                reply_markup=banana_ready_kb()); return
+                await update.message.reply_text("⚠️ Принято уже 4 фото. Нажмите «🚀 Начать генерацию».", reply_markup=banana_ready_kb(s)); return
             imgs.append(url); s["banana_images"] = imgs
-            if update.message.caption:
-                s["banana_prompt"] = (update.message.caption or "").strip()
-                s["banana_wait_prompt"] = False
-            await update.message.reply_text(f"📸 Фото принято ({len(imgs)}/4).", reply_markup=banana_ready_kb()); return
+            await update.message.reply_text(f"📸 Фото принято ({len(imgs)}/4).", reply_markup=banana_ready_kb(s))
+            if not (s.get("banana_prompt") or "").strip() and not (update.message.caption or "").strip():
+                await update.message.reply_text(
+                    "✍️ Теперь пришлите *текст-промпт*, что сделать с фото "
+                    "(например: «поменяй фон на городской вечер», «смени одежду на чёрный пиджак», "
+                    "«добавь лёгкий макияж»).",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            # если добавили подпись к фото — используем как промпт, если его ещё нет
+            if (update.message.caption or "").strip() and not (s.get("banana_prompt") or "").strip():
+                s["banana_prompt"] = (update.message.caption or "").strip()[:1000]
+                await update.message.reply_text("✅ Промпт для Banana сохранён из подписи.", reply_markup=banana_ready_kb(s))
+            await show_card_banana(update, ctx)
+            return
         else:
             s["last_image_url"] = url
             if update.message.caption:
@@ -1175,6 +1184,7 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"VEO_GEN: `{KIE_VEO_GEN_PATH}`",
         f"VEO_STATUS: `{KIE_VEO_STATUS_PATH}`",
         f"MJ_GEN: `{KIE_MJ_GENERATE}`",
+        f"BANANA_GEN: `{KIE_BANANA_GENERATE}`",
         f"Redis: `{'on' if redis_client else 'off'}`",
         f"Balance: *{get_user_balance_value(ctx)}* 💎",
     ]
@@ -1193,7 +1203,6 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
 # ==========================
 def main():
     if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
-    # гарантированно снимаем вебхук для polling
     try:
         Bot(TELEGRAM_TOKEN).delete_webhook(drop_pending_updates=True)
     except Exception:
