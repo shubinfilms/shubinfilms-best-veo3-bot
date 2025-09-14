@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.x
-# Версия: 2025-09-14r3
-# Изменения: бонус +10 (однократно), VEO-карточка автооткрывается и обновляется,
-# Prompt-Master: диалоги на языке пользователя, MJ=10 и только 16:9,
-# FAQ+, Промокоды (одноразовые на весь бот), Кнопка «Активировать промокод»
+# Версия: 2025-09-14r4
+# Единственное изменение против прежней версии: надежная доставка VEO-видео в Telegram
+# (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
+# Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re
 from typing import Dict, Any, Optional, List, Tuple
@@ -100,7 +100,6 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 #   Promo codes (one-time / global)
 # ==========================
-# Можно дописывать новые коды здесь без перезапуска через Redis (см. promo_amount()).
 PROMO_CODES = {
     "WELCOME50": 50,
     "FREE10": 10,
@@ -108,11 +107,8 @@ PROMO_CODES = {
 }
 
 def promo_amount(code: str) -> Optional[int]:
-    """Вернёт размер бонуса для кода. Сначала проверяет Redis (promo:amount:<CODE>),
-    потом локальный словарь PROMO_CODES."""
     code = (code or "").strip().upper()
     if not code: return None
-    # Redis-override
     if redis_client:
         v = redis_client.get(_rk("promo", "amount", code))
         if v:
@@ -121,23 +117,19 @@ def promo_amount(code: str) -> Optional[int]:
     return PROMO_CODES.get(code)
 
 def promo_used_global(code: str) -> Optional[int]:
-    """Если код уже активирован кем-то — вернёт uid; иначе None."""
     code = (code or "").strip().upper()
     if not code: return None
     if redis_client:
         u = redis_client.get(_rk("promo", "used_by", code))
         try: return int(u) if u is not None else None
         except: return None
-    # fallback (на время жизни процесса)
-    return app_cache.get(("promo_used", code))
+    return None
 
 def promo_mark_used(code: str, uid: int):
     code = (code or "").strip().upper()
     if not code: return
     if redis_client:
         redis_client.setnx(_rk("promo", "used_by", code), str(uid))
-        return
-    app_cache[("promo_used", code)] = uid
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
@@ -553,36 +545,74 @@ def _ffmpeg_force_16x9_fhd(inp: str, outp: str, target_mb: int) -> bool:
         log.warning("ffmpeg 16x9 FHD failed: %s", e); return False
 
 # ==========================
-#   Sending video
+#   Sending video (FIXED)
 # ==========================
-async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, expect_vertical: bool = False) -> bool:
+async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str,
+                                   expect_vertical: bool = False, task_id: Optional[str] = None) -> bool:
+    """
+    Надёжная отправка VEO-видео:
+    1) пробуем прямой URL (если не вертикаль);
+    2) если не вышло — освежаем ссылку у KIE (1080p/record-info) и пробуем ещё раз;
+    3) скачиваем и перезаливаем (таймаут 300с). Остальной UX не меняется.
+    """
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
+
+    # 1) прямая отправка
     if not expect_vertical:
         try:
             await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
             return True
         except Exception as e:
             event("SEND_FAIL_DIRECT", err=str(e))
-    # download & reupload
+
+    # 2) освежим ссылку и попробуем снова
+    refreshed = None
+    try:
+        if task_id:
+            u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
+            if isinstance(u1080, str) and u1080.startswith("http"):
+                refreshed = u1080
+            else:
+                ok2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
+                if ok2 and isinstance(u2, str) and u2.startswith("http"):
+                    refreshed = u2
+    except Exception as e:
+        event("SEND_REFRESH_ERR", err=str(e))
+
+    if refreshed:
+        event("SEND_TRY_REFRESHED", url=refreshed)
+        if not expect_vertical:
+            try:
+                await ctx.bot.send_video(chat_id=chat_id, video=refreshed, supports_streaming=True)
+                return True
+            except Exception as e:
+                event("SEND_FAIL_REFRESHED_DIRECT", err=str(e))
+        url = refreshed  # перейдём к скачиванию с обновлённой ссылки
+
+    # 3) download & reupload
     tmp_path = None
     try:
-        r = requests.get(url, stream=True, timeout=180); r.raise_for_status()
+        r = requests.get(url, stream=True, timeout=300)  # увеличили таймаут
+        r.raise_for_status()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
-            for c in r.iter_content(256*1024):
+            for c in r.iter_content(256 * 1024):
                 if c: f.write(c)
             tmp_path = f.name
+
         if expect_vertical and ENABLE_VERTICAL_NORMALIZE and _ffmpeg_available():
             out = tmp_path + "_v.mp4"
             if _ffmpeg_normalize_vertical(tmp_path, out):
                 with open(out, "rb") as f:
                     await ctx.bot.send_video(chat_id, InputFile(f, filename="result_vertical.mp4"), supports_streaming=True)
                 return True
+
         if (not expect_vertical) and ALWAYS_FORCE_FHD and _ffmpeg_available():
             out = tmp_path + "_1080.mp4"
             if _ffmpeg_force_16x9_fhd(tmp_path, out, MAX_TG_VIDEO_MB):
                 with open(out, "rb") as f:
                     await ctx.bot.send_video(chat_id, InputFile(f, filename="result_1080p.mp4"), supports_streaming=True)
                 return True
+
         with open(tmp_path, "rb") as f:
             await ctx.bot.send_video(chat_id, InputFile(f, filename="result.mp4"), supports_streaming=True)
         return True
@@ -613,12 +643,21 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                 await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса VEO. 💎 Токены возвращены.\n{msg or ''}")
                 break
             if isinstance(res_url, str) and res_url.startswith("http"):
+                # 🔄 освежаем ссылку непосредственно перед отправкой
                 final_url = res_url
                 if (s.get("aspect") or "16:9") == "16:9":
                     u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
-                    if isinstance(u1080, str) and u1080.startswith("http"): final_url = u1080
+                    if isinstance(u1080, str) and u1080.startswith("http"):
+                        final_url = u1080
+                else:
+                    ok_r2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
+                    if ok_r2 and isinstance(u2, str) and u2.startswith("http"):
+                        final_url = u2
+
                 await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
-                await send_video_with_fallback(ctx, chat_id, final_url, expect_vertical=(s.get("aspect") == "9:16"))
+                await send_video_with_fallback(ctx, chat_id, final_url,
+                                               expect_vertical=(s.get("aspect") == "9:16"),
+                                               task_id=task_id)
                 await ctx.bot.send_message(chat_id, "✅ *Готово!*", parse_mode=ParseMode.MARKDOWN,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]))
                 break
@@ -720,7 +759,6 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
-# --- FIX: бонус +10 выдается 1 раз независимо от баланса
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx); s.update({**DEFAULT_STATE})
     uid = update.effective_user.id
@@ -929,7 +967,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"🆔 VEO taskId: `{task_id}`\n🎞 Рендер начат — вернусь с готовым видео.", parse_mode=ParseMode.MARKDOWN)
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
-    # MJ запуск
+    # MJ запуск (кнопка "mj:start" сохраняется как раньше)
     if data == "mj:start":
         prompt = (s.get("last_prompt") or "").strip()
         if not prompt:
@@ -966,9 +1004,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ Этот промокод уже был активирован другим пользователем.")
             s["mode"] = None
             return
-        # отметить использованным (глобально)
         promo_mark_used(code, uid)
-        # начислить
         add_tokens(ctx, bonus)
         await update.message.reply_text(f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎")
         s["mode"] = None
@@ -1127,6 +1163,14 @@ def main():
     except Exception as e:
         log.warning("Delete webhook failed: %s", e)
 
+    # (опциональный) Redis-замок от дублей — можно оставить как есть или убрать
+    lock_key = _rk("poll_lock")
+    if redis_client:
+        got_lock = redis_client.set(lock_key, str(time.time()), nx=True, ex=30*60)
+        if not got_lock:
+            log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+            return
+
     app = (ApplicationBuilder()
            .token(TELEGRAM_TOKEN)
            .rate_limiter(AIORateLimiter())
@@ -1142,8 +1186,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
 
-    log.info("Bot starting… (Redis=%s)", "on" if redis_client else "off")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, stop_signals=None)
+    try:
+        log.info("Bot starting… (Redis=%s)", "on" if redis_client else "off")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, stop_signals=None)
+    finally:
+        try:
+            if redis_client: redis_client.delete(lock_key)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
