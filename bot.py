@@ -550,62 +550,53 @@ def _ffmpeg_force_16x9_fhd(inp: str, outp: str, target_mb: int) -> bool:
 async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str,
                                    expect_vertical: bool = False, task_id: Optional[str] = None) -> bool:
     """
-    Надёжная отправка VEO-видео:
-    1) пробуем прямой URL (если не вертикаль);
-    2) если не вышло — освежаем ссылку у KIE (1080p/record-info) и пробуем ещё раз;
-    3) скачиваем и перезаливаем (таймаут 300с). Остальной UX не меняется.
+    Унифицированная надёжная отправка для 16:9 и 9:16:
+    1) Освежаем ссылку у KIE (для 16:9 пробуем явный 1080p).
+    2) Скачиваем и перезаливаем в Telegram.
+       — 9:16: нормализуем scale/pad 1080x1920.
+       — 16:9: если ALWAYS_FORCE_FHD=True и есть ffmpeg — приводим к 1080p.
+    Никакой прямой отправки по внешней ссылке.
     """
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
 
-    # 1) прямая отправка
-    if not expect_vertical:
-        try:
-            await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
-            return True
-        except Exception as e:
-            event("SEND_FAIL_DIRECT", err=str(e))
-
-    # 2) освежим ссылку и попробуем снова
-    refreshed = None
+    # 1) Освежаем ссылку непосредственно перед закачкой
     try:
         if task_id:
-            u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
-            if isinstance(u1080, str) and u1080.startswith("http"):
-                refreshed = u1080
+            if not expect_vertical:
+                u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
+                if isinstance(u1080, str) and u1080.startswith("http"):
+                    url = u1080
+                else:
+                    ok2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
+                    if ok2 and isinstance(u2, str) and u2.startswith("http"):
+                        url = u2
             else:
                 ok2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
                 if ok2 and isinstance(u2, str) and u2.startswith("http"):
-                    refreshed = u2
+                    url = u2
     except Exception as e:
         event("SEND_REFRESH_ERR", err=str(e))
 
-    if refreshed:
-        event("SEND_TRY_REFRESHED", url=refreshed)
-        if not expect_vertical:
-            try:
-                await ctx.bot.send_video(chat_id=chat_id, video=refreshed, supports_streaming=True)
-                return True
-            except Exception as e:
-                event("SEND_FAIL_REFRESHED_DIRECT", err=str(e))
-        url = refreshed  # перейдём к скачиванию с обновлённой ссылки
-
-    # 3) download & reupload
+    # 2) Скачиваем и перезаливаем
     tmp_path = None
     try:
-        r = requests.get(url, stream=True, timeout=300)  # увеличили таймаут
+        r = requests.get(url, stream=True, timeout=300)
         r.raise_for_status()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
             for c in r.iter_content(256 * 1024):
-                if c: f.write(c)
+                if c:
+                    f.write(c)
             tmp_path = f.name
 
-        if expect_vertical and ENABLE_VERTICAL_NORMALIZE and _ffmpeg_available():
+        # 9:16 — нормализуем и заливаем
+        if expect_vertical and _ffmpeg_available():
             out = tmp_path + "_v.mp4"
             if _ffmpeg_normalize_vertical(tmp_path, out):
                 with open(out, "rb") as f:
                     await ctx.bot.send_video(chat_id, InputFile(f, filename="result_vertical.mp4"), supports_streaming=True)
                 return True
 
+        # 16:9 — гарантируем 1080p при необходимости
         if (not expect_vertical) and ALWAYS_FORCE_FHD and _ffmpeg_available():
             out = tmp_path + "_1080.mp4"
             if _ffmpeg_force_16x9_fhd(tmp_path, out, MAX_TG_VIDEO_MB):
@@ -613,11 +604,13 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                     await ctx.bot.send_video(chat_id, InputFile(f, filename="result_1080p.mp4"), supports_streaming=True)
                 return True
 
+        # Если ffmpeg не требуется — шлём как есть
         with open(tmp_path, "rb") as f:
             await ctx.bot.send_video(chat_id, InputFile(f, filename="result.mp4"), supports_streaming=True)
         return True
+
     except Exception as e:
-        log.exception("send_video failed: %s", e)
+        log.exception("send_video reupload failed: %s", e)
         try:
             await ctx.bot.send_message(chat_id, f"🔗 Результат готов, но загрузка в Telegram не удалась. Ссылка:\n{url}")
             return True
@@ -625,8 +618,10 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             return False
     finally:
         if tmp_path:
-            try: os.unlink(tmp_path)
-            except Exception: pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 # ==========================
 #   VEO polling
