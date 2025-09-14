@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.x
-# Версия: 2025-09-14r1 (MJ только 16:9 + цена 10, VEO-карточка по кнопке, PromptMaster отвечает промптом, FAQ расширен)
+# Версия: 2025-09-14r2 (signup +10 fix, VEO card callback fix, MJ=16:9/10💎, PM returns prompt, FAQ+)
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -87,7 +87,7 @@ TOKEN_COSTS = {
     "veo_fast": 50,
     "veo_quality": 150,
     "veo_photo": 50,
-    "mj": 10,          # ↓ было 15
+    "mj": 10,          # только 16:9, цена 10
     "banana": 5,
     "chat": 0,
 }
@@ -312,11 +312,15 @@ def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     aspect = s.get("aspect") or "16:9"
     toggle_to = "9:16" if aspect == "16:9" else "16:9"
     rows = [
-        [InlineKeyboardButton(f"🎞 Формат: {aspect} (сменить → {toggle_to})", callback_data="veo:toggle_ar")],
-        [InlineKeyboardButton("🧷 Убрать референс-фото", callback_data="veo:clear_img")],
-        [InlineKeyboardButton("🚀 Поехали", callback_data="veo:start")],
+        [InlineKeyboardButton("🖼 Добавить/Удалить референс", callback_data="veo:clear_img")],
+        [InlineKeyboardButton(f"16:9 ✅", callback_data="veo:set_ar:16:9"),
+         InlineKeyboardButton(f"9:16",     callback_data="veo:set_ar:9:16")],
+        [InlineKeyboardButton("⚡ Fast ✅", callback_data="veo:set_model:fast"),
+         InlineKeyboardButton("💎 Quality", callback_data="veo:set_model:quality")],
+        [InlineKeyboardButton("🚀 Сгенерировать", callback_data="veo:start")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
+    # простая разметка; можно усложнить как раньше
     return InlineKeyboardMarkup(rows)
 
 # ==========================
@@ -660,14 +664,25 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
+# --- FIXED: бонус +10 выдается 1 раз независимо от текущего баланса
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx); s.update({**DEFAULT_STATE})
     uid = update.effective_user.id
-    if redis_client and not has_signup_bonus(uid):
-        if get_user_balance_value(ctx) == 0:
-            add_tokens(ctx, 10)
-            await update.message.reply_text("🎁 Добро пожаловать! +10💎 на баланс.")
-        set_signup_bonus(uid)
+
+    got_bonus = False
+    if redis_client:
+        if not has_signup_bonus(uid):
+            set_signup_bonus(uid)
+            got_bonus = True
+    else:
+        if not ctx.user_data.get("__signup_bonus"):
+            ctx.user_data["__signup_bonus"] = True
+            got_bonus = True
+
+    if got_bonus:
+        add_tokens(ctx, 10)
+        await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
+
     await update.message.reply_text(render_welcome_for(uid, ctx), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -730,22 +745,24 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     s = state(ctx)
 
+    # --- FIXED: кнопка «📋 Карточка Veo»
+    if data == "veo:show_card":
+        await show_or_update_veo_card(update.effective_chat.id, ctx); return
+
     if data == "faq":
         await q.message.reply_text(
             "📘 *FAQ*\n"
             "— *Как начать с VEO?*\n"
-            "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом. 3) (Необязательно) пришлите фотографию-референс. "
-            "4) Нажмите «📋 Карточка Veo», проверьте параметры и жмите «🚀 Поехали».\n\n"
-            "— *Чем отличаются Fast и Quality?*\n"
-            "Fast — быстрее и дешевле. Quality — дольше, но выше детализация. Оба поддерживают 16:9 и 9:16.\n\n"
-            "— *Поддерживаемые форматы VEO?* 16:9 и 9:16. Для 16:9 бот старается получить 1080p; вертикаль нормализуется локально для Telegram.\n\n"
-            "— *MJ (изображения)*: сейчас *только 16:9*, цена *10💎*. Бот делает 1 бесплатный перезапуск при сетевых ошибках. На выходе — до 4 изображений.\n\n"
-            "— *Banana (редактор фото)*: загрузите до 4 фото, затем напишите, что изменить (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
-            "— *Сколько ждать?* VEO обычно 2–10 мин (иногда больше при нагрузке). MJ — 1–3 мин. Banana — 1–5 мин.\n\n"
-            "— *Токены и возвраты*: списываются при старте. При любой ошибке/таймауте бот автоматически возвращает 💎.\n\n"
-            f"— *Как пополнять?* Через Stars-счёт в меню. Если Stars нет — купите в офиц. боте: {STARS_BUY_URL}\n\n"
-            "— *Где смотреть примеры и идеи?* Кнопка «Канал с промптами» в меню.\n"
-            "— *Не пришёл файл в Telegram?* Бот пришлёт ссылку на скачивание. Можно попробовать ещё раз позже — деньги не спишутся повторно при ошибке.",
+            "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом. 3) (Необязательно) пришлите фото-референс. "
+            "4) Нажмите «📋 Карточка Veo», проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
+            "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
+            "— *Форматы VEO?* 16:9 и 9:16. Для 16:9 стараемся получить 1080p, вертикаль нормализуется локально.\n\n"
+            "— *MJ:* только 16:9, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе до 4 изображений.\n\n"
+            "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
+            "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (м.б. дольше при нагрузке).\n\n"
+            "— *Токены/возвраты:* списываются при старте; при ошибке/таймауте бот автоматически возвращает 💎.\n\n"
+            f"— *Пополнение:* через Stars в меню. Если Stars нет — купите в офиц. боте: {STARS_BUY_URL}\n"
+            "— *Примеры и идеи:* кнопка «Канал с промптами».",
             parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb()
         ); return
 
@@ -790,26 +807,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["mode"] = mode
         if mode in ("veo_text_fast","veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if mode.endswith("fast") else "veo3"
-            await q.message.reply_text("📝 Пришлите идею/промпт для видео.")
-            return
+            await q.message.reply_text("📝 Пришлите идею/промпт для видео."); return
         if mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
-            await q.message.reply_text("🖼️ Пришлите фото (подпись-промпт — по желанию).")
-            return
+            await q.message.reply_text("🖼️ Пришлите фото (подпись-промпт — по желанию)."); return
         if mode == "prompt_master":
             await q.message.reply_text(PM_HINT, parse_mode=ParseMode.MARKDOWN); return
         if mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
         if mode == "mj_txt":
-            await q.message.reply_text(
-                "🖼️ Пришлите текстовый *prompt* для картинки (формат *16:9*).",
-                parse_mode=ParseMode.MARKDOWN
-            ); return
+            await q.message.reply_text("🖼️ Пришлите текстовый *prompt* для картинки (формат *16:9*).", parse_mode=ParseMode.MARKDOWN); return
         if mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
             await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
-            await show_or_update_banana_card(update.effective_chat.id, ctx)
-            return
+            await show_or_update_banana_card(update.effective_chat.id, ctx); return
 
     # Banana callbacks
     if data.startswith("banana:"):
@@ -818,30 +829,27 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("➕ Пришлите ещё фото (всего до 4)."); return
         if act == "reset_imgs":
             s["banana_images"] = []
-            await q.message.reply_text("🧹 Фото очищены.")
-            await show_or_update_banana_card(update.effective_chat.id, ctx); return
+            await q.message.reply_text("🧹 Фото очищены."); await show_or_update_banana_card(update.effective_chat.id, ctx); return
         if act == "edit_prompt":
             await q.message.reply_text("✍️ Пришлите новый промпт для Banana."); return
         if act == "start":
             imgs = s.get("banana_images") or []
             prompt = (s.get("last_prompt") or "").strip()
-            if not imgs:
-                await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото."); return
-            if not prompt:
-                await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить)."); return
+            if not imgs:   await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото."); return
+            if not prompt: await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить)."); return
             price = TOKEN_COSTS['banana']
             ok, rest = try_charge(ctx, price)
             if not ok:
-                await q.message.reply_text(
-                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()
-                ); return
+                await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
             await q.message.reply_text("🍌 Запускаю Banana…")
-            asyncio.create_task(_banana_run_and_send(update.effective_chat.id, ctx, imgs, prompt))
-            return
+            asyncio.create_task(_banana_run_and_send(update.effective_chat.id, ctx, imgs, prompt)); return
 
     # -------- VEO card actions --------
-    if data == "veo:toggle_ar":
-        s["aspect"] = "9:16" if (s.get("aspect") == "16:9") else "16:9"
+    if data.startswith("veo:set_ar:"):
+        s["aspect"] = "9:16" if data.endswith("9:16") else "16:9"
+        await show_or_update_veo_card(update.effective_chat.id, ctx); return
+    if data.startswith("veo:set_model:"):
+        s["model"] = "veo3_fast" if data.endswith("fast") else "veo3"
         await show_or_update_veo_card(update.effective_chat.id, ctx); return
     if data == "veo:clear_img":
         s["last_image_url"] = None
@@ -862,10 +870,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         gen_id = uuid.uuid4().hex
         s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
         await q.message.reply_text(f"🆔 VEO taskId: `{task_id}`\n🎞 Рендер начат — вернусь с готовым видео.", parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx))
-        return
+        asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
-    # MJ запуск (только кнопка «Сгенерировать 16:9»)
+    # MJ запуск
     if data == "mj:start":
         prompt = (s.get("last_prompt") or "").strip()
         if not prompt:
@@ -873,21 +880,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         price = TOKEN_COSTS['mj']
         ok_balance, rest = try_charge(ctx, price)
         if not ok_balance:
-            await q.message.reply_text(
-                f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()
-            ); return
-        await q.message.reply_text(
-            f"🎨 Генерация фото запущена…\nФормат: *16:9*\nPrompt: `{prompt}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+            await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
+        await q.message.reply_text(f"🎨 Генерация фото запущена…\nФормат: *16:9*\nPrompt: `{prompt}`", parse_mode=ParseMode.MARKDOWN)
         ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt.strip())
         event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
         if not ok or not task_id:
             add_tokens(ctx, price)
             await q.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены."); return
         await q.message.reply_text(f"🆔 MJ taskId: `{task_id}`\n🖌️ Рисую эскиз и детали…", parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(poll_mj_and_send_photos(update.effective_chat.id, task_id, ctx, (s.get("last_prompt") or "")))
-        return
+        asyncio.create_task(poll_mj_and_send_photos(update.effective_chat.id, task_id, ctx, (s.get("last_prompt") or ""))); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
@@ -901,8 +902,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
             s["banana_images"].append(text.strip())
             await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
-            await show_or_update_banana_card(update.effective_chat.id, ctx)
-            return
+            await show_or_update_banana_card(update.effective_chat.id, ctx); return
         s["last_image_url"] = text.strip()
         await update.message.reply_text("🧷 Ссылка на изображение принята.")
         if mode in ("veo_text_fast","veo_text_quality","veo_photo"):
@@ -945,9 +945,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Prompt сохранён:\n\n`{text}`\n\nНажмите, чтобы запустить (16:9):",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🖼️ Сгенерировать (16:9)", callback_data="mj:start")],
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖼️ Сгенерировать (16:9)", callback_data="mj:start")]])
         ); return
 
     if mode == "banana":
@@ -1007,8 +1005,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cap = (update.message.caption or "").strip()
             if cap: s["last_prompt"] = cap
             await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
-            await show_or_update_banana_card(update.effective_chat.id, ctx)
-            return
+            await show_or_update_banana_card(update.effective_chat.id, ctx); return
         s["last_image_url"] = url
         await update.message.reply_text("🖼️ Фото принято как референс.")
         if s.get("mode") in ("veo_text_fast","veo_text_quality","veo_photo"):
@@ -1016,10 +1013,6 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Get photo failed: %s", e)
         await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
-
-# map callback to show card
-async def veo_show_card_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await show_or_update_veo_card(update.effective_chat.id, ctx)
 
 # ---------- Payments: Stars (XTR) ----------
 async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1050,6 +1043,7 @@ def main():
     if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
 
+    # удалить webhook перед polling
     try:
         Bot(TELEGRAM_TOKEN).delete_webhook(drop_pending_updates=True)
         log.info("Webhook deleted")
@@ -1067,7 +1061,6 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(CallbackQueryHandler(veo_show_card_router, pattern="^veo:show_card$"))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
