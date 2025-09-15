@@ -37,9 +37,19 @@ POLL_TIMEOUT_SECS=1200
 # Logging
 LOG_LEVEL=INFO
 
-# Redis cache / promo codes (optional)
+# Redis cache / promo codes / runner lock
+REDIS_LOCK_ENABLED=true
 REDIS_URL=redis://:password@host:port/0
 REDIS_PREFIX=veo3:prod
+
+## Redis runner lock mechanics
+
+* При запуске бот ставит ключ `{REDIS_PREFIX}:lock:runner` в Redis (`SET NX EX=60`). Значение — JSON с `host`, `pid`, `started_at`, `heartbeat_at`, `version`.
+* Каждые ~25 секунд происходит heartbeat: TTL продлевается до 60 секунд и обновляется `heartbeat_at`. В логах появляются события `LOCK_HEARTBEAT`.
+* Если при старте обнаружен свежий ключ, логируется `LOCK_BUSY`, бот завершается без повторных попыток (чтобы избежать 409 от Telegram).
+* Если ключ устарел (нет heartbeat >90 секунд), выводится `LOCK_STALE_TAKEOVER`, старый ключ удаляется и ставится новый.
+* При штатном завершении или сигнале SIGINT/SIGTERM ключ удаляется (`LOCK_RELEASED`).
+* Чтобы отключить блокировку (например, локально), установите `REDIS_LOCK_ENABLED=false` — Redis для локера тогда не используется.
 
 # --- Midjourney интерактивный поток ---
 # 1. Нажмите «Генерация изображений (MJ)» в меню → откроется карточка с выбором формата (16:9 или 9:16).
