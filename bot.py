@@ -1057,11 +1057,11 @@ promo_mark_used(code, uid)
 if not redis_client:
     promo_mark_used_local(ctx, code)
 add_tokens(ctx, bonus)
-await update.message.reply_text(f"✅ Промокод принят! +{bonus}💎
-Баланс: {get_user_balance_value(ctx)} 💎")
+await update.message.reply_text(
+    f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎"
+)
 s["mode"] = None
 return
-
     # Ссылка на картинку как текст
     low = text.lower()
     if low.startswith(("http://", "https://")) and any(low.split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".heic")):
