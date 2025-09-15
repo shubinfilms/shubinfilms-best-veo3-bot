@@ -197,16 +197,43 @@ def _coerce_url_list(value) -> List[str]:
     return urls
 
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
-    for key in ("originUrls", "resultUrls", "videoUrls"):
-        urls = _coerce_url_list(data.get(key))
-        if urls: return urls[0]
-    for cont in ("info", "response", "resultInfoJson"):
-        v = data.get(cont)
-        if isinstance(v, dict):
-            for key in ("originUrls", "resultUrls", "videoUrls", "urls"):
-                urls = _coerce_url_list(v.get(key))
-                if urls: return urls[0]
-    return None
+    """Try to locate the first http(s) URL anywhere inside ``data``.
+
+    KIE responses are not stable: depending on the aspect ratio the video
+    link may appear under different keys or even be wrapped into JSON
+    strings.  The previous implementation only inspected a couple of fixed
+    fields which caused 9:16 videos to be missed when the API returned them
+    in a new structure.  To make the bot robust we recursively walk through
+    the response and apply :func:`_coerce_url_list` to every value we find.
+    """
+
+    def _search(obj) -> Optional[str]:
+        # Try to extract URLs from the current object itself
+        urls = _coerce_url_list(obj)
+        if urls:
+            return urls[0]
+
+        # If it's a JSON string – decode and continue searching
+        if isinstance(obj, str):
+            try:
+                return _search(json.loads(obj))
+            except Exception:
+                return None
+
+        # Recurse into dicts and lists
+        if isinstance(obj, dict):
+            for v in obj.values():
+                res = _search(v)
+                if res:
+                    return res
+        elif isinstance(obj, list):
+            for v in obj:
+                res = _search(v)
+                if res:
+                    return res
+        return None
+
+    return _search(data)
 
 def event(tag: str, **kw):
     try: log.info("EVT %s | %s", tag, json.dumps(kw, ensure_ascii=False))
