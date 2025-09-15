@@ -6,7 +6,7 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, threading, signal, socket
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Callable
 from datetime import datetime, timezone
 from contextlib import suppress
 
@@ -1999,6 +1999,7 @@ class RedisRunnerLock:
         self._acquired = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._signal_handlers: List[signal.Signals] = []
+        self._stop_callbacks: List[Callable[[Optional[signal.Signals]], None]] = []
 
     async def __aenter__(self) -> "RedisRunnerLock":
         if not self.enabled:
@@ -2018,6 +2019,11 @@ class RedisRunnerLock:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.release()
+
+    def add_stop_callback(self, callback: Callable[[Optional[signal.Signals]], None]) -> None:
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        self._stop_callbacks.append(callback)
 
     async def _acquire(self) -> None:
         if not self._redis:
@@ -2192,7 +2198,15 @@ class RedisRunnerLock:
                 continue
             sig = getattr(signal, sig_name)
             try:
-                self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._on_signal(s)))
+                def _handler(s: signal.Signals = sig) -> None:
+                    for cb in list(self._stop_callbacks):
+                        try:
+                            cb(s)
+                        except Exception as exc:
+                            log.warning("Runner lock stop callback failed: %s", exc)
+                    asyncio.create_task(self._on_signal(s))
+
+                self._loop.add_signal_handler(sig, _handler)
                 self._signal_handlers.append(sig)
             except (NotImplementedError, RuntimeError):
                 continue
@@ -2248,32 +2262,98 @@ async def run_bot_async() -> None:
 
     try:
         async with lock:
-            log.info("Bot starting… (Redis=%s, lock=%s)", "on" if redis_client else "off", "enabled" if lock.enabled else "disabled")
+            log.info(
+                "Bot starting… (Redis=%s, lock=%s)",
+                "on" if redis_client else "off",
+                "enabled" if lock.enabled else "disabled",
+            )
+
+            loop = asyncio.get_running_loop()
+            stop_event = asyncio.Event()
+            manual_signal_handlers: List[signal.Signals] = []
+
+            def _trigger_stop(sig: Optional[signal.Signals] = None, *, reason: str = "external") -> None:
+                if stop_event.is_set():
+                    return
+                if sig is not None:
+                    sig_name = sig.name if hasattr(sig, "name") else str(sig)
+                    log.info("Stop signal received: %s. Triggering shutdown.", sig_name)
+                else:
+                    log.info("Stop requested (%s). Triggering shutdown.", reason)
+                stop_event.set()
+
+            lock.add_stop_callback(lambda sig: _trigger_stop(sig))
+
+            if not lock.enabled:
+                for sig_name in ("SIGINT", "SIGTERM"):
+                    if not hasattr(signal, sig_name):
+                        continue
+                    sig_obj = getattr(signal, sig_name)
+                    try:
+                        loop.add_signal_handler(sig_obj, lambda s=sig_obj: _trigger_stop(s))
+                        manual_signal_handlers.append(sig_obj)
+                    except (NotImplementedError, RuntimeError):
+                        continue
+
+            previous_post_stop = application.post_stop
+
+            async def _post_stop(app) -> None:
+                _trigger_stop(reason="post_stop")
+                if previous_post_stop:
+                    await previous_post_stop(app)
+
+            application.post_stop = _post_stop
 
             # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
             await application.initialize()
 
             try:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-                log.info("Webhook deleted")
-            except Exception as exc:
-                event("WEBHOOK_DELETE_ERROR", error=str(exc))
-                log.warning("Delete webhook failed: %s", exc)
+                try:
+                    await application.bot.delete_webhook(drop_pending_updates=True)
+                    event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+                    log.info("Webhook deleted")
+                except Exception as exc:
+                    event("WEBHOOK_DELETE_ERROR", error=str(exc))
+                    log.warning("Delete webhook failed: %s", exc)
 
-            try:
                 await application.start()
                 await application.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
+                    drop_pending_updates=True,
                 )
 
-                # Блокирующее ожидание SIGINT/SIGTERM
-                await application.updater.idle()
+                log.info("Application started")
+
+                try:
+                    await stop_event.wait()
+                except asyncio.CancelledError:
+                    _trigger_stop(reason="cancelled")
+                    raise
             finally:
-                # Корректная остановка
-                await application.stop()
-                await application.shutdown()
+                for sig_obj in manual_signal_handlers:
+                    try:
+                        loop.remove_signal_handler(sig_obj)
+                    except (NotImplementedError, RuntimeError):
+                        pass
+
+                if application.updater:
+                    try:
+                        await application.updater.stop()
+                    except RuntimeError as exc:
+                        log.warning("Updater stop failed: %s", exc)
+                    except Exception as exc:
+                        log.warning("Updater stop failed with unexpected error: %s", exc)
+
+                try:
+                    await application.stop()
+                except Exception as exc:
+                    log.warning("Application stop failed: %s", exc)
+
+                try:
+                    await application.shutdown()
+                except Exception as exc:
+                    log.warning("Application shutdown failed: %s", exc)
+                application.post_stop = previous_post_stop
     except RedisLockBusy:
         log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
 
