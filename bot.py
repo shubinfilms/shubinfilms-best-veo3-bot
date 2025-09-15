@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.x
 # Версия: 2025-09-14r4
@@ -299,14 +298,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
-     rows = [
-    [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
-]
-
-if PROMO_ENABLED:
-    rows.append([InlineKeyboardButton("🎟️ Активировать промокод", callback_data="promo_open")])
-
-return InlineKeyboardMarkup(rows)
+        ],
+        [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
+        ([InlineKeyboardButton("🎟️ Активировать промокод", callback_data="promo_open")], if PROMO_ENABLED else []),
+    ]
     return InlineKeyboardMarkup(rows)
 
 def banana_examples_block() -> str:
