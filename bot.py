@@ -92,7 +92,7 @@ TOKEN_COSTS = {
     "veo_fast": 50,
     "veo_quality": 150,
     "veo_photo": 50,
-    "mj": 10,          # только 16:9
+    "mj": 10,          # 16:9 или 9:16
     "banana": 5,
     "chat": 0,
 }
@@ -339,6 +339,7 @@ DEFAULT_STATE = {
     "last_ui_msg_id": None, "last_ui_msg_id_banana": None,
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
+    "mj_generating": False, "last_mj_task_id": None, "last_mj_msg_id": None,
 }
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
@@ -388,7 +389,7 @@ def set_signup_bonus(uid: int):
 # ==========================
 WELCOME = (
     "🎬 *Veo 3 — съёмочная команда*: опиши идею и получи *готовый клип*.\n"
-    "🖌️ *MJ — художник*: рисует изображение по тексту (*только 16:9*).\n"
+    "🖌️ *MJ — художник*: рисует изображение по тексту (16:9 или 9:16).\n"
     "🍌 *Banana — редактор из будущего*: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
     "🧠 *Prompt-Master* — вернёт профессиональный *кинопромпт*.\n"
     "💬 *Обычный чат* — ответы на любые вопросы.\n\n"
@@ -422,6 +423,117 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         ])
 
     return InlineKeyboardMarkup(keyboard)
+
+def _short_prompt(prompt: Optional[str], limit: int = 120) -> str:
+    txt = (prompt or "").strip()
+    if not txt:
+        return ""
+    normalized = re.sub(r"\s+", " ", txt)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit].rstrip() + "…"
+
+def _mj_format_card_text(aspect: str) -> str:
+    aspect = "9:16" if aspect == "9:16" else "16:9"
+    choice = "Горизонтальный (16:9)" if aspect == "16:9" else "Вертикальный (9:16)"
+    return (
+        "🖼 Midjourney\n"
+        "Выберите формат изображения.\n\n"
+        "• Горизонтальный — 16:9\n"
+        "• Вертикальный — 9:16\n\n"
+        f"Текущий выбор: {choice}"
+    )
+
+def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
+    aspect = "9:16" if aspect == "9:16" else "16:9"
+    def _btn(label: str, value: str) -> InlineKeyboardButton:
+        mark = "✅ " if value == aspect else ""
+        return InlineKeyboardButton(f"{mark}{label}", callback_data=f"mj:aspect:{value}")
+    keyboard = [
+        [_btn("Горизонтальный (16:9)", "16:9")],
+        [_btn("Вертикальный (9:16)", "9:16")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
+    aspect = "9:16" if aspect == "9:16" else "16:9"
+    lines = [
+        "Введите промпт сообщением. После этого нажмите «Подтвердить».",
+        f"Текущий формат: {aspect}",
+    ]
+    snippet = _short_prompt(prompt)
+    if snippet:
+        lines.extend(["", f'Последний промпт: "{snippet}"'])
+    return "\n".join(lines)
+
+def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Подтвердить", callback_data="mj:confirm")],
+        [
+            InlineKeyboardButton("Отменить", callback_data="mj:cancel"),
+            InlineKeyboardButton("Сменить формат", callback_data="mj:change_format"),
+        ],
+    ])
+
+async def _send_or_edit_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: str,
+                                reply_markup: Optional[InlineKeyboardMarkup]) -> None:
+    s = state(ctx)
+    mid = s.get("last_mj_msg_id")
+    try:
+        if mid:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=mid,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        else:
+            msg = await ctx.bot.send_message(
+                chat_id,
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            s["last_mj_msg_id"] = msg.message_id
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            return
+        log.warning("MJ card send/edit failed: %s", e)
+        try:
+            msg = await ctx.bot.send_message(
+                chat_id,
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            s["last_mj_msg_id"] = msg.message_id
+        except Exception as e2:
+            log.warning("MJ card send fallback failed: %s", e2)
+
+async def show_mj_format_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
+    s["aspect"] = aspect
+    s["last_prompt"] = None
+    await _send_or_edit_mj_card(chat_id, ctx, _mj_format_card_text(aspect), _mj_format_keyboard(aspect))
+
+async def show_mj_prompt_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
+    s["aspect"] = aspect
+    await _send_or_edit_mj_card(chat_id, ctx, _mj_prompt_card_text(aspect, s.get("last_prompt")), _mj_prompt_keyboard())
+
+async def show_mj_generating_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, prompt: str, aspect: str) -> None:
+    aspect = "9:16" if aspect == "9:16" else "16:9"
+    snippet = _short_prompt(prompt, 160)
+    text = (
+        "⏳ Midjourney генерирует изображение…\n"
+        f"Формат: {aspect}\n"
+        f'Промпт: "{snippet}"'
+    )
+    await _send_or_edit_mj_card(chat_id, ctx, text, None)
 
 def banana_examples_block() -> str:
     return (
@@ -647,7 +759,7 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
     return None
 
 # ==========================
-#   MJ (только 16:9)
+#   MJ
 # ==========================
 def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     code = j.get("code", status_code)
@@ -658,19 +770,25 @@ def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {msg}".strip()
 
-def mj_generate(prompt: str) -> Tuple[bool, Optional[str], str]:
+def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
+    aspect_ratio = "9:16" if aspect == "9:16" else "16:9"
     payload = {
         "taskType": "mj_txt2img",
         "prompt": prompt,
         "speed": "fast",
-        "aspectRatio": "16:9",
+        "aspectRatio": aspect_ratio,
         "version": "7",
         "enableTranslation": True,
+        "input": {
+            "prompt": prompt,
+            "aspectRatio": aspect_ratio,
+            "aspect_ratio": aspect_ratio,
+        },
     }
     status, resp, req_id = _kie_request("POST", KIE_MJ_GENERATE, json_payload=payload)
     code = resp.get("code", status)
     tid = _extract_task_id(resp)
-    kie_event("MJ_SUBMIT", request_id=req_id, status=status, code=code, task_id=tid)
+    kie_event("MJ_SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, aspect=aspect_ratio)
     if status == 200 and code == 200:
         if tid:
             return True, tid, "MJ задача создана."
@@ -702,7 +820,12 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
 def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
     res: List[str] = []
     rj = status_data.get("resultInfoJson") or {}
-    urls = _coerce_url_list(rj.get("resultUrls"))
+    if isinstance(rj, str):
+        try:
+            rj = json.loads(rj)
+        except Exception:
+            rj = {}
+    urls = _coerce_url_list((rj or {}).get("resultUrls"))
     for u in urls:
         if isinstance(u, str) and u.startswith("http"): res.append(u)
     return res
@@ -899,12 +1022,17 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
 #   MJ poll (1 авторетрай)
 # ==========================
 async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE,
-                                  orig_prompt: Optional[str] = None):
+                                  prompt: str, aspect: str) -> None:
     price = TOKEN_COSTS["mj"]
     start_ts = time.time()
     delay = 12
     max_wait = 12 * 60
     retried = False
+    success = False
+    aspect_ratio = "9:16" if aspect == "9:16" else "16:9"
+    prompt_for_retry = (prompt or "").strip()
+    s = state(ctx)
+    s["last_mj_task_id"] = task_id
     try:
         while True:
             ok, flag, data = await asyncio.to_thread(mj_status, task_id)
@@ -922,13 +1050,14 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 continue
             if flag in (2, 3) or flag is None:
                 err = (data or {}).get("errorMessage") or "No response from MidJourney Official Website after multiple attempts."
-                if (not retried) and orig_prompt and _mj_should_retry(err):
+                if (not retried) and prompt_for_retry and _mj_should_retry(err):
                     retried = True
                     await ctx.bot.send_message(chat_id, "🔁 MJ подвис. Перезапускаю задачу бесплатно…")
-                    ok2, new_tid, msg2 = await asyncio.to_thread(mj_generate, orig_prompt.strip())
+                    ok2, new_tid, msg2 = await asyncio.to_thread(mj_generate, prompt_for_retry, aspect_ratio)
                     event("MJ_RETRY_SUBMIT", ok=ok2, task_id=new_tid, msg=msg2)
                     if ok2 and new_tid:
                         task_id = new_tid
+                        s["last_mj_task_id"] = new_tid
                         start_ts = time.time()
                         delay = 12
                         continue
@@ -936,23 +1065,56 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 await ctx.bot.send_message(chat_id, f"❌ MJ: {err}\n💎 Токены возвращены.")
                 return
             if flag == 1:
-                urls = _extract_mj_image_urls(data or {})
-                if not urls:
+                payload = data or {}
+                url = _extract_result_url(payload)
+                if not url:
+                    urls = _extract_mj_image_urls(payload)
+                    url = urls[0] if urls else None
+                if not url:
                     add_tokens(ctx, price)
                     await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
                     return
-                if len(urls) == 1:
-                    await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0])
-                else:
-                    await ctx.bot.send_media_group(chat_id=chat_id, media=[InputMediaPhoto(u) for u in urls[:10]])
-                await ctx.bot.send_message(chat_id, "✅ *Готово!*", parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Ещё", callback_data="start_new_cycle")]]))
+                base_prompt = re.sub(r"\s+", " ", prompt_for_retry).strip()
+                snippet = base_prompt[:100] if base_prompt else ""
+                if not snippet:
+                    snippet = "—"
+                caption = "\n".join([
+                    "🖼 Midjourney",
+                    f"• Формат: {aspect_ratio}",
+                    f'• Промпт: "{snippet}"',
+                ])
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Открыть", url=url)],
+                    [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
+                    [InlineKeyboardButton("Назад в меню", callback_data="back")],
+                ])
+                try:
+                    await ctx.bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=keyboard)
+                except Exception as e:
+                    log.warning("MJ send_photo failed: %s", e)
+                    try:
+                        await ctx.bot.send_message(chat_id, caption + f"\n{url}", reply_markup=keyboard)
+                    except Exception as e2:
+                        log.warning("MJ send_message fallback failed: %s", e2)
+                success = True
                 return
     except Exception as e:
         log.exception("MJ poll crash: %s", e)
         add_tokens(ctx, price)
         try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка MJ. 💎 Токены возвращены.")
         except Exception: pass
+    finally:
+        s = state(ctx)
+        s["mj_generating"] = False
+        s["last_mj_task_id"] = None
+        s["mj_last_wait_ts"] = 0.0
+        s["last_prompt"] = None
+        mid = s.get("last_mj_msg_id")
+        if mid:
+            final_text = "✅ Midjourney: изображение обработано." if success else "ℹ️ Midjourney: поток завершён."
+            try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None)
+            except Exception: pass
+            s["last_mj_msg_id"] = None
 
 # ==========================
 #   Handlers
@@ -1066,7 +1228,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "3) Карточка откроется автоматически — проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
             "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
             "— *Форматы VEO?* 16:9 и 9:16. Для 16:9 стараемся получить 1080p; вертикаль нормализуется локально для Telegram.\n\n"
-            "— *MJ:* только 16:9, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе до 4 изображений.\n\n"
+            "— *MJ:* 16:9 или 9:16, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
             "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
             "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
             "— *Токены/возвраты:* списываются при старте; при ошибке/таймауте бот автоматически возвращает 💎.\n\n"
@@ -1129,11 +1291,103 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
         if mode == "mj_txt":
-            await q.message.reply_text("🖼️ Пришлите текстовый *prompt* для картинки (формат *16:9*).", parse_mode=ParseMode.MARKDOWN); return
+            s["aspect"] = "9:16" if s.get("aspect") == "9:16" else "16:9"
+            s["last_prompt"] = None
+            s["mj_generating"] = False
+            s["mj_last_wait_ts"] = 0.0
+            s["last_mj_task_id"] = None
+            mid = s.get("last_mj_msg_id")
+            if mid:
+                try: await ctx.bot.delete_message(update.effective_chat.id, mid)
+                except Exception: pass
+            s["last_mj_msg_id"] = None
+            await show_mj_format_card(update.effective_chat.id, ctx)
+            return
         if mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
             await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
             await show_or_update_banana_card(update.effective_chat.id, ctx); return
+
+    if data.startswith("mj:"):
+        chat = update.effective_chat
+        if not chat:
+            return
+        parts = data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        payload = parts[2] if len(parts) > 2 else ""
+        chat_id = chat.id
+        current_aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
+
+        if action == "aspect":
+            if s.get("mj_generating"):
+                await q.message.reply_text("⏳ Дождитесь завершения текущей генерации."); return
+            new_aspect = "9:16" if payload == "9:16" else "16:9"
+            s["aspect"] = new_aspect
+            s["last_prompt"] = None
+            await show_mj_prompt_card(chat_id, ctx)
+            return
+
+        if action == "change_format":
+            if s.get("mj_generating"):
+                await q.message.reply_text("⏳ Дождитесь завершения текущей генерации."); return
+            await show_mj_format_card(chat_id, ctx)
+            return
+
+        if action == "cancel":
+            s["mode"] = None
+            s["last_prompt"] = None
+            s["mj_generating"] = False
+            s["last_mj_task_id"] = None
+            s["mj_last_wait_ts"] = 0.0
+            mid = s.get("last_mj_msg_id")
+            if mid:
+                try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text="❌ Midjourney отменён.", reply_markup=None)
+                except Exception: pass
+            s["last_mj_msg_id"] = None
+            await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
+
+        if action == "confirm":
+            if s.get("mj_generating"):
+                await q.message.reply_text("⏳ Уже идёт генерация. Дождитесь результата."); return
+            prompt = (s.get("last_prompt") or "").strip()
+            if not prompt:
+                await q.message.reply_text("❌ Промпт не найден, отправьте текст и повторите."); return
+            price = TOKEN_COSTS['mj']
+            ok_balance, rest = try_charge(ctx, price)
+            if not ok_balance:
+                await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
+            await q.message.reply_text("✅ Промпт принят.")
+            s["mj_generating"] = True
+            s["mj_last_wait_ts"] = time.time()
+            aspect_value = "9:16" if s.get("aspect") == "9:16" else "16:9"
+            await show_mj_generating_card(chat_id, ctx, prompt, aspect_value)
+            ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt, aspect_value)
+            event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
+            if not ok or not task_id:
+                add_tokens(ctx, price)
+                s["mj_generating"] = False
+                s["last_mj_task_id"] = None
+                s["mj_last_wait_ts"] = 0.0
+                await q.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены.")
+                await show_mj_prompt_card(chat_id, ctx)
+                return
+            s["last_mj_task_id"] = task_id
+            asyncio.create_task(poll_mj_and_send_photos(chat_id, task_id, ctx, prompt, aspect_value))
+            return
+
+        if action == "repeat":
+            if s.get("mj_generating"):
+                await q.message.reply_text("⏳ Уже идёт генерация. Дождитесь результата."); return
+            s["mode"] = "mj_txt"
+            s["last_prompt"] = None
+            s["mj_generating"] = False
+            s["mj_last_wait_ts"] = 0.0
+            s["last_mj_task_id"] = None
+            await show_mj_prompt_card(chat_id, ctx)
+            await q.message.reply_text("✍️ Пришлите новый промпт для Midjourney.")
+            return
+
+        return
 
     # Banana callbacks
     if data.startswith("banana:"):
@@ -1184,24 +1438,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
         await q.message.reply_text(f"🆔 VEO taskId: `{task_id}`\n🎞 Рендер начат — вернусь с готовым видео.", parse_mode=ParseMode.MARKDOWN)
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
-
-    # MJ запуск (кнопка "mj:start" сохраняется как раньше)
-    if data == "mj:start":
-        prompt = (s.get("last_prompt") or "").strip()
-        if not prompt:
-            await q.message.reply_text("⚠️ Сначала отправьте текстовый prompt."); return
-        price = TOKEN_COSTS['mj']
-        ok_balance, rest = try_charge(ctx, price)
-        if not ok_balance:
-            await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
-        await q.message.reply_text(f"🎨 Генерация фото запущена…\nФормат: *16:9*\nPrompt: `{prompt}`", parse_mode=ParseMode.MARKDOWN)
-        ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt.strip())
-        event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
-        if not ok or not task_id:
-            add_tokens(ctx, price)
-            await q.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены."); return
-        await q.message.reply_text(f"🆔 MJ taskId: `{task_id}`\n🖌️ Рисую эскиз и детали…", parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(poll_mj_and_send_photos(update.effective_chat.id, task_id, ctx, (s.get("last_prompt") or ""))); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
@@ -1281,12 +1517,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "mj_txt":
+        if not text:
+            await update.message.reply_text("⚠️ Отправьте текстовый промпт.")
+            return
         s["last_prompt"] = text
-        await update.message.reply_text(
-            f"✅ Prompt сохранён:\n\n`{text}`\n\nНажмите, чтобы запустить (16:9):",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖼️ Сгенерировать (16:9)", callback_data="mj:start")]])
-        ); return
+        await show_mj_prompt_card(update.effective_chat.id, ctx)
+        await update.message.reply_text("📝 Промпт сохранён. Нажмите «Подтвердить».")
+        return
 
     if mode == "banana":
         s["last_prompt"] = text
