@@ -143,8 +143,34 @@ else:
     KIE_VEO_1080_PATHS = [KIE_VEO_1080_PATH]
 
 # MJ
-KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
-KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/recordInfo")
+_KIE_MJ_GENERATE_DEFAULT = "/api/v1/mj/generate"
+_KIE_MJ_GENERATE_RAW = _env("KIE_MJ_GENERATE", _KIE_MJ_GENERATE_DEFAULT)
+KIE_MJ_GENERATE_PATHS = _normalize_endpoint_values(
+    _KIE_MJ_GENERATE_RAW,
+    _KIE_MJ_GENERATE_DEFAULT,
+    "/api/v1/mj/createTask",
+    "/api/v1/mj/create-task",
+)
+if KIE_MJ_GENERATE_PATHS:
+    KIE_MJ_GENERATE = KIE_MJ_GENERATE_PATHS[0]
+else:
+    KIE_MJ_GENERATE = _KIE_MJ_GENERATE_DEFAULT
+    KIE_MJ_GENERATE_PATHS = [KIE_MJ_GENERATE]
+
+_KIE_MJ_STATUS_DEFAULT = "/api/v1/mj/recordInfo"
+_KIE_MJ_STATUS_RAW = _env("KIE_MJ_STATUS", _KIE_MJ_STATUS_DEFAULT)
+KIE_MJ_STATUS_PATHS = _normalize_endpoint_values(
+    _KIE_MJ_STATUS_RAW,
+    _KIE_MJ_STATUS_DEFAULT,
+    "/api/v1/mj/record-info",
+    "/api/v1/mj/status",
+    "/api/v1/mj/recordinfo",
+)
+if KIE_MJ_STATUS_PATHS:
+    KIE_MJ_STATUS = KIE_MJ_STATUS_PATHS[0]
+else:
+    KIE_MJ_STATUS = _KIE_MJ_STATUS_DEFAULT
+    KIE_MJ_STATUS_PATHS = [KIE_MJ_STATUS]
 
 # Видео
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
@@ -871,22 +897,29 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
 # ==========================
 #   VEO
 # ==========================
-def _veo_endpoint_cache_key(kind: str) -> str:
-    return f"veo:endpoint:{kind}"
+def _endpoint_cache_key(service: str, kind: str) -> str:
+    return f"{service}:endpoint:{kind}"
 
-def _remember_veo_endpoint(kind: str, path: str):
+
+def _remember_endpoint(service: str, kind: str, path: str):
     if not path:
         return
-    app_cache[_veo_endpoint_cache_key(kind)] = path
-    if kind == "status":
-        global KIE_VEO_STATUS_PATH
-        KIE_VEO_STATUS_PATH = path
-    elif kind == "1080":
-        global KIE_VEO_1080_PATH
-        KIE_VEO_1080_PATH = path
+    global KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH, KIE_MJ_GENERATE, KIE_MJ_STATUS
+    app_cache[_endpoint_cache_key(service, kind)] = path
+    if service == "veo":
+        if kind == "status":
+            KIE_VEO_STATUS_PATH = path
+        elif kind == "1080":
+            KIE_VEO_1080_PATH = path
+    elif service == "mj":
+        if kind == "generate":
+            KIE_MJ_GENERATE = path
+        elif kind == "status":
+            KIE_MJ_STATUS = path
 
-def _veo_endpoint_candidates(kind: str, base_paths: List[str]) -> List[str]:
-    cached = app_cache.get(_veo_endpoint_cache_key(kind))
+
+def _endpoint_candidates(service: str, kind: str, base_paths: List[str]) -> List[str]:
+    cached = app_cache.get(_endpoint_cache_key(service, kind))
     if cached:
         return _normalize_endpoint_values(cached, base_paths)
     return list(base_paths)
@@ -906,6 +939,7 @@ def _is_not_found_response(status: int, payload: Dict[str, Any]) -> bool:
     return False
 
 def _kie_request_with_endpoint(
+    service: str,
     kind: str,
     method: str,
     paths: List[str],
@@ -913,7 +947,7 @@ def _kie_request_with_endpoint(
     request_id: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[int, Dict[str, Any], str, str]:
-    candidates = _veo_endpoint_candidates(kind, paths)
+    candidates = _endpoint_candidates(service, kind, paths)
     if not candidates:
         return 0, {"error": "no endpoint configured"}, request_id or "", ""
 
@@ -936,16 +970,18 @@ def _kie_request_with_endpoint(
             if idx > 0:
                 kie_event(
                     "ENDPOINT_SWITCH",
+                    service=service,
                     kind=kind,
                     method=method,
                     path=path,
                     attempts=idx + 1,
                 )
-            _remember_veo_endpoint(kind, path)
+            _remember_endpoint(service, kind, path)
             return status, resp, req_id, path
         if idx + 1 < len(candidates):
             kie_event(
                 "ENDPOINT_FALLBACK",
+                service=service,
                 kind=kind,
                 method=method,
                 path=path,
@@ -995,6 +1031,7 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
 def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
     req_id_hint = _get_kie_request_id(task_id)
     status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "veo",
         "status",
         "GET",
         KIE_VEO_STATUS_PATHS,
@@ -1036,6 +1073,7 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
     req_id = _get_kie_request_id(task_id)
     for attempt in range(1, attempts + 1):
         status, resp, req_id_used, path_used = _kie_request_with_endpoint(
+            "veo",
             "1080",
             "GET",
             KIE_VEO_1080_PATHS,
@@ -1131,10 +1169,24 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
             "aspect_ratio": aspect_ratio,
         },
     }
-    status, resp, req_id = _kie_request("POST", KIE_MJ_GENERATE, json_payload=payload)
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "mj",
+        "generate",
+        "POST",
+        KIE_MJ_GENERATE_PATHS,
+        json_payload=payload,
+    )
     code = resp.get("code", status)
     tid = _extract_task_id(resp)
-    kie_event("MJ_SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, aspect=aspect_ratio)
+    kie_event(
+        "MJ_SUBMIT",
+        request_id=req_id,
+        status=status,
+        code=code,
+        task_id=tid,
+        aspect=aspect_ratio,
+        path=path_used,
+    )
     if status == 200 and code == 200:
         if tid:
             return True, tid, "MJ задача создана."
@@ -1142,15 +1194,29 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
     return False, None, _kie_error_message(status, resp)
 
 def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
-    status, resp, req_id = _kie_request("GET", KIE_MJ_STATUS, params={"taskId": task_id})
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "mj",
+        "status",
+        "GET",
+        KIE_MJ_STATUS_PATHS,
+        params={"taskId": task_id},
+    )
     code = resp.get("code", status)
-    data = resp.get("data") or {}
-    if isinstance(data, str):
+    raw_data = resp.get("data")
+    if isinstance(raw_data, str):
         try:
-            data = json.loads(data)
+            parsed = json.loads(raw_data)
+            data = parsed if isinstance(parsed, dict) else {"value": parsed}
         except Exception:
-            data = {"raw": data}
+            data = {"raw": raw_data}
+    elif isinstance(raw_data, dict):
+        data = raw_data
+    else:
+        data = None
     flag = _parse_success_flag(data) if isinstance(data, dict) else None
+    not_found = _is_not_found_response(status, resp)
+    if not_found:
+        flag = 0
     kie_event(
         "MJ_STATUS",
         request_id=req_id,
@@ -1158,7 +1224,11 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
         status=status,
         code=code,
         flag=flag,
+        path=path_used,
+        not_found=not_found,
     )
+    if not_found:
+        return True, 0, None
     if status == 200 and code == 200:
         return True, flag, data if isinstance(data, dict) else None
     return False, None, None
