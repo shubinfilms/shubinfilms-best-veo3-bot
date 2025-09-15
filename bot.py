@@ -24,6 +24,12 @@ from telegram.ext import (
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
+from handlers.prompt_master_handler import (
+    PROMPT_MASTER_BODY,
+    PROMPT_MASTER_HEADER,
+    prompt_master_conv,
+)
+
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
 
@@ -151,8 +157,34 @@ if _kie_token:
     KIE_1080_SESSION.headers.update({"Authorization": _kie_token})
 
 # MJ
-KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
-KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/recordInfo")
+_KIE_MJ_GENERATE_DEFAULT = "/api/v1/mj/generate"
+_KIE_MJ_GENERATE_RAW = _env("KIE_MJ_GENERATE", _KIE_MJ_GENERATE_DEFAULT)
+KIE_MJ_GENERATE_PATHS = _normalize_endpoint_values(
+    _KIE_MJ_GENERATE_RAW,
+    _KIE_MJ_GENERATE_DEFAULT,
+    "/api/v1/mj/createTask",
+    "/api/v1/mj/create-task",
+)
+if KIE_MJ_GENERATE_PATHS:
+    KIE_MJ_GENERATE = KIE_MJ_GENERATE_PATHS[0]
+else:
+    KIE_MJ_GENERATE = _KIE_MJ_GENERATE_DEFAULT
+    KIE_MJ_GENERATE_PATHS = [KIE_MJ_GENERATE]
+
+_KIE_MJ_STATUS_DEFAULT = "/api/v1/mj/recordInfo"
+_KIE_MJ_STATUS_RAW = _env("KIE_MJ_STATUS", _KIE_MJ_STATUS_DEFAULT)
+KIE_MJ_STATUS_PATHS = _normalize_endpoint_values(
+    _KIE_MJ_STATUS_RAW,
+    _KIE_MJ_STATUS_DEFAULT,
+    "/api/v1/mj/record-info",
+    "/api/v1/mj/status",
+    "/api/v1/mj/recordinfo",
+)
+if KIE_MJ_STATUS_PATHS:
+    KIE_MJ_STATUS = KIE_MJ_STATUS_PATHS[0]
+else:
+    KIE_MJ_STATUS = _KIE_MJ_STATUS_DEFAULT
+    KIE_MJ_STATUS_PATHS = [KIE_MJ_STATUS]
 
 # Видео
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
@@ -635,7 +667,7 @@ WELCOME = (
     "🎬 *Veo 3 — съёмочная команда*: опиши идею и получи *готовый клип*.\n"
     "🖌️ *MJ — художник*: рисует изображение по тексту (16:9 или 9:16).\n"
     "🍌 *Banana — редактор из будущего*: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
-    "🧠 *Prompt-Master* — вернёт профессиональный *кинопромпт*.\n"
+    "🧠 *Prompt-Master (/promptmaster)* — вернёт профессиональный *кинопромпт*.\n"
     "💬 *Обычный чат* — ответы на любые вопросы.\n\n"
     "💎 *Ваш баланс:* {balance}\n"
     "📈 Больше идей и примеров: {prompts_url}\n\n"
@@ -652,7 +684,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master (ChatGPT)", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("🧠 Prompt-Master (/promptmaster)", callback_data="mode:prompt_master")],
         [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
@@ -845,56 +877,31 @@ def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 # ==========================
-#   Prompt-Master (ChatGPT)
-# ==========================
-PM_HINT = (
-    "🧠 *Prompt-Master готов!* Коротко опишите идею сцены — сделаю проф. кинопромпт.\n"
-    "Подсказка: локация, атмосфера/свет, действие, камера, реплики (в кавычках), детали.\n"
-    "Диалоги и lip-sync будут на *языке вашего сообщения*; остальное — на английском для качества."
-)
-async def oai_prompt_master(idea_text: str) -> Optional[str]:
-    if openai is None or not OPENAI_API_KEY: return None
-    dialogue_lang = "Russian" if re.search(r"[\u0400-\u04FF]", idea_text or "") else "English"
-    system = (
-        "You are a Prompt-Master for cinematic AI video generation (Veo-style). "
-        "Return ONE multi-line prompt with these labeled sections exactly:\n"
-        "Scene:\nCamera:\nAction:\nDialogue:\nLip-sync:\nAudio:\nLighting:\nWardrobe/props:\nFraming:\n"
-        f"Write ALL sections in English EXCEPT 'Dialogue' and 'Lip-sync', which must be in {dialogue_lang}. "
-        "Dialogue must be short ad lines in quotes. "
-        "No subtitles/logos/on-screen text in the video. Keep 16:9 framing. Total 600–1100 chars."
-    )
-    try:
-        user = (idea_text or "").strip()[:900]
-        resp = await asyncio.to_thread(
-            openai.ChatCompletion.create,
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.8, max_tokens=800,
-        )
-        return (resp["choices"][0]["message"]["content"] or "").strip()[:1400]
-    except Exception as e:
-        log.exception("Prompt-Master error: %s", e)
-        return None
-
-# ==========================
 #   VEO
 # ==========================
-def _veo_endpoint_cache_key(kind: str) -> str:
-    return f"veo:endpoint:{kind}"
+def _endpoint_cache_key(service: str, kind: str) -> str:
+    return f"{service}:endpoint:{kind}"
 
-def _remember_veo_endpoint(kind: str, path: str):
+
+def _remember_endpoint(service: str, kind: str, path: str):
     if not path:
         return
-    app_cache[_veo_endpoint_cache_key(kind)] = path
-    if kind == "status":
-        global KIE_VEO_STATUS_PATH
-        KIE_VEO_STATUS_PATH = path
-    elif kind == "1080":
-        global KIE_VEO_1080_PATH
-        KIE_VEO_1080_PATH = path
+    global KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH, KIE_MJ_GENERATE, KIE_MJ_STATUS
+    app_cache[_endpoint_cache_key(service, kind)] = path
+    if service == "veo":
+        if kind == "status":
+            KIE_VEO_STATUS_PATH = path
+        elif kind == "1080":
+            KIE_VEO_1080_PATH = path
+    elif service == "mj":
+        if kind == "generate":
+            KIE_MJ_GENERATE = path
+        elif kind == "status":
+            KIE_MJ_STATUS = path
 
-def _veo_endpoint_candidates(kind: str, base_paths: List[str]) -> List[str]:
-    cached = app_cache.get(_veo_endpoint_cache_key(kind))
+
+def _endpoint_candidates(service: str, kind: str, base_paths: List[str]) -> List[str]:
+    cached = app_cache.get(_endpoint_cache_key(service, kind))
     if cached:
         return _normalize_endpoint_values(cached, base_paths)
     return list(base_paths)
@@ -914,6 +921,7 @@ def _is_not_found_response(status: int, payload: Dict[str, Any]) -> bool:
     return False
 
 def _kie_request_with_endpoint(
+    service: str,
     kind: str,
     method: str,
     paths: List[str],
@@ -921,7 +929,7 @@ def _kie_request_with_endpoint(
     request_id: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[int, Dict[str, Any], str, str]:
-    candidates = _veo_endpoint_candidates(kind, paths)
+    candidates = _endpoint_candidates(service, kind, paths)
     if not candidates:
         return 0, {"error": "no endpoint configured"}, request_id or "", ""
 
@@ -944,16 +952,18 @@ def _kie_request_with_endpoint(
             if idx > 0:
                 kie_event(
                     "ENDPOINT_SWITCH",
+                    service=service,
                     kind=kind,
                     method=method,
                     path=path,
                     attempts=idx + 1,
                 )
-            _remember_veo_endpoint(kind, path)
+            _remember_endpoint(service, kind, path)
             return status, resp, req_id, path
         if idx + 1 < len(candidates):
             kie_event(
                 "ENDPOINT_FALLBACK",
+                service=service,
                 kind=kind,
                 method=method,
                 path=path,
@@ -1003,6 +1013,7 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
 def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
     req_id_hint = _get_kie_request_id(task_id)
     status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "veo",
         "status",
         "GET",
         KIE_VEO_STATUS_PATHS,
@@ -1039,6 +1050,7 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
         return True, flag, message, url
     return False, None, f"Ошибка статуса VEO: {resp}", None
 
+codex/implement-1080p-video-fetch-and-send
 def fetch_1080p_result_url(task_id: str, index: Optional[int] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     params: Dict[str, Any] = {"taskId": task_id}
     if index is not None:
@@ -1151,6 +1163,7 @@ async def send_kie_1080p_to_tg(
         wh = probe_size(path)
         width, height = (wh if wh else (None, None))
         resolution = f"{width}x{height}" if width and height else None
+        main
         kie_event(
             "1080_LOCAL",
             taskId=task_id,
@@ -1211,10 +1224,24 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
             "aspect_ratio": aspect_ratio,
         },
     }
-    status, resp, req_id = _kie_request("POST", KIE_MJ_GENERATE, json_payload=payload)
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "mj",
+        "generate",
+        "POST",
+        KIE_MJ_GENERATE_PATHS,
+        json_payload=payload,
+    )
     code = resp.get("code", status)
     tid = _extract_task_id(resp)
-    kie_event("MJ_SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, aspect=aspect_ratio)
+    kie_event(
+        "MJ_SUBMIT",
+        request_id=req_id,
+        status=status,
+        code=code,
+        task_id=tid,
+        aspect=aspect_ratio,
+        path=path_used,
+    )
     if status == 200 and code == 200:
         if tid:
             return True, tid, "MJ задача создана."
@@ -1222,15 +1249,29 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
     return False, None, _kie_error_message(status, resp)
 
 def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
-    status, resp, req_id = _kie_request("GET", KIE_MJ_STATUS, params={"taskId": task_id})
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "mj",
+        "status",
+        "GET",
+        KIE_MJ_STATUS_PATHS,
+        params={"taskId": task_id},
+    )
     code = resp.get("code", status)
-    data = resp.get("data") or {}
-    if isinstance(data, str):
+    raw_data = resp.get("data")
+    if isinstance(raw_data, str):
         try:
-            data = json.loads(data)
+            parsed = json.loads(raw_data)
+            data = parsed if isinstance(parsed, dict) else {"value": parsed}
         except Exception:
-            data = {"raw": data}
+            data = {"raw": raw_data}
+    elif isinstance(raw_data, dict):
+        data = raw_data
+    else:
+        data = None
     flag = _parse_success_flag(data) if isinstance(data, dict) else None
+    not_found = _is_not_found_response(status, resp)
+    if not_found:
+        flag = 0
     kie_event(
         "MJ_STATUS",
         request_id=req_id,
@@ -1238,7 +1279,11 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
         status=status,
         code=code,
         flag=flag,
+        path=path_used,
+        not_found=not_found,
     )
+    if not_found:
+        return True, 0, None
     if status == 200 and code == 200:
         return True, flag, data if isinstance(data, dict) else None
     return False, None, None
@@ -1585,6 +1630,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Режимы
     if data.startswith("mode:"):
         mode = data.split(":",1)[1]
+        if mode == "prompt_master":
+            s["mode"] = None
+            await q.message.reply_text(
+                f"{PROMPT_MASTER_HEADER} 2.0 запускается командой /promptmaster.\n\n{PROMPT_MASTER_BODY}"
+            )
+            return
         s["mode"] = mode
         if mode in ("veo_text_fast","veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if mode.endswith("fast") else "veo3"
@@ -1596,8 +1647,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show_or_update_veo_card(update.effective_chat.id, ctx)
             await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
             return
-        if mode == "prompt_master":
-            await q.message.reply_text(PM_HINT, parse_mode=ParseMode.MARKDOWN); return
         if mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
         if mode == "mj_txt":
@@ -1793,18 +1842,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🧷 Ссылка на изображение принята.")
         if mode in ("veo_text_fast","veo_text_quality","veo_photo"):
             await show_or_update_veo_card(update.effective_chat.id, ctx)
-        return
-
-    if mode == "prompt_master":
-        if not text:
-            await update.message.reply_text("✍️ Напишите идею по подсказке выше."); return
-        if len(text) > 700:
-            await update.message.reply_text("ℹ️ Урежу ввод до 700 символов для лучшего качества.")
-        prompt = await oai_prompt_master(text[:700])
-        if not prompt:
-            await update.message.reply_text("⚠️ Prompt-Master недоступен или ответ пуст."); return
-        s["last_prompt"] = prompt
-        await update.message.reply_text(f"🧠 Готово! Вот ваш кинопромпт:\n\n```\n{prompt}\n```", parse_mode=ParseMode.MARKDOWN)
         return
 
     if mode == "chat":
@@ -2208,6 +2245,7 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
+    application.add_handler(prompt_master_conv, group=10)
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))
