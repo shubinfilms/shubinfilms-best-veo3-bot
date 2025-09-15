@@ -25,7 +25,7 @@ from telegram.ext import (
 )
 
 from handlers.prompt_master_handler import PROMPT_MASTER_HINT
-from prompt_master import generate_prompt
+from prompt_master import generate_prompt_master
 
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
@@ -609,11 +609,9 @@ DEFAULT_STATE = {
 
 MODE_PROMPTMASTER = "MODE_PROMPTMASTER"
 PROMPT_MASTER_TIMEOUT = 27.0
-PROMPT_MASTER_ERROR_MESSAGE = "Не удалось собрать промпт, попробуй короче/иначе сформулировать."
+PROMPT_MASTER_ERROR_MESSAGE = "❌ Не удалось собрать промпт. Попробуй сформулировать короче."
 PROMPT_MASTER_CARD_TEMPLATE = (
     "🟦 Карточка Prompt-Master\n"
-    "• Формат: auto (VEO/MJ)\n"
-    "• Референс: нет\n\n"
     "✍️ Промпт:\n{prompt}"
 )
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -1839,8 +1837,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
         user_id = update.effective_user.id if update.effective_user else None
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(generate_prompt, text),
+            prompt_text = await asyncio.wait_for(
+                asyncio.to_thread(generate_prompt_master, text),
                 timeout=PROMPT_MASTER_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -1852,11 +1850,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
             return
 
-        prompt_text = ""
-        if isinstance(result, dict):
-            prompt_text = (result.get("text_markdown") or "").strip()
-        elif isinstance(result, str):
-            prompt_text = result.strip()
+        prompt_text = (prompt_text or "").strip()
         if not prompt_text:
             log.error("PromptMaster empty response: uid=%s", user_id)
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
