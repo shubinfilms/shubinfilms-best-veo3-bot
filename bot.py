@@ -5,7 +5,7 @@
 # (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, threading
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
@@ -83,6 +83,8 @@ except Exception:
 REDIS_URL    = _env("REDIS_URL")
 REDIS_PREFIX = _env("REDIS_PREFIX", "veo3:prod")
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+BALANCE_BACKUP_PATH = _env("BALANCE_BACKUP_PATH", os.path.join(SCRIPT_DIR, "balances.json")).strip()
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
 # ==========================
@@ -134,6 +136,146 @@ def promo_mark_used(code: str, uid: int):
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
+
+
+class PersistentBalanceStorage:
+    def __init__(self, redis_conn: Optional["redis.Redis"], backup_path: str):
+        self.redis = redis_conn
+        self.backup_path = backup_path
+        self.backup_enabled = bool(self.backup_path)
+        self._lock = threading.RLock()
+        self._balances: Dict[str, int] = {}
+        if self.backup_enabled:
+            self.backup_path = os.path.abspath(self.backup_path)
+        self._load_backup()
+        self._sync_backup_to_redis()
+
+    @staticmethod
+    def _parse_int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _redis_get(self, key: str) -> Optional[int]:
+        if not self.redis:
+            return None
+        try:
+            raw = self.redis.get(key)
+        except redis.RedisError as exc:
+            log.warning("Redis get failed for %s: %s", key, exc)
+            return None
+        if raw is None:
+            return None
+        parsed = self._parse_int(raw)
+        if parsed is None:
+            log.warning("Invalid balance value in Redis for %s: %r", key, raw)
+        return parsed
+
+    def _redis_set(self, key: str, value: int) -> bool:
+        if not self.redis:
+            return False
+        try:
+            self.redis.set(key, value)
+            return True
+        except redis.RedisError as exc:
+            log.warning("Redis set failed for %s: %s", key, exc)
+            return False
+
+    def _load_backup(self):
+        if not self.backup_enabled:
+            return
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.backup_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                data = raw
+        except FileNotFoundError:
+            data = {}
+        except Exception as exc:
+            log.warning("Failed to load balance backup %s: %s", self.backup_path, exc)
+            data = {}
+
+        cleaned: Dict[str, int] = {}
+        for key, value in data.items():
+            parsed = self._parse_int(value)
+            if parsed is not None:
+                cleaned[str(key)] = parsed
+
+        with self._lock:
+            self._balances = cleaned
+
+    def _write_backup_locked(self):
+        if not self.backup_enabled:
+            return
+        try:
+            directory = os.path.dirname(self.backup_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp_path = f"{self.backup_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(self._balances, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp_path, self.backup_path)
+        except Exception as exc:
+            log.warning("Failed to write balance backup %s: %s", self.backup_path, exc)
+
+    def _update_backup(self, uid: int, value: int):
+        if not self.backup_enabled:
+            return
+        with self._lock:
+            key = str(uid)
+            int_value = int(value)
+            if self._balances.get(key) == int_value:
+                return
+            self._balances[key] = int_value
+            self._write_backup_locked()
+
+    def _get_backup(self, uid: int) -> Optional[int]:
+        if not self.backup_enabled:
+            return None
+        with self._lock:
+            value = self._balances.get(str(uid))
+        if value is None:
+            return None
+        return int(value)
+
+    def _sync_backup_to_redis(self):
+        if not self.redis or not self.backup_enabled or not self._balances:
+            return
+        for uid, value in list(self._balances.items()):
+            key = _rk("balance", str(uid))
+            try:
+                if self.redis.get(key) is None:
+                    self.redis.set(key, value)
+            except redis.RedisError as exc:
+                log.warning("Redis sync failed for %s: %s", key, exc)
+                break
+
+    def get(self, uid: int) -> int:
+        if not uid:
+            return 0
+        key = _rk("balance", str(uid))
+        value = self._redis_get(key)
+        if value is not None:
+            self._update_backup(uid, value)
+            return value
+        backup = self._get_backup(uid)
+        if backup is not None:
+            return backup
+        return 0
+
+    def set(self, uid: int, value: int) -> int:
+        value = max(0, int(value))
+        if not uid:
+            return value
+        key = _rk("balance", str(uid))
+        self._redis_set(key, value)
+        self._update_backup(uid, value)
+        return value
+
+
+balance_storage = PersistentBalanceStorage(redis_client, BALANCE_BACKUP_PATH)
 
 # ==========================
 #   Helpers / storage
@@ -353,19 +495,27 @@ def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     except Exception: return None
 
 def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    cached = ctx.user_data.get("balance")
+    if cached is not None:
+        try:
+            return int(cached)
+        except (TypeError, ValueError):
+            pass
+
     uid = get_user_id(ctx)
-    if redis_client and uid:
-        v = redis_client.get(_rk("balance", str(uid)))
-        if v is not None:
-            try: return int(v)
-            except: return 0
-    return int(ctx.user_data.get("balance", 0))
+    if not uid:
+        return 0
+
+    balance = balance_storage.get(uid)
+    ctx.user_data["balance"] = balance
+    return balance
 
 def set_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, v: int):
     v = max(0, int(v))
     ctx.user_data["balance"] = v
     uid = get_user_id(ctx)
-    if redis_client and uid: redis_client.set(_rk("balance", str(uid)), v)
+    if uid:
+        balance_storage.set(uid, v)
 
 def add_tokens(ctx: ContextTypes.DEFAULT_TYPE, add: int):
     set_user_balance_value(ctx, get_user_balance_value(ctx) + int(add))
