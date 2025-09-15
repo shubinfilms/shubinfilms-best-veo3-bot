@@ -7,6 +7,7 @@
 
 # odex/fix-balance-reset-after-deploy
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io
+from html import escape
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from datetime import datetime, timezone
@@ -676,10 +677,12 @@ DEFAULT_STATE = {
 
 MODE_PROMPTMASTER = "MODE_PROMPTMASTER"
 PROMPT_MASTER_TIMEOUT = 27.0
-PROMPT_MASTER_ERROR_MESSAGE = "❌ Не удалось собрать промпт. Попробуй сформулировать короче."
+PROMPT_MASTER_ERROR_MESSAGE = (
+    f"{cemoji('cross')} Не удалось собрать промпт. Попробуй сформулировать короче."
+)
 PROMPT_MASTER_CARD_TEMPLATE = (
-    "🟦 Карточка Prompt-Master\n"
-    "✍️ Промпт:\n{prompt}"
+    f"{cemoji('brain')} Карточка Prompt-Master\n"
+    f"{cemoji('paperclip')} Промпт:\n<code>{{prompt}}</code>"
 )
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
@@ -693,19 +696,95 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 # ==========================
 #   UI / Texts
 # ==========================
-WELCOME = (
-    "🎬 *Veo 3 — съёмочная команда*: опиши идею и получи *готовый клип*.\n"
-    "🖌️ *MJ — художник*: рисует изображение по тексту (16:9 или 9:16).\n"
-    "🍌 *Banana — редактор из будущего*: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
-    "🧠 *Prompt-Master* — вернёт профессиональный *кинопромпт*.\n"
-    "💬 *Обычный чат* — ответы на любые вопросы.\n\n"
-    "💎 *Ваш баланс:* {balance}\n"
-    "📈 Больше идей и примеров: {prompts_url}\n\n"
-    "Выберите режим 👇"
+CEMOJI: Dict[str, Tuple[str, str]] = {
+    "sparkles": ("5472164874886846699", "✨"),
+    "check": ("5427009714745517609", "✅"),
+    "cross": ("5465665476971471368", "❌"),
+    "thought": ("5465143921912846619", "💭"),
+    "speech": ("5465300082628763143", "💬"),
+    "camera": ("5375309569905938163", "📷"),
+    "clapper": ("5375464961822695044", "🎬"),
+    "brain": ("5237799019329105246", "🧠"),
+    "star": ("5435957248314579621", "⭐"),
+    "fire": ("5420315771991497307", "🔥"),
+    "party": ("5436040291507247633", "🎉"),
+    "paperclip": ("5377844313575150051", "📎"),
+    "bulb": ("5472146462362048818", "💡"),
+    "frame": ("5375074927252621134", "🖼️"),
+    "ticket": ("5377599075237502153", "🎟️"),
+    "hourglass": ("5451646226975955576", "⏳"),
+    "speak": ("5370765563226236970", "🗣️"),
+    "banana": ("5390950002551954897", "🍌"),
+    "rocket": ("5445284980978621387", "🚀"),
+    "diamond": ("5471952986970267163", "💎"),
+}
+
+
+def cemoji(name: str, fallback: Optional[str] = None) -> str:
+    record = CEMOJI.get(name)
+    if not record:
+        raise KeyError(f"Unknown custom emoji: {name}")
+    emoji_id, default = record
+    text = fallback if fallback is not None else default
+    return f'<tg-emoji emoji-id="{emoji_id}">{escape(text)}</tg-emoji>'
+
+
+CE = {name: cemoji(name) for name in CEMOJI}
+
+
+WELCOME_TEMPLATE = (
+    "{clapper} <b>Veo 3 — съёмочная команда</b>: опиши идею и получи <b>готовый клип</b>.\n"
+    "{frame} <b>MJ — художник</b>: рисует изображение по тексту (16:9 или 9:16).\n"
+    "{banana} <b>Banana — редактор из будущего</b>: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
+    "{brain} <b>Prompt-Master</b> — вернёт профессиональный <b>кинопромпт</b>.\n"
+    "{speech} <b>Обычный чат</b> — ответы на любые вопросы.\n\n"
+    "{diamond} <b>Ваш баланс: {balance}</b>\n"
+    "{sparkles} Больше идей и примеров: {prompts_url}\n\n"
+    "{sparkles} Выберите режим"
 )
 
+
 def render_welcome_for(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
-    return WELCOME.format(balance=get_user_balance_value(ctx), prompts_url=PROMPTS_CHANNEL_URL)
+    return WELCOME_TEMPLATE.format(
+        balance=get_user_balance_value(ctx),
+        prompts_url=escape(PROMPTS_CHANNEL_URL),
+        clapper=cemoji("clapper"),
+        frame=cemoji("frame"),
+        banana=cemoji("banana"),
+        brain=cemoji("brain"),
+        speech=cemoji("speech"),
+        diamond=cemoji("diamond"),
+        sparkles=cemoji("sparkles"),
+    )
+
+
+def format_balance_line(balance: Any) -> str:
+    return f"{CE['diamond']} <b>Ваш баланс: {escape(str(balance))}</b>"
+
+
+FAQ_TEXT_TEMPLATE = (
+    "{sparkles} <b>FAQ</b>\n"
+    "— <b>Как начать с VEO?</b>\n"
+    "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом и/или фото.\n"
+    "3) Карточка откроется автоматически — проверьте параметры и жмите «{rocket} Сгенерировать».\n\n"
+    "— <b>Fast vs Quality?</b> Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
+    "— <b>Форматы VEO?</b> 16:9 и 9:16. Готовые клипы загружаем в чат как видеофайлы.\n\n"
+    "— <b>MJ:</b> 16:9 или 9:16, цена 10{diamond}. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
+    "— <b>Banana:</b> до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
+    "— <b>Время ожидания:</b> VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
+    "— <b>Токены/возвраты:</b> списываются при старте; при ошибке/таймауте бот автоматически возвращает {diamond}.\n\n"
+    "— <b>Пополнение:</b> через Stars в меню. Где купить: {stars_buy}\n"
+    "— <b>Примеры и идеи:</b> кнопка «Канал с промптами»."
+)
+
+
+def render_faq_text() -> str:
+    return FAQ_TEXT_TEMPLATE.format(
+        sparkles=CE['sparkles'],
+        rocket=CE['rocket'],
+        diamond=CE['diamond'],
+        stars_buy=escape(STARS_BUY_URL),
+    )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
@@ -743,11 +822,11 @@ def _mj_format_card_text(aspect: str) -> str:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     choice = "Горизонтальный (16:9)" if aspect == "16:9" else "Вертикальный (9:16)"
     return (
-        "🖼 Midjourney\n"
+        f"{CE['frame']} Midjourney\n"
         "Выберите формат изображения.\n\n"
         "• Горизонтальный — 16:9\n"
         "• Вертикальный — 9:16\n\n"
-        f"Текущий выбор: {choice}"
+        f"Текущий выбор: <b>{choice}</b>"
     )
 
 def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
@@ -765,14 +844,14 @@ def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
 def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     lines = [
-        "🖼 Midjourney",
+        f"{CE['frame']} Midjourney",
         "",
-        'Введите промпт сообщением. После этого нажмите "Подтвердить".',
-        f"Текущий формат: {aspect}",
+        f"{CE['paperclip']} Введите промпт сообщением. После этого нажмите «Подтвердить».",
+        f"Текущий формат: <b>{escape(aspect)}</b>",
     ]
     snippet = _short_prompt(prompt)
     if snippet:
-        lines.extend(["", f'Последний промпт: "{snippet}"'])
+        lines.extend(["", f"{CE['paperclip']} Последний промпт: <code>{escape(snippet)}</code>"])
     return "\n".join(lines)
 
 def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -794,6 +873,7 @@ async def _send_or_edit_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, te
                 chat_id=chat_id,
                 message_id=mid,
                 text=text,
+                parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
             )
@@ -801,6 +881,7 @@ async def _send_or_edit_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, te
             msg = await ctx.bot.send_message(
                 chat_id,
                 text,
+                parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
             )
@@ -813,6 +894,7 @@ async def _send_or_edit_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, te
             msg = await ctx.bot.send_message(
                 chat_id,
                 text,
+                parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
             )
@@ -836,16 +918,17 @@ async def show_mj_prompt_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> N
 async def show_mj_generating_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, prompt: str, aspect: str) -> None:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     snippet = _short_prompt(prompt, 160)
+    safe_snippet = escape(snippet) if snippet else "—"
     text = (
-        "⏳ Midjourney генерирует изображение…\n"
-        f"Формат: {aspect}\n"
-        f'Промпт: "{snippet}"'
+        f"{CE['hourglass']} Midjourney генерирует изображение…\n"
+        f"Формат: <code>{escape(aspect)}</code>\n"
+        f"Промпт: <code>{safe_snippet}</code>"
     )
     await _send_or_edit_mj_card(chat_id, ctx, text, None)
 
 def banana_examples_block() -> str:
     return (
-        "💡 *Примеры запросов:*\n"
+        f"{CE['bulb']} <b>Примеры запросов:</b>\n"
         "• поменяй фон на городской вечер\n"
         "• смени одежду на чёрный пиджак\n"
         "• добавь лёгкий макияж, подчеркни глаза\n"
@@ -856,12 +939,13 @@ def banana_examples_block() -> str:
 def banana_card_text(s: Dict[str, Any]) -> str:
     n = len(s.get("banana_images") or [])
     prompt = (s.get("last_prompt") or "—").strip()
+    prompt_html = escape(prompt) if prompt else "—"
     lines = [
-        "🍌 *Карточка Banana*",
-        f"🧩 Фото: *{n}/4*  •  Промпт: *{'есть' if s.get('last_prompt') else 'нет'}*",
+        f"{CE['banana']} <b>Карточка Banana</b>",
+        f"{CE['frame']} Фото: <b>{n}/4</b>  •  Промпт: <b>{'есть' if s.get('last_prompt') else 'нет'}</b>",
         "",
-        "🖊️ *Промпт:*",
-        f"`{prompt}`",
+        f"{CE['paperclip']} <b>Промпт:</b>",
+        f"<code>{prompt_html}</code>",
         "",
         banana_examples_block()
     ]
@@ -881,13 +965,16 @@ def banana_kb() -> InlineKeyboardMarkup:
 def veo_card_text(s: Dict[str, Any]) -> str:
     prompt = (s.get("last_prompt") or "—").strip()
     img = "есть" if s.get("last_image_url") else "нет"
+    aspect = escape(s.get("aspect") or "16:9")
+    model = "Veo Quality" if s.get("model") == "veo3" else "Veo Fast"
+    prompt_html = escape(prompt) if prompt else "—"
     return (
-        "🟦 *Карточка VEO*\n"
-        f"• Формат: *{s.get('aspect') or '16:9'}*\n"
-        f"• Модель: *{'Veo Quality' if s.get('model')=='veo3' else 'Veo Fast'}*\n"
-        f"• Фото-референс: *{img}*\n\n"
-        "🖊️ *Промпт:*\n"
-        f"`{prompt}`"
+        f"{CE['clapper']} <b>Карточка VEO</b>\n"
+        f"{CE['frame']} Формат: <b>{aspect}</b>\n"
+        f"{CE['rocket']} Модель: <b>{model}</b>\n"
+        f"{CE['camera']} Фото-референс: <b>{img}</b>\n\n"
+        f"{CE['paperclip']} <b>Промпт:</b>\n"
+        f"<code>{prompt_html}</code>"
     )
 
 def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -1185,14 +1272,22 @@ async def send_kie_1080p_to_tg(
             )
 
     if not chosen_url:
-        await ctx.bot.send_message(chat_id, "❌ Не удалось получить видео.")
+        await ctx.bot.send_message(
+            chat_id,
+            f"{CE['cross']} Не удалось получить видео.",
+            parse_mode=ParseMode.HTML,
+        )
         return False
 
     try:
         path = download_file(chosen_url)
     except Exception as exc:
         kie_event("1080_DOWNLOAD_FAIL", taskId=task_id, index=index, error=str(exc))
-        await ctx.bot.send_message(chat_id, "❌ Не удалось отправить видео.")
+        await ctx.bot.send_message(
+            chat_id,
+            f"{CE['cross']} Не удалось отправить видео.",
+            parse_mode=ParseMode.HTML,
+        )
         return False
 
     try:
@@ -1488,7 +1583,12 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             ok, flag, msg, res_url = await asyncio.to_thread(get_kie_veo_status, task_id)
             if not ok:
                 _refund("status_error", msg)
-                await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса VEO. 💎 Токены возвращены.\n{msg or ''}")
+                details = escape(msg or "")
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['cross']} Ошибка статуса VEO. {CE['diamond']} Токены возвращены.\n{details}",
+                    parse_mode=ParseMode.HTML,
+                )
                 break
             if isinstance(res_url, str) and res_url.startswith("http"):
                 # 🔄 освежаем ссылку непосредственно перед отправкой
@@ -1504,7 +1604,11 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     task_id=task_id,
                     final_url=final_url,
                 )
-                await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['clapper']} Рендер завершён — отправляю файл…",
+                    parse_mode=ParseMode.HTML,
+                )
                 sent = await send_kie_1080p_to_tg(
                     ctx,
                     chat_id,
@@ -1516,27 +1620,42 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                 if sent:
                     await ctx.bot.send_message(
                         chat_id,
-                        "✅ Готово!",
+                        f"{CE['check']} Готово!",
                         reply_markup=InlineKeyboardMarkup(
                             [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
                         ),
+                        parse_mode=ParseMode.HTML,
                     )
                 break
             if flag in (2, 3):
 # codex/update-video-file-sending-logic
                 add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
-                await ctx.bot.send_message(chat_id, f"❌ Не удалось получить видео. 💎 Токены возвращены.\n{msg or ''}")
+                details = escape(msg or "")
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['cross']} Не удалось получить видео. {CE['diamond']} Токены возвращены.\n{details}",
+                    parse_mode=ParseMode.HTML,
+                )
 # main
                 break
             if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
                 _refund("timeout")
-                await ctx.bot.send_message(chat_id, "⌛ Превышено время ожидания VEO. 💎 Токены возвращены.")
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['hourglass']} Превышено время ожидания VEO. {CE['diamond']} Токены возвращены.",
+                    parse_mode=ParseMode.HTML,
+                )
                 break
             await asyncio.sleep(POLL_INTERVAL_SECS)
     except Exception as e:
         log.exception("VEO poll crash: %s", e)
         _refund("exception", str(e))
-        try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка при опросе VEO. 💎 Токены возвращены.")
+        try:
+            await ctx.bot.send_message(
+                chat_id,
+                f"{CE['fire']} Внутренняя ошибка при опросе VEO. {CE['diamond']} Токены возвращены.",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception: pass
     finally:
         if s.get("generation_id") == gen_id:
@@ -1580,12 +1699,20 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
             ok, flag, data = await asyncio.to_thread(mj_status, task_id)
             if not ok:
                 _refund("status_error")
-                await ctx.bot.send_message(chat_id, "❌ MJ: сервис недоступен. 💎 Токены возвращены.")
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['cross']} MJ: сервис недоступен. {CE['diamond']} Токены возвращены.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             if flag == 0:
                 if time.time() - start_ts > max_wait:
                     _refund("timeout")
-                    await ctx.bot.send_message(chat_id, "⌛ MJ долго отвечает. 💎 Токены возвращены.")
+                    await ctx.bot.send_message(
+                        chat_id,
+                        f"{CE['hourglass']} MJ долго отвечает. {CE['diamond']} Токены возвращены.",
+                        parse_mode=ParseMode.HTML,
+                    )
                     return
                 await asyncio.sleep(delay)
                 delay = min(delay + 6, 30)
@@ -1605,7 +1732,11 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     err = "No response from MidJourney Official Website after multiple attempts."
                 if (not retried) and prompt_for_retry and _mj_should_retry(err):
                     retried = True
-                    await ctx.bot.send_message(chat_id, "🔁 MJ подвис. Перезапускаю задачу бесплатно…")
+                    await ctx.bot.send_message(
+                        chat_id,
+                        f"{CE['sparkles']} MJ подвис. Перезапускаю задачу бесплатно…",
+                        parse_mode=ParseMode.HTML,
+                    )
                     ok2, new_tid, msg2 = await asyncio.to_thread(mj_generate, prompt_for_retry, aspect_ratio)
                     event("MJ_RETRY_SUBMIT", ok=ok2, task_id=new_tid, msg=msg2)
                     if ok2 and new_tid:
@@ -1615,7 +1746,12 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                         delay = 12
                         continue
                 _refund("error", err)
-                await ctx.bot.send_message(chat_id, f"❌ MJ: {err}\n💎 Токены возвращены.")
+                err_text = escape(err)
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['cross']} MJ: {err_text}\n{CE['diamond']} Токены возвращены.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             if flag == 1:
                 payload = data or {}
@@ -1627,12 +1763,22 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
 
                 if not urls:
                     _refund("empty")
-                    await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
+                    await ctx.bot.send_message(
+                        chat_id,
+                        f"{CE['bulb']} MJ вернул пустой результат. {CE['diamond']} Токены возвращены.",
+                        parse_mode=ParseMode.HTML,
+                    )
                     return
 
                 base_prompt = re.sub(r"\s+", " ", prompt_for_retry).strip()
                 snippet = base_prompt[:100] if base_prompt else "—"
-                caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
+                safe_ar = escape(aspect_ratio)
+                safe_snip = escape(snippet)
+                caption = (
+                    f"{CE['frame']} Midjourney\n"
+                    f"• Формат: <code>{safe_ar}</code>\n"
+                    f"• Промпт: <code>{safe_snip}</code>"
+                )
 
                 downloaded: List[Tuple[bytes, str]] = []
                 for idx, u in enumerate(urls[:10]):
@@ -1646,7 +1792,8 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     _refund("download_failed")
                     await ctx.bot.send_message(
                         chat_id,
-                        "⚠️ MJ вернул результат, но изображения не удалось загрузить. 💎 Токены возвращены.",
+                        f"{CE['bulb']} MJ вернул результат, но изображения не удалось загрузить. {CE['diamond']} Токены возвращены.",
+                        parse_mode=ParseMode.HTML,
                     )
                     return
 
@@ -1658,6 +1805,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                                 chat_id=chat_id,
                                 photo=_make_input_photo(data, filename),
                                 caption=caption if idx == 0 else None,
+                                parse_mode=ParseMode.HTML,
                             )
                             sent_any = True
                         except Exception as send_exc:
@@ -1672,6 +1820,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                             InputMediaPhoto(
                                 media=_make_input_photo(data, filename),
                                 caption=caption if idx == 0 else None,
+                                parse_mode=ParseMode.HTML,
                             )
                         )
                     try:
@@ -1687,7 +1836,8 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     _refund("send_failed")
                     await ctx.bot.send_message(
                         chat_id,
-                        "❌ Не удалось отправить изображения MJ. 💎 Токены возвращены.",
+                        f"{CE['cross']} Не удалось отправить изображения MJ. {CE['diamond']} Токены возвращены.",
+                        parse_mode=ParseMode.HTML,
                     )
                     return
 
@@ -1695,14 +1845,24 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
                     [InlineKeyboardButton("Назад в меню", callback_data="back")],
                 ])
-                await ctx.bot.send_message(chat_id, "Галерея сгенерирована.", reply_markup=keyboard)
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{CE['sparkles']} Галерея сгенерирована.",
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML,
+                )
 
                 success = True
                 return
     except Exception as e:
         log.exception("MJ poll crash: %s", e)
         _refund("exception", str(e))
-        try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка MJ. 💎 Токены возвращены.")
+        try:
+            await ctx.bot.send_message(
+                chat_id,
+                f"{CE['fire']} Внутренняя ошибка MJ. {CE['diamond']} Токены возвращены.",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception: pass
     finally:
         s = state(ctx)
@@ -1712,8 +1872,19 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
         s["last_prompt"] = None
         mid = s.get("last_mj_msg_id")
         if mid:
-            final_text = "✅ Midjourney: изображение обработано." if success else "ℹ️ Midjourney: поток завершён."
-            try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None)
+            final_text = (
+                f"{CE['check']} Midjourney: изображение обработано."
+                if success
+                else f"{CE['sparkles']} Midjourney: поток завершён."
+            )
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=final_text,
+                    reply_markup=None,
+                    parse_mode=ParseMode.HTML,
+                )
             except Exception: pass
             s["last_mj_msg_id"] = None
         if op_key:
@@ -1748,27 +1919,33 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
         _set_cached_balance(ctx, bonus_result.balance)
         if bonus_result.applied:
-            await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
+            await update.message.reply_text(
+                f"{CE['party']} Добро пожаловать! Начислил +10{CE['diamond']} на баланс.",
+                parse_mode=ParseMode.HTML,
+            )
     except Exception as exc:
         log.exception("Signup bonus failed for %s: %s", uid, exc)
 
     await update.message.reply_text(
         render_welcome_for(uid, ctx),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(),
     )
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "💳 Пополнение через *Telegram Stars*.\nЕсли звёзд не хватает — купите в официальном боте:",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
+        f"{CE['diamond']} Пополнение через <b>Telegram Stars</b>.\nЕсли звёзд не хватает — купите в официальном боте:",
+        parse_mode=ParseMode.HTML, reply_markup=stars_topup_kb()
     )
 
 
 # codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     balance = get_user_balance_value(ctx, force_refresh=True)
-    await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+    await update.message.reply_text(
+        format_balance_line(balance),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1778,14 +1955,23 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _set_cached_balance(ctx, result.calculated)
     except Exception as exc:
         log.exception("Balance recalc failed for %s: %s", uid, exc)
-        await update.message.reply_text("⚠️ Не удалось пересчитать баланс. Попробуйте позже.")
+        await update.message.reply_text(
+            f"{CE['bulb']} Не удалось пересчитать баланс. Попробуйте позже.",
+            parse_mode=ParseMode.HTML,
+        )
         return
     if result.updated:
+        prev_val = escape(str(result.previous))
+        new_val = escape(str(result.calculated))
         await update.message.reply_text(
-            f"♻️ Баланс обновлён: было {result.previous} 💎 → стало {result.calculated} 💎"
+            f"{CE['sparkles']} Баланс обновлён: было {prev_val} {CE['diamond']} → стало {new_val} {CE['diamond']}",
+            parse_mode=ParseMode.HTML,
         )
     else:
-        await update.message.reply_text(f"✅ Баланс актуален: {result.calculated} 💎")
+        await update.message.reply_text(
+            f"{CE['check']} Баланс актуален: {escape(str(result.calculated))} {CE['diamond']}",
+            parse_mode=ParseMode.HTML,
+        )
 main
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1811,7 +1997,11 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
     log.exception("Unhandled error: %s", context.error)
     try:
         if update and update.effective_chat:
-            await context.bot.send_message(update.effective_chat.id, "⚠️ Системная ошибка. Попробуйте ещё раз.")
+            await context.bot.send_message(
+                update.effective_chat.id,
+                f"{CE['fire']} Системная ошибка. Попробуйте ещё раз.",
+                parse_mode=ParseMode.HTML,
+            )
     except Exception:
         pass
 
@@ -1823,9 +2013,9 @@ async def show_or_update_banana_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYP
     try:
         if mid:
             await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text,
-                                            parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
+                                            parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
         else:
-            m = await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
+            m = await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
             s["last_ui_msg_id_banana"] = m.message_id
     except Exception as e:
         log.warning("banana card edit/send failed: %s", e)
@@ -1838,9 +2028,9 @@ async def show_or_update_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if mid:
             await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text,
-                                            parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
+                                            parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
         else:
-            m = await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
+            m = await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
             s["last_ui_msg_id"] = m.message_id
     except Exception as e:
         log.warning("veo card edit/send failed: %s", e)
@@ -1852,38 +2042,45 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "promo_open":
         if not PROMO_ENABLED:
-            await q.message.reply_text("🎟️ Промокоды временно отключены.")
+            await q.message.reply_text(
+                f"{CE['ticket']} Промокоды временно отключены.",
+                parse_mode=ParseMode.HTML,
+            )
             return
         s["mode"] = "promo"
-        await q.message.reply_text("🎟️ Введите промокод одним сообщением:"); return
+        await q.message.reply_text(
+            f"{CE['ticket']} Введите промокод одним сообщением:",
+            parse_mode=ParseMode.HTML,
+        ); return
 
     if data == "faq":
         await q.message.reply_text(
-            "📘 *FAQ*\n"
-            "— *Как начать с VEO?*\n"
-            "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом и/или фото. "
-            "3) Карточка откроется автоматически — проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
-            "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
-            "— *Форматы VEO?* 16:9 и 9:16. Готовые клипы загружаем в чат как видеофайлы.\n\n"
-            "— *MJ:* 16:9 или 9:16, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
-            "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
-            "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
-            "— *Токены/возвраты:* списываются при старте; при ошибке/таймауте бот автоматически возвращает 💎.\n\n"
-            f"— *Пополнение:* через Stars в меню. Где купить: {STARS_BUY_URL}\n"
-            "— *Примеры и идеи:* кнопка «Канал с промптами».",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb()
+            render_faq_text(),
+            parse_mode=ParseMode.HTML, reply_markup=main_menu_kb()
         ); return
 
     if data == "back":
         s.update({**DEFAULT_STATE})
-        await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
+        await q.message.reply_text(
+            f"{CE['sparkles']} Главное меню:",
+            reply_markup=main_menu_kb(),
+            parse_mode=ParseMode.HTML,
+        ); return
 
     if data == "start_new_cycle":
         s.update({**DEFAULT_STATE})
-        await q.message.reply_text("Выберите режим:", reply_markup=main_menu_kb()); return
+        await q.message.reply_text(
+            f"{CE['sparkles']} Выберите режим:",
+            reply_markup=main_menu_kb(),
+            parse_mode=ParseMode.HTML,
+        ); return
 
     if data == "topup_open":
-        await q.message.reply_text("💳 Выберите пакет Stars ниже:", reply_markup=stars_topup_kb()); return
+        await q.message.reply_text(
+            f"{CE['diamond']} Выберите пакет Stars ниже:",
+            reply_markup=stars_topup_kb(),
+            parse_mode=ParseMode.HTML,
+        ); return
 
     # Покупка
     if data.startswith("buy:stars:"):
@@ -1914,21 +2111,30 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         selected_mode = data.split(":", 1)[1]
         if selected_mode == "prompt_master":
             activate_prompt_master_mode(ctx)
-            await q.message.reply_text(PROMPT_MASTER_HINT)
+            await q.message.reply_text(PROMPT_MASTER_HINT, parse_mode=ParseMode.HTML)
             return
         s["mode"] = selected_mode
         if selected_mode in ("veo_text_fast", "veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
             await show_or_update_veo_card(update.effective_chat.id, ctx)
-            await q.message.reply_text("✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.")
+            await q.message.reply_text(
+                f"{CE['paperclip']} Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
+                parse_mode=ParseMode.HTML,
+            )
             return
         if selected_mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
             await show_or_update_veo_card(update.effective_chat.id, ctx)
-            await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
+            await q.message.reply_text(
+                f"{CE['camera']} Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.",
+                parse_mode=ParseMode.HTML,
+            )
             return
         if selected_mode == "chat":
-            await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
+            await q.message.reply_text(
+                f"{CE['speech']} Чат активен. Напишите сообщение.",
+                parse_mode=ParseMode.HTML,
+            ); return
         if selected_mode == "mj_txt":
             s["aspect"] = "9:16" if s.get("aspect") == "9:16" else "16:9"
             s["last_prompt"] = None
@@ -1944,7 +2150,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if selected_mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
-            await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(
+                f"{CE['banana']} Banana включён\nСначала пришлите до <b>4 фото</b> (можно по одному). Когда будут готовы — пришлите <b>текст-промпт</b>, что изменить.",
+                parse_mode=ParseMode.HTML,
+            )
             await show_or_update_banana_card(update.effective_chat.id, ctx); return
 
     if data.startswith("mj:"):
@@ -1959,7 +2168,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if action == "aspect":
             if s.get("mj_generating"):
-                await q.message.reply_text("⏳ Дождитесь завершения текущей генерации."); return
+                await q.message.reply_text(
+                    f"{CE['hourglass']} Дождитесь завершения текущей генерации.",
+                    parse_mode=ParseMode.HTML,
+                ); return
             new_aspect = "9:16" if payload == "9:16" else "16:9"
             s["aspect"] = new_aspect
             s["last_prompt"] = None
@@ -1968,7 +2180,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if action == "change_format":
             if s.get("mj_generating"):
-                await q.message.reply_text("⏳ Дождитесь завершения текущей генерации."); return
+                await q.message.reply_text(
+                    f"{CE['hourglass']} Дождитесь завершения текущей генерации.",
+                    parse_mode=ParseMode.HTML,
+                ); return
             await show_mj_format_card(chat_id, ctx)
             return
 
@@ -1980,17 +2195,35 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_last_wait_ts"] = 0.0
             mid = s.get("last_mj_msg_id")
             if mid:
-                try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text="❌ Midjourney отменён.", reply_markup=None)
-                except Exception: pass
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=mid,
+                        text=f"{CE['cross']} Midjourney отменён.",
+                        reply_markup=None,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
             s["last_mj_msg_id"] = None
-            await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
+            await q.message.reply_text(
+                f"{CE['sparkles']} Главное меню:",
+                reply_markup=main_menu_kb(),
+            parse_mode=ParseMode.HTML,
+        ); return
 
         if action == "confirm":
             if s.get("mj_generating"):
-                await q.message.reply_text("⏳ Уже идёт генерация. Дождитесь результата."); return
+                await q.message.reply_text(
+                    f"{CE['hourglass']} Уже идёт генерация. Дождитесь результата.",
+                    parse_mode=ParseMode.HTML,
+                ); return
             prompt = (s.get("last_prompt") or "").strip()
             if not prompt:
-                await q.message.reply_text("❌ Промпт не найден, отправьте текст и повторите."); return
+                await q.message.reply_text(
+                    f"{CE['cross']} Промпт не найден, отправьте текст и повторите.",
+                    parse_mode=ParseMode.HTML,
+                ); return
             price = TOKEN_COSTS['mj']
             aspect_value = "9:16" if s.get("aspect") == "9:16" else "16:9"
             fingerprint = _make_fingerprint({"prompt": prompt, "aspect": aspect_value})
@@ -2006,14 +2239,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if status == "insufficient":
                 _clear_operation(ctx, op_key)
                 await q.message.reply_text(
-                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
+                    f"{CE['diamond']} Недостаточно токенов: нужно {escape(str(price))}, на балансе {escape(str(rest))}.",
                     reply_markup=stars_topup_kb(),
+                    parse_mode=ParseMode.HTML,
                 );
                 return
             if status == "duplicate":
-                await q.message.reply_text("⏳ Уже выполняю этот промпт. Дождитесь результата.")
+                await q.message.reply_text(
+                    f"{CE['hourglass']} Уже выполняю этот промпт. Дождитесь результата.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
-            await q.message.reply_text("✅ Промпт принят.")
+            await q.message.reply_text(
+                f"{CE['check']} Промпт принят.",
+                parse_mode=ParseMode.HTML,
+            )
             s["mj_generating"] = True
             s["mj_last_wait_ts"] = time.time()
             await show_mj_generating_card(chat_id, ctx, prompt, aspect_value)
@@ -2035,7 +2275,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 s["mj_generating"] = False
                 s["last_mj_task_id"] = None
                 s["mj_last_wait_ts"] = 0.0
-                await q.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены.")
+                details = escape(msg or "")
+                await q.message.reply_text(
+                    f"{CE['cross']} Не удалось создать MJ-задачу: {details}\n{CE['diamond']} Токены возвращены.",
+                    parse_mode=ParseMode.HTML,
+                )
                 await show_mj_prompt_card(chat_id, ctx)
                 return
             final_op_id = f"gen:{task_id}"
@@ -2049,14 +2293,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if action == "repeat":
             if s.get("mj_generating"):
-                await q.message.reply_text("⏳ Уже идёт генерация. Дождитесь результата."); return
+                await q.message.reply_text(
+                    f"{CE['hourglass']} Уже идёт генерация. Дождитесь результата.",
+                    parse_mode=ParseMode.HTML,
+                ); return
             s["mode"] = "mj_txt"
             s["last_prompt"] = None
             s["mj_generating"] = False
             s["mj_last_wait_ts"] = 0.0
             s["last_mj_task_id"] = None
             await show_mj_prompt_card(chat_id, ctx)
-            await q.message.reply_text("✍️ Пришлите новый промпт для Midjourney.")
+            await q.message.reply_text(
+                f"{CE['paperclip']} Пришлите новый промпт для Midjourney.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         return
@@ -2065,17 +2315,38 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("banana:"):
         act = data.split(":",1)[1]
         if act == "add_more":
-            await q.message.reply_text("➕ Пришлите ещё фото (всего до 4)."); return
+            await q.message.reply_text(
+                f"{CE['sparkles']} Пришлите ещё фото (всего до 4).",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         if act == "reset_imgs":
             s["banana_images"] = []
-            await q.message.reply_text("🧹 Фото очищены."); await show_or_update_banana_card(update.effective_chat.id, ctx); return
+            await q.message.reply_text(
+                f"{CE['sparkles']} Фото очищены.",
+                parse_mode=ParseMode.HTML,
+            )
+            await show_or_update_banana_card(update.effective_chat.id, ctx)
+            return
         if act == "edit_prompt":
-            await q.message.reply_text("✍️ Пришлите новый промпт для Banana."); return
+            await q.message.reply_text(
+                f"{CE['paperclip']} Пришлите новый промпт для Banana.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         if act == "start":
             imgs = s.get("banana_images") or []
             prompt = (s.get("last_prompt") or "").strip()
-            if not imgs:   await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото."); return
-            if not prompt: await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить)."); return
+            if not imgs:
+                await q.message.reply_text(
+                    f"{CE['bulb']} Сначала добавьте хотя бы одно фото.",
+                    parse_mode=ParseMode.HTML,
+                ); return
+            if not prompt:
+                await q.message.reply_text(
+                    f"{CE['bulb']} Добавьте текст-промпт (что изменить).",
+                    parse_mode=ParseMode.HTML,
+                ); return
             price = TOKEN_COSTS['banana']
             fingerprint = _make_fingerprint({"prompt": prompt, "images": imgs})
             op_key = f"banana:{fingerprint}"
@@ -2090,14 +2361,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if status == "insufficient":
                 _clear_operation(ctx, op_key)
                 await q.message.reply_text(
-                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
+                    f"{CE['diamond']} Недостаточно токенов: нужно {escape(str(price))}, на балансе {escape(str(rest))}.",
                     reply_markup=stars_topup_kb(),
+                    parse_mode=ParseMode.HTML,
                 );
                 return
             if status == "duplicate":
-                await q.message.reply_text("⏳ Уже обрабатываю предыдущий запрос Banana. Дождитесь результата.")
+                await q.message.reply_text(
+                    f"{CE['hourglass']} Уже обрабатываю предыдущий запрос Banana. Дождитесь результата.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
-            await q.message.reply_text("🍌 Запускаю Banana…")
+            await q.message.reply_text(
+                f"{CE['banana']} Запускаю Banana…",
+                parse_mode=ParseMode.HTML,
+            )
             s["banana_active_op_key"] = op_key
             asyncio.create_task(_banana_run_and_send(update.effective_chat.id, ctx, imgs, prompt, op_key, op_id, price)); return
 
@@ -2114,7 +2392,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "veo:start":
         prompt = (s.get("last_prompt") or "").strip()
         if not prompt:
-            await q.message.reply_text("⚠️ Сначала пришлите текстовый промпт."); return
+            await q.message.reply_text(
+                f"{CE['bulb']} Сначала пришлите текстовый промпт.",
+                parse_mode=ParseMode.HTML,
+            ); return
         price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
         uid = update.effective_user.id
         fingerprint = _make_fingerprint({
@@ -2134,14 +2415,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if status == "insufficient":
             _clear_operation(ctx, op_key)
             await q.message.reply_text(
-                f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
+                f"{CE['diamond']} Недостаточно токенов: нужно {escape(str(price))}, на балансе {escape(str(rest))}.",
                 reply_markup=stars_topup_kb(),
+                parse_mode=ParseMode.HTML,
             );
             return
         if status == "duplicate":
-            await q.message.reply_text("⏳ Уже выполняю предыдущий запрос. Дождитесь результата.")
+            await q.message.reply_text(
+                f"{CE['hourglass']} Уже выполняю предыдущий запрос. Дождитесь результата.",
+                parse_mode=ParseMode.HTML,
+            )
             return
-        await q.message.reply_text("🎬 Отправляю задачу в VEO…")
+        await q.message.reply_text(
+            f"{CE['clapper']} Отправляю задачу в VEO…",
+            parse_mode=ParseMode.HTML,
+        )
         ok, task_id, msg = await asyncio.to_thread(
             submit_kie_veo,
             prompt,
@@ -2162,8 +2450,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as exc:
                 log.exception("VEO submit refund failed for %s: %s", uid, exc)
             _clear_operation(ctx, op_key)
+            details = escape(msg or "")
             await q.message.reply_text(
-                f"❌ Не удалось создать VEO-задачу: {msg}\n💎 Токены возвращены.",
+                f"{CE['cross']} Не удалось создать VEO-задачу: {details}\n{CE['diamond']} Токены возвращены.",
+                parse_mode=ParseMode.HTML,
             )
             return
         final_op_id = f"gen:{task_id}"
@@ -2173,7 +2463,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["active_generation_op"] = op_key
         gen_id = uuid.uuid4().hex
         s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
-        await q.message.reply_text(f"🆔 VEO taskId: `{task_id}`\n🎞 Рендер начат — вернусь с готовым видео.", parse_mode=ParseMode.MARKDOWN)
+        await q.message.reply_text(
+            f"{CE['ticket']} VEO taskId: <code>{escape(str(task_id))}</code>\n{CE['clapper']} Рендер начат — вернусь с готовым видео.",
+            parse_mode=ParseMode.HTML,
+        )
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2196,39 +2489,48 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except asyncio.TimeoutError:
             log.error("PromptMaster timeout: uid=%s len=%s", user_id, len(text))
-            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
         except Exception:
             log.exception("PromptMaster error: uid=%s", user_id)
-            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
         prompt_text = (prompt_text or "").strip()
         if not prompt_text:
             log.error("PromptMaster empty response: uid=%s", user_id)
-            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
-        card_text = PROMPT_MASTER_CARD_TEMPLATE.format(prompt=prompt_text)
-        await update.message.reply_text(card_text)
+        card_text = PROMPT_MASTER_CARD_TEMPLATE.format(prompt=escape(prompt_text))
+        await update.message.reply_text(card_text, parse_mode=ParseMode.HTML)
         return
 
     # PROMO
     if mode == "promo":
         if not PROMO_ENABLED:
-            await update.message.reply_text("🎟️ Промокоды временно отключены.")
+            await update.message.reply_text(
+                f"{CE['ticket']} Промокоды временно отключены.",
+                parse_mode=ParseMode.HTML,
+            )
             s["mode"] = None
             return
         code = text.upper()
         uid = update.effective_user.id
         bonus = promo_amount(code)
         if not bonus:
-            await update.message.reply_text("❌ Неверный промокод.")
+            await update.message.reply_text(
+                f"{CE['cross']} Неверный промокод.",
+                parse_mode=ParseMode.HTML,
+            )
             s["mode"] = None
             return
         used_by = promo_used_global(code)
         if used_by and used_by != uid:
-            await update.message.reply_text("❌ Этот промокод уже использован.")
+            await update.message.reply_text(
+                f"{CE['cross']} Этот промокод уже использован.",
+                parse_mode=ParseMode.HTML,
+            )
             s["mode"] = None
             return
         try:
@@ -2241,21 +2543,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _set_cached_balance(ctx, result.balance)
             if not result.applied:
                 if used_by == uid or result.duplicate:
-                    await update.message.reply_text("❌ Этот промокод уже использован.")
+                    await update.message.reply_text(
+                        f"{CE['cross']} Этот промокод уже использован.",
+                        parse_mode=ParseMode.HTML,
+                    )
                 else:
-                    await update.message.reply_text("⚠️ Промокод сейчас недоступен. Попробуйте другой.")
+                    await update.message.reply_text(
+                        f"{CE['bulb']} Промокод сейчас недоступен. Попробуйте другой.",
+                        parse_mode=ParseMode.HTML,
+                    )
                 s["mode"] = None
                 return
         except Exception as exc:
             log.exception("Promo apply failed for %s (%s): %s", uid, code, exc)
-            await update.message.reply_text("⚠️ Не удалось применить промокод. Попробуйте позже.")
+            await update.message.reply_text(
+                f"{CE['bulb']} Не удалось применить промокод. Попробуйте позже.",
+                parse_mode=ParseMode.HTML,
+            )
             s["mode"] = None
             return
 
         promo_mark_used(code, uid)
         get_user_balance_value(ctx, force_refresh=True)
         await update.message.reply_text(
-            f"✅ Промокод активирован! Вам начислено {bonus} токенов."
+            f"{CE['check']} Промокод активирован! Вам начислено {escape(str(bonus))} токенов.",
+            parse_mode=ParseMode.HTML,
         )
         s["mode"] = None
         return
@@ -2265,21 +2577,37 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if low.startswith(("http://", "https://")) and any(low.split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".heic")):
         if mode == "banana":
             if len(s["banana_images"]) >= 4:
-                await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
+                await update.message.reply_text(
+                    f"{CE['bulb']} Достигнут лимит 4 фото.",
+                    reply_markup=banana_kb(),
+                    parse_mode=ParseMode.HTML,
+                ); return
             s["banana_images"].append(text.strip())
-            await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
+            await update.message.reply_text(
+                f"{CE['camera']} Фото принято ({len(s['banana_images'])}/4).",
+                parse_mode=ParseMode.HTML,
+            )
             await show_or_update_banana_card(update.effective_chat.id, ctx); return
         s["last_image_url"] = text.strip()
-        await update.message.reply_text("🧷 Ссылка на изображение принята.")
+        await update.message.reply_text(
+            f"{CE['paperclip']} Ссылка на изображение принята.",
+            parse_mode=ParseMode.HTML,
+        )
         if mode in ("veo_text_fast","veo_text_quality","veo_photo"):
             await show_or_update_veo_card(update.effective_chat.id, ctx)
         return
 
     if mode == "chat":
         if openai is None or not OPENAI_API_KEY:
-            await update.message.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY)."); return
+            await update.message.reply_text(
+                f"{CE['cross']} ChatGPT недоступен (нет OPENAI_API_KEY).",
+                parse_mode=ParseMode.HTML,
+            ); return
         try:
-            await update.message.reply_text("💬 Думаю над ответом…")
+            await update.message.reply_text(
+                f"{CE['thought']} Думаю над ответом…",
+                parse_mode=ParseMode.HTML,
+            )
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
                 model="gpt-4o-mini",
@@ -2291,21 +2619,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(answer)
         except Exception as e:
             log.exception("Chat error: %s", e)
-            await update.message.reply_text("⚠️ Ошибка запроса к ChatGPT.")
+            await update.message.reply_text(
+                f"{CE['bulb']} Ошибка запроса к ChatGPT.",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
     if mode == "mj_txt":
         if not text:
-            await update.message.reply_text("⚠️ Отправьте текстовый промпт.")
+            await update.message.reply_text(
+                f"{CE['bulb']} Отправьте текстовый промпт.",
+                parse_mode=ParseMode.HTML,
+            )
             return
         s["last_prompt"] = text
         await show_mj_prompt_card(update.effective_chat.id, ctx)
-        await update.message.reply_text("📝 Промпт сохранён. Нажмите «Подтвердить».")
+        await update.message.reply_text(
+            f"{CE['paperclip']} Промпт сохранён. Нажмите «Подтвердить».",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if mode == "banana":
         s["last_prompt"] = text
-        await update.message.reply_text("✍️ Промпт сохранён.")
+        await update.message.reply_text(
+            f"{CE['sparkles']} Промпт сохранён.",
+            parse_mode=ParseMode.HTML,
+        )
         await show_or_update_banana_card(update.effective_chat.id, ctx)
         return
 
@@ -2341,14 +2681,27 @@ async def _banana_run_and_send(
             log.warning("Failed to rename Banana op %s -> %s", op_id, final_op_id)
         _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
         s["banana_active_op_key"] = op_key
-        await ctx.bot.send_message(chat_id, f"🍌 Задача Banana создана.\n🆔 taskId={task_id}\nЖдём результат…")
+        await ctx.bot.send_message(
+            chat_id,
+            f"{CE['banana']} Задача Banana создана.\n{CE['ticket']} taskId=<code>{escape(str(task_id))}</code>\n{CE['hourglass']} Ждём результат…",
+            parse_mode=ParseMode.HTML,
+        )
         urls = await asyncio.to_thread(wait_for_banana_result, task_id, 8 * 60, 3)
         if not urls:
             _refund("empty")
-            await ctx.bot.send_message(chat_id, "⚠️ Banana вернула пустой результат. 💎 Токены возвращены."); return
+            await ctx.bot.send_message(
+                chat_id,
+                f"{CE['bulb']} Banana вернула пустой результат. {CE['diamond']} Токены возвращены.",
+                parse_mode=ParseMode.HTML,
+            ); return
         u0 = urls[0]
         try:
-            await ctx.bot.send_photo(chat_id=chat_id, photo=u0, caption="✅ Banana готово")
+            await ctx.bot.send_photo(
+                chat_id=chat_id,
+                photo=u0,
+                caption=f"{CE['check']} Banana готово",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             r = requests.get(u0, timeout=180)
             r.raise_for_status()
@@ -2359,7 +2712,8 @@ async def _banana_run_and_send(
                 await ctx.bot.send_document(
                     chat_id=chat_id,
                     document=InputFile(f, filename="banana.png"),
-                    caption="✅ Banana готово",
+                    caption=f"{CE['check']} Banana готово",
+                    parse_mode=ParseMode.HTML,
                 )
             try:
                 os.unlink(path)
@@ -2367,11 +2721,20 @@ async def _banana_run_and_send(
                 pass
     except KieBananaError as e:
         _refund("error", str(e))
-        await ctx.bot.send_message(chat_id, f"❌ Banana ошибка: {e}\n💎 Токены возвращены.")
+        details = escape(str(e))
+        await ctx.bot.send_message(
+            chat_id,
+            f"{CE['cross']} Banana ошибка: {details}\n{CE['diamond']} Токены возвращены.",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as e:
         _refund("exception", str(e))
         log.exception("BANANA unexpected: %s", e)
-        await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка Banana. 💎 Токены возвращены.")
+        await ctx.bot.send_message(
+            chat_id,
+            f"{CE['fire']} Внутренняя ошибка Banana. {CE['diamond']} Токены возвращены.",
+            parse_mode=ParseMode.HTML,
+        )
     finally:
         _clear_operation(ctx, op_key)
         s.pop("banana_active_op_key", None)
@@ -2384,23 +2747,39 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         file = await ctx.bot.get_file(ph.file_id)
         if not file.file_path:
-            await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram."); return
+            await update.message.reply_text(
+                f"{CE['bulb']} Не удалось получить путь к файлу Telegram.",
+                parse_mode=ParseMode.HTML,
+            ); return
         url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)
         if s.get("mode") == "banana":
             if len(s["banana_images"]) >= 4:
-                await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
+                await update.message.reply_text(
+                    f"{CE['bulb']} Достигнут лимит 4 фото.",
+                    reply_markup=banana_kb(),
+                    parse_mode=ParseMode.HTML,
+                ); return
             s["banana_images"].append(url)
             cap = (update.message.caption or "").strip()
             if cap: s["last_prompt"] = cap
-            await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
+            await update.message.reply_text(
+                f"{CE['camera']} Фото принято ({len(s['banana_images'])}/4).",
+                parse_mode=ParseMode.HTML,
+            )
             await show_or_update_banana_card(update.effective_chat.id, ctx); return
         s["last_image_url"] = url
-        await update.message.reply_text("🖼️ Фото принято как референс.")
+        await update.message.reply_text(
+            f"{CE['frame']} Фото принято как референс.",
+            parse_mode=ParseMode.HTML,
+        )
         if s.get("mode") in ("veo_text_fast","veo_text_quality","veo_photo"):
             await show_or_update_veo_card(update.effective_chat.id, ctx)
     except Exception as e:
         log.exception("Get photo failed: %s", e)
-        await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+        await update.message.reply_text(
+            f"{CE['bulb']} Не удалось обработать фото. Пришлите публичный URL картинки текстом.",
+            parse_mode=ParseMode.HTML,
+        )
 
 # ---------- Payments: Stars (XTR) ----------
 async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2429,14 +2808,26 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
                 result = credit_tokens(ctx, tokens, "topup_stars", f"payment:{charge_id}", payment_meta)
             except Exception as exc:
                 log.exception("Top-up credit failed for %s: %s", charge_id, exc)
-                await update.message.reply_text("⚠️ Платёж получен, но обновить баланс не удалось. Свяжитесь с поддержкой.")
+                await update.message.reply_text(
+                    f"{CE['bulb']} Платёж получен, но обновить баланс не удалось. Свяжитесь с поддержкой.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             balance = result.balance
-            msg = "✅ Оплата учтена повторно." if not result.applied else f"✅ Оплата получена: +{tokens} токенов."
-            await update.message.reply_text(f"{msg}\nБаланс: {balance} 💎")
+            if not result.applied:
+                msg = f"{CE['check']} Оплата учтена повторно."
+            else:
+                msg = f"{CE['check']} Оплата получена: +{escape(str(tokens))} токенов."
+            await update.message.reply_text(
+                f"{msg}\n{format_balance_line(balance)}",
+                parse_mode=ParseMode.HTML,
+            )
             return
         return
-    await update.message.reply_text("✅ Оплата получена.")
+    await update.message.reply_text(
+        f"{CE['check']} Оплата получена.",
+        parse_mode=ParseMode.HTML,
+    )
 
 # ==========================
 #   Redis runner lock
