@@ -241,6 +241,8 @@ PROMO_CODES = {
     "WELCOME50": 50,
     "FREE10": 10,
     "LABACCENT100": 100,
+    "BONUS50": 50,
+    "FRIENDS150": 150,
 }
 
 def promo_amount(code: str) -> Optional[int]:
@@ -2138,7 +2140,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         used_by = promo_used_global(code)
         if used_by and used_by != uid:
-            await update.message.reply_text("⛔ Этот промокод уже был активирован другим пользователем.")
+            await update.message.reply_text("❌ Этот промокод уже использован.")
             s["mode"] = None
             return
         try:
@@ -2151,7 +2153,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _set_cached_balance(ctx, result.balance)
             if not result.applied:
                 if used_by == uid or result.duplicate:
-                    await update.message.reply_text("ℹ️ Вы уже активировали этот промокод ранее.")
+                    await update.message.reply_text("❌ Этот промокод уже использован.")
                 else:
                     await update.message.reply_text("⚠️ Промокод сейчас недоступен. Попробуйте другой.")
                 s["mode"] = None
@@ -2163,9 +2165,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         promo_mark_used(code, uid)
-        balance = get_user_balance_value(ctx, force_refresh=True)
+        get_user_balance_value(ctx, force_refresh=True)
         await update.message.reply_text(
-            f"✅ Промокод принят! +{bonus}💎\nБаланс: {balance} 💎"
+            f"✅ Промокод активирован! Вам начислено {bonus} токенов."
         )
         s["mode"] = None
         return
