@@ -287,7 +287,7 @@ def render_welcome_for(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
     return WELCOME.format(balance=get_user_balance_value(ctx), prompts_url=PROMPTS_CHANNEL_URL)
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-    rows = [
+    keyboard = [
         [InlineKeyboardButton(f"🎬 Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}", callback_data="mode:veo_text_fast")],
         [InlineKeyboardButton(f"🎬 Генерация видео (Veo Quality) 💎 {TOKEN_COSTS['veo_quality']}", callback_data="mode:veo_text_quality")],
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
@@ -300,9 +300,14 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
         ],
         [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
-        ([InlineKeyboardButton("🎟️ Активировать промокод", callback_data="promo_open")], if PROMO_ENABLED else []),
     ]
-    return InlineKeyboardMarkup(rows)
+
+    if PROMO_ENABLED:
+        keyboard.append([
+            InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
 
 def banana_examples_block() -> str:
     return (
@@ -996,10 +1001,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # PROMO
     if mode == "promo":
-    if not PROMO_ENABLED:
-        await update.message.reply_text("🎟️ Промокоды временно отключены.")
-        s["mode"] = None
-        return
+        if not PROMO_ENABLED:
+            await update.message.reply_text("🎟️ Промокоды временно отключены.")
+            s["mode"] = None
+            return
         code = text.upper()
         uid = update.effective_user.id
         bonus = promo_amount(code)
@@ -1014,7 +1019,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         promo_mark_used(code, uid)
         add_tokens(ctx, bonus)
-        await update.message.reply_text(f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎")
+        await update.message.reply_text(
+            f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎"
+        )
         s["mode"] = None
         return
 
