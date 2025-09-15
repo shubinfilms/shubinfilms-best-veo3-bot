@@ -5,12 +5,13 @@
 # (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
-odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib
- main
+# odex/fix-balance-reset-after-deploy
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io
+# main
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from datetime import datetime, timezone
 from contextlib import suppress
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -492,6 +493,59 @@ def _coerce_url_list(value) -> List[str]:
             if isinstance(u, str): add(u)
     return urls
 
+
+_MJ_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _mj_content_type_extension(content_type: Optional[str]) -> Optional[str]:
+    if not content_type:
+        return None
+    base = content_type.split(";", 1)[0].strip().lower()
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    return mapping.get(base)
+
+
+def _mj_guess_filename(url: str, index: int, content_type: Optional[str]) -> str:
+    try:
+        path = urlparse(url).path
+    except Exception:
+        path = ""
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    if ext not in _MJ_ALLOWED_EXTENSIONS:
+        ext = _mj_content_type_extension(content_type) or ".jpg"
+    return f"midjourney_{index + 1:02d}{ext}"
+
+
+def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str]]:
+    try:
+        resp = requests.get(url, timeout=60)
+    except requests.RequestException as exc:
+        log.warning("MJ image download failed (%s): %s", url, exc)
+        return None
+    if resp.status_code != 200:
+        log.warning("MJ image download status %s for %s", resp.status_code, url)
+        return None
+    data = resp.content
+    if not data:
+        log.warning("MJ image download empty response for %s", url)
+        return None
+    filename = _mj_guess_filename(url, index, resp.headers.get("Content-Type"))
+    return data, filename
+
+
+def _make_input_photo(data: bytes, filename: str) -> InputFile:
+    buffer = io.BytesIO(data)
+    buffer.name = filename
+    buffer.seek(0)
+    return InputFile(buffer, filename=filename)
+
+
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
     visited: set[int] = set()
     stack: List[Any] = [data]
@@ -632,8 +686,8 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     if not isinstance(ud.get("banana_images"), list): ud["banana_images"] = []
     return ud
 
-odex/fix-balance-reset-after-deploy
-main
+# odex/fix-balance-reset-after-deploy
+# main
 # ==========================
 #   UI / Texts
 # ==========================
@@ -1467,10 +1521,10 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     )
                 break
             if flag in (2, 3):
-codex/update-video-file-sending-logic
+# codex/update-video-file-sending-logic
                 add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
                 await ctx.bot.send_message(chat_id, f"❌ Не удалось получить видео. 💎 Токены возвращены.\n{msg or ''}")
- main
+# main
                 break
             if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
                 _refund("timeout")
@@ -1578,30 +1632,64 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 snippet = base_prompt[:100] if base_prompt else "—"
                 caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
 
-                if len(urls) >= 2:
+                downloaded: List[Tuple[bytes, str]] = []
+                for idx, u in enumerate(urls[:10]):
+                    result = await asyncio.to_thread(_download_mj_image_bytes, u, idx)
+                    if result:
+                        downloaded.append(result)
+                    else:
+                        log.warning("MJ skip image due to download failure: %s", u)
+
+                if not downloaded:
+                    _refund("download_failed")
+                    await ctx.bot.send_message(
+                        chat_id,
+                        "⚠️ MJ вернул результат, но изображения не удалось загрузить. 💎 Токены возвращены.",
+                    )
+                    return
+
+                async def _send_photos_one_by_one() -> bool:
+                    sent_any = False
+                    for idx, (data, filename) in enumerate(downloaded):
+                        try:
+                            await ctx.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=_make_input_photo(data, filename),
+                                caption=caption if idx == 0 else None,
+                            )
+                            sent_any = True
+                        except Exception as send_exc:
+                            log.warning("MJ send_photo #%s failed: %s", idx, send_exc)
+                    return sent_any
+
+                sent_successfully = False
+                if len(downloaded) >= 2:
                     media: List[InputMediaPhoto] = []
-                    for i, u in enumerate(urls[:10]):
-                        if i == 0:
-                            media.append(InputMediaPhoto(media=u, caption=caption))
-                        else:
-                            media.append(InputMediaPhoto(media=u))
+                    for idx, (data, filename) in enumerate(downloaded):
+                        media.append(
+                            InputMediaPhoto(
+                                media=_make_input_photo(data, filename),
+                                caption=caption if idx == 0 else None,
+                            )
+                        )
                     try:
                         await ctx.bot.send_media_group(chat_id=chat_id, media=media)
+                        sent_successfully = True
                     except Exception as e:
                         log.warning("MJ send_media_group failed: %s", e)
-                        try:
-                            await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0], caption=caption)
-                        except Exception as e2:
-                            log.warning("MJ send_photo fallback failed: %s", e2)
+                        sent_successfully = await _send_photos_one_by_one()
                 else:
-                    try:
-                        await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0], caption=caption)
-                    except Exception as e:
-                        log.warning("MJ single send_photo failed: %s", e)
-                        await ctx.bot.send_message(chat_id, caption + f"\n{urls[0]}")
+                    sent_successfully = await _send_photos_one_by_one()
+
+                if not sent_successfully:
+                    _refund("send_failed")
+                    await ctx.bot.send_message(
+                        chat_id,
+                        "❌ Не удалось отправить изображения MJ. 💎 Токены возвращены.",
+                    )
+                    return
 
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Открыть", url=urls[0])],
                     [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
                     [InlineKeyboardButton("Назад в меню", callback_data="back")],
                 ])
@@ -1675,7 +1763,7 @@ async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-codex/fix-balance-reset-after-deploy
+# codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     balance = get_user_balance_value(ctx, force_refresh=True)
     await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
@@ -2637,11 +2725,11 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
-codex/fix-balance-reset-after-deploy
+# codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
     application.add_handler(prompt_master_conv, group=10)
- main
+# main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))
