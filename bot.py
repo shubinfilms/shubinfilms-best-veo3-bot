@@ -593,7 +593,7 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
 
 # ---------- User state ----------
 DEFAULT_STATE = {
-    "mode": None, "aspect": None, "model": None,
+    "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
     "last_ui_msg_id": None, "last_ui_msg_id_banana": None,
@@ -720,14 +720,16 @@ def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
     keyboard = [
         [_btn("Горизонтальный (16:9)", "16:9")],
         [_btn("Вертикальный (9:16)", "9:16")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton("Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     lines = [
-        "Введите промпт сообщением. После этого нажмите «Подтвердить».",
+        "🖼 Midjourney",
+        "",
+        'Введите промпт сообщением. После этого нажмите "Подтвердить".',
         f"Текущий формат: {aspect}",
     ]
     snippet = _short_prompt(prompt)
