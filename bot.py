@@ -5,7 +5,7 @@
 # (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, threading
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
@@ -34,6 +34,37 @@ def _env(k: str, d: str = "") -> str:
     v = os.getenv(k)
     return (v if v is not None else d).strip()
 
+def _normalize_endpoint_values(*values: Any) -> List[str]:
+    """Collect endpoint path candidates from strings / iterables."""
+
+    seen: set[str] = set()
+    result: List[str] = []
+
+    def _add(value: Any):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _add(item)
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        if "," in text or any(ch.isspace() for ch in text):
+            parts = re.split(r"[,\s]+", text)
+        else:
+            parts = [text]
+        for part in parts:
+            p = part.strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            result.append(p)
+
+    for v in values:
+        _add(v)
+    return result
+
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
@@ -53,9 +84,36 @@ KIE_API_KEY  = _env("KIE_API_KEY")
 KIE_BASE_URL = _env("KIE_BASE_URL", "https://api.kie.ai")
 
 # VEO
-KIE_VEO_GEN_PATH    = _env("KIE_VEO_GEN_PATH",    "/api/v1/veo/generate")
-KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", "/api/v1/veo/recordInfo")
-KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   "/api/v1/veo/get1080pVideo")
+KIE_VEO_GEN_PATH = _env("KIE_VEO_GEN_PATH", "/api/v1/veo/generate")
+
+_KIE_VEO_STATUS_DEFAULT = "/api/v1/veo/record-info"
+_KIE_VEO_STATUS_RAW = _env("KIE_VEO_STATUS_PATH", _KIE_VEO_STATUS_DEFAULT)
+KIE_VEO_STATUS_PATHS = _normalize_endpoint_values(
+    _KIE_VEO_STATUS_RAW,
+    _KIE_VEO_STATUS_DEFAULT,
+    "/api/v1/veo/status",
+    "/api/v1/veo/recordInfo",
+)
+if KIE_VEO_STATUS_PATHS:
+    KIE_VEO_STATUS_PATH = KIE_VEO_STATUS_PATHS[0]
+else:
+    KIE_VEO_STATUS_PATH = _KIE_VEO_STATUS_DEFAULT
+    KIE_VEO_STATUS_PATHS = [KIE_VEO_STATUS_PATH]
+
+_KIE_VEO_1080_DEFAULT = "/api/v1/veo/get-1080p-video"
+_KIE_VEO_1080_RAW = _env("KIE_VEO_1080_PATH", _KIE_VEO_1080_DEFAULT)
+KIE_VEO_1080_PATHS = _normalize_endpoint_values(
+    _KIE_VEO_1080_RAW,
+    _KIE_VEO_1080_DEFAULT,
+    "/api/v1/veo/video-1080p",
+    "/api/v1/veo/video/1080p",
+    "/api/v1/veo/get1080pVideo",
+)
+if KIE_VEO_1080_PATHS:
+    KIE_VEO_1080_PATH = KIE_VEO_1080_PATHS[0]
+else:
+    KIE_VEO_1080_PATH = _KIE_VEO_1080_DEFAULT
+    KIE_VEO_1080_PATHS = [KIE_VEO_1080_PATH]
 
 # MJ
 KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
@@ -83,6 +141,8 @@ except Exception:
 REDIS_URL    = _env("REDIS_URL")
 REDIS_PREFIX = _env("REDIS_PREFIX", "veo3:prod")
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+BALANCE_BACKUP_PATH = _env("BALANCE_BACKUP_PATH", os.path.join(SCRIPT_DIR, "balances.json")).strip()
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
 # ==========================
@@ -134,6 +194,146 @@ def promo_mark_used(code: str, uid: int):
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
+
+
+class PersistentBalanceStorage:
+    def __init__(self, redis_conn: Optional["redis.Redis"], backup_path: str):
+        self.redis = redis_conn
+        self.backup_path = backup_path
+        self.backup_enabled = bool(self.backup_path)
+        self._lock = threading.RLock()
+        self._balances: Dict[str, int] = {}
+        if self.backup_enabled:
+            self.backup_path = os.path.abspath(self.backup_path)
+        self._load_backup()
+        self._sync_backup_to_redis()
+
+    @staticmethod
+    def _parse_int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _redis_get(self, key: str) -> Optional[int]:
+        if not self.redis:
+            return None
+        try:
+            raw = self.redis.get(key)
+        except redis.RedisError as exc:
+            log.warning("Redis get failed for %s: %s", key, exc)
+            return None
+        if raw is None:
+            return None
+        parsed = self._parse_int(raw)
+        if parsed is None:
+            log.warning("Invalid balance value in Redis for %s: %r", key, raw)
+        return parsed
+
+    def _redis_set(self, key: str, value: int) -> bool:
+        if not self.redis:
+            return False
+        try:
+            self.redis.set(key, value)
+            return True
+        except redis.RedisError as exc:
+            log.warning("Redis set failed for %s: %s", key, exc)
+            return False
+
+    def _load_backup(self):
+        if not self.backup_enabled:
+            return
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.backup_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                data = raw
+        except FileNotFoundError:
+            data = {}
+        except Exception as exc:
+            log.warning("Failed to load balance backup %s: %s", self.backup_path, exc)
+            data = {}
+
+        cleaned: Dict[str, int] = {}
+        for key, value in data.items():
+            parsed = self._parse_int(value)
+            if parsed is not None:
+                cleaned[str(key)] = parsed
+
+        with self._lock:
+            self._balances = cleaned
+
+    def _write_backup_locked(self):
+        if not self.backup_enabled:
+            return
+        try:
+            directory = os.path.dirname(self.backup_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp_path = f"{self.backup_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(self._balances, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp_path, self.backup_path)
+        except Exception as exc:
+            log.warning("Failed to write balance backup %s: %s", self.backup_path, exc)
+
+    def _update_backup(self, uid: int, value: int):
+        if not self.backup_enabled:
+            return
+        with self._lock:
+            key = str(uid)
+            int_value = int(value)
+            if self._balances.get(key) == int_value:
+                return
+            self._balances[key] = int_value
+            self._write_backup_locked()
+
+    def _get_backup(self, uid: int) -> Optional[int]:
+        if not self.backup_enabled:
+            return None
+        with self._lock:
+            value = self._balances.get(str(uid))
+        if value is None:
+            return None
+        return int(value)
+
+    def _sync_backup_to_redis(self):
+        if not self.redis or not self.backup_enabled or not self._balances:
+            return
+        for uid, value in list(self._balances.items()):
+            key = _rk("balance", str(uid))
+            try:
+                if self.redis.get(key) is None:
+                    self.redis.set(key, value)
+            except redis.RedisError as exc:
+                log.warning("Redis sync failed for %s: %s", key, exc)
+                break
+
+    def get(self, uid: int) -> int:
+        if not uid:
+            return 0
+        key = _rk("balance", str(uid))
+        value = self._redis_get(key)
+        if value is not None:
+            self._update_backup(uid, value)
+            return value
+        backup = self._get_backup(uid)
+        if backup is not None:
+            return backup
+        return 0
+
+    def set(self, uid: int, value: int) -> int:
+        value = max(0, int(value))
+        if not uid:
+            return value
+        key = _rk("balance", str(uid))
+        self._redis_set(key, value)
+        self._update_backup(uid, value)
+        return value
+
+
+balance_storage = PersistentBalanceStorage(redis_client, BALANCE_BACKUP_PATH)
 
 # ==========================
 #   Helpers / storage
@@ -354,19 +554,27 @@ def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     except Exception: return None
 
 def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    cached = ctx.user_data.get("balance")
+    if cached is not None:
+        try:
+            return int(cached)
+        except (TypeError, ValueError):
+            pass
+
     uid = get_user_id(ctx)
-    if redis_client and uid:
-        v = redis_client.get(_rk("balance", str(uid)))
-        if v is not None:
-            try: return int(v)
-            except: return 0
-    return int(ctx.user_data.get("balance", 0))
+    if not uid:
+        return 0
+
+    balance = balance_storage.get(uid)
+    ctx.user_data["balance"] = balance
+    return balance
 
 def set_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, v: int):
     v = max(0, int(v))
     ctx.user_data["balance"] = v
     uid = get_user_id(ctx)
-    if redis_client and uid: redis_client.set(_rk("balance", str(uid)), v)
+    if uid:
+        balance_storage.set(uid, v)
 
 def add_tokens(ctx: ContextTypes.DEFAULT_TYPE, add: int):
     set_user_balance_value(ctx, get_user_balance_value(ctx) + int(add))
@@ -635,6 +843,92 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
 # ==========================
 #   VEO
 # ==========================
+def _veo_endpoint_cache_key(kind: str) -> str:
+    return f"veo:endpoint:{kind}"
+
+def _remember_veo_endpoint(kind: str, path: str):
+    if not path:
+        return
+    app_cache[_veo_endpoint_cache_key(kind)] = path
+    if kind == "status":
+        global KIE_VEO_STATUS_PATH
+        KIE_VEO_STATUS_PATH = path
+    elif kind == "1080":
+        global KIE_VEO_1080_PATH
+        KIE_VEO_1080_PATH = path
+
+def _veo_endpoint_candidates(kind: str, base_paths: List[str]) -> List[str]:
+    cached = app_cache.get(_veo_endpoint_cache_key(kind))
+    if cached:
+        return _normalize_endpoint_values(cached, base_paths)
+    return list(base_paths)
+
+def _is_not_found_response(status: int, payload: Dict[str, Any]) -> bool:
+    if status == 404:
+        return True
+    for key in ("code", "status"):
+        val = payload.get(key)
+        if isinstance(val, int) and val == 404:
+            return True
+        if isinstance(val, str) and val.strip() == "404":
+            return True
+    message = payload.get("message") or payload.get("error")
+    if isinstance(message, str) and "not found" in message.lower():
+        return True
+    return False
+
+def _kie_request_with_endpoint(
+    kind: str,
+    method: str,
+    paths: List[str],
+    *,
+    request_id: Optional[str] = None,
+    **kwargs: Any,
+) -> Tuple[int, Dict[str, Any], str, str]:
+    candidates = _veo_endpoint_candidates(kind, paths)
+    if not candidates:
+        return 0, {"error": "no endpoint configured"}, request_id or "", ""
+
+    current_request_id = request_id
+    last_status = 0
+    last_resp: Dict[str, Any] = {}
+    last_req_id = request_id or ""
+    last_path = candidates[0]
+
+    for idx, path in enumerate(candidates):
+        status, resp, req_id = _kie_request(
+            method,
+            path,
+            request_id=current_request_id,
+            **kwargs,
+        )
+        if current_request_id is None:
+            current_request_id = req_id
+        if not _is_not_found_response(status, resp):
+            if idx > 0:
+                kie_event(
+                    "ENDPOINT_SWITCH",
+                    kind=kind,
+                    method=method,
+                    path=path,
+                    attempts=idx + 1,
+                )
+            _remember_veo_endpoint(kind, path)
+            return status, resp, req_id, path
+        if idx + 1 < len(candidates):
+            kie_event(
+                "ENDPOINT_FALLBACK",
+                kind=kind,
+                method=method,
+                path=path,
+                status=status,
+                body_status=resp.get("status"),
+                body_code=resp.get("code"),
+            )
+        last_status, last_resp, last_req_id, last_path = status, resp, req_id, path
+
+    return last_status, last_resp, last_req_id, last_path
+
 def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Dict[str, Any]:
     aspect_ratio = "9:16" if aspect == "9:16" else "16:9"
     model = "veo3" if model_key == "veo3" else "veo3_fast"
@@ -672,9 +966,10 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
 
 def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
     req_id_hint = _get_kie_request_id(task_id)
-    status, resp, req_id = _kie_request(
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "status",
         "GET",
-        KIE_VEO_STATUS_PATH,
+        KIE_VEO_STATUS_PATHS,
         params={"taskId": task_id},
         request_id=req_id_hint,
     )
@@ -702,6 +997,7 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
         code=code,
         flag=flag,
         has_url=bool(url),
+        path=path_used,
     )
     if status == 200 and code == 200:
         return True, flag, message, url
@@ -711,9 +1007,10 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
     last_err: Optional[str] = None
     req_id = _get_kie_request_id(task_id)
     for attempt in range(1, attempts + 1):
-        status, resp, req_id_used = _kie_request(
+        status, resp, req_id_used, path_used = _kie_request_with_endpoint(
+            "1080",
             "GET",
-            KIE_VEO_1080_PATH,
+            KIE_VEO_1080_PATHS,
             params={"taskId": task_id},
             timeout=per_try_timeout,
             request_id=req_id,
@@ -737,10 +1034,22 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
             if not (isinstance(url, str) and url.startswith("http")):
                 url = _extract_result_url(data)
             if isinstance(url, str) and url.startswith("http"):
-                kie_event("FETCH_1080_SUCCESS", request_id=req_id, task_id=task_id, attempt=attempt)
+                kie_event(
+                    "FETCH_1080_SUCCESS",
+                    request_id=req_id,
+                    task_id=task_id,
+                    attempt=attempt,
+                    path=path_used,
+                )
                 return url
             last_err = "empty_url"
-            kie_event("FETCH_1080_EMPTY", request_id=req_id, task_id=task_id, attempt=attempt)
+            kie_event(
+                "FETCH_1080_EMPTY",
+                request_id=req_id,
+                task_id=task_id,
+                attempt=attempt,
+                path=path_used,
+            )
         else:
             last_err = f"{status}/{code}"
             message = resp.get("msg") or resp.get("message") or resp.get("error")
@@ -752,7 +1061,16 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
                 status=status,
                 code=code,
                 message=message,
+                path=path_used,
             )
+        kie_event(
+            "1080_RETRY",
+            task_id=task_id,
+            attempt=attempt,
+            status=status,
+            code=code,
+            path=path_used,
+        )
         time.sleep(attempt)
     log.warning("1080p retries failed: %s", last_err)
     kie_event("FETCH_1080_GIVEUP", request_id=req_id, task_id=task_id, error=last_err)
@@ -883,7 +1201,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     """
     Надёжная отправка VEO-видео:
     1) пробуем прямой URL (если не вертикаль);
-    2) если не вышло — освежаем ссылку у KIE (1080p/recordInfo) и пробуем ещё раз;
+    2) если не вышло — освежаем ссылку у KIE (1080p/record-info) и пробуем ещё раз;
     3) скачиваем и перезаливаем (таймаут 300с). Остальной UX не меняется.
     """
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
