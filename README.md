@@ -1,17 +1,37 @@
-# Best VEO3 Bot (Fast)
+# Example environment variables for Best VEO3 Bot
+# Copy this file to `.env` and fill in the secrets before running locally.
 
-## Env (Render → Environment)
-- TELEGRAM_TOKEN      = <токен бота>
-- OPENAI_API_KEY      = <ключ OpenAI>           # для Prompt-Master (можно пусто — тогда PM отключён)
-- KIE_API_KEY         = <ключ KIE>              # просто ключ; код сам добавит 'Bearer '
-- KIE_BASE_URL        = https://api.kie.ai
-- KIE_VEO_GEN_PATH    = /api/v1/veo/generate
-- KIE_VEO_STATUS_PATH = /api/v1/veo/record-info
-- KIE_VEO_1080_PATH   = /api/v1/veo/get-1080p-video
-- KIE_ENABLE_FALLBACK = false                   # true только если надо включать Fallback при 16:9
-- KIE_DEFAULT_SEED    =                          # опционально: число 10000–99999
-- KIE_WATERMARK_TEXT  =                          # опционально
+# Telegram bot credentials
+TELEGRAM_TOKEN=your-telegram-token
+PROMPTS_CHANNEL_URL=https://t.me/bestveo3promts
+STARS_BUY_URL=https://t.me/PremiumBot
+PROMO_ENABLED=true
+DEV_MODE=false
 
-## Запуск локально
-pip install -r requirements.txt
-python bot.py
+# OpenAI / Prompt Master (optional)
+OPENAI_API_KEY=
+
+# KIE API configuration
+KIE_API_KEY=
+KIE_BASE_URL=https://api.kie.ai
+KIE_VEO_GEN_PATH=/api/v1/veo/generate
+KIE_VEO_STATUS_PATH=/api/v1/veo/record-info
+KIE_VEO_1080_PATH=/api/v1/veo/get-1080p-video
+KIE_MJ_GENERATE=/api/v1/mj/generate
+KIE_MJ_STATUS=/api/v1/mj/recordInfo
+KIE_BANANA_MODEL=google/nano-banana-edit
+
+# Video processing
+FFMPEG_BIN=ffmpeg
+ENABLE_VERTICAL_NORMALIZE=true
+ALWAYS_FORCE_FHD=true
+MAX_TG_VIDEO_MB=48
+POLL_INTERVAL_SECS=6
+POLL_TIMEOUT_SECS=1200
+
+# Logging
+LOG_LEVEL=INFO
+
+# Redis cache / promo codes (optional)
+REDIS_URL=redis://:password@host:port/0
+REDIS_PREFIX=veo3:prod
