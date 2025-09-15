@@ -54,12 +54,12 @@ KIE_BASE_URL = _env("KIE_BASE_URL", "https://api.kie.ai")
 
 # VEO
 KIE_VEO_GEN_PATH    = _env("KIE_VEO_GEN_PATH",    "/api/v1/veo/generate")
-KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", "/api/v1/veo/record-info")
-KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   "/api/v1/veo/get-1080p-video")
+KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", "/api/v1/veo/recordInfo")
+KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   "/api/v1/veo/get1080pVideo")
 
 # MJ
 KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
-KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/record-info")
+KIE_MJ_STATUS   = _env("KIE_MJ_STATUS",   "/api/v1/mj/recordInfo")
 
 # Видео
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
@@ -142,22 +142,65 @@ def join_url(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
     return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
 
-def _kie_headers_json() -> Dict[str, str]:
-    h = {"Content-Type": "application/json"}
+def _kie_auth_header() -> Dict[str, str]:
     tok = (KIE_API_KEY or "").strip()
-    if tok and not tok.lower().startswith("bearer "): tok = f"Bearer {tok}"
-    if tok: h["Authorization"] = tok
-    return h
+    if tok and not tok.lower().startswith("bearer "):
+        tok = f"Bearer {tok}"
+    return {"Authorization": tok} if tok else {}
 
-def _post_json(url: str, payload: Dict[str, Any], timeout: int = 50) -> Tuple[int, Dict[str, Any]]:
-    r = requests.post(url, json=payload, headers=_kie_headers_json(), timeout=timeout)
-    try: return r.status_code, r.json()
-    except Exception: return r.status_code, {"error": r.text}
+def _kie_headers(method: str, request_id: str) -> Dict[str, str]:
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    headers.update(_kie_auth_header())
+    if method in {"POST", "PUT", "PATCH"}:
+        headers["Content-Type"] = "application/json"
+    headers["X-Request-Id"] = request_id
+    return headers
 
-def _get_json(url: str, params: Dict[str, Any], timeout: int = 50) -> Tuple[int, Dict[str, Any]]:
-    r = requests.get(url, params=params, headers=_kie_headers_json(), timeout=timeout)
-    try: return r.status_code, r.json()
-    except Exception: return r.status_code, {"error": r.text}
+def _kie_request(
+    method: str,
+    path: str,
+    *,
+    json_payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 50,
+    request_id: Optional[str] = None,
+) -> Tuple[int, Dict[str, Any], str]:
+    method = method.upper()
+    req_id = request_id or str(uuid.uuid4())
+    url = join_url(KIE_BASE_URL, path)
+    headers = _kie_headers(method, req_id)
+    started = time.time()
+    try:
+        resp = requests.request(method, url, json=json_payload, params=params, headers=headers, timeout=timeout)
+    except requests.RequestException as exc:
+        elapsed = round((time.time() - started) * 1000)
+        event("KIE_HTTP_ERROR", method=method, url=url, request_id=req_id, error=str(exc), elapsed_ms=elapsed)
+        return 0, {"error": str(exc)}, req_id
+
+    try:
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+    except ValueError:
+        payload = {"error": resp.text}
+
+    elapsed = round((time.time() - started) * 1000)
+    code = payload.get("code", resp.status_code)
+    msg = payload.get("msg") or payload.get("message") or payload.get("error")
+    task_id = _extract_task_id(payload)
+    event(
+        "KIE_HTTP",
+        method=method,
+        url=url,
+        status=resp.status_code,
+        code=code,
+        request_id=req_id,
+        task_id=task_id,
+        message=msg,
+        elapsed_ms=elapsed,
+        payload_keys=list(json_payload.keys()) if isinstance(json_payload, dict) else None,
+    )
+    return resp.status_code, payload, req_id
 
 def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
     data = j.get("data") or {}
@@ -197,20 +240,91 @@ def _coerce_url_list(value) -> List[str]:
     return urls
 
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
-    for key in ("originUrls", "resultUrls", "videoUrls"):
-        urls = _coerce_url_list(data.get(key))
-        if urls: return urls[0]
-    for cont in ("info", "response", "resultInfoJson"):
-        v = data.get(cont)
-        if isinstance(v, dict):
-            for key in ("originUrls", "resultUrls", "videoUrls", "urls"):
-                urls = _coerce_url_list(v.get(key))
-                if urls: return urls[0]
+    visited: set[int] = set()
+    stack: List[Any] = [data]
+
+    def _maybe_parse_json(text: str) -> Any:
+        s = text.strip()
+        if not s:
+            return None
+        if len(s) > 20000:
+            return None
+        if (s[0] in "[{" and s[-1] in "]}"):
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+        return None
+
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (list, tuple, set)):
+            for item in current:
+                stack.append(item)
+            continue
+        if isinstance(current, dict):
+            for key in ("resultUrls", "resultUrl", "originUrls", "originUrl", "videoUrls", "videoUrl",
+                        "videos", "urls", "url", "downloadUrl", "fileUrl", "cdnUrl", "outputUrl"):
+                if key in current:
+                    stack.append(current[key])
+            for value in current.values():
+                stack.append(value)
+            continue
+        obj_id = id(current)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+        if isinstance(current, str):
+            stripped = current.strip()
+            if stripped.startswith("http"):
+                return stripped
+            parsed = _maybe_parse_json(stripped)
+            if parsed is not None:
+                stack.append(parsed)
     return None
+
+def _parse_success_flag(data: Dict[str, Any]) -> Optional[int]:
+    for key in ("successFlag", "state", "status", "taskStatus"):
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return 1 if value else 0
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            if isinstance(value, str):
+                lower = value.lower()
+                if lower in ("success", "succeeded", "finished", "done"):
+                    return 1
+                if lower in ("fail", "failed", "error", "cancelled", "canceled"):
+                    return 2
+                if lower in ("waiting", "queued", "processing", "running"):
+                    return 0
+    return None
+
+def _kie_req_cache_key(task_id: str) -> str:
+    return f"kie:req:{task_id}"
+
+def _remember_kie_request_id(task_id: Optional[str], request_id: str):
+    if not task_id or not request_id:
+        return
+    app_cache[_kie_req_cache_key(str(task_id))] = request_id
+
+def _get_kie_request_id(task_id: str) -> Optional[str]:
+    return app_cache.get(_kie_req_cache_key(str(task_id)))
+
+def _clear_kie_request_id(task_id: str):
+    app_cache.pop(_kie_req_cache_key(str(task_id)), None)
 
 def event(tag: str, **kw):
     try: log.info("EVT %s | %s", tag, json.dumps(kw, ensure_ascii=False))
     except Exception: log.info("EVT %s | %s", tag, kw)
+
+def kie_event(stage: str, **kw):
+    event(f"KIE_{stage}", **kw)
 
 def tg_direct_file_url(bot_token: str, file_path: str) -> str:
     p = (file_path or "").strip()
@@ -410,52 +524,126 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
 #   VEO
 # ==========================
 def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Dict[str, Any]:
-    payload = {
+    aspect_ratio = "9:16" if aspect == "9:16" else "16:9"
+    model = "veo3" if model_key == "veo3" else "veo3_fast"
+    payload: Dict[str, Any] = {
+        "model": model,
         "prompt": prompt,
-        "aspectRatio": "9:16" if aspect == "9:16" else "16:9",
-        "model": "veo3" if model_key == "veo3" else "veo3_fast",
+        "aspectRatio": aspect_ratio,
         "enableFallback": aspect == "16:9",
+        "input": {
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "aspectRatio": aspect_ratio,
+            "enable_fallback": aspect == "16:9",
+        },
     }
-    if image_url: payload["imageUrls"] = [image_url]
+    if image_url:
+        payload["imageUrls"] = [image_url]
+        payload["input"]["image_urls"] = [image_url]
     return payload
 
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
-    status, j = _post_json(join_url(KIE_BASE_URL, KIE_VEO_GEN_PATH),
-                           _build_payload_for_veo(prompt, aspect, image_url, model_key))
-    code = j.get("code", status)
+    payload = _build_payload_for_veo(prompt, aspect, image_url, model_key)
+    status, resp, req_id = _kie_request("POST", KIE_VEO_GEN_PATH, json_payload=payload)
+    code = resp.get("code", status)
+    tid = _extract_task_id(resp)
+    message = resp.get("msg") or resp.get("message")
+    kie_event("SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, message=message)
     if status == 200 and code == 200:
-        tid = _extract_task_id(j)
-        if tid: return True, tid, "Задача создана."
+        if tid:
+            _remember_kie_request_id(tid, req_id)
+            return True, tid, "Задача создана."
         return False, None, "Ответ KIE без taskId."
-    return False, None, f"Ошибка VEO: {j}"
+    error_msg = message or resp.get("error") or str(resp)
+    return False, None, f"Ошибка VEO: {error_msg}"
 
 def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
-    status, j = _get_json(join_url(KIE_BASE_URL, KIE_VEO_STATUS_PATH), {"taskId": task_id})
-    code = j.get("code", status)
+    req_id_hint = _get_kie_request_id(task_id)
+    status, resp, req_id = _kie_request(
+        "GET",
+        KIE_VEO_STATUS_PATH,
+        params={"taskId": task_id},
+        request_id=req_id_hint,
+    )
+    if not req_id_hint:
+        _remember_kie_request_id(task_id, req_id)
+    code = resp.get("code", status)
+    data_raw = resp.get("data") or {}
+    if isinstance(data_raw, str):
+        try:
+            data = json.loads(data_raw)
+        except Exception:
+            data = {"raw": data_raw}
+    elif isinstance(data_raw, dict):
+        data = data_raw
+    else:
+        data = {"value": data_raw}
+    flag = _parse_success_flag(data)
+    message = resp.get("msg") or resp.get("message")
+    url = _extract_result_url(data)
+    kie_event(
+        "STATUS",
+        request_id=req_id,
+        task_id=task_id,
+        status=status,
+        code=code,
+        flag=flag,
+        has_url=bool(url),
+    )
     if status == 200 and code == 200:
-        data = j.get("data") or {}
-        try: flag = int(data.get("successFlag"))
-        except Exception: flag = None
-        return True, flag, (j.get("msg") or j.get("message")), _extract_result_url(data)
-    return False, None, f"Ошибка статуса VEO: {j}", None
+        return True, flag, message, url
+    return False, None, f"Ошибка статуса VEO: {resp}", None
 
 def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15) -> Optional[str]:
-    last_err = None
-    for i in range(attempts):
-        try:
-            status, j = _get_json(join_url(KIE_BASE_URL, KIE_VEO_1080_PATH), {"taskId": task_id}, timeout=per_try_timeout)
-            code = j.get("code", status)
-            if status == 200 and code == 200:
-                data = j.get("data") or {}
-                u = data.get("url") or _extract_result_url(data)
-                if isinstance(u, str) and u.startswith("http"): return u
-                last_err = "empty_url"
-            else:
-                last_err = f"{status}/{code}"
-        except Exception as e:
-            last_err = str(e)
-        time.sleep(1+i)
+    last_err: Optional[str] = None
+    req_id = _get_kie_request_id(task_id)
+    for attempt in range(1, attempts + 1):
+        status, resp, req_id_used = _kie_request(
+            "GET",
+            KIE_VEO_1080_PATH,
+            params={"taskId": task_id},
+            timeout=per_try_timeout,
+            request_id=req_id,
+        )
+        if not req_id:
+            req_id = req_id_used
+            _remember_kie_request_id(task_id, req_id)
+        code = resp.get("code", status)
+        data_raw = resp.get("data") or {}
+        if isinstance(data_raw, str):
+            try:
+                data = json.loads(data_raw)
+            except Exception:
+                data = {"raw": data_raw}
+        elif isinstance(data_raw, dict):
+            data = data_raw
+        else:
+            data = {"value": data_raw}
+        url = data.get("url") if isinstance(data.get("url"), str) else None
+        if status == 200 and code == 200:
+            if not (isinstance(url, str) and url.startswith("http")):
+                url = _extract_result_url(data)
+            if isinstance(url, str) and url.startswith("http"):
+                kie_event("FETCH_1080_SUCCESS", request_id=req_id, task_id=task_id, attempt=attempt)
+                return url
+            last_err = "empty_url"
+            kie_event("FETCH_1080_EMPTY", request_id=req_id, task_id=task_id, attempt=attempt)
+        else:
+            last_err = f"{status}/{code}"
+            message = resp.get("msg") or resp.get("message") or resp.get("error")
+            kie_event(
+                "FETCH_1080_FAIL",
+                request_id=req_id,
+                task_id=task_id,
+                attempt=attempt,
+                status=status,
+                code=code,
+                message=message,
+            )
+        time.sleep(attempt)
     log.warning("1080p retries failed: %s", last_err)
+    kie_event("FETCH_1080_GIVEUP", request_id=req_id, task_id=task_id, error=last_err)
     return None
 
 # ==========================
@@ -479,22 +667,36 @@ def mj_generate(prompt: str) -> Tuple[bool, Optional[str], str]:
         "version": "7",
         "enableTranslation": True,
     }
-    status, j = _post_json(join_url(KIE_BASE_URL, KIE_MJ_GENERATE), payload)
-    code = j.get("code", status)
+    status, resp, req_id = _kie_request("POST", KIE_MJ_GENERATE, json_payload=payload)
+    code = resp.get("code", status)
+    tid = _extract_task_id(resp)
+    kie_event("MJ_SUBMIT", request_id=req_id, status=status, code=code, task_id=tid)
     if status == 200 and code == 200:
-        tid = _extract_task_id(j)
-        if tid: return True, tid, "MJ задача создана."
+        if tid:
+            return True, tid, "MJ задача создана."
         return False, None, "Ответ MJ без taskId."
-    return False, None, _kie_error_message(status, j)
+    return False, None, _kie_error_message(status, resp)
 
 def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
-    status, j = _get_json(join_url(KIE_BASE_URL, KIE_MJ_STATUS), {"taskId": task_id})
-    code = j.get("code", status)
+    status, resp, req_id = _kie_request("GET", KIE_MJ_STATUS, params={"taskId": task_id})
+    code = resp.get("code", status)
+    data = resp.get("data") or {}
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            data = {"raw": data}
+    flag = _parse_success_flag(data) if isinstance(data, dict) else None
+    kie_event(
+        "MJ_STATUS",
+        request_id=req_id,
+        task_id=task_id,
+        status=status,
+        code=code,
+        flag=flag,
+    )
     if status == 200 and code == 200:
-        data = j.get("data") or {}
-        try: flag = int(data.get("successFlag"))
-        except Exception: flag = None
-        return True, flag, data
+        return True, flag, data if isinstance(data, dict) else None
     return False, None, None
 
 def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
@@ -558,7 +760,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     """
     Надёжная отправка VEO-видео:
     1) пробуем прямой URL (если не вертикаль);
-    2) если не вышло — освежаем ссылку у KIE (1080p/record-info) и пробуем ещё раз;
+    2) если не вышло — освежаем ссылку у KIE (1080p/recordInfo) и пробуем ещё раз;
     3) скачиваем и перезаливаем (таймаут 300с). Остальной UX не меняется.
     """
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
@@ -660,6 +862,12 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     if ok_r2 and isinstance(u2, str) and u2.startswith("http"):
                         final_url = u2
 
+                kie_event(
+                    "FINAL_URL",
+                    request_id=_get_kie_request_id(task_id),
+                    task_id=task_id,
+                    final_url=final_url,
+                )
                 await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
                 await send_video_with_fallback(ctx, chat_id, final_url,
                                                expect_vertical=(s.get("aspect") == "9:16"),
@@ -685,6 +893,7 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
+        _clear_kie_request_id(task_id)
 
 # ==========================
 #   MJ poll (1 авторетрай)
