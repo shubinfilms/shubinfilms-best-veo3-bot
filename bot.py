@@ -450,7 +450,7 @@ def _kie_request(
         payload = {"error": resp.text}
 
     elapsed = round((time.time() - started) * 1000)
-    code = payload.get("code", resp.status_code)
+    code = _extract_response_code(payload, resp.status_code)
     msg = payload.get("msg") or payload.get("message") or payload.get("error")
     task_id = _extract_task_id(payload)
     event(
@@ -528,8 +528,28 @@ def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
                 stack.append(item)
             continue
         if isinstance(current, dict):
-            for key in ("resultUrls", "resultUrl", "originUrls", "originUrl", "videoUrls", "videoUrl",
-                        "videos", "urls", "url", "downloadUrl", "fileUrl", "cdnUrl", "outputUrl"):
+            for key in (
+                "resultUrls",
+                "resultUrl",
+                "originUrls",
+                "originUrl",
+                "videoUrls",
+                "videoUrl",
+                "videos",
+                "urls",
+                "url",
+                "downloadUrl",
+                "fileUrl",
+                "cdnUrl",
+                "outputUrl",
+                "imageUrls",
+                "imageUrl",
+                "imageUrlList",
+                "image_url",
+                "image_urls",
+                "finalImageUrl",
+                "finalImageUrls",
+            ):
                 if key in current:
                     stack.append(current[key])
             for value in current.values():
@@ -1013,7 +1033,7 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     payload = _build_payload_for_veo(prompt, aspect, image_url, model_key)
     status, resp, req_id = _kie_request("POST", KIE_VEO_GEN_PATH, json_payload=payload)
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     tid = _extract_task_id(resp)
     message = resp.get("msg") or resp.get("message")
     kie_event("SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, message=message)
@@ -1037,7 +1057,7 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
     )
     if not req_id_hint:
         _remember_kie_request_id(task_id, req_id)
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     data_raw = resp.get("data") or {}
     if isinstance(data_raw, str):
         try:
@@ -1215,12 +1235,86 @@ async def send_kie_1080p_to_tg(
 # ==========================
 #   MJ
 # ==========================
+def _parse_status_code_value(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 200 if value else 500
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return int(float(text))
+            except (TypeError, ValueError):
+                pass
+        lowered = text.lower()
+        mapping = {
+            "success": 200,
+            "ok": 200,
+            "succeeded": 200,
+            "finished": 200,
+            "done": 200,
+            "pending": 102,
+            "processing": 102,
+            "queued": 102,
+            "fail": 500,
+            "failed": 500,
+            "error": 500,
+            "denied": 403,
+            "forbidden": 403,
+            "unauthorized": 401,
+            "timeout": 504,
+            "notfound": 404,
+            "not_found": 404,
+        }
+        normalized = lowered.replace("-", "").replace("_", "")
+        if normalized in mapping:
+            return mapping[normalized]
+        if lowered in mapping:
+            return mapping[lowered]
+        match = re.search(r"\d+", text)
+        if match:
+            try:
+                return int(match.group(0))
+            except ValueError:
+                return default
+    return default
+
+
+def _extract_response_code(payload: Dict[str, Any], http_status: int) -> int:
+    if not isinstance(payload, dict):
+        return http_status
+    for key in ("code", "statusCode", "status_code", "errorCode", "error_code", "resultCode"):
+        if key in payload:
+            return _parse_status_code_value(payload.get(key), http_status)
+    status_val = payload.get("status")
+    if isinstance(status_val, str):
+        return _parse_status_code_value(status_val, http_status)
+    return http_status
+
+
 def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
-    code = j.get("code", status_code)
+    code = _extract_response_code(j, status_code)
     msg = j.get("msg") or j.get("message") or j.get("error") or ""
-    mapping = {401: "Доступ запрещён.", 402: "Недостаточно кредитов.",
-               429: "Превышен лимит.", 500: "Внутренняя ошибка KIE.",
-               422: "Запрос отклонён модерацией.", 400: "Неверный запрос."}
+    mapping = {
+        400: "Неверный запрос.",
+        401: "Доступ запрещён.",
+        402: "Недостаточно кредитов.",
+        404: "Задача не найдена.",
+        422: "Запрос отклонён модерацией.",
+        429: "Превышен лимит.",
+        500: "Внутренняя ошибка KIE.",
+        504: "Таймаут KIE.",
+    }
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {msg}".strip()
 
@@ -1246,7 +1340,7 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
         KIE_MJ_GENERATE_PATHS,
         json_payload=payload,
     )
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     tid = _extract_task_id(resp)
     kie_event(
         "MJ_SUBMIT",
@@ -1271,7 +1365,7 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
         KIE_MJ_STATUS_PATHS,
         params={"taskId": task_id},
     )
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     raw_data = resp.get("data")
     if isinstance(raw_data, str):
         try:
@@ -1281,6 +1375,10 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
             data = {"raw": raw_data}
     elif isinstance(raw_data, dict):
         data = raw_data
+    elif isinstance(raw_data, list):
+        data = next((item for item in raw_data if isinstance(item, dict)), None)
+        if data is None:
+            data = {"value": raw_data}
     else:
         data = None
     flag = _parse_success_flag(data) if isinstance(data, dict) else None
@@ -1305,21 +1403,63 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
 
 def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
     res: List[str] = []
-    rj = status_data.get("resultInfoJson") or {}
-    if isinstance(rj, str):
-        try:
-            rj = json.loads(rj)
-        except Exception:
-            rj = {}
-    urls = _coerce_url_list((rj or {}).get("resultUrls"))
-    for u in urls:
-        if isinstance(u, str) and u.startswith("http"): res.append(u)
+    seen: set[str] = set()
+
+    def _add_from(value: Any) -> None:
+        for url in _coerce_url_list(value):
+            if url not in seen:
+                seen.add(url)
+                res.append(url)
+
+    direct_keys = (
+        "imageUrls",
+        "imageUrl",
+        "imageUrlList",
+        "image_url",
+        "image_urls",
+        "resultUrls",
+        "resultUrl",
+        "urls",
+    )
+    for key in direct_keys:
+        if key in status_data:
+            _add_from(status_data.get(key))
+
+    for meta_key in ("resultInfoJson", "resultInfo", "resultJson"):
+        raw = status_data.get(meta_key)
+        if not raw:
+            continue
+        parsed: Any = raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                continue
+        if isinstance(parsed, dict):
+            for key in direct_keys:
+                if key in parsed:
+                    _add_from(parsed.get(key))
+        elif isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    for key in direct_keys:
+                        if key in item:
+                            _add_from(item.get(key))
+
     return res
 
 def _mj_should_retry(msg: Optional[str]) -> bool:
     if not msg: return False
     m = msg.lower()
-    return ("no response from midjourney official website" in m) or ("timeout" in m) or ("server error" in m)
+    retry_tokens = (
+        "no response from midjourney official website",
+        "timeout",
+        "server error",
+        "timed out",
+        "gateway",
+        "504",
+    )
+    return any(token in m for token in retry_tokens)
 
 # ==========================
 #   VEO polling
@@ -1412,7 +1552,18 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 delay = min(delay + 6, 30)
                 continue
             if flag in (2, 3) or flag is None:
-                err = (data or {}).get("errorMessage") or "No response from MidJourney Official Website after multiple attempts."
+                err_info = None
+                if isinstance(data, dict):
+                    err_info = (
+                        data.get("errorMessage")
+                        or data.get("error_message")
+                        or data.get("message")
+                        or data.get("reason")
+                    )
+                if isinstance(err_info, str):
+                    err = err_info.strip() or "No response from MidJourney Official Website after multiple attempts."
+                else:
+                    err = "No response from MidJourney Official Website after multiple attempts."
                 if (not retried) and prompt_for_retry and _mj_should_retry(err):
                     retried = True
                     await ctx.bot.send_message(chat_id, "🔁 MJ подвис. Перезапускаю задачу бесплатно…")
