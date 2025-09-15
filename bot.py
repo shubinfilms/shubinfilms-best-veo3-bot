@@ -18,17 +18,14 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
-from handlers.prompt_master_handler import (
-    PROMPT_MASTER_BODY,
-    PROMPT_MASTER_HEADER,
-    prompt_master_conv,
-)
+from handlers.prompt_master_handler import PROMPT_MASTER_HINT
+from prompt_master import generate_prompt
 
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
@@ -609,12 +606,30 @@ DEFAULT_STATE = {
     "mj_last_wait_ts": 0.0,
     "mj_generating": False, "last_mj_task_id": None, "last_mj_msg_id": None,
 }
+
+MODE_PROMPTMASTER = "MODE_PROMPTMASTER"
+PROMPT_MASTER_TIMEOUT = 27.0
+PROMPT_MASTER_ERROR_MESSAGE = "Не удалось собрать промпт, попробуй короче/иначе сформулировать."
+PROMPT_MASTER_CARD_TEMPLATE = (
+    "🟦 Карточка Prompt-Master\n"
+    "• Формат: auto (VEO/MJ)\n"
+    "• Референс: нет\n\n"
+    "✍️ Промпт:\n{prompt}"
+)
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
     for k, v in DEFAULT_STATE.items():
         if k not in ud: ud[k] = [] if isinstance(v, list) else v
     if not isinstance(ud.get("banana_images"), list): ud["banana_images"] = []
     return ud
+
+
+def activate_prompt_master_mode(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    s = state(ctx)
+    s["mode"] = MODE_PROMPTMASTER
+    s["last_prompt"] = None
+    s["last_image_url"] = None
+    return s
 
 # ---------- Balance ----------
 def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
@@ -667,7 +682,7 @@ WELCOME = (
     "🎬 *Veo 3 — съёмочная команда*: опиши идею и получи *готовый клип*.\n"
     "🖌️ *MJ — художник*: рисует изображение по тексту (16:9 или 9:16).\n"
     "🍌 *Banana — редактор из будущего*: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
-    "🧠 *Prompt-Master (/promptmaster)* — вернёт профессиональный *кинопромпт*.\n"
+    "🧠 *Prompt-Master* — вернёт профессиональный *кинопромпт*.\n"
     "💬 *Обычный чат* — ответы на любые вопросы.\n\n"
     "💎 *Ваш баланс:* {balance}\n"
     "📈 Больше идей и примеров: {prompts_url}\n\n"
@@ -684,7 +699,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master (/promptmaster)", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:prompt_master")],
         [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
@@ -1507,6 +1522,18 @@ async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
     )
 
+
+async def prompt_master_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    activate_prompt_master_mode(ctx)
+    msg = update.message
+    if msg:
+        await msg.reply_text(PROMPT_MASTER_HINT)
+        return
+    chat = update.effective_chat
+    if chat:
+        await ctx.bot.send_message(chat_id=chat.id, text=PROMPT_MASTER_HINT)
+
+
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
         f"PTB: `{getattr(_tg, '__version__', 'unknown')}`" if _tg else "PTB: `unknown`",
@@ -1629,27 +1656,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Режимы
     if data.startswith("mode:"):
-        mode = data.split(":",1)[1]
-        if mode == "prompt_master":
-            s["mode"] = None
-            await q.message.reply_text(
-                f"{PROMPT_MASTER_HEADER} 2.0 запускается командой /promptmaster.\n\n{PROMPT_MASTER_BODY}"
-            )
+        selected_mode = data.split(":", 1)[1]
+        if selected_mode == "prompt_master":
+            activate_prompt_master_mode(ctx)
+            await q.message.reply_text(PROMPT_MASTER_HINT)
             return
-        s["mode"] = mode
-        if mode in ("veo_text_fast","veo_text_quality"):
-            s["aspect"] = "16:9"; s["model"] = "veo3_fast" if mode.endswith("fast") else "veo3"
+        s["mode"] = selected_mode
+        if selected_mode in ("veo_text_fast", "veo_text_quality"):
+            s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
             await show_or_update_veo_card(update.effective_chat.id, ctx)
             await q.message.reply_text("✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.")
             return
-        if mode == "veo_photo":
+        if selected_mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
             await show_or_update_veo_card(update.effective_chat.id, ctx)
             await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
             return
-        if mode == "chat":
+        if selected_mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
-        if mode == "mj_txt":
+        if selected_mode == "mj_txt":
             s["aspect"] = "9:16" if s.get("aspect") == "9:16" else "16:9"
             s["last_prompt"] = None
             s["mj_generating"] = False
@@ -1662,7 +1687,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["last_mj_msg_id"] = None
             await show_mj_format_card(update.effective_chat.id, ctx)
             return
-        if mode == "banana":
+        if selected_mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
             await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
             await show_or_update_banana_card(update.effective_chat.id, ctx); return
@@ -1802,6 +1827,42 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
     mode = s.get("mode")
+
+    if mode == MODE_PROMPTMASTER:
+        if not text:
+            return
+        chat = update.effective_chat
+        if chat:
+            with suppress(Exception):
+                await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        user_id = update.effective_user.id if update.effective_user else None
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(generate_prompt, text),
+                timeout=PROMPT_MASTER_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.error("PromptMaster timeout: uid=%s len=%s", user_id, len(text))
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            return
+        except Exception:
+            log.exception("PromptMaster error: uid=%s", user_id)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            return
+
+        prompt_text = ""
+        if isinstance(result, dict):
+            prompt_text = (result.get("text_markdown") or "").strip()
+        elif isinstance(result, str):
+            prompt_text = result.strip()
+        if not prompt_text:
+            log.error("PromptMaster empty response: uid=%s", user_id)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            return
+
+        card_text = PROMPT_MASTER_CARD_TEMPLATE.format(prompt=prompt_text)
+        await update.message.reply_text(card_text)
+        return
 
     # PROMO
     if mode == "promo":
@@ -2245,7 +2306,7 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
-    application.add_handler(prompt_master_conv, group=10)
+    application.add_handler(CommandHandler("promptmaster", prompt_master_command))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))
