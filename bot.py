@@ -1050,7 +1050,7 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
         return True, flag, message, url
     return False, None, f"Ошибка статуса VEO: {resp}", None
 
-codex/implement-1080p-video-fetch-and-send
+
 def fetch_1080p_result_url(task_id: str, index: Optional[int] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     params: Dict[str, Any] = {"taskId": task_id}
     if index is not None:
