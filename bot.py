@@ -5,7 +5,7 @@
 # (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, threading, signal, socket
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from datetime import datetime, timezone
 from contextlib import suppress
@@ -33,6 +33,13 @@ from handlers.prompt_master_handler import (
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
 
 import redis
+
+from ledger import (
+    LedgerStorage,
+    LedgerOpResult,
+    BalanceRecalcResult,
+    InsufficientBalance,
+)
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -201,8 +208,11 @@ REDIS_URL           = _env("REDIS_URL")
 REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-BALANCE_BACKUP_PATH = _env("BALANCE_BACKUP_PATH", os.path.join(SCRIPT_DIR, "balances.json")).strip()
+
+DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
+
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
 # ==========================
@@ -244,7 +254,12 @@ def promo_used_global(code: str) -> Optional[int]:
         u = redis_client.get(_rk("promo", "used_by", code))
         try: return int(u) if u is not None else None
         except: return None
-    return None
+    try:
+        owner = ledger_storage.get_promo_owner(code)
+        return owner
+    except Exception as exc:
+        log.warning("Failed to fetch promo owner for %s: %s", code, exc)
+        return None
 
 def promo_mark_used(code: str, uid: int):
     code = (code or "").strip().upper()
@@ -255,145 +270,117 @@ def promo_mark_used(code: str, uid: int):
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
 
+# Ledger storage (Postgres)
+ledger_storage = LedgerStorage(DATABASE_URL)
 
-class PersistentBalanceStorage:
-    def __init__(self, redis_conn: Optional["redis.Redis"], backup_path: str):
-        self.redis = redis_conn
-        self.backup_path = backup_path
-        self.backup_enabled = bool(self.backup_path)
-        self._lock = threading.RLock()
-        self._balances: Dict[str, int] = {}
-        if self.backup_enabled:
-            self.backup_path = os.path.abspath(self.backup_path)
-        self._load_backup()
-        self._sync_backup_to_redis()
 
-    @staticmethod
-    def _parse_int(value: Any) -> Optional[int]:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    ops = ctx.user_data.get("__ops__")
+    if not isinstance(ops, dict):
+        ops = {}
+        ctx.user_data["__ops__"] = ops
+    return ops
 
-    def _redis_get(self, key: str) -> Optional[int]:
-        if not self.redis:
-            return None
-        try:
-            raw = self.redis.get(key)
-        except redis.RedisError as exc:
-            log.warning("Redis get failed for %s: %s", key, exc)
-            return None
-        if raw is None:
-            return None
-        parsed = self._parse_int(raw)
-        if parsed is None:
-            log.warning("Invalid balance value in Redis for %s: %r", key, raw)
-        return parsed
 
-    def _redis_set(self, key: str, value: int) -> bool:
-        if not self.redis:
-            return False
-        try:
-            self.redis.set(key, value)
-            return True
-        except redis.RedisError as exc:
-            log.warning("Redis set failed for %s: %s", key, exc)
-            return False
+def _make_fingerprint(payload: Dict[str, Any]) -> str:
+    try:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        canonical = repr(payload)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _load_backup(self):
-        if not self.backup_enabled:
-            return
-        data: Dict[str, Any] = {}
-        try:
-            with open(self.backup_path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-            if isinstance(raw, dict):
-                data = raw
-        except FileNotFoundError:
-            data = {}
-        except Exception as exc:
-            log.warning("Failed to load balance backup %s: %s", self.backup_path, exc)
-            data = {}
 
-        cleaned: Dict[str, int] = {}
-        for key, value in data.items():
-            parsed = self._parse_int(value)
-            if parsed is not None:
-                cleaned[str(key)] = parsed
+def _ensure_operation(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> Tuple[str, bool]:
+    ops = _ops_state(ctx)
+    entry = ops.get(key)
+    if isinstance(entry, dict) and "op_id" in entry:
+        return str(entry["op_id"]), False
+    op_id = f"{key}:{uuid.uuid4().hex}"
+    ops[key] = {"op_id": op_id}
+    return op_id, True
 
-        with self._lock:
-            self._balances = cleaned
 
-    def _write_backup_locked(self):
-        if not self.backup_enabled:
-            return
-        try:
-            directory = os.path.dirname(self.backup_path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            tmp_path = f"{self.backup_path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(self._balances, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp_path, self.backup_path)
-        except Exception as exc:
-            log.warning("Failed to write balance backup %s: %s", self.backup_path, exc)
+def _update_operation(ctx: ContextTypes.DEFAULT_TYPE, key: str, **fields: Any) -> None:
+    ops = _ops_state(ctx)
+    entry = ops.get(key)
+    if isinstance(entry, dict):
+        entry.update(fields)
+    else:
+        ops[key] = {**fields}
 
-    def _update_backup(self, uid: int, value: int):
-        if not self.backup_enabled:
-            return
-        with self._lock:
-            key = str(uid)
-            int_value = int(value)
-            if self._balances.get(key) == int_value:
-                return
-            self._balances[key] = int_value
-            self._write_backup_locked()
 
-    def _get_backup(self, uid: int) -> Optional[int]:
-        if not self.backup_enabled:
-            return None
-        with self._lock:
-            value = self._balances.get(str(uid))
-        if value is None:
-            return None
-        return int(value)
+def _clear_operation(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    _ops_state(ctx).pop(key, None)
 
-    def _sync_backup_to_redis(self):
-        if not self.redis or not self.backup_enabled or not self._balances:
-            return
-        for uid, value in list(self._balances.items()):
-            key = _rk("balance", str(uid))
+
+def _set_cached_balance(ctx: ContextTypes.DEFAULT_TYPE, value: int) -> None:
+    ctx.user_data["balance"] = int(value)
+
+
+def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    try:
+        return ctx._user_id_and_data[0]  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
+def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, force_refresh: bool = False) -> int:
+    if not force_refresh:
+        cached = ctx.user_data.get("balance")
+        if cached is not None:
             try:
-                if self.redis.get(key) is None:
-                    self.redis.set(key, value)
-            except redis.RedisError as exc:
-                log.warning("Redis sync failed for %s: %s", key, exc)
-                break
+                return int(cached)
+            except (TypeError, ValueError):
+                pass
 
-    def get(self, uid: int) -> int:
-        if not uid:
-            return 0
-        key = _rk("balance", str(uid))
-        value = self._redis_get(key)
-        if value is not None:
-            self._update_backup(uid, value)
-            return value
-        backup = self._get_backup(uid)
-        if backup is not None:
-            return backup
+    uid = get_user_id(ctx)
+    if not uid:
         return 0
 
-    def set(self, uid: int, value: int) -> int:
-        value = max(0, int(value))
-        if not uid:
-            return value
-        key = _rk("balance", str(uid))
-        self._redis_set(key, value)
-        self._update_backup(uid, value)
-        return value
+    balance = ledger_storage.get_balance(uid)
+    _set_cached_balance(ctx, balance)
+    return balance
 
 
-balance_storage = PersistentBalanceStorage(redis_client, BALANCE_BACKUP_PATH)
+def credit_tokens(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    amount: int,
+    reason: str,
+    op_id: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> LedgerOpResult:
+    uid = get_user_id(ctx)
+    if not uid:
+        raise RuntimeError("Cannot credit tokens without user id")
+    result = ledger_storage.credit(uid, amount, reason, op_id, meta)
+    _set_cached_balance(ctx, result.balance)
+    return result
+
+
+def try_charge(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    need: int,
+    reason: str,
+    op_id: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, int, Optional[LedgerOpResult]]:
+    uid = get_user_id(ctx)
+    if not uid:
+        return "no_user", 0, None
+    try:
+        result = ledger_storage.debit(uid, need, reason, op_id, meta)
+    except InsufficientBalance as exc:
+        _set_cached_balance(ctx, exc.balance)
+        return "insufficient", exc.balance, None
+    _set_cached_balance(ctx, result.balance)
+    status = "applied" if result.applied else "duplicate"
+    return status, result.balance, result
+
+
+def rename_operation(op_id: str, new_op_id: str, extra_meta: Optional[Dict[str, Any]] = None) -> bool:
+    if not op_id or not new_op_id:
+        return False
+    return ledger_storage.rename_operation(op_id, new_op_id, extra_meta)
 
 # ==========================
 #   Helpers / storage
@@ -600,6 +587,9 @@ DEFAULT_STATE = {
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
     "mj_generating": False, "last_mj_task_id": None, "last_mj_msg_id": None,
+    "active_generation_op": None,
+    "mj_active_op_key": None,
+    "banana_active_op_key": None,
 }
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
@@ -607,50 +597,6 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         if k not in ud: ud[k] = [] if isinstance(v, list) else v
     if not isinstance(ud.get("banana_images"), list): ud["banana_images"] = []
     return ud
-
-# ---------- Balance ----------
-def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    try: return ctx._user_id_and_data[0]  # type: ignore[attr-defined]
-    except Exception: return None
-
-def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    cached = ctx.user_data.get("balance")
-    if cached is not None:
-        try:
-            return int(cached)
-        except (TypeError, ValueError):
-            pass
-
-    uid = get_user_id(ctx)
-    if not uid:
-        return 0
-
-    balance = balance_storage.get(uid)
-    ctx.user_data["balance"] = balance
-    return balance
-
-def set_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, v: int):
-    v = max(0, int(v))
-    ctx.user_data["balance"] = v
-    uid = get_user_id(ctx)
-    if uid:
-        balance_storage.set(uid, v)
-
-def add_tokens(ctx: ContextTypes.DEFAULT_TYPE, add: int):
-    set_user_balance_value(ctx, get_user_balance_value(ctx) + int(add))
-
-def try_charge(ctx: ContextTypes.DEFAULT_TYPE, need: int) -> Tuple[bool, int]:
-    bal = get_user_balance_value(ctx)
-    if bal < need: return False, bal
-    set_user_balance_value(ctx, bal - need)
-    return True, bal - need
-
-def has_signup_bonus(uid: int) -> bool:
-    if not redis_client: return False
-    return bool(redis_client.get(_rk("signup_bonus", str(uid))))
-
-def set_signup_bonus(uid: int):
-    if redis_client: redis_client.set(_rk("signup_bonus", str(uid)), "1")
 
 # ==========================
 #   UI / Texts
@@ -1355,12 +1301,25 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
 async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     start_ts = time.time()
+    price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
+    op_key = s.get("active_generation_op")
+
+    def _refund(reason_tag: str, message: Optional[str] = None) -> None:
+        meta: Dict[str, Any] = {"reason": reason_tag}
+        if message:
+            meta["message"] = message
+        refund_op_id = f"refund:{task_id}:{reason_tag}"
+        try:
+            credit_tokens(ctx, price, "veo_refund", refund_op_id, meta)
+        except Exception as exc:
+            log.exception("VEO refund %s failed: %s", reason_tag, exc)
+
     try:
         while True:
             if s.get("generation_id") != gen_id: return
             ok, flag, msg, res_url = await asyncio.to_thread(get_kie_veo_status, task_id)
             if not ok:
-                add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
+                _refund("status_error", msg)
                 await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса VEO. 💎 Токены возвращены.\n{msg or ''}")
                 break
             if isinstance(res_url, str) and res_url.startswith("http"):
@@ -1389,23 +1348,26 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]))
                 break
             if flag in (2, 3):
-                add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
+                _refund("no_url", msg)
                 await ctx.bot.send_message(chat_id, f"❌ KIE не вернул ссылку на видео. 💎 Токены возвращены.\n{msg or ''}")
                 break
             if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
-                add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
+                _refund("timeout")
                 await ctx.bot.send_message(chat_id, "⌛ Превышено время ожидания VEO. 💎 Токены возвращены.")
                 break
             await asyncio.sleep(POLL_INTERVAL_SECS)
     except Exception as e:
         log.exception("VEO poll crash: %s", e)
-        add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
+        _refund("exception", str(e))
         try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка при опросе VEO. 💎 Токены возвращены.")
         except Exception: pass
     finally:
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
+        if op_key:
+            _clear_operation(ctx, op_key)
+        s.pop("active_generation_op", None)
         _clear_kie_request_id(task_id)
 
 # ==========================
@@ -1423,16 +1385,29 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
     prompt_for_retry = (prompt or "").strip()
     s = state(ctx)
     s["last_mj_task_id"] = task_id
+
+    op_key = s.get("mj_active_op_key")
+
+    def _refund(reason_tag: str, message: Optional[str] = None) -> None:
+        meta: Dict[str, Any] = {"reason": reason_tag}
+        if message:
+            meta["message"] = message
+        refund_op_id = f"refund:{task_id}:{reason_tag}"
+        try:
+            credit_tokens(ctx, price, "mj_refund", refund_op_id, meta)
+        except Exception as exc:
+            log.exception("MJ refund %s failed: %s", reason_tag, exc)
+
     try:
         while True:
             ok, flag, data = await asyncio.to_thread(mj_status, task_id)
             if not ok:
-                add_tokens(ctx, price)
+                _refund("status_error")
                 await ctx.bot.send_message(chat_id, "❌ MJ: сервис недоступен. 💎 Токены возвращены.")
                 return
             if flag == 0:
                 if time.time() - start_ts > max_wait:
-                    add_tokens(ctx, price)
+                    _refund("timeout")
                     await ctx.bot.send_message(chat_id, "⌛ MJ долго отвечает. 💎 Токены возвращены.")
                     return
                 await asyncio.sleep(delay)
@@ -1451,7 +1426,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                         start_ts = time.time()
                         delay = 12
                         continue
-                add_tokens(ctx, price)
+                _refund("error", err)
                 await ctx.bot.send_message(chat_id, f"❌ MJ: {err}\n💎 Токены возвращены.")
                 return
             if flag == 1:
@@ -1461,7 +1436,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     urls = _extract_mj_image_urls(payload)
                     url = urls[0] if urls else None
                 if not url:
-                    add_tokens(ctx, price)
+                    _refund("empty")
                     await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
                     return
                 base_prompt = re.sub(r"\s+", " ", prompt_for_retry).strip()
@@ -1490,7 +1465,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 return
     except Exception as e:
         log.exception("MJ poll crash: %s", e)
-        add_tokens(ctx, price)
+        _refund("exception", str(e))
         try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка MJ. 💎 Токены возвращены.")
         except Exception: pass
     finally:
@@ -1505,6 +1480,9 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
             try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None)
             except Exception: pass
             s["last_mj_msg_id"] = None
+        if op_key:
+            _clear_operation(ctx, op_key)
+        s.pop("mj_active_op_key", None)
 
 # ==========================
 #   Handlers
@@ -1530,24 +1508,47 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx); s.update({**DEFAULT_STATE})
     uid = update.effective_user.id
 
-    got_bonus = False
-    if redis_client:
-        if not has_signup_bonus(uid):
-            set_signup_bonus(uid); got_bonus = True
-    else:
-        if not ctx.user_data.get("__signup_bonus"):
-            ctx.user_data["__signup_bonus"] = True; got_bonus = True
-    if got_bonus:
-        add_tokens(ctx, 10)
-        await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
+    try:
+        bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
+        _set_cached_balance(ctx, bonus_result.balance)
+        if bonus_result.applied:
+            await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
+    except Exception as exc:
+        log.exception("Signup bonus failed for %s: %s", uid, exc)
 
-    await update.message.reply_text(render_welcome_for(uid, ctx), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
+    await update.message.reply_text(
+        render_welcome_for(uid, ctx),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💳 Пополнение через *Telegram Stars*.\nЕсли звёзд не хватает — купите в официальном боте:",
         parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
     )
+
+
+async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    balance = get_user_balance_value(ctx, force_refresh=True)
+    await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+
+
+async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    try:
+        result = ledger_storage.recalc_user_balance(uid)
+        _set_cached_balance(ctx, result.calculated)
+    except Exception as exc:
+        log.exception("Balance recalc failed for %s: %s", uid, exc)
+        await update.message.reply_text("⚠️ Не удалось пересчитать баланс. Попробуйте позже.")
+        return
+    if result.updated:
+        await update.message.reply_text(
+            f"♻️ Баланс обновлён: было {result.previous} 💎 → стало {result.calculated} 💎"
+        )
+    else:
+        await update.message.reply_text(f"✅ Баланс актуален: {result.calculated} 💎")
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
@@ -1558,6 +1559,7 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"REDIS: `{'on' if REDIS_URL else 'off'}`",
         f"FFMPEG: `{FFMPEG_BIN}`",
     ]
+    parts.append(f"DB: `{'ok' if ledger_storage.ping() else 'error'}`")
     lock_status = "disabled"
     if runner_lock_state.get("enabled"):
         lock_status = "owned" if runner_lock_state.get("owned") else "free"
@@ -1754,24 +1756,57 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not prompt:
                 await q.message.reply_text("❌ Промпт не найден, отправьте текст и повторите."); return
             price = TOKEN_COSTS['mj']
-            ok_balance, rest = try_charge(ctx, price)
-            if not ok_balance:
-                await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
+            aspect_value = "9:16" if s.get("aspect") == "9:16" else "16:9"
+            fingerprint = _make_fingerprint({"prompt": prompt, "aspect": aspect_value})
+            op_key = f"mj:{fingerprint}"
+            op_id, _ = _ensure_operation(ctx, op_key)
+            status, rest, _ = try_charge(
+                ctx,
+                price,
+                "mj_charge",
+                op_id,
+                {"prompt": _short_prompt(prompt, 160), "aspect": aspect_value},
+            )
+            if status == "insufficient":
+                _clear_operation(ctx, op_key)
+                await q.message.reply_text(
+                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
+                    reply_markup=stars_topup_kb(),
+                );
+                return
+            if status == "duplicate":
+                await q.message.reply_text("⏳ Уже выполняю этот промпт. Дождитесь результата.")
+                return
             await q.message.reply_text("✅ Промпт принят.")
             s["mj_generating"] = True
             s["mj_last_wait_ts"] = time.time()
-            aspect_value = "9:16" if s.get("aspect") == "9:16" else "16:9"
             await show_mj_generating_card(chat_id, ctx, prompt, aspect_value)
             ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt, aspect_value)
             event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
             if not ok or not task_id:
-                add_tokens(ctx, price)
+                refund_id = f"refund:{op_id}:submit"
+                try:
+                    credit_tokens(
+                        ctx,
+                        price,
+                        "mj_refund",
+                        refund_id,
+                        {"reason": "submit_failed", "message": msg},
+                    )
+                except Exception as exc:
+                    log.exception("MJ submit refund failed for %s: %s", update.effective_user.id, exc)
+                _clear_operation(ctx, op_key)
                 s["mj_generating"] = False
                 s["last_mj_task_id"] = None
                 s["mj_last_wait_ts"] = 0.0
                 await q.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены.")
                 await show_mj_prompt_card(chat_id, ctx)
                 return
+            final_op_id = f"gen:{task_id}"
+            if not rename_operation(op_id, final_op_id, {"task_id": task_id}):
+                log.warning("Failed to rename MJ op %s -> %s", op_id, final_op_id)
+            _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
+            s["mj_active_op_key"] = op_key
             s["last_mj_task_id"] = task_id
             asyncio.create_task(poll_mj_and_send_photos(chat_id, task_id, ctx, prompt, aspect_value))
             return
@@ -1806,11 +1841,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not imgs:   await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото."); return
             if not prompt: await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить)."); return
             price = TOKEN_COSTS['banana']
-            ok, rest = try_charge(ctx, price)
-            if not ok:
-                await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
+            fingerprint = _make_fingerprint({"prompt": prompt, "images": imgs})
+            op_key = f"banana:{fingerprint}"
+            op_id, _ = _ensure_operation(ctx, op_key)
+            status, rest, _ = try_charge(
+                ctx,
+                price,
+                "banana_charge",
+                op_id,
+                {"prompt": _short_prompt(prompt, 160), "images": len(imgs)},
+            )
+            if status == "insufficient":
+                _clear_operation(ctx, op_key)
+                await q.message.reply_text(
+                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
+                    reply_markup=stars_topup_kb(),
+                );
+                return
+            if status == "duplicate":
+                await q.message.reply_text("⏳ Уже обрабатываю предыдущий запрос Banana. Дождитесь результата.")
+                return
             await q.message.reply_text("🍌 Запускаю Banana…")
-            asyncio.create_task(_banana_run_and_send(update.effective_chat.id, ctx, imgs, prompt)); return
+            s["banana_active_op_key"] = op_key
+            asyncio.create_task(_banana_run_and_send(update.effective_chat.id, ctx, imgs, prompt, op_key, op_id, price)); return
 
     # -------- VEO card actions --------
     if data.startswith("veo:set_ar:"):
@@ -1827,14 +1880,61 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not prompt:
             await q.message.reply_text("⚠️ Сначала пришлите текстовый промпт."); return
         price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
-        ok_balance, rest = try_charge(ctx, price)
-        if not ok_balance:
-            await q.message.reply_text(f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.", reply_markup=stars_topup_kb()); return
+        uid = update.effective_user.id
+        fingerprint = _make_fingerprint({
+            "prompt": prompt,
+            "image": s.get("last_image_url"),
+            "aspect": s.get("aspect"),
+            "model": s.get("model"),
+        })
+        op_key = f"veo:{fingerprint}"
+        op_id, _ = _ensure_operation(ctx, op_key)
+        meta = {
+            "prompt": _short_prompt(prompt, 160),
+            "aspect": s.get("aspect") or "16:9",
+            "model": s.get("model") or "veo3_fast",
+        }
+        status, rest, _ = try_charge(ctx, price, "veo_charge", op_id, meta)
+        if status == "insufficient":
+            _clear_operation(ctx, op_key)
+            await q.message.reply_text(
+                f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
+                reply_markup=stars_topup_kb(),
+            );
+            return
+        if status == "duplicate":
+            await q.message.reply_text("⏳ Уже выполняю предыдущий запрос. Дождитесь результата.")
+            return
         await q.message.reply_text("🎬 Отправляю задачу в VEO…")
-        ok, task_id, msg = await asyncio.to_thread(submit_kie_veo, prompt, (s.get("aspect") or "16:9"), s.get("last_image_url"), s.get("model") or "veo3_fast")
+        ok, task_id, msg = await asyncio.to_thread(
+            submit_kie_veo,
+            prompt,
+            (s.get("aspect") or "16:9"),
+            s.get("last_image_url"),
+            s.get("model") or "veo3_fast",
+        )
         if not ok or not task_id:
-            add_tokens(ctx, price)
-            await q.message.reply_text(f"❌ Не удалось создать VEO-задачу: {msg}\n💎 Токены возвращены."); return
+            refund_id = f"refund:{op_id}:submit"
+            try:
+                credit_tokens(
+                    ctx,
+                    price,
+                    "veo_refund",
+                    refund_id,
+                    {"reason": "submit_failed", "message": msg},
+                )
+            except Exception as exc:
+                log.exception("VEO submit refund failed for %s: %s", uid, exc)
+            _clear_operation(ctx, op_key)
+            await q.message.reply_text(
+                f"❌ Не удалось создать VEO-задачу: {msg}\n💎 Токены возвращены.",
+            )
+            return
+        final_op_id = f"gen:{task_id}"
+        if not rename_operation(op_id, final_op_id, {"task_id": task_id}):
+            log.warning("Failed to rename ledger op %s -> %s", op_id, final_op_id)
+        _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
+        s["active_generation_op"] = op_key
         gen_id = uuid.uuid4().hex
         s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
         await q.message.reply_text(f"🆔 VEO taskId: `{task_id}`\n🎞 Рендер начат — вернусь с готовым видео.", parse_mode=ParseMode.MARKDOWN)
@@ -1863,10 +1963,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ Этот промокод уже был активирован другим пользователем.")
             s["mode"] = None
             return
+        try:
+            result = ledger_storage.apply_promo(
+                uid,
+                code,
+                bonus,
+                {"source": "promo_command"},
+            )
+            _set_cached_balance(ctx, result.balance)
+            if not result.applied:
+                if used_by == uid or result.duplicate:
+                    await update.message.reply_text("ℹ️ Вы уже активировали этот промокод ранее.")
+                else:
+                    await update.message.reply_text("⚠️ Промокод сейчас недоступен. Попробуйте другой.")
+                s["mode"] = None
+                return
+        except Exception as exc:
+            log.exception("Promo apply failed for %s (%s): %s", uid, code, exc)
+            await update.message.reply_text("⚠️ Не удалось применить промокод. Попробуйте позже.")
+            s["mode"] = None
+            return
+
         promo_mark_used(code, uid)
-        add_tokens(ctx, bonus)
+        balance = get_user_balance_value(ctx, force_refresh=True)
         await update.message.reply_text(
-            f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎"
+            f"✅ Промокод принят! +{bonus}💎\nБаланс: {balance} 💎"
         )
         s["mode"] = None
         return
@@ -1924,32 +2045,68 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s["last_prompt"] = text
     await show_or_update_veo_card(update.effective_chat.id, ctx)
 
-async def _banana_run_and_send(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, src_urls: List[str], prompt: str):
+async def _banana_run_and_send(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    src_urls: List[str],
+    prompt: str,
+    op_key: str,
+    op_id: str,
+    price: int,
+) -> None:
+    s = state(ctx)
+
+    def _refund(reason_tag: str, message: Optional[str] = None) -> None:
+        meta: Dict[str, Any] = {"reason": reason_tag}
+        if message:
+            meta["message"] = message
+        refund_op_id = f"refund:{op_id}:{reason_tag}"
+        try:
+            credit_tokens(ctx, price, "banana_refund", refund_op_id, meta)
+        except Exception as exc:
+            log.exception("Banana refund %s failed: %s", reason_tag, exc)
+
     try:
         task_id = await asyncio.to_thread(create_banana_task, prompt, src_urls, "png", "auto", None, None, 60)
+        final_op_id = f"gen:{task_id}"
+        if not rename_operation(op_id, final_op_id, {"task_id": task_id}):
+            log.warning("Failed to rename Banana op %s -> %s", op_id, final_op_id)
+        _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
+        s["banana_active_op_key"] = op_key
         await ctx.bot.send_message(chat_id, f"🍌 Задача Banana создана.\n🆔 taskId={task_id}\nЖдём результат…")
-        urls = await asyncio.to_thread(wait_for_banana_result, task_id, 8*60, 3)
+        urls = await asyncio.to_thread(wait_for_banana_result, task_id, 8 * 60, 3)
         if not urls:
-            add_tokens(ctx, TOKEN_COSTS["banana"])
+            _refund("empty")
             await ctx.bot.send_message(chat_id, "⚠️ Banana вернула пустой результат. 💎 Токены возвращены."); return
         u0 = urls[0]
         try:
             await ctx.bot.send_photo(chat_id=chat_id, photo=u0, caption="✅ Banana готово")
         except Exception:
-            r = requests.get(u0, timeout=180); r.raise_for_status()
+            r = requests.get(u0, timeout=180)
+            r.raise_for_status()
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                f.write(r.content); path = f.name
+                f.write(r.content)
+                path = f.name
             with open(path, "rb") as f:
-                await ctx.bot.send_document(chat_id=chat_id, document=InputFile(f, filename="banana.png"), caption="✅ Banana готово")
-            try: os.unlink(path)
-            except Exception: pass
+                await ctx.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(f, filename="banana.png"),
+                    caption="✅ Banana готово",
+                )
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
     except KieBananaError as e:
-        add_tokens(ctx, TOKEN_COSTS["banana"])
+        _refund("error", str(e))
         await ctx.bot.send_message(chat_id, f"❌ Banana ошибка: {e}\n💎 Токены возвращены.")
     except Exception as e:
-        add_tokens(ctx, TOKEN_COSTS["banana"])
+        _refund("exception", str(e))
         log.exception("BANANA unexpected: %s", e)
         await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка Banana. 💎 Токены возвращены.")
+    finally:
+        _clear_operation(ctx, op_key)
+        s.pop("banana_active_op_key", None)
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
@@ -1993,8 +2150,23 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
         if tokens <= 0:
             mapping = {50:50,100:110,200:220,300:330,400:440,500:550}
             tokens = mapping.get(stars, 0)
-        add_tokens(ctx, tokens)
-        await update.message.reply_text(f"✅ Оплата получена: +{tokens} токенов.\nБаланс: {get_user_balance_value(ctx)} 💎")
+        if tokens > 0:
+            charge_id = sp.telegram_payment_charge_id or sp.provider_payment_charge_id or uuid.uuid4().hex
+            payment_meta = {
+                "source": "telegram_stars",
+                "stars": stars,
+                "payload": meta,
+            }
+            try:
+                result = credit_tokens(ctx, tokens, "topup_stars", f"payment:{charge_id}", payment_meta)
+            except Exception as exc:
+                log.exception("Top-up credit failed for %s: %s", charge_id, exc)
+                await update.message.reply_text("⚠️ Платёж получен, но обновить баланс не удалось. Свяжитесь с поддержкой.")
+                return
+            balance = result.balance
+            msg = "✅ Оплата учтена повторно." if not result.applied else f"✅ Оплата получена: +{tokens} токенов."
+            await update.message.reply_text(f"{msg}\nБаланс: {balance} 💎")
+            return
         return
     await update.message.reply_text("✅ Оплата получена.")
 
@@ -2287,6 +2459,8 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
+    application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("balance_recalc", balance_recalc))
     application.add_handler(prompt_master_conv, group=10)
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

@@ -42,6 +42,9 @@ REDIS_LOCK_ENABLED=true
 REDIS_URL=redis://:password@host:port/0
 REDIS_PREFIX=veo3:prod
 
+# Postgres ledger storage (обязательно)
+DATABASE_URL=postgresql://user:password@host:5432/database
+
 ## Redis runner lock mechanics
 
 * При запуске бот ставит ключ `{REDIS_PREFIX}:lock:runner` в Redis (`SET NX EX=60`). Значение — JSON с `host`, `pid`, `started_at`, `heartbeat_at`, `version`.
