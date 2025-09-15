@@ -982,7 +982,7 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
         if tid:
             _remember_kie_request_id(tid, req_id)
             return True, tid, "Задача создана."
-        return False, None, "Ответ KIE без taskId."
+        return False, None, "Ответ сервиса без taskId."
     error_msg = message or resp.get("error") or str(resp)
     return False, None, f"Ошибка VEO: {error_msg}"
 
@@ -1114,59 +1114,64 @@ async def send_kie_1080p_to_tg(
     is_vertical: bool,
 ) -> bool:
     hd_url, meta = fetch_1080p_result_url(task_id, index)
-    code_for_user = meta.get("code") or meta.get("http_status") or "n/a"
+    chosen_url = hd_url or fallback_url
 
     if not hd_url:
         reason = meta.get("error") or meta.get("message")
         if reason:
-            kie_event("1080_UNAVAILABLE", taskId=task_id, index=index, reason=reason, code=meta.get("code"), http_status=meta.get("http_status"))
-        message = f"KIE не вернул 1080p: {code_for_user}"
-        await ctx.bot.send_message(chat_id, f"ℹ️ {message}")
-        if fallback_url:
-            await ctx.bot.send_message(chat_id, f"🔗 Исходный URL: {fallback_url}")
+            kie_event(
+                "1080_UNAVAILABLE",
+                taskId=task_id,
+                index=index,
+                reason=reason,
+                code=meta.get("code"),
+                http_status=meta.get("http_status"),
+            )
+
+    if not chosen_url:
+        await ctx.bot.send_message(chat_id, "❌ Не удалось получить видео.")
         return False
 
     try:
-        path = download_file(hd_url)
+        path = download_file(chosen_url)
     except Exception as exc:
         kie_event("1080_DOWNLOAD_FAIL", taskId=task_id, index=index, error=str(exc))
-        await ctx.bot.send_message(chat_id, "❌ Не удалось скачать 1080p видео.")
-        if fallback_url:
-            await ctx.bot.send_message(chat_id, f"🔗 Исходный URL: {fallback_url}")
+        await ctx.bot.send_message(chat_id, "❌ Не удалось отправить видео.")
         return False
 
     try:
         wh = probe_size(path)
         width, height = (wh if wh else (None, None))
         resolution = f"{width}x{height}" if width and height else None
-        main
+        expected = (1080, 1920) if is_vertical else (1920, 1080)
+        if width and height and (width, height) != expected:
+            log.warning(
+                "Unexpected video size: %s×%s (expected %s×%s)",
+                width,
+                height,
+                expected[0],
+                expected[1],
+            )
+
         kie_event(
             "1080_LOCAL",
             taskId=task_id,
             index=index,
             http_status=meta.get("http_status"),
             code=meta.get("code"),
-            resultUrl=hd_url,
+            resultUrl=chosen_url,
             local_path=str(path),
             resolution=resolution,
             width=width,
             height=height,
         )
 
-        caption = (f"{width}×{height}" if width and height else "1080p")
         with path.open("rb") as fh:
             await ctx.bot.send_video(
                 chat_id=chat_id,
-                video=InputFile(fh, filename="veo_result_1080p.mp4"),
+                video=InputFile(fh, filename="veo_result.mp4"),
                 supports_streaming=True,
-                caption=caption,
             )
-
-        if width and height:
-            expected = (1080, 1920) if is_vertical else (1920, 1080)
-            if (width, height) != expected:
-                log.warning("KIE returned non-1080p (%s×%s), expected %s×%s", width, height, expected[0], expected[1])
-                await ctx.bot.send_message(chat_id, "ℹ️ KIE вернул не 1080p. Проверим тариф/параметры.")
         return True
     finally:
         with suppress(Exception):
@@ -1253,10 +1258,10 @@ def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
         404: "Задача не найдена.",
         422: "Запрос отклонён модерацией.",
         429: "Превышен лимит.",
-        500: "Внутренняя ошибка KIE.",
-        504: "Таймаут KIE.",
+        500: "Внутренняя ошибка сервиса.",
+        504: "Таймаут сервиса.",
     }
-    base = mapping.get(code, f"KIE code {code}.")
+    base = mapping.get(code, f"Код ошибки {code}.")
     return f"{base} {msg}".strip()
 
 def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
@@ -1444,7 +1449,7 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     final_url=final_url,
                 )
                 await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
-                await send_kie_1080p_to_tg(
+                sent = await send_kie_1080p_to_tg(
                     ctx,
                     chat_id,
                     task_id,
@@ -1452,12 +1457,20 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     fallback_url=final_url,
                     is_vertical=(s.get("aspect") == "9:16"),
                 )
-                await ctx.bot.send_message(chat_id, "✅ *Готово!*", parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]))
+                if sent:
+                    await ctx.bot.send_message(
+                        chat_id,
+                        "✅ Готово!",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
+                        ),
+                    )
                 break
             if flag in (2, 3):
-                _refund("no_url", msg)
-                await ctx.bot.send_message(chat_id, f"❌ KIE не вернул ссылку на видео. 💎 Токены возвращены.\n{msg or ''}")
+codex/update-video-file-sending-logic
+                add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
+                await ctx.bot.send_message(chat_id, f"❌ Не удалось получить видео. 💎 Токены возвращены.\n{msg or ''}")
+ main
                 break
             if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
                 _refund("timeout")
@@ -1747,7 +1760,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом и/или фото. "
             "3) Карточка откроется автоматически — проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
             "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
-            "— *Форматы VEO?* 16:9 и 9:16. Для 16:9 стараемся получить 1080p; вертикаль нормализуется локально для Telegram.\n\n"
+            "— *Форматы VEO?* 16:9 и 9:16. Готовые клипы загружаем в чат как видеофайлы.\n\n"
             "— *MJ:* 16:9 или 9:16, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
             "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
             "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
