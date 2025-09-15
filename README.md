@@ -21,11 +21,6 @@ KIE_MJ_GENERATE=/api/v1/mj/generate
 KIE_MJ_STATUS=/api/v1/mj/recordInfo
 KIE_BANANA_MODEL=google/nano-banana-edit
 
-# Дополнительные KIE настройки (опционально)
-KIE_ENABLE_FALLBACK=false         # true только если надо включать fallback при 16:9
-KIE_DEFAULT_SEED=                 # опционально: число 10000–99999
-KIE_WATERMARK_TEXT=               # опционально
-
 # Video processing
 FFMPEG_BIN=ffmpeg
 ENABLE_VERTICAL_NORMALIZE=true
@@ -40,9 +35,3 @@ LOG_LEVEL=INFO
 # Redis cache / promo codes (optional)
 REDIS_URL=redis://:password@host:port/0
 REDIS_PREFIX=veo3:prod
-
-# --- Midjourney интерактивный поток ---
-# 1. Нажмите «Генерация изображений (MJ)» в меню → откроется карточка с выбором формата (16:9 или 9:16).
-# 2. Выберите формат. Бот запомнит выбор и покажет карточку «Введите промпт…» с кнопками «Подтвердить», «Отменить», «Сменить формат».
-# 3. Отправьте текст и нажмите «Подтвердить». Если промпта нет, бот напомнит «❌ Промпт не найден…».
-# 4. После генерации бот пришлёт изображение с кнопками «Открыть», «Повторить», «Назад в меню». Кнопка «Повторить» сохраняет формат.
