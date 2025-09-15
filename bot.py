@@ -34,6 +34,37 @@ def _env(k: str, d: str = "") -> str:
     v = os.getenv(k)
     return (v if v is not None else d).strip()
 
+def _normalize_endpoint_values(*values: Any) -> List[str]:
+    """Collect endpoint path candidates from strings / iterables."""
+
+    seen: set[str] = set()
+    result: List[str] = []
+
+    def _add(value: Any):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _add(item)
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        if "," in text or any(ch.isspace() for ch in text):
+            parts = re.split(r"[,\s]+", text)
+        else:
+            parts = [text]
+        for part in parts:
+            p = part.strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            result.append(p)
+
+    for v in values:
+        _add(v)
+    return result
+
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
@@ -53,9 +84,36 @@ KIE_API_KEY  = _env("KIE_API_KEY")
 KIE_BASE_URL = _env("KIE_BASE_URL", "https://api.kie.ai")
 
 # VEO
-KIE_VEO_GEN_PATH    = _env("KIE_VEO_GEN_PATH",    "/api/v1/veo/generate")
-KIE_VEO_STATUS_PATH = _env("KIE_VEO_STATUS_PATH", "/api/v1/veo/recordInfo")
-KIE_VEO_1080_PATH   = _env("KIE_VEO_1080_PATH",   "/api/v1/veo/get1080pVideo")
+KIE_VEO_GEN_PATH = _env("KIE_VEO_GEN_PATH", "/api/v1/veo/generate")
+
+_KIE_VEO_STATUS_DEFAULT = "/api/v1/veo/record-info"
+_KIE_VEO_STATUS_RAW = _env("KIE_VEO_STATUS_PATH", _KIE_VEO_STATUS_DEFAULT)
+KIE_VEO_STATUS_PATHS = _normalize_endpoint_values(
+    _KIE_VEO_STATUS_RAW,
+    _KIE_VEO_STATUS_DEFAULT,
+    "/api/v1/veo/status",
+    "/api/v1/veo/recordInfo",
+)
+if KIE_VEO_STATUS_PATHS:
+    KIE_VEO_STATUS_PATH = KIE_VEO_STATUS_PATHS[0]
+else:
+    KIE_VEO_STATUS_PATH = _KIE_VEO_STATUS_DEFAULT
+    KIE_VEO_STATUS_PATHS = [KIE_VEO_STATUS_PATH]
+
+_KIE_VEO_1080_DEFAULT = "/api/v1/veo/get-1080p-video"
+_KIE_VEO_1080_RAW = _env("KIE_VEO_1080_PATH", _KIE_VEO_1080_DEFAULT)
+KIE_VEO_1080_PATHS = _normalize_endpoint_values(
+    _KIE_VEO_1080_RAW,
+    _KIE_VEO_1080_DEFAULT,
+    "/api/v1/veo/video-1080p",
+    "/api/v1/veo/video/1080p",
+    "/api/v1/veo/get1080pVideo",
+)
+if KIE_VEO_1080_PATHS:
+    KIE_VEO_1080_PATH = KIE_VEO_1080_PATHS[0]
+else:
+    KIE_VEO_1080_PATH = _KIE_VEO_1080_DEFAULT
+    KIE_VEO_1080_PATHS = [KIE_VEO_1080_PATH]
 
 # MJ
 KIE_MJ_GENERATE = _env("KIE_MJ_GENERATE", "/api/v1/mj/generate")
@@ -523,6 +581,92 @@ async def oai_prompt_master(idea_text: str) -> Optional[str]:
 # ==========================
 #   VEO
 # ==========================
+def _veo_endpoint_cache_key(kind: str) -> str:
+    return f"veo:endpoint:{kind}"
+
+def _remember_veo_endpoint(kind: str, path: str):
+    if not path:
+        return
+    app_cache[_veo_endpoint_cache_key(kind)] = path
+    if kind == "status":
+        global KIE_VEO_STATUS_PATH
+        KIE_VEO_STATUS_PATH = path
+    elif kind == "1080":
+        global KIE_VEO_1080_PATH
+        KIE_VEO_1080_PATH = path
+
+def _veo_endpoint_candidates(kind: str, base_paths: List[str]) -> List[str]:
+    cached = app_cache.get(_veo_endpoint_cache_key(kind))
+    if cached:
+        return _normalize_endpoint_values(cached, base_paths)
+    return list(base_paths)
+
+def _is_not_found_response(status: int, payload: Dict[str, Any]) -> bool:
+    if status == 404:
+        return True
+    for key in ("code", "status"):
+        val = payload.get(key)
+        if isinstance(val, int) and val == 404:
+            return True
+        if isinstance(val, str) and val.strip() == "404":
+            return True
+    message = payload.get("message") or payload.get("error")
+    if isinstance(message, str) and "not found" in message.lower():
+        return True
+    return False
+
+def _kie_request_with_endpoint(
+    kind: str,
+    method: str,
+    paths: List[str],
+    *,
+    request_id: Optional[str] = None,
+    **kwargs: Any,
+) -> Tuple[int, Dict[str, Any], str, str]:
+    candidates = _veo_endpoint_candidates(kind, paths)
+    if not candidates:
+        return 0, {"error": "no endpoint configured"}, request_id or "", ""
+
+    current_request_id = request_id
+    last_status = 0
+    last_resp: Dict[str, Any] = {}
+    last_req_id = request_id or ""
+    last_path = candidates[0]
+
+    for idx, path in enumerate(candidates):
+        status, resp, req_id = _kie_request(
+            method,
+            path,
+            request_id=current_request_id,
+            **kwargs,
+        )
+        if current_request_id is None:
+            current_request_id = req_id
+        if not _is_not_found_response(status, resp):
+            if idx > 0:
+                kie_event(
+                    "ENDPOINT_SWITCH",
+                    kind=kind,
+                    method=method,
+                    path=path,
+                    attempts=idx + 1,
+                )
+            _remember_veo_endpoint(kind, path)
+            return status, resp, req_id, path
+        if idx + 1 < len(candidates):
+            kie_event(
+                "ENDPOINT_FALLBACK",
+                kind=kind,
+                method=method,
+                path=path,
+                status=status,
+                body_status=resp.get("status"),
+                body_code=resp.get("code"),
+            )
+        last_status, last_resp, last_req_id, last_path = status, resp, req_id, path
+
+    return last_status, last_resp, last_req_id, last_path
+
 def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Dict[str, Any]:
     aspect_ratio = "9:16" if aspect == "9:16" else "16:9"
     model = "veo3" if model_key == "veo3" else "veo3_fast"
@@ -560,9 +704,10 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
 
 def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
     req_id_hint = _get_kie_request_id(task_id)
-    status, resp, req_id = _kie_request(
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "status",
         "GET",
-        KIE_VEO_STATUS_PATH,
+        KIE_VEO_STATUS_PATHS,
         params={"taskId": task_id},
         request_id=req_id_hint,
     )
@@ -590,6 +735,7 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
         code=code,
         flag=flag,
         has_url=bool(url),
+        path=path_used,
     )
     if status == 200 and code == 200:
         return True, flag, message, url
@@ -599,9 +745,10 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
     last_err: Optional[str] = None
     req_id = _get_kie_request_id(task_id)
     for attempt in range(1, attempts + 1):
-        status, resp, req_id_used = _kie_request(
+        status, resp, req_id_used, path_used = _kie_request_with_endpoint(
+            "1080",
             "GET",
-            KIE_VEO_1080_PATH,
+            KIE_VEO_1080_PATHS,
             params={"taskId": task_id},
             timeout=per_try_timeout,
             request_id=req_id,
@@ -625,10 +772,22 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
             if not (isinstance(url, str) and url.startswith("http")):
                 url = _extract_result_url(data)
             if isinstance(url, str) and url.startswith("http"):
-                kie_event("FETCH_1080_SUCCESS", request_id=req_id, task_id=task_id, attempt=attempt)
+                kie_event(
+                    "FETCH_1080_SUCCESS",
+                    request_id=req_id,
+                    task_id=task_id,
+                    attempt=attempt,
+                    path=path_used,
+                )
                 return url
             last_err = "empty_url"
-            kie_event("FETCH_1080_EMPTY", request_id=req_id, task_id=task_id, attempt=attempt)
+            kie_event(
+                "FETCH_1080_EMPTY",
+                request_id=req_id,
+                task_id=task_id,
+                attempt=attempt,
+                path=path_used,
+            )
         else:
             last_err = f"{status}/{code}"
             message = resp.get("msg") or resp.get("message") or resp.get("error")
@@ -640,7 +799,16 @@ def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15)
                 status=status,
                 code=code,
                 message=message,
+                path=path_used,
             )
+        kie_event(
+            "1080_RETRY",
+            task_id=task_id,
+            attempt=attempt,
+            status=status,
+            code=code,
+            path=path_used,
+        )
         time.sleep(attempt)
     log.warning("1080p retries failed: %s", last_err)
     kie_event("FETCH_1080_GIVEUP", request_id=req_id, task_id=task_id, error=last_err)
@@ -760,7 +928,7 @@ async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     """
     Надёжная отправка VEO-видео:
     1) пробуем прямой URL (если не вертикаль);
-    2) если не вышло — освежаем ссылку у KIE (1080p/recordInfo) и пробуем ещё раз;
+    2) если не вышло — освежаем ссылку у KIE (1080p/record-info) и пробуем ещё раз;
     3) скачиваем и перезаливаем (таймаут 300с). Остальной UX не меняется.
     """
     event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
