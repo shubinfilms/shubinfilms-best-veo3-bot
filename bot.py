@@ -2221,9 +2221,9 @@ class RedisRunnerLock:
         self._redis = None
 
 # ==========================
-#   Entry
+#   Entry (fixed for PTB 21.x)
 # ==========================
-async def main() -> None:
+async def run_bot_async() -> None:
     if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
     if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
@@ -2233,14 +2233,7 @@ async def main() -> None:
                    .rate_limiter(AIORateLimiter())
                    .build())
 
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-        log.info("Webhook deleted")
-    except Exception as exc:
-        event("WEBHOOK_DELETE_ERROR", error=str(exc))
-        log.warning("Delete webhook failed: %s", exc)
-
+    # Handlers (оставляем как есть)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
@@ -2252,13 +2245,43 @@ async def main() -> None:
     application.add_error_handler(error_handler)
 
     lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
+
     try:
         async with lock:
             log.info("Bot starting… (Redis=%s, lock=%s)", "on" if redis_client else "off", "enabled" if lock.enabled else "disabled")
-            await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
+
+            # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
+            await application.initialize()
+
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+                log.info("Webhook deleted")
+            except Exception as exc:
+                event("WEBHOOK_DELETE_ERROR", error=str(exc))
+                log.warning("Delete webhook failed: %s", exc)
+
+            try:
+                await application.start()
+                await application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True
+                )
+
+                # Блокирующее ожидание SIGINT/SIGTERM
+                await application.updater.idle()
+            finally:
+                # Корректная остановка
+                await application.stop()
+                await application.shutdown()
     except RedisLockBusy:
         log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
 
 
+def main() -> None:
+    # Единая точка входа: создаём и закрываем цикл здесь
+    asyncio.run(run_bot_async())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
