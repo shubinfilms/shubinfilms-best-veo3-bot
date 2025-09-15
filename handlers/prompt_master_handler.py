@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Prompt-Master text constants."""
 
-PROMPT_MASTER_HEADER = "🧠 Prompt-Master 2.0"
+PROMPT_MASTER_HEADER = "<tg-emoji emoji-id=\"5237799019329105246\">🧠</tg-emoji> <b>Prompt-Master 2.0</b>"
 PROMPT_MASTER_BODY = (
     "Опиши идею (1–3 предложения). Если нужна озвучка — укажи язык и характер голоса.\n"
     "Можно добавить тех. детали (например: “85mm prime, shallow DOF, real-time”)."
