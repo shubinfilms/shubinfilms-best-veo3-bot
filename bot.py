@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # Best VEO3 Bot — PTB 21.x
 # Версия: 2025-09-14r4
@@ -37,6 +38,7 @@ def _env(k: str, d: str = "") -> str:
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
+PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
@@ -130,39 +132,8 @@ def promo_mark_used(code: str, uid: int):
     if not code: return
     if redis_client:
         redis_client.setnx(_rk("promo", "used_by", code), str(uid))
-# Local promo guard when Redis is off (prevents re-use within same chat/session)
-def promo_used_by_user(ctx: ContextTypes.DEFAULT_TYPE, code: str) -> bool:
-    used = ctx.user_data.get("promo_used", set())
-    return (code or "").strip().upper() in used
-
-def promo_mark_used_local(ctx: ContextTypes.DEFAULT_TYPE, code: str):
-    used = ctx.user_data.get("promo_used", set())
-    try:
-        used.add((code or "").strip().upper())
-    except Exception:
-        used = set([(code or "").strip().upper()])
-    ctx.user_data["promo_used"] = used
-
 
 # локальный кэш процесса (если Redis выключен)
-# ---------- Persistent balance fallback (file) when Redis is off ----------
-BAL_STORE = _env("BAL_STORE", "balances.json")
-
-def _bal_load() -> dict:
-    try:
-        with open(BAL_STORE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _bal_save(d: dict):
-    try:
-        tmp = BAL_STORE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f)
-        os.replace(tmp, BAL_STORE)
-    except Exception:
-        pass
 app_cache: Dict[Any, Any] = {}
 
 # ==========================
@@ -275,26 +246,13 @@ def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if v is not None:
             try: return int(v)
             except: return 0
-    # Fallback to file if Redis is off
-    if uid:
-        d = _bal_load()
-        if str(uid) in d:
-            try: return int(d[str(uid)])
-            except: return 0
     return int(ctx.user_data.get("balance", 0))
 
 def set_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, v: int):
     v = max(0, int(v))
     ctx.user_data["balance"] = v
     uid = get_user_id(ctx)
-    if redis_client and uid:
-        redis_client.set(_rk("balance", str(uid)), v)
-    else:
-        # Fallback to file if Redis is off
-        if uid:
-            d = _bal_load()
-            d[str(uid)] = v
-            _bal_save(d)
+    if redis_client and uid: redis_client.set(_rk("balance", str(uid)), v)
 
 def add_tokens(ctx: ContextTypes.DEFAULT_TYPE, add: int):
     set_user_balance_value(ctx, get_user_balance_value(ctx) + int(add))
@@ -343,7 +301,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
         ],
         [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
-        [InlineKeyboardButton("🎟️ Активировать промокод", callback_data="promo_open")],
+        ([InlineKeyboardButton("🎟️ Активировать промокод", callback_data="promo_open")], if PROMO_ENABLED else []),
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -881,6 +839,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
 
     if data == "promo_open":
+        if not PROMO_ENABLED:
+            await q.message.reply_text("🎟️ Промокоды временно отключены.")
+            return
         s["mode"] = "promo"
         await q.message.reply_text("🎟️ Введите промокод одним сообщением:"); return
 
@@ -1036,6 +997,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # PROMO
     if mode == "promo":
+    if not PROMO_ENABLED:
+        await update.message.reply_text("🎟️ Промокоды временно отключены.")
+        s["mode"] = None
+        return
         code = text.upper()
         uid = update.effective_user.id
         bonus = promo_amount(code)
@@ -1044,24 +1009,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mode"] = None
             return
         used_by = promo_used_global(code)
-if used_by and used_by != uid:
-    await update.message.reply_text("⛔ Этот промокод уже был активирован другим пользователем.")
-    s["mode"] = None
-    return
-# If Redis is off, prevent repeated use within this chat/session
-if (not redis_client) and promo_used_by_user(ctx, code):
-    await update.message.reply_text("⛔ Этот промокод уже активирован в этом чате.")
-    s["mode"] = None
-    return
-promo_mark_used(code, uid)
-if not redis_client:
-    promo_mark_used_local(ctx, code)
-add_tokens(ctx, bonus)
-await update.message.reply_text(
-    f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎"
-)
-s["mode"] = None
-return
+        if used_by and used_by != uid:
+            await update.message.reply_text("⛔ Этот промокод уже был активирован другим пользователем.")
+            s["mode"] = None
+            return
+        promo_mark_used(code, uid)
+        add_tokens(ctx, bonus)
+        await update.message.reply_text(f"✅ Промокод принят! +{bonus}💎\nБаланс: {get_user_balance_value(ctx)} 💎")
+        s["mode"] = None
+        return
+
     # Ссылка на картинку как текст
     low = text.lower()
     if low.startswith(("http://", "https://")) and any(low.split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".heic")):
