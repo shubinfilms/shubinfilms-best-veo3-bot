@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, LabeledPrice
+    InputFile, LabeledPrice, InputMediaPhoto
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -1563,36 +1563,50 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 return
             if flag == 1:
                 payload = data or {}
-                url = _extract_result_url(payload)
-                if not url:
-                    urls = _extract_mj_image_urls(payload)
-                    url = urls[0] if urls else None
-                if not url:
+
+                urls = _extract_mj_image_urls(payload)
+                if not urls:
+                    one_url = _extract_result_url(payload)
+                    urls = [one_url] if one_url else []
+
+                if not urls:
                     _refund("empty")
                     await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
                     return
+
                 base_prompt = re.sub(r"\s+", " ", prompt_for_retry).strip()
-                snippet = base_prompt[:100] if base_prompt else ""
-                if not snippet:
-                    snippet = "—"
-                caption = "\n".join([
-                    "🖼 Midjourney",
-                    f"• Формат: {aspect_ratio}",
-                    f'• Промпт: "{snippet}"',
-                ])
+                snippet = base_prompt[:100] if base_prompt else "—"
+                caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
+
+                if len(urls) >= 2:
+                    media: List[InputMediaPhoto] = []
+                    for i, u in enumerate(urls[:10]):
+                        if i == 0:
+                            media.append(InputMediaPhoto(media=u, caption=caption))
+                        else:
+                            media.append(InputMediaPhoto(media=u))
+                    try:
+                        await ctx.bot.send_media_group(chat_id=chat_id, media=media)
+                    except Exception as e:
+                        log.warning("MJ send_media_group failed: %s", e)
+                        try:
+                            await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0], caption=caption)
+                        except Exception as e2:
+                            log.warning("MJ send_photo fallback failed: %s", e2)
+                else:
+                    try:
+                        await ctx.bot.send_photo(chat_id=chat_id, photo=urls[0], caption=caption)
+                    except Exception as e:
+                        log.warning("MJ single send_photo failed: %s", e)
+                        await ctx.bot.send_message(chat_id, caption + f"\n{urls[0]}")
+
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Открыть", url=url)],
+                    [InlineKeyboardButton("Открыть", url=urls[0])],
                     [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
                     [InlineKeyboardButton("Назад в меню", callback_data="back")],
                 ])
-                try:
-                    await ctx.bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=keyboard)
-                except Exception as e:
-                    log.warning("MJ send_photo failed: %s", e)
-                    try:
-                        await ctx.bot.send_message(chat_id, caption + f"\n{url}", reply_markup=keyboard)
-                    except Exception as e2:
-                        log.warning("MJ send_message fallback failed: %s", e2)
+                await ctx.bot.send_message(chat_id, "Галерея сгенерирована.", reply_markup=keyboard)
+
                 success = True
                 return
     except Exception as e:
