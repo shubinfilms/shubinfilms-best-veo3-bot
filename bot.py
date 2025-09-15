@@ -23,6 +23,12 @@ from telegram.ext import (
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
+from handlers.prompt_master_handler import (
+    PROMPT_MASTER_BODY,
+    PROMPT_MASTER_HEADER,
+    prompt_master_conv,
+)
+
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
 
@@ -627,7 +633,7 @@ WELCOME = (
     "🎬 *Veo 3 — съёмочная команда*: опиши идею и получи *готовый клип*.\n"
     "🖌️ *MJ — художник*: рисует изображение по тексту (16:9 или 9:16).\n"
     "🍌 *Banana — редактор из будущего*: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
-    "🧠 *Prompt-Master* — вернёт профессиональный *кинопромпт*.\n"
+    "🧠 *Prompt-Master (/promptmaster)* — вернёт профессиональный *кинопромпт*.\n"
     "💬 *Обычный чат* — ответы на любые вопросы.\n\n"
     "💎 *Ваш баланс:* {balance}\n"
     "📈 Больше идей и примеров: {prompts_url}\n\n"
@@ -644,7 +650,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master (ChatGPT)", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("🧠 Prompt-Master (/promptmaster)", callback_data="mode:prompt_master")],
         [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
@@ -835,38 +841,6 @@ def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(rows)
-
-# ==========================
-#   Prompt-Master (ChatGPT)
-# ==========================
-PM_HINT = (
-    "🧠 *Prompt-Master готов!* Коротко опишите идею сцены — сделаю проф. кинопромпт.\n"
-    "Подсказка: локация, атмосфера/свет, действие, камера, реплики (в кавычках), детали.\n"
-    "Диалоги и lip-sync будут на *языке вашего сообщения*; остальное — на английском для качества."
-)
-async def oai_prompt_master(idea_text: str) -> Optional[str]:
-    if openai is None or not OPENAI_API_KEY: return None
-    dialogue_lang = "Russian" if re.search(r"[\u0400-\u04FF]", idea_text or "") else "English"
-    system = (
-        "You are a Prompt-Master for cinematic AI video generation (Veo-style). "
-        "Return ONE multi-line prompt with these labeled sections exactly:\n"
-        "Scene:\nCamera:\nAction:\nDialogue:\nLip-sync:\nAudio:\nLighting:\nWardrobe/props:\nFraming:\n"
-        f"Write ALL sections in English EXCEPT 'Dialogue' and 'Lip-sync', which must be in {dialogue_lang}. "
-        "Dialogue must be short ad lines in quotes. "
-        "No subtitles/logos/on-screen text in the video. Keep 16:9 framing. Total 600–1100 chars."
-    )
-    try:
-        user = (idea_text or "").strip()[:900]
-        resp = await asyncio.to_thread(
-            openai.ChatCompletion.create,
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.8, max_tokens=800,
-        )
-        return (resp["choices"][0]["message"]["content"] or "").strip()[:1400]
-    except Exception as e:
-        log.exception("Prompt-Master error: %s", e)
-        return None
 
 # ==========================
 #   VEO
@@ -1628,6 +1602,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Режимы
     if data.startswith("mode:"):
         mode = data.split(":",1)[1]
+        if mode == "prompt_master":
+            s["mode"] = None
+            await q.message.reply_text(
+                f"{PROMPT_MASTER_HEADER} 2.0 запускается командой /promptmaster.\n\n{PROMPT_MASTER_BODY}"
+            )
+            return
         s["mode"] = mode
         if mode in ("veo_text_fast","veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if mode.endswith("fast") else "veo3"
@@ -1639,8 +1619,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show_or_update_veo_card(update.effective_chat.id, ctx)
             await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
             return
-        if mode == "prompt_master":
-            await q.message.reply_text(PM_HINT, parse_mode=ParseMode.MARKDOWN); return
         if mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
         if mode == "mj_txt":
@@ -1836,18 +1814,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🧷 Ссылка на изображение принята.")
         if mode in ("veo_text_fast","veo_text_quality","veo_photo"):
             await show_or_update_veo_card(update.effective_chat.id, ctx)
-        return
-
-    if mode == "prompt_master":
-        if not text:
-            await update.message.reply_text("✍️ Напишите идею по подсказке выше."); return
-        if len(text) > 700:
-            await update.message.reply_text("ℹ️ Урежу ввод до 700 символов для лучшего качества.")
-        prompt = await oai_prompt_master(text[:700])
-        if not prompt:
-            await update.message.reply_text("⚠️ Prompt-Master недоступен или ответ пуст."); return
-        s["last_prompt"] = prompt
-        await update.message.reply_text(f"🧠 Готово! Вот ваш кинопромпт:\n\n```\n{prompt}\n```", parse_mode=ParseMode.MARKDOWN)
         return
 
     if mode == "chat":
@@ -2251,6 +2217,7 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
+    application.add_handler(prompt_master_conv, group=10)
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))
