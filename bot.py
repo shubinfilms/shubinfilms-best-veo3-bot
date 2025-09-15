@@ -5,15 +5,17 @@
 # (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, threading
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, threading, signal, socket
 from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime, timezone
+from contextlib import suppress
 
 import requests
 from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, InputMediaPhoto, LabeledPrice, Bot
+    InputFile, LabeledPrice
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -25,10 +27,35 @@ from telegram.ext import (
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
 
 import redis
+try:
+    import redis.asyncio as redis_asyncio  # type: ignore
+except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
+    redis_asyncio = None
 
 # ==========================
 #   ENV / INIT
 # ==========================
+APP_VERSION = "2025-09-14r4"
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 load_dotenv()
 def _env(k: str, d: str = "") -> str:
     v = os.getenv(k)
@@ -138,8 +165,9 @@ except Exception:
     _tg = None
 
 # Redis
-REDIS_URL    = _env("REDIS_URL")
-REDIS_PREFIX = _env("REDIS_PREFIX", "veo3:prod")
+REDIS_URL           = _env("REDIS_URL")
+REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
+REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 BALANCE_BACKUP_PATH = _env("BALANCE_BACKUP_PATH", os.path.join(SCRIPT_DIR, "balances.json")).strip()
@@ -1486,6 +1514,13 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"REDIS: `{'on' if REDIS_URL else 'off'}`",
         f"FFMPEG: `{FFMPEG_BIN}`",
     ]
+    lock_status = "disabled"
+    if runner_lock_state.get("enabled"):
+        lock_status = "owned" if runner_lock_state.get("owned") else "free"
+    lock_payload: Dict[str, Any] = {"ok": True, "lock": lock_status}
+    if runner_lock_state.get("heartbeat_at"):
+        lock_payload["hb"] = runner_lock_state.get("heartbeat_at")
+    parts.append(f"LOCK: `{json.dumps(lock_payload, ensure_ascii=False)}`")
     await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
@@ -1928,51 +1963,302 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
     await update.message.reply_text("✅ Оплата получена.")
 
 # ==========================
+#   Redis runner lock
+# ==========================
+
+class RedisLockBusy(RuntimeError):
+    """Raised when Redis runner lock is already held by another instance."""
+
+
+runner_lock_state: Dict[str, Any] = {
+    "enabled": bool(REDIS_URL) and REDIS_LOCK_ENABLED and redis_asyncio is not None,
+    "owned": False,
+    "heartbeat_at": None,
+    "started_at": None,
+    "host": None,
+    "pid": None,
+}
+
+
+class RedisRunnerLock:
+    LOCK_TTL_SECONDS = 60
+    HEARTBEAT_INTERVAL = 25
+    STALE_THRESHOLD_SECONDS = 90
+
+    def __init__(self, redis_url: str, key: str, enabled: bool, version: str):
+        self.redis_url = redis_url
+        self.key = key
+        self.version = version
+        self.enabled = enabled and bool(redis_url) and redis_asyncio is not None
+        runner_lock_state["enabled"] = self.enabled
+
+        self._redis: Optional["redis_asyncio.Redis"] = None
+        self._value: Dict[str, Any] = {}
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._released = False
+        self._acquired = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._signal_handlers: List[signal.Signals] = []
+
+    async def __aenter__(self) -> "RedisRunnerLock":
+        if not self.enabled:
+            log.info("Redis runner lock disabled (enabled=%s, redis_asyncio=%s)", REDIS_LOCK_ENABLED, bool(redis_asyncio))
+            return self
+
+        assert redis_asyncio is not None  # for type checkers
+        self._redis = redis_asyncio.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+        try:
+            await self._acquire()
+        except Exception:
+            await self._close_redis()
+            raise
+        self._loop = asyncio.get_running_loop()
+        self._install_signal_handlers()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.release()
+
+    async def _acquire(self) -> None:
+        if not self._redis:
+            return
+
+        backoff = 1.0
+        while True:
+            now_iso = _utcnow_iso()
+            host = socket.gethostname()
+            pid = os.getpid()
+            self._value = {
+                "host": host,
+                "pid": pid,
+                "started_at": now_iso,
+                "heartbeat_at": now_iso,
+                "version": self.version,
+            }
+            payload = json.dumps(self._value, ensure_ascii=False)
+
+            try:
+                acquired = await self._redis.set(self.key, payload, nx=True, px=self.LOCK_TTL_SECONDS * 1000)
+            except Exception as exc:
+                log.exception("Redis lock SET failed: %s", exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+                continue
+
+            if acquired:
+                self._on_acquired(takeover=False)
+                return
+
+            existing_raw = await self._redis.get(self.key)
+            existing = self._decode_existing(existing_raw)
+            if self._is_stale(existing):
+                event("LOCK_STALE_TAKEOVER", key=self.key, previous_host=existing.get("host"),
+                      previous_pid=existing.get("pid"), previous_heartbeat_at=existing.get("heartbeat_at"))
+                try:
+                    await self._redis.getdel(self.key)
+                except Exception as exc:
+                    log.warning("Redis lock GETDEL failed: %s", exc)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 5.0)
+                    continue
+
+                takeover = await self._redis.set(self.key, payload, nx=True, px=self.LOCK_TTL_SECONDS * 1000)
+                if takeover:
+                    self._on_acquired(takeover=True)
+                    return
+
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+                continue
+
+            runner_lock_state.update({
+                "owned": False,
+                "heartbeat_at": existing.get("heartbeat_at"),
+                "started_at": existing.get("started_at"),
+                "host": existing.get("host"),
+                "pid": existing.get("pid"),
+            })
+            event("LOCK_BUSY", key=self.key, owner_host=existing.get("host"), owner_pid=existing.get("pid"),
+                  owner_heartbeat_at=existing.get("heartbeat_at"))
+            raise RedisLockBusy("redis runner lock busy")
+
+    def _on_acquired(self, takeover: bool) -> None:
+        self._acquired = True
+        runner_lock_state.update({
+            "owned": True,
+            "heartbeat_at": self._value.get("heartbeat_at"),
+            "started_at": self._value.get("started_at"),
+            "host": self._value.get("host"),
+            "pid": self._value.get("pid"),
+        })
+        event("LOCK_ACQUIRED", key=self.key, host=self._value.get("host"), pid=self._value.get("pid"), takeover=takeover)
+        log.info("Redis runner lock acquired (takeover=%s)", takeover)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+
+        self._remove_signal_handlers()
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+
+        if not self.enabled or not self._redis:
+            runner_lock_state.update({
+                "owned": False,
+                "heartbeat_at": None,
+                "started_at": None,
+                "host": None,
+                "pid": None,
+            })
+            return
+
+        try:
+            await self._redis.delete(self.key)
+            event("LOCK_RELEASED", key=self.key, host=self._value.get("host"), pid=self._value.get("pid"))
+            log.info("Redis runner lock released")
+        except Exception as exc:
+            log.warning("Redis lock delete failed: %s", exc)
+        finally:
+            runner_lock_state.update({
+                "owned": False,
+                "heartbeat_at": None,
+                "started_at": None,
+                "host": None,
+                "pid": None,
+            })
+            await self._close_redis()
+
+    async def _heartbeat_loop(self) -> None:
+        if not self._redis:
+            return
+        try:
+            while not self._released:
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+                if self._released:
+                    break
+                await self._heartbeat_once()
+        except asyncio.CancelledError:
+            pass
+
+    async def _heartbeat_once(self) -> None:
+        if not self._redis or not self._acquired:
+            return
+        hb_iso = _utcnow_iso()
+        self._value["heartbeat_at"] = hb_iso
+        payload = json.dumps(self._value, ensure_ascii=False)
+        try:
+            updated = await self._redis.set(self.key, payload, xx=True, px=self.LOCK_TTL_SECONDS * 1000)
+        except Exception as exc:
+            log.warning("Redis heartbeat failed: %s", exc)
+            return
+
+        if updated:
+            runner_lock_state["heartbeat_at"] = hb_iso
+            event("LOCK_HEARTBEAT", key=self.key, heartbeat_at=hb_iso)
+        else:
+            log.warning("Redis heartbeat lost lock (key missing)")
+
+    def _decode_existing(self, raw: Optional[str]) -> Dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _is_stale(self, existing: Dict[str, Any]) -> bool:
+        if not existing:
+            return True
+        hb = _parse_iso8601(existing.get("heartbeat_at")) or _parse_iso8601(existing.get("started_at"))
+        if not hb:
+            return True
+        return (datetime.now(timezone.utc) - hb).total_seconds() > self.STALE_THRESHOLD_SECONDS
+
+    def _install_signal_handlers(self) -> None:
+        if not self.enabled:
+            return
+        if not self._loop:
+            return
+        for sig_name in ("SIGTERM", "SIGINT"):
+            if not hasattr(signal, sig_name):
+                continue
+            sig = getattr(signal, sig_name)
+            try:
+                self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._on_signal(s)))
+                self._signal_handlers.append(sig)
+            except (NotImplementedError, RuntimeError):
+                continue
+
+    def _remove_signal_handlers(self) -> None:
+        if not self._loop:
+            return
+        for sig in self._signal_handlers:
+            try:
+                self._loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+        self._signal_handlers.clear()
+
+    async def _on_signal(self, sig: signal.Signals) -> None:
+        log.info("Signal received: %s. Releasing Redis lock.", sig.name if hasattr(sig, "name") else str(sig))
+        await self.release()
+
+    async def _close_redis(self) -> None:
+        if not self._redis:
+            return
+        try:
+            await self._redis.close()
+        except Exception:
+            pass
+        self._redis = None
+
+# ==========================
 #   Entry
 # ==========================
-def main():
+async def main() -> None:
     if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
     if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
 
-    # удалить webhook перед polling
+    application = (ApplicationBuilder()
+                   .token(TELEGRAM_TOKEN)
+                   .rate_limiter(AIORateLimiter())
+                   .build())
+
     try:
-        Bot(TELEGRAM_TOKEN).delete_webhook(drop_pending_updates=True)
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
         log.info("Webhook deleted")
-    except Exception as e:
-        log.warning("Delete webhook failed: %s", e)
+    except Exception as exc:
+        event("WEBHOOK_DELETE_ERROR", error=str(exc))
+        log.warning("Delete webhook failed: %s", exc)
 
-    # (опциональный) Redis-замок от дублей — можно оставить как есть или убрать
-    lock_key = _rk("poll_lock")
-    if redis_client:
-        got_lock = redis_client.set(lock_key, str(time.time()), nx=True, ex=30*60)
-        if not got_lock:
-            log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
-            return
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("health", health))
+    application.add_handler(CommandHandler("topup", topup))
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_error_handler(error_handler)
 
-    app = (ApplicationBuilder()
-           .token(TELEGRAM_TOKEN)
-           .rate_limiter(AIORateLimiter())
-           .build())
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("health", health))
-    app.add_handler(CommandHandler("topup", topup))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_error_handler(error_handler)
-
+    lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
     try:
-        log.info("Bot starting… (Redis=%s)", "on" if redis_client else "off")
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, stop_signals=None)
-    finally:
-        try:
-            if redis_client: redis_client.delete(lock_key)
-        except Exception:
-            pass
+        async with lock:
+            log.info("Bot starting… (Redis=%s, lock=%s)", "on" if redis_client else "off", "enabled" if lock.enabled else "disabled")
+            await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
+    except RedisLockBusy:
+        log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
