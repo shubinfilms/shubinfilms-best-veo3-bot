@@ -5,7 +5,9 @@
 # (освежение ссылки + повторная попытка + download&reupload с увеличенным таймаутом).
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
+odex/fix-balance-reset-after-deploy
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib
+ main
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from datetime import datetime, timezone
 from contextlib import suppress
@@ -17,17 +19,14 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
-from handlers.prompt_master_handler import (
-    PROMPT_MASTER_BODY,
-    PROMPT_MASTER_HEADER,
-    prompt_master_conv,
-)
+from handlers.prompt_master_handler import PROMPT_MASTER_HINT
+from prompt_master import generate_prompt_master
 
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
@@ -154,6 +153,13 @@ if KIE_VEO_1080_PATHS:
 else:
     KIE_VEO_1080_PATH = _KIE_VEO_1080_DEFAULT
     KIE_VEO_1080_PATHS = [KIE_VEO_1080_PATH]
+
+KIE_1080_SESSION = requests.Session()
+_kie_token = (KIE_API_KEY or "").strip()
+if _kie_token and not _kie_token.lower().startswith("bearer "):
+    _kie_token = f"Bearer {_kie_token}"
+if _kie_token:
+    KIE_1080_SESSION.headers.update({"Authorization": _kie_token})
 
 # MJ
 _KIE_MJ_GENERATE_DEFAULT = "/api/v1/mj/generate"
@@ -432,7 +438,7 @@ def _kie_request(
         payload = {"error": resp.text}
 
     elapsed = round((time.time() - started) * 1000)
-    code = payload.get("code", resp.status_code)
+    code = _extract_response_code(payload, resp.status_code)
     msg = payload.get("msg") or payload.get("message") or payload.get("error")
     task_id = _extract_task_id(payload)
     event(
@@ -510,8 +516,28 @@ def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
                 stack.append(item)
             continue
         if isinstance(current, dict):
-            for key in ("resultUrls", "resultUrl", "originUrls", "originUrl", "videoUrls", "videoUrl",
-                        "videos", "urls", "url", "downloadUrl", "fileUrl", "cdnUrl", "outputUrl"):
+            for key in (
+                "resultUrls",
+                "resultUrl",
+                "originUrls",
+                "originUrl",
+                "videoUrls",
+                "videoUrl",
+                "videos",
+                "urls",
+                "url",
+                "downloadUrl",
+                "fileUrl",
+                "cdnUrl",
+                "outputUrl",
+                "imageUrls",
+                "imageUrl",
+                "imageUrlList",
+                "image_url",
+                "image_urls",
+                "finalImageUrl",
+                "finalImageUrls",
+            ):
                 if key in current:
                     stack.append(current[key])
             for value in current.values():
@@ -580,7 +606,7 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
 
 # ---------- User state ----------
 DEFAULT_STATE = {
-    "mode": None, "aspect": None, "model": None,
+    "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
     "last_ui_msg_id": None, "last_ui_msg_id_banana": None,
@@ -591,6 +617,14 @@ DEFAULT_STATE = {
     "mj_active_op_key": None,
     "banana_active_op_key": None,
 }
+
+MODE_PROMPTMASTER = "MODE_PROMPTMASTER"
+PROMPT_MASTER_TIMEOUT = 27.0
+PROMPT_MASTER_ERROR_MESSAGE = "❌ Не удалось собрать промпт. Попробуй сформулировать короче."
+PROMPT_MASTER_CARD_TEMPLATE = (
+    "🟦 Карточка Prompt-Master\n"
+    "✍️ Промпт:\n{prompt}"
+)
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
     for k, v in DEFAULT_STATE.items():
@@ -598,6 +632,8 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     if not isinstance(ud.get("banana_images"), list): ud["banana_images"] = []
     return ud
 
+odex/fix-balance-reset-after-deploy
+main
 # ==========================
 #   UI / Texts
 # ==========================
@@ -605,7 +641,7 @@ WELCOME = (
     "🎬 *Veo 3 — съёмочная команда*: опиши идею и получи *готовый клип*.\n"
     "🖌️ *MJ — художник*: рисует изображение по тексту (16:9 или 9:16).\n"
     "🍌 *Banana — редактор из будущего*: меняет фон, одежду, макияж, убирает лишнее, объединяет людей.\n"
-    "🧠 *Prompt-Master (/promptmaster)* — вернёт профессиональный *кинопромпт*.\n"
+    "🧠 *Prompt-Master* — вернёт профессиональный *кинопромпт*.\n"
     "💬 *Обычный чат* — ответы на любые вопросы.\n\n"
     "💎 *Ваш баланс:* {balance}\n"
     "📈 Больше идей и примеров: {prompts_url}\n\n"
@@ -622,7 +658,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master (/promptmaster)", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:prompt_master")],
         [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
@@ -666,14 +702,16 @@ def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
     keyboard = [
         [_btn("Горизонтальный (16:9)", "16:9")],
         [_btn("Вертикальный (9:16)", "9:16")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton("Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     lines = [
-        "Введите промпт сообщением. После этого нажмите «Подтвердить».",
+        "🖼 Midjourney",
+        "",
+        'Введите промпт сообщением. После этого нажмите "Подтвердить".',
         f"Текущий формат: {aspect}",
     ]
     snippet = _short_prompt(prompt)
@@ -936,7 +974,7 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     payload = _build_payload_for_veo(prompt, aspect, image_url, model_key)
     status, resp, req_id = _kie_request("POST", KIE_VEO_GEN_PATH, json_payload=payload)
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     tid = _extract_task_id(resp)
     message = resp.get("msg") or resp.get("message")
     kie_event("SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, message=message)
@@ -960,7 +998,7 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
     )
     if not req_id_hint:
         _remember_kie_request_id(task_id, req_id)
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     data_raw = resp.get("data") or {}
     if isinstance(data_raw, str):
         try:
@@ -988,89 +1026,236 @@ def get_kie_veo_status(task_id: str) -> Tuple[bool, Optional[int], Optional[str]
         return True, flag, message, url
     return False, None, f"Ошибка статуса VEO: {resp}", None
 
-def try_get_1080_url(task_id: str, attempts: int = 3, per_try_timeout: int = 15) -> Optional[str]:
-    last_err: Optional[str] = None
-    req_id = _get_kie_request_id(task_id)
-    for attempt in range(1, attempts + 1):
-        status, resp, req_id_used, path_used = _kie_request_with_endpoint(
-            "veo",
-            "1080",
-            "GET",
-            KIE_VEO_1080_PATHS,
-            params={"taskId": task_id},
-            timeout=per_try_timeout,
-            request_id=req_id,
-        )
-        if not req_id:
-            req_id = req_id_used
-            _remember_kie_request_id(task_id, req_id)
-        code = resp.get("code", status)
-        data_raw = resp.get("data") or {}
-        if isinstance(data_raw, str):
-            try:
-                data = json.loads(data_raw)
-            except Exception:
-                data = {"raw": data_raw}
-        elif isinstance(data_raw, dict):
-            data = data_raw
-        else:
-            data = {"value": data_raw}
-        url = data.get("url") if isinstance(data.get("url"), str) else None
-        if status == 200 and code == 200:
-            if not (isinstance(url, str) and url.startswith("http")):
-                url = _extract_result_url(data)
-            if isinstance(url, str) and url.startswith("http"):
-                kie_event(
-                    "FETCH_1080_SUCCESS",
-                    request_id=req_id,
-                    task_id=task_id,
-                    attempt=attempt,
-                    path=path_used,
-                )
-                return url
-            last_err = "empty_url"
-            kie_event(
-                "FETCH_1080_EMPTY",
-                request_id=req_id,
-                task_id=task_id,
-                attempt=attempt,
-                path=path_used,
-            )
-        else:
-            last_err = f"{status}/{code}"
-            message = resp.get("msg") or resp.get("message") or resp.get("error")
-            kie_event(
-                "FETCH_1080_FAIL",
-                request_id=req_id,
-                task_id=task_id,
-                attempt=attempt,
-                status=status,
-                code=code,
-                message=message,
-                path=path_used,
-            )
+
+def fetch_1080p_result_url(task_id: str, index: Optional[int] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    params: Dict[str, Any] = {"taskId": task_id}
+    if index is not None:
+        params["index"] = index
+
+    url = join_url(KIE_BASE_URL, KIE_VEO_1080_PATH)
+    meta: Dict[str, Any] = {"taskId": task_id, "index": index, "http_status": None, "code": None, "resultUrl": None}
+
+    try:
+        resp = KIE_1080_SESSION.get(url, params=params, timeout=120)
+    except requests.RequestException as exc:
+        meta.update({"error": str(exc)})
+        kie_event("1080_FETCH_ERROR", **meta)
+        return None, meta
+
+    meta["http_status"] = resp.status_code
+    try:
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+    except ValueError:
+        meta.update({"error": "non_json_response"})
+        kie_event("1080_FETCH_PARSE", **meta)
+        return None, meta
+
+    data = payload.get("data") or {}
+    if isinstance(data, dict):
+        result_url = data.get("resultUrl") or data.get("result_url")
+    else:
+        result_url = None
+
+    meta.update({
+        "code": payload.get("code"),
+        "message": payload.get("msg") or payload.get("message"),
+        "resultUrl": result_url,
+    })
+
+    kie_event("1080_FETCH", **meta)
+    if resp.status_code == 200 and payload.get("code") == 200 and isinstance(result_url, str) and result_url.startswith("http"):
+        return result_url, meta
+    return None, meta
+
+
+def download_file(url: str) -> Path:
+    tmp_path = Path(tempfile.gettempdir()) / f"{uuid.uuid4()}.mp4"
+    with KIE_1080_SESSION.get(url, stream=True, timeout=600) as resp:
+        resp.raise_for_status()
+        with tmp_path.open("wb") as fh:
+            for chunk in resp.iter_content(1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+    return tmp_path
+
+
+def probe_size(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            text=True,
+        ).strip()
+        width, height = out.split(",")
+        return int(width), int(height)
+    except Exception:
+        log.warning("ffprobe not available; skip size probe")
+        return None
+
+
+async def send_kie_1080p_to_tg(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    task_id: str,
+    index: Optional[int],
+    fallback_url: Optional[str],
+    is_vertical: bool,
+) -> bool:
+    hd_url, meta = fetch_1080p_result_url(task_id, index)
+    code_for_user = meta.get("code") or meta.get("http_status") or "n/a"
+
+    if not hd_url:
+        reason = meta.get("error") or meta.get("message")
+        if reason:
+            kie_event("1080_UNAVAILABLE", taskId=task_id, index=index, reason=reason, code=meta.get("code"), http_status=meta.get("http_status"))
+        message = f"KIE не вернул 1080p: {code_for_user}"
+        await ctx.bot.send_message(chat_id, f"ℹ️ {message}")
+        if fallback_url:
+            await ctx.bot.send_message(chat_id, f"🔗 Исходный URL: {fallback_url}")
+        return False
+
+    try:
+        path = download_file(hd_url)
+    except Exception as exc:
+        kie_event("1080_DOWNLOAD_FAIL", taskId=task_id, index=index, error=str(exc))
+        await ctx.bot.send_message(chat_id, "❌ Не удалось скачать 1080p видео.")
+        if fallback_url:
+            await ctx.bot.send_message(chat_id, f"🔗 Исходный URL: {fallback_url}")
+        return False
+
+    try:
+        wh = probe_size(path)
+        width, height = (wh if wh else (None, None))
+        resolution = f"{width}x{height}" if width and height else None
+        main
         kie_event(
-            "1080_RETRY",
-            task_id=task_id,
-            attempt=attempt,
-            status=status,
-            code=code,
-            path=path_used,
+            "1080_LOCAL",
+            taskId=task_id,
+            index=index,
+            http_status=meta.get("http_status"),
+            code=meta.get("code"),
+            resultUrl=hd_url,
+            local_path=str(path),
+            resolution=resolution,
+            width=width,
+            height=height,
         )
-        time.sleep(attempt)
-    log.warning("1080p retries failed: %s", last_err)
-    kie_event("FETCH_1080_GIVEUP", request_id=req_id, task_id=task_id, error=last_err)
-    return None
+
+        caption = (f"{width}×{height}" if width and height else "1080p")
+        with path.open("rb") as fh:
+            await ctx.bot.send_video(
+                chat_id=chat_id,
+                video=InputFile(fh, filename="veo_result_1080p.mp4"),
+                supports_streaming=True,
+                caption=caption,
+            )
+
+        if width and height:
+            expected = (1080, 1920) if is_vertical else (1920, 1080)
+            if (width, height) != expected:
+                log.warning("KIE returned non-1080p (%s×%s), expected %s×%s", width, height, expected[0], expected[1])
+                await ctx.bot.send_message(chat_id, "ℹ️ KIE вернул не 1080p. Проверим тариф/параметры.")
+        return True
+    finally:
+        with suppress(Exception):
+            path.unlink()
+
 
 # ==========================
 #   MJ
 # ==========================
+def _parse_status_code_value(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 200 if value else 500
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return int(float(text))
+            except (TypeError, ValueError):
+                pass
+        lowered = text.lower()
+        mapping = {
+            "success": 200,
+            "ok": 200,
+            "succeeded": 200,
+            "finished": 200,
+            "done": 200,
+            "pending": 102,
+            "processing": 102,
+            "queued": 102,
+            "fail": 500,
+            "failed": 500,
+            "error": 500,
+            "denied": 403,
+            "forbidden": 403,
+            "unauthorized": 401,
+            "timeout": 504,
+            "notfound": 404,
+            "not_found": 404,
+        }
+        normalized = lowered.replace("-", "").replace("_", "")
+        if normalized in mapping:
+            return mapping[normalized]
+        if lowered in mapping:
+            return mapping[lowered]
+        match = re.search(r"\d+", text)
+        if match:
+            try:
+                return int(match.group(0))
+            except ValueError:
+                return default
+    return default
+
+
+def _extract_response_code(payload: Dict[str, Any], http_status: int) -> int:
+    if not isinstance(payload, dict):
+        return http_status
+    for key in ("code", "statusCode", "status_code", "errorCode", "error_code", "resultCode"):
+        if key in payload:
+            return _parse_status_code_value(payload.get(key), http_status)
+    status_val = payload.get("status")
+    if isinstance(status_val, str):
+        return _parse_status_code_value(status_val, http_status)
+    return http_status
+
+
 def _kie_error_message(status_code: int, j: Dict[str, Any]) -> str:
-    code = j.get("code", status_code)
+    code = _extract_response_code(j, status_code)
     msg = j.get("msg") or j.get("message") or j.get("error") or ""
-    mapping = {401: "Доступ запрещён.", 402: "Недостаточно кредитов.",
-               429: "Превышен лимит.", 500: "Внутренняя ошибка KIE.",
-               422: "Запрос отклонён модерацией.", 400: "Неверный запрос."}
+    mapping = {
+        400: "Неверный запрос.",
+        401: "Доступ запрещён.",
+        402: "Недостаточно кредитов.",
+        404: "Задача не найдена.",
+        422: "Запрос отклонён модерацией.",
+        429: "Превышен лимит.",
+        500: "Внутренняя ошибка KIE.",
+        504: "Таймаут KIE.",
+    }
     base = mapping.get(code, f"KIE code {code}.")
     return f"{base} {msg}".strip()
 
@@ -1096,7 +1281,7 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
         KIE_MJ_GENERATE_PATHS,
         json_payload=payload,
     )
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     tid = _extract_task_id(resp)
     kie_event(
         "MJ_SUBMIT",
@@ -1121,7 +1306,7 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
         KIE_MJ_STATUS_PATHS,
         params={"taskId": task_id},
     )
-    code = resp.get("code", status)
+    code = _extract_response_code(resp, status)
     raw_data = resp.get("data")
     if isinstance(raw_data, str):
         try:
@@ -1131,6 +1316,10 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
             data = {"raw": raw_data}
     elif isinstance(raw_data, dict):
         data = raw_data
+    elif isinstance(raw_data, list):
+        data = next((item for item in raw_data if isinstance(item, dict)), None)
+        if data is None:
+            data = {"value": raw_data}
     else:
         data = None
     flag = _parse_success_flag(data) if isinstance(data, dict) else None
@@ -1155,145 +1344,63 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
 
 def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
     res: List[str] = []
-    rj = status_data.get("resultInfoJson") or {}
-    if isinstance(rj, str):
-        try:
-            rj = json.loads(rj)
-        except Exception:
-            rj = {}
-    urls = _coerce_url_list((rj or {}).get("resultUrls"))
-    for u in urls:
-        if isinstance(u, str) and u.startswith("http"): res.append(u)
+    seen: set[str] = set()
+
+    def _add_from(value: Any) -> None:
+        for url in _coerce_url_list(value):
+            if url not in seen:
+                seen.add(url)
+                res.append(url)
+
+    direct_keys = (
+        "imageUrls",
+        "imageUrl",
+        "imageUrlList",
+        "image_url",
+        "image_urls",
+        "resultUrls",
+        "resultUrl",
+        "urls",
+    )
+    for key in direct_keys:
+        if key in status_data:
+            _add_from(status_data.get(key))
+
+    for meta_key in ("resultInfoJson", "resultInfo", "resultJson"):
+        raw = status_data.get(meta_key)
+        if not raw:
+            continue
+        parsed: Any = raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                continue
+        if isinstance(parsed, dict):
+            for key in direct_keys:
+                if key in parsed:
+                    _add_from(parsed.get(key))
+        elif isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    for key in direct_keys:
+                        if key in item:
+                            _add_from(item.get(key))
+
     return res
 
 def _mj_should_retry(msg: Optional[str]) -> bool:
     if not msg: return False
     m = msg.lower()
-    return ("no response from midjourney official website" in m) or ("timeout" in m) or ("server error" in m)
-
-# ==========================
-#   ffmpeg helpers (видео)
-# ==========================
-def _ffmpeg_available() -> bool:
-    from shutil import which
-    return bool(which(FFMPEG_BIN))
-
-def _ffmpeg_normalize_vertical(inp: str, outp: str) -> bool:
-    cmd = [
-        FFMPEG_BIN, "-y", "-i", inp,
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
-               "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        "-c:a", "aac", "-b:a", "128k",
-        "-metadata:s:v:0", "rotate=0",
-        outp
-    ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE); return True
-    except Exception as e:
-        log.warning("ffmpeg vertical failed: %s", e); return False
-
-def _ffmpeg_force_16x9_fhd(inp: str, outp: str, target_mb: int) -> bool:
-    target_bytes = max(8, int(target_mb)) * 1024 * 1024
-    cmd = [
-        FFMPEG_BIN, "-y", "-i", inp,
-        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
-               "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        "-c:a", "aac", "-b:a", "128k",
-        "-fs", str(target_bytes),
-        outp
-    ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE); return True
-    except Exception as e:
-        log.warning("ffmpeg 16x9 FHD failed: %s", e); return False
-
-# ==========================
-#   Sending video (FIXED)
-# ==========================
-async def send_video_with_fallback(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str,
-                                   expect_vertical: bool = False, task_id: Optional[str] = None) -> bool:
-    """
-    Надёжная отправка VEO-видео:
-    1) пробуем прямой URL (если не вертикаль);
-    2) если не вышло — освежаем ссылку у KIE (1080p/record-info) и пробуем ещё раз;
-    3) скачиваем и перезаливаем (таймаут 300с). Остальной UX не меняется.
-    """
-    event("SEND_TRY_URL", url=url, expect_vertical=expect_vertical)
-
-    # 1) прямая отправка
-    if not expect_vertical:
-        try:
-            await ctx.bot.send_video(chat_id=chat_id, video=url, supports_streaming=True)
-            return True
-        except Exception as e:
-            event("SEND_FAIL_DIRECT", err=str(e))
-
-    # 2) освежим ссылку и попробуем снова
-    refreshed = None
-    try:
-        if task_id:
-            u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
-            if isinstance(u1080, str) and u1080.startswith("http"):
-                refreshed = u1080
-            else:
-                ok2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
-                if ok2 and isinstance(u2, str) and u2.startswith("http"):
-                    refreshed = u2
-    except Exception as e:
-        event("SEND_REFRESH_ERR", err=str(e))
-
-    if refreshed:
-        event("SEND_TRY_REFRESHED", url=refreshed)
-        if not expect_vertical:
-            try:
-                await ctx.bot.send_video(chat_id=chat_id, video=refreshed, supports_streaming=True)
-                return True
-            except Exception as e:
-                event("SEND_FAIL_REFRESHED_DIRECT", err=str(e))
-        url = refreshed  # перейдём к скачиванию с обновлённой ссылки
-
-    # 3) download & reupload
-    tmp_path = None
-    try:
-        r = requests.get(url, stream=True, timeout=300)  # увеличили таймаут
-        r.raise_for_status()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
-            for c in r.iter_content(256 * 1024):
-                if c: f.write(c)
-            tmp_path = f.name
-
-        if expect_vertical and ENABLE_VERTICAL_NORMALIZE and _ffmpeg_available():
-            out = tmp_path + "_v.mp4"
-            if _ffmpeg_normalize_vertical(tmp_path, out):
-                with open(out, "rb") as f:
-                    await ctx.bot.send_video(chat_id, InputFile(f, filename="result_vertical.mp4"), supports_streaming=True)
-                return True
-
-        if (not expect_vertical) and ALWAYS_FORCE_FHD and _ffmpeg_available():
-            out = tmp_path + "_1080.mp4"
-            if _ffmpeg_force_16x9_fhd(tmp_path, out, MAX_TG_VIDEO_MB):
-                with open(out, "rb") as f:
-                    await ctx.bot.send_video(chat_id, InputFile(f, filename="result_1080p.mp4"), supports_streaming=True)
-                return True
-
-        with open(tmp_path, "rb") as f:
-            await ctx.bot.send_video(chat_id, InputFile(f, filename="result.mp4"), supports_streaming=True)
-        return True
-    except Exception as e:
-        log.exception("send_video failed: %s", e)
-        try:
-            await ctx.bot.send_message(chat_id, f"🔗 Результат готов, но загрузка в Telegram не удалась. Ссылка:\n{url}")
-            return True
-        except Exception:
-            return False
-    finally:
-        if tmp_path:
-            try: os.unlink(tmp_path)
-            except Exception: pass
+    retry_tokens = (
+        "no response from midjourney official website",
+        "timeout",
+        "server error",
+        "timed out",
+        "gateway",
+        "504",
+    )
+    return any(token in m for token in retry_tokens)
 
 # ==========================
 #   VEO polling
@@ -1325,11 +1432,7 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             if isinstance(res_url, str) and res_url.startswith("http"):
                 # 🔄 освежаем ссылку непосредственно перед отправкой
                 final_url = res_url
-                if (s.get("aspect") or "16:9") == "16:9":
-                    u1080 = await asyncio.to_thread(try_get_1080_url, task_id)
-                    if isinstance(u1080, str) and u1080.startswith("http"):
-                        final_url = u1080
-                else:
+                if (s.get("aspect") or "16:9") == "9:16":
                     ok_r2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
                     if ok_r2 and isinstance(u2, str) and u2.startswith("http"):
                         final_url = u2
@@ -1341,9 +1444,14 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     final_url=final_url,
                 )
                 await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
-                await send_video_with_fallback(ctx, chat_id, final_url,
-                                               expect_vertical=(s.get("aspect") == "9:16"),
-                                               task_id=task_id)
+                await send_kie_1080p_to_tg(
+                    ctx,
+                    chat_id,
+                    task_id,
+                    index=None,
+                    fallback_url=final_url,
+                    is_vertical=(s.get("aspect") == "9:16"),
+                )
                 await ctx.bot.send_message(chat_id, "✅ *Готово!*", parse_mode=ParseMode.MARKDOWN,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]))
                 break
@@ -1414,7 +1522,18 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 delay = min(delay + 6, 30)
                 continue
             if flag in (2, 3) or flag is None:
-                err = (data or {}).get("errorMessage") or "No response from MidJourney Official Website after multiple attempts."
+                err_info = None
+                if isinstance(data, dict):
+                    err_info = (
+                        data.get("errorMessage")
+                        or data.get("error_message")
+                        or data.get("message")
+                        or data.get("reason")
+                    )
+                if isinstance(err_info, str):
+                    err = err_info.strip() or "No response from MidJourney Official Website after multiple attempts."
+                else:
+                    err = "No response from MidJourney Official Website after multiple attempts."
                 if (not retried) and prompt_for_retry and _mj_should_retry(err):
                     retried = True
                     await ctx.bot.send_message(chat_id, "🔁 MJ подвис. Перезапускаю задачу бесплатно…")
@@ -1529,6 +1648,7 @@ async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     balance = get_user_balance_value(ctx, force_refresh=True)
     await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
@@ -1549,6 +1669,7 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(f"✅ Баланс актуален: {result.calculated} 💎")
+main
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
@@ -1673,27 +1794,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Режимы
     if data.startswith("mode:"):
-        mode = data.split(":",1)[1]
-        if mode == "prompt_master":
-            s["mode"] = None
-            await q.message.reply_text(
-                f"{PROMPT_MASTER_HEADER} 2.0 запускается командой /promptmaster.\n\n{PROMPT_MASTER_BODY}"
-            )
+        selected_mode = data.split(":", 1)[1]
+        if selected_mode == "prompt_master":
+            activate_prompt_master_mode(ctx)
+            await q.message.reply_text(PROMPT_MASTER_HINT)
             return
-        s["mode"] = mode
-        if mode in ("veo_text_fast","veo_text_quality"):
-            s["aspect"] = "16:9"; s["model"] = "veo3_fast" if mode.endswith("fast") else "veo3"
+        s["mode"] = selected_mode
+        if selected_mode in ("veo_text_fast", "veo_text_quality"):
+            s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
             await show_or_update_veo_card(update.effective_chat.id, ctx)
             await q.message.reply_text("✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.")
             return
-        if mode == "veo_photo":
+        if selected_mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
             await show_or_update_veo_card(update.effective_chat.id, ctx)
             await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
             return
-        if mode == "chat":
+        if selected_mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
-        if mode == "mj_txt":
+        if selected_mode == "mj_txt":
             s["aspect"] = "9:16" if s.get("aspect") == "9:16" else "16:9"
             s["last_prompt"] = None
             s["mj_generating"] = False
@@ -1706,7 +1825,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["last_mj_msg_id"] = None
             await show_mj_format_card(update.effective_chat.id, ctx)
             return
-        if mode == "banana":
+        if selected_mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
             await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
             await show_or_update_banana_card(update.effective_chat.id, ctx); return
@@ -1944,6 +2063,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
     mode = s.get("mode")
+
+    if mode == MODE_PROMPTMASTER:
+        if not text:
+            return
+        chat = update.effective_chat
+        if chat:
+            with suppress(Exception):
+                await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        user_id = update.effective_user.id if update.effective_user else None
+        try:
+            prompt_text = await asyncio.wait_for(
+                asyncio.to_thread(generate_prompt_master, text),
+                timeout=PROMPT_MASTER_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.error("PromptMaster timeout: uid=%s len=%s", user_id, len(text))
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            return
+        except Exception:
+            log.exception("PromptMaster error: uid=%s", user_id)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            return
+
+        prompt_text = (prompt_text or "").strip()
+        if not prompt_text:
+            log.error("PromptMaster empty response: uid=%s", user_id)
+            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
+            return
+
+        card_text = PROMPT_MASTER_CARD_TEMPLATE.format(prompt=prompt_text)
+        await update.message.reply_text(card_text)
+        return
 
     # PROMO
     if mode == "promo":
@@ -2459,9 +2610,11 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
+codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
     application.add_handler(prompt_master_conv, group=10)
+ main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))

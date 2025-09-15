@@ -175,6 +175,17 @@ def generate_prompt(user_text: str) -> Dict[str, Any]:
         },
     }
 
+
+def generate_prompt_master(user_text: str) -> str:
+    """Return only the Prompt-Master text block."""
+
+    result = generate_prompt(user_text)
+    if isinstance(result, dict):
+        return (result.get("text_markdown") or "").strip()
+    if isinstance(result, str):
+        return result.strip()
+    return ""
+
 if __name__ == "__main__":
     demo = "High-quality cinematic 4K. 85mm prime lens for shallow DOF. Озвучка по-русски, современная музыка."
     print(json.dumps(generate_prompt(demo), ensure_ascii=False, indent=2))
