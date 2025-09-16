@@ -19,13 +19,14 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, LabeledPrice, InputMediaPhoto
+    InputFile, LabeledPrice, InputMediaPhoto, Message
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
+from telegram.error import TelegramError
 
 from handlers.prompt_master_handler import PROMPT_MASTER_HINT
 from prompt_master import generate_prompt_master, PM_QUOTE_MODE, ensure_quote_block
@@ -127,6 +128,7 @@ MENU_COMPACT_ENABLED   = _env("MENU_COMPACT", "false").lower() == "true"
 PM_QUOTE_MODE_ENABLED  = _env("PM_QUOTE_MODE", "false").lower() == "true"
 CHAT_TYPING_ONLY_MODE  = _env("CHAT_TYPING_ONLY", "false").lower() == "true"
 MJ_FOUR_IMAGES_ENABLED = _env("MJ_FOUR_IMAGES", "false").lower() == "true"
+main
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -3050,8 +3052,10 @@ codex/add-feature-flags-for-new-changes
             ); return
         chat = update.effective_chat
         typing_task: Optional[asyncio.Task[Any]] = None
+        thinking_message: Optional[Message] = None
         if chat:
             if CHAT_TYPING_ONLY_MODE:
+ main
                 async def _typing_loop() -> None:
                     try:
                         while True:
@@ -3062,8 +3066,15 @@ codex/add-feature-flags-for-new-changes
 
                 typing_task = asyncio.create_task(_typing_loop())
             else:
-                with suppress(Exception):
-                    await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+ codex/remove-unnecessary-chat-message
+                try:
+                    thinking_message = await update.message.reply_text(
+                        f"{CE['hourglass']} Думаю над ответом…",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError as exc:
+                    log.warning("Failed to send chat placeholder: %s", exc)
+ main
         try:
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
@@ -3079,13 +3090,32 @@ codex/add-feature-flags-for-new-changes
                     await typing_task
                 typing_task = None
             reply_text = f"🤖 {answer}" if answer else "🤖"
-            await update.message.reply_text(reply_text)
+            sent_via_placeholder = False
+            if not CHAT_TYPING_ONLY and thinking_message:
+                try:
+                    await thinking_message.edit_text(reply_text)
+                except TelegramError as exc:
+                    log.warning("Failed to edit chat placeholder: %s", exc)
+                else:
+                    sent_via_placeholder = True
+            if not sent_via_placeholder:
+                await update.message.reply_text(reply_text)
         except Exception as e:
             log.exception("Chat error: %s", e)
-            await update.message.reply_text(
-                f"{CE['bulb']} Ошибка запроса к ChatGPT.",
-                parse_mode=ParseMode.HTML,
-            )
+            if typing_task:
+                typing_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await typing_task
+                typing_task = None
+            error_text = f"{CE['bulb']} Ошибка запроса к ChatGPT."
+            if not CHAT_TYPING_ONLY and thinking_message:
+                try:
+                    await thinking_message.edit_text(error_text, parse_mode=ParseMode.HTML)
+                except TelegramError as exc:
+                    log.warning("Failed to edit chat placeholder with error: %s", exc)
+                    await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
         finally:
             if typing_task:
                 typing_task.cancel()
