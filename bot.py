@@ -549,6 +549,12 @@ def _make_input_photo(data: bytes, filename: str) -> InputFile:
     return InputFile(buffer, filename=filename)
 
 
+def _looks_like_image_url(url: str) -> bool:
+    lowered = url.lower()
+    match = re.search(r"\.(png|jpe?g|webp|gif|bmp|tiff?|avif)(?:\?|$)", lowered)
+    return bool(match)
+
+
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
     visited: set[int] = set()
     stack: List[Any] = [data]
@@ -732,6 +738,68 @@ def cemoji(name: str, fallback: Optional[str] = None) -> str:
 CE = {name: cemoji(name) for name in CEMOJI}
 
 
+class EmojiSegment(NamedTuple):
+    name: str
+    fallback: Optional[str] = None
+
+
+ButtonTextPart = Union[str, EmojiSegment]
+
+
+def button_emoji(name: str, fallback: Optional[str] = None) -> EmojiSegment:
+    return EmojiSegment(name=name, fallback=fallback)
+
+
+def _button_text_with_entities(parts: Tuple[ButtonTextPart, ...]) -> Tuple[str, List[Dict[str, Any]]]:
+    text = ""
+    entities: List[Dict[str, Any]] = []
+    offset = 0
+
+    for part in parts:
+        if part is None:
+            continue
+        if isinstance(part, EmojiSegment):
+            record = CEMOJI.get(part.name)
+            if not record:
+                raise KeyError(f"Unknown custom emoji for button: {part.name}")
+            emoji_id, default = record
+            fallback = part.fallback if part.fallback is not None else default
+            if not fallback:
+                continue
+            text += fallback
+            entities.append(
+                {
+                    "type": "custom_emoji",
+                    "offset": offset,
+                    "length": len(fallback),
+                    "custom_emoji_id": emoji_id,
+                }
+            )
+            offset += len(fallback)
+        else:
+            piece = str(part)
+            if not piece:
+                continue
+            text += piece
+            offset += len(piece)
+
+    return text, entities
+
+
+def inline_button(*parts: ButtonTextPart, **kwargs: Any) -> InlineKeyboardButton:
+    text, entities = _button_text_with_entities(tuple(parts))
+    api_kwargs = kwargs.pop("api_kwargs", None)
+    if entities:
+        if api_kwargs is None:
+            api_kwargs = {}
+        else:
+            api_kwargs = dict(api_kwargs)
+        existing = list(api_kwargs.get("text_entities", []))
+        existing.extend(entities)
+        api_kwargs["text_entities"] = existing
+    return InlineKeyboardButton(text or "", api_kwargs=api_kwargs, **kwargs)
+
+
 WELCOME_TEMPLATE = (
     "{clapper} <b>Veo 3 — съёмочная команда</b>: опиши идею и получи <b>готовый клип</b>.\n"
     "{frame} <b>MJ — художник</b>: рисует изображение по тексту (16:9 или 9:16).\n"
@@ -788,23 +856,63 @@ def render_faq_text() -> str:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton(f"🎬 Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}", callback_data="mode:veo_text_fast")],
-        [InlineKeyboardButton(f"🎬 Генерация видео (Veo Quality) 💎 {TOKEN_COSTS['veo_quality']}", callback_data="mode:veo_text_quality")],
-        [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
-        [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
-        [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:prompt_master")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
         [
-            InlineKeyboardButton("❓ FAQ", callback_data="faq"),
-            InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
+            inline_button(
+                button_emoji("clapper"),
+                " Генерация видео (Veo Fast) ",
+                button_emoji("diamond"),
+                f" {TOKEN_COSTS['veo_fast']}",
+                callback_data="mode:veo_text_fast",
+            )
         ],
-        [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
+        [
+            inline_button(
+                button_emoji("clapper"),
+                " Генерация видео (Veo Quality) ",
+                button_emoji("diamond"),
+                f" {TOKEN_COSTS['veo_quality']}",
+                callback_data="mode:veo_text_quality",
+            )
+        ],
+        [
+            inline_button(
+                button_emoji("frame"),
+                " Генерация изображений (MJ) ",
+                button_emoji("diamond"),
+                f" {TOKEN_COSTS['mj']}",
+                callback_data="mode:mj_txt",
+            )
+        ],
+        [
+            inline_button(
+                button_emoji("banana"),
+                " Редактор изображений (Banana) ",
+                button_emoji("diamond"),
+                f" {TOKEN_COSTS['banana']}",
+                callback_data="mode:banana",
+            )
+        ],
+        [
+            inline_button(
+                button_emoji("camera"),
+                " Оживить изображение (Veo) ",
+                button_emoji("diamond"),
+                f" {TOKEN_COSTS['veo_photo']}",
+                callback_data="mode:veo_photo",
+            )
+        ],
+        [inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master")],
+        [inline_button(button_emoji("speech"), " Обычный чат (ChatGPT)", callback_data="mode:chat")],
+        [
+            inline_button(button_emoji("sparkles"), " FAQ", callback_data="faq"),
+            inline_button(button_emoji("sparkles"), " Канал с промптами", url=PROMPTS_CHANNEL_URL),
+        ],
+        [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
     ]
 
     if PROMO_ENABLED:
         keyboard.append([
-            InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")
+            inline_button(button_emoji("ticket"), " Активировать промокод", callback_data="promo_open")
         ])
 
     return InlineKeyboardMarkup(keyboard)
@@ -831,13 +939,17 @@ def _mj_format_card_text(aspect: str) -> str:
 
 def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
     aspect = "9:16" if aspect == "9:16" else "16:9"
+
     def _btn(label: str, value: str) -> InlineKeyboardButton:
-        mark = "✅ " if value == aspect else ""
-        return InlineKeyboardButton(f"{mark}{label}", callback_data=f"mj:aspect:{value}")
+        parts: List[ButtonTextPart] = [button_emoji("frame"), f" {label}"]
+        if value == aspect:
+            parts.extend([" ", button_emoji("check")])
+        return inline_button(*parts, callback_data=f"mj:aspect:{value}")
+
     keyboard = [
         [_btn("Горизонтальный (16:9)", "16:9")],
         [_btn("Вертикальный (9:16)", "9:16")],
-        [InlineKeyboardButton("Назад", callback_data="back")],
+        [inline_button(button_emoji("sparkles"), " Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -856,10 +968,10 @@ def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
 
 def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Подтвердить", callback_data="mj:confirm")],
+        [inline_button(button_emoji("check"), " Подтвердить", callback_data="mj:confirm")],
         [
-            InlineKeyboardButton("Отменить", callback_data="mj:cancel"),
-            InlineKeyboardButton("Сменить формат", callback_data="mj:change_format"),
+            inline_button(button_emoji("cross"), " Отменить", callback_data="mj:cancel"),
+            inline_button(button_emoji("frame"), " Сменить формат", callback_data="mj:change_format"),
         ],
     ])
 
@@ -953,11 +1065,11 @@ def banana_card_text(s: Dict[str, Any]) -> str:
 
 def banana_kb() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("➕ Добавить ещё фото", callback_data="banana:add_more")],
-        [InlineKeyboardButton("🧹 Очистить фото", callback_data="banana:reset_imgs")],
-        [InlineKeyboardButton("✍️ Изменить промпт", callback_data="banana:edit_prompt")],
-        [InlineKeyboardButton("🚀 Начать генерацию Banana", callback_data="banana:start")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [inline_button(button_emoji("banana"), " Добавить ещё фото", callback_data="banana:add_more")],
+        [inline_button(button_emoji("sparkles"), " Очистить фото", callback_data="banana:reset_imgs")],
+        [inline_button(button_emoji("paperclip"), " Изменить промпт", callback_data="banana:edit_prompt")],
+        [inline_button(button_emoji("rocket"), " Начать генерацию Banana", callback_data="banana:start")],
+        [inline_button(button_emoji("sparkles"), " Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -980,18 +1092,31 @@ def veo_card_text(s: Dict[str, Any]) -> str:
 def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     aspect = s.get("aspect") or "16:9"
     model = s.get("model") or "veo3_fast"
-    ar16 = "✅" if aspect == "16:9" else ""
-    ar916 = "✅" if aspect == "9:16" else ""
-    fast = "✅" if model != "veo3" else ""
-    qual = "✅" if model == "veo3" else ""
+
+    def _aspect_button(label: str, value: str) -> InlineKeyboardButton:
+        parts: List[ButtonTextPart] = [button_emoji("frame"), f" {label}"]
+        if aspect == value:
+            parts.extend([" ", button_emoji("check")])
+        return inline_button(*parts, callback_data=f"veo:set_ar:{value}")
+
+    def _model_button(label: str, value: str, selected: bool) -> InlineKeyboardButton:
+        parts: List[ButtonTextPart] = [button_emoji("rocket"), f" {label}"]
+        if selected:
+            parts.extend([" ", button_emoji("check")])
+        return inline_button(*parts, callback_data=f"veo:set_model:{value}")
+
     rows = [
-        [InlineKeyboardButton("🖼 Добавить/Удалить референс", callback_data="veo:clear_img")],
-        [InlineKeyboardButton(f"16:9 {ar16}", callback_data="veo:set_ar:16:9"),
-         InlineKeyboardButton(f"9:16 {ar916}", callback_data="veo:set_ar:9:16")],
-        [InlineKeyboardButton(f"⚡ Fast {fast}", callback_data="veo:set_model:fast"),
-         InlineKeyboardButton(f"💎 Quality {qual}", callback_data="veo:set_model:quality")],
-        [InlineKeyboardButton("🚀 Сгенерировать", callback_data="veo:start")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [inline_button(button_emoji("camera"), " Добавить/Удалить референс", callback_data="veo:clear_img")],
+        [
+            _aspect_button("16:9", "16:9"),
+            _aspect_button("9:16", "9:16"),
+        ],
+        [
+            _model_button("Fast", "fast", model != "veo3"),
+            _model_button("Quality", "quality", model == "veo3"),
+        ],
+        [inline_button(button_emoji("rocket"), " Сгенерировать", callback_data="veo:start")],
+        [inline_button(button_emoji("sparkles"), " Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1279,6 +1404,28 @@ async def send_kie_1080p_to_tg(
         )
         return False
 
+    if is_vertical:
+        safe_url = chosen_url.strip()
+        escaped_url = escape(safe_url)
+        kie_event(
+            "1080_LINK_SENT",
+            taskId=task_id,
+            index=index,
+            resultUrl=safe_url,
+            http_status=meta.get("http_status"),
+            code=meta.get("code"),
+        )
+        link_markup = InlineKeyboardMarkup(
+            [[inline_button(button_emoji("diamond"), " Открыть вертикальное видео", url=safe_url)]]
+        )
+        await ctx.bot.send_message(
+            chat_id,
+            f"{CE['sparkles']} Ссылка на вертикальное видео:\n<a href=\"{escaped_url}\">Открыть в 1080p</a>",
+            reply_markup=link_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
     try:
         path = download_file(chosen_url)
     except Exception as exc:
@@ -1508,6 +1655,44 @@ def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
                 seen.add(url)
                 res.append(url)
 
+    def _maybe_parse_json(text: str) -> Any:
+        s = text.strip()
+        if not s:
+            return None
+        if len(s) > 20000:
+            return None
+        if s[0] in "[{" and s[-1] in "]}":
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+        return None
+
+    def _scan(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return
+            if text.startswith("http"):
+                if _looks_like_image_url(text) and text not in seen:
+                    seen.add(text)
+                    res.append(text)
+                return
+            parsed = _maybe_parse_json(text)
+            if parsed is not None:
+                _scan(parsed)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                _scan(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _scan(item)
+            return
+
     direct_keys = (
         "imageUrls",
         "imageUrl",
@@ -1542,6 +1727,8 @@ def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
                     for key in direct_keys:
                         if key in item:
                             _add_from(item.get(key))
+
+    _scan(status_data)
 
     return res
 
@@ -1604,9 +1791,11 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     task_id=task_id,
                     final_url=final_url,
                 )
+                is_vertical = (s.get("aspect") == "9:16")
+                status_phrase = "ссылку" if is_vertical else "файл"
                 await ctx.bot.send_message(
                     chat_id,
-                    f"{CE['clapper']} Рендер завершён — отправляю файл…",
+                    f"{CE['clapper']} Рендер завершён — отправляю {status_phrase}…",
                     parse_mode=ParseMode.HTML,
                 )
                 sent = await send_kie_1080p_to_tg(
@@ -1615,14 +1804,20 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                     task_id,
                     index=None,
                     fallback_url=final_url,
-                    is_vertical=(s.get("aspect") == "9:16"),
+                    is_vertical=is_vertical,
                 )
                 if sent:
                     await ctx.bot.send_message(
                         chat_id,
                         f"{CE['check']} Готово!",
                         reply_markup=InlineKeyboardMarkup(
-                            [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
+                            [[
+                                inline_button(
+                                    button_emoji("rocket"),
+                                    " Сгенерировать ещё видео",
+                                    callback_data="start_new_cycle",
+                                )
+                            ]]
                         ),
                         parse_mode=ParseMode.HTML,
                     )
@@ -1842,8 +2037,8 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     return
 
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
-                    [InlineKeyboardButton("Назад в меню", callback_data="back")],
+                    [inline_button(button_emoji("rocket"), " Повторить", callback_data="mj:repeat")],
+                    [inline_button(button_emoji("sparkles"), " Назад в меню", callback_data="back")],
                 ])
                 await ctx.bot.send_message(
                     chat_id,
@@ -1905,10 +2100,27 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
         (500, 550, 50),
     ]
     for stars, tokens, bonus in packs:
-        cap = f"⭐ {stars} → 💎 {tokens}" + (f" +{bonus}💎 бонус" if bonus else "")
-        rows.append([InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{tokens}")])
-    rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+        parts: List[ButtonTextPart] = [
+            button_emoji("star"),
+            f" {stars} → ",
+            button_emoji("diamond"),
+            f" {tokens}",
+        ]
+        if bonus:
+            parts.extend([
+                f" +{bonus} ",
+                button_emoji("diamond"),
+                " бонус",
+            ])
+        rows.append([
+            inline_button(*parts, callback_data=f"buy:stars:{stars}:{tokens}")
+        ])
+    rows.append([
+        inline_button(button_emoji("diamond"), " Где купить Stars", url=STARS_BUY_URL)
+    ])
+    rows.append([
+        inline_button(button_emoji("sparkles"), " Назад", callback_data="back")
+    ])
     return InlineKeyboardMarkup(rows)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1972,26 +2184,26 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{CE['check']} Баланс актуален: {escape(str(result.calculated))} {CE['diamond']}",
             parse_mode=ParseMode.HTML,
         )
-main
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
-        f"PTB: `{getattr(_tg, '__version__', 'unknown')}`" if _tg else "PTB: `unknown`",
-        f"KIEBASEURL: `{KIE_BASE_URL}`",
-        f"OPENAI: `{'set' if OPENAI_API_KEY else 'missing'}`",
-        f"KIE: `{'set' if KIE_API_KEY else 'missing'}`",
-        f"REDIS: `{'on' if REDIS_URL else 'off'}`",
-        f"FFMPEG: `{FFMPEG_BIN}`",
+        f"PTB: <code>{escape(str(getattr(_tg, '__version__', 'unknown')))}</code>" if _tg else "PTB: <code>unknown</code>",
+        f"Media API: <code>{escape(KIE_BASE_URL or '—')}</code>",
+        f"OpenAI: <code>{'set' if OPENAI_API_KEY else 'missing'}</code>",
+        f"Media token: <code>{'set' if KIE_API_KEY else 'missing'}</code>",
+        f"Redis: <code>{'on' if REDIS_URL else 'off'}</code>",
+        f"FFmpeg: <code>{escape(str(FFMPEG_BIN))}</code>",
     ]
-    parts.append(f"DB: `{'ok' if ledger_storage.ping() else 'error'}`")
+    parts.append(f"DB: <code>{'ok' if ledger_storage.ping() else 'error'}</code>")
     lock_status = "disabled"
     if runner_lock_state.get("enabled"):
         lock_status = "owned" if runner_lock_state.get("owned") else "free"
     lock_payload: Dict[str, Any] = {"ok": True, "lock": lock_status}
     if runner_lock_state.get("heartbeat_at"):
         lock_payload["hb"] = runner_lock_state.get("heartbeat_at")
-    parts.append(f"LOCK: `{json.dumps(lock_payload, ensure_ascii=False)}`")
-    await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
+    parts.append(f"Lock: <code>{escape(json.dumps(lock_payload, ensure_ascii=False))}</code>")
+    text = f"{CE['sparkles']} <b>Статус бота</b>\n" + "\n".join(parts)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
@@ -2564,9 +2776,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         promo_mark_used(code, uid)
-        get_user_balance_value(ctx, force_refresh=True)
+        new_balance = get_user_balance_value(ctx, force_refresh=True)
         await update.message.reply_text(
-            f"{CE['check']} Промокод активирован! Вам начислено {escape(str(bonus))} токенов.",
+            (
+                f"{CE['check']} Промокод активирован! Вам начислено {escape(str(bonus))} токенов.\n"
+                f"{format_balance_line(new_balance)}"
+            ),
             parse_mode=ParseMode.HTML,
         )
         s["mode"] = None
