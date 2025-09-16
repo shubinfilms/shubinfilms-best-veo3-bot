@@ -41,6 +41,7 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
+from promo_codes import DEFAULT_PROMO_CODES, load_promo_codes, normalize_promo_code
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -239,43 +240,45 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 #   Promo codes (one-time / global)
 # ==========================
-PROMO_CODES = {
-    "WELCOME50": 50,
-    "FREE10": 10,
-    "LABACCENT100": 100,
-    "BONUS50": 50,
-    "FRIENDS150": 150,
-}
+PROMO_CODES = load_promo_codes(DEFAULT_PROMO_CODES)
+if PROMO_CODES:
+    loaded_codes = ", ".join(f"{code}={amount}" for code, amount in sorted(PROMO_CODES.items()))
+    log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), loaded_codes)
+else:
+    log.warning("No promo codes configured")
 
 def promo_amount(code: str) -> Optional[int]:
-    code = (code or "").strip().upper()
-    if not code: return None
+    normalized = normalize_promo_code(code)
+    if not normalized:
+        return None
     if redis_client:
-        v = redis_client.get(_rk("promo", "amount", code))
+        v = redis_client.get(_rk("promo", "amount", normalized))
         if v:
             try: return int(v)
             except: pass
-    return PROMO_CODES.get(code)
+    return PROMO_CODES.get(normalized)
 
 def promo_used_global(code: str) -> Optional[int]:
-    code = (code or "").strip().upper()
-    if not code: return None
+    normalized = normalize_promo_code(code)
+    if not normalized:
+        return None
     if redis_client:
-        u = redis_client.get(_rk("promo", "used_by", code))
+        u = redis_client.get(_rk("promo", "used_by", normalized))
         try: return int(u) if u is not None else None
         except: return None
     try:
-        owner = ledger_storage.get_promo_owner(code)
+        owner = ledger_storage.get_promo_owner(normalized)
         return owner
     except Exception as exc:
-        log.warning("Failed to fetch promo owner for %s: %s", code, exc)
+        log.warning("Failed to fetch promo owner for %s: %s", normalized, exc)
         return None
 
 def promo_mark_used(code: str, uid: int):
-    code = (code or "").strip().upper()
-    if not code: return
+    normalized = normalize_promo_code(code)
+    if not normalized:
+        return
     if redis_client:
-        redis_client.setnx(_rk("promo", "used_by", code), str(uid))
+        redis_client.setnx(_rk("promo", "used_by", normalized), str(uid))
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
@@ -2758,9 +2761,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             s["mode"] = None
             return
-        code = text.upper()
+
+        normalized_code = normalize_promo_code(text)
+        if not normalized_code:
+            await update.message.reply_text(
+                f"{CE['cross']} Неверный промокод.",
+                parse_mode=ParseMode.HTML,
+            )
+            s["mode"] = None
+            return
+
         uid = update.effective_user.id
-        bonus = promo_amount(code)
+        bonus = promo_amount(normalized_code)
         if not bonus:
             await update.message.reply_text(
                 f"{CE['cross']} Неверный промокод.",
@@ -2768,7 +2780,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             s["mode"] = None
             return
-        used_by = promo_used_global(code)
+
+        used_by = promo_used_global(normalized_code)
         if used_by and used_by != uid:
             await update.message.reply_text(
                 f"{CE['cross']} Этот промокод уже использован.",
@@ -2776,12 +2789,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             s["mode"] = None
             return
+
         try:
             result = ledger_storage.apply_promo(
                 uid,
-                code,
+                normalized_code,
                 bonus,
-                {"source": "promo_command"},
+                {"source": "promo_command", "raw_code": text},
             )
             _set_cached_balance(ctx, result.balance)
             if not result.applied:
@@ -2798,7 +2812,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 s["mode"] = None
                 return
         except Exception as exc:
-            log.exception("Promo apply failed for %s (%s): %s", uid, code, exc)
+            log.exception("Promo apply failed for %s (%s): %s", uid, normalized_code, exc)
             await update.message.reply_text(
                 f"{CE['bulb']} Не удалось применить промокод. Попробуйте позже.",
                 parse_mode=ParseMode.HTML,
@@ -2806,11 +2820,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mode"] = None
             return
 
-        promo_mark_used(code, uid)
+        promo_mark_used(normalized_code, uid)
         new_balance = get_user_balance_value(ctx, force_refresh=True)
+        bonus_text = f"+{escape(str(bonus))}{CE['star']}"
         await update.message.reply_text(
             (
-                f"{CE['check']} Промокод активирован! Вам начислено {escape(str(bonus))} токенов.\n"
+                f"{CE['check']} Промокод активирован, на баланс добавлено {bonus_text}.\n"
                 f"{format_balance_line(new_balance)}"
             ),
             parse_mode=ParseMode.HTML,
