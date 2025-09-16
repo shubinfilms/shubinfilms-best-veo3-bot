@@ -194,6 +194,8 @@ else:
     KIE_MJ_STATUS = _KIE_MJ_STATUS_DEFAULT
     KIE_MJ_STATUS_PATHS = [KIE_MJ_STATUS]
 
+MJ_FOUR_IMAGES = _env("MJ_FOUR_IMAGES", "false").lower() == "true"
+
 # Видео
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
 ENABLE_VERTICAL_NORMALIZE = _env("ENABLE_VERTICAL_NORMALIZE", "true").lower() == "true"
@@ -1651,7 +1653,7 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
         return False, None, "Ответ MJ без taskId."
     return False, None, _kie_error_message(status, resp)
 
-def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
+def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Any]]:
     status, resp, req_id, path_used = _kie_request_with_endpoint(
         "mj",
         "status",
@@ -1661,24 +1663,41 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
     )
     code = _extract_response_code(resp, status)
     raw_data = resp.get("data")
+    data: Any
     if isinstance(raw_data, str):
         try:
             parsed = json.loads(raw_data)
-            data = parsed if isinstance(parsed, dict) else {"value": parsed}
+            if isinstance(parsed, dict):
+                data = parsed
+            elif isinstance(parsed, list):
+                if MJ_FOUR_IMAGES:
+                    data = parsed
+                else:
+                    candidate = next((item for item in parsed if isinstance(item, dict)), None)
+                    data = candidate if candidate is not None else {"value": parsed}
+            else:
+                data = {"value": parsed}
         except Exception:
             data = {"raw": raw_data}
     elif isinstance(raw_data, dict):
         data = raw_data
     elif isinstance(raw_data, list):
-        data = next((item for item in raw_data if isinstance(item, dict)), None)
-        if data is None:
-            data = {"value": raw_data}
+        if MJ_FOUR_IMAGES:
+            data = raw_data
+        else:
+            candidate = next((item for item in raw_data if isinstance(item, dict)), None)
+            data = candidate if candidate is not None else {"value": raw_data}
     else:
         data = None
-    flag = _parse_success_flag(data) if isinstance(data, dict) else None
+    flag_source: Optional[Dict[str, Any]] = data if isinstance(data, dict) else None
+    if flag_source is None and isinstance(data, list):
+        flag_source = next((item for item in data if isinstance(item, dict)), None)
+    flag = _parse_success_flag(flag_source) if flag_source else None
     not_found = _is_not_found_response(status, resp)
     if not_found:
         flag = 0
+    if flag is None and MJ_FOUR_IMAGES and isinstance(data, list) and data:
+        flag = 1
     kie_event(
         "MJ_STATUS",
         request_id=req_id,
@@ -1692,10 +1711,12 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
     if not_found:
         return True, 0, None
     if status == 200 and code == 200:
+        if MJ_FOUR_IMAGES:
+            return True, flag, data
         return True, flag, data if isinstance(data, dict) else None
     return False, None, None
 
-def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
+def _extract_mj_image_urls(status_data: Any) -> List[str]:
     res: List[str] = []
     seen: set[str] = set()
 
@@ -1758,30 +1779,38 @@ def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
         "resultUrl",
         "urls",
     )
-    for key in direct_keys:
-        if key in status_data:
-            _add_from(status_data.get(key))
 
-    for meta_key in ("resultInfoJson", "resultInfo", "resultJson"):
-        raw = status_data.get(meta_key)
-        if not raw:
-            continue
-        parsed: Any = raw
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-            except Exception:
+    def _process_dict(source: Dict[str, Any]) -> None:
+        for key in direct_keys:
+            if key in source:
+                _add_from(source.get(key))
+        for meta_key in ("resultInfoJson", "resultInfo", "resultJson"):
+            raw = source.get(meta_key)
+            if not raw:
                 continue
-        if isinstance(parsed, dict):
-            for key in direct_keys:
-                if key in parsed:
-                    _add_from(parsed.get(key))
-        elif isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, dict):
-                    for key in direct_keys:
-                        if key in item:
-                            _add_from(item.get(key))
+            parsed: Any = raw
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    continue
+            if isinstance(parsed, dict):
+                _process_dict(parsed)
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        _process_dict(item)
+                    else:
+                        _scan(item)
+            else:
+                _scan(parsed)
+
+    if isinstance(status_data, dict):
+        _process_dict(status_data)
+    elif isinstance(status_data, list):
+        for item in status_data:
+            if isinstance(item, dict):
+                _process_dict(item)
 
     _scan(status_data)
 
@@ -2004,11 +2033,18 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 )
                 return
             if flag == 1:
-                payload = data or {}
+                payload_raw = data
 
-                urls = _extract_mj_image_urls(payload)
+                urls = _extract_mj_image_urls(payload_raw)
                 if not urls:
-                    one_url = _extract_result_url(payload)
+                    fallback_payload: Optional[Dict[str, Any]]
+                    if isinstance(payload_raw, dict):
+                        fallback_payload = payload_raw
+                    elif isinstance(payload_raw, list):
+                        fallback_payload = next((item for item in payload_raw if isinstance(item, dict)), None)
+                    else:
+                        fallback_payload = None
+                    one_url = _extract_result_url(fallback_payload or {})
                     urls = [one_url] if one_url else []
 
                 if not urls:
