@@ -10,6 +10,7 @@ PROMO_CODES=WELCOME50=50,FREE10=10              # опционально: спи
 PROMO_CODES_JSON={"SPRING200": 200}            # опционально: JSON-словарь с промокодами
 PROMO_CODES_FILE=/app/config/promo_codes.txt    # опционально: путь до файла с промокодами (JSON или CODE=AMOUNT)
 DEV_MODE=false
+ADMIN_ID=123456789                              # опционально: ID администратора для /promolist
 
 # OpenAI / Prompt Master (optional)
 OPENAI_API_KEY=
