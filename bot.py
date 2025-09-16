@@ -111,6 +111,7 @@ TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
+MENU_COMPACT        = _env("MENU_COMPACT", "false").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
@@ -893,6 +894,22 @@ def render_faq_text() -> str:
     )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    if MENU_COMPACT:
+        keyboard = [
+            [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
+            [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
+            [
+                inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master"),
+                inline_button(button_emoji("speech"), " Обычный чат", callback_data="mode:chat"),
+            ],
+            [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+        ]
+
+        if PROMO_ENABLED:
+            keyboard.append([inline_button("🎁 Активировать промокод", callback_data="promo_open")])
+
+        return InlineKeyboardMarkup(keyboard)
+
     keyboard = [
         [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
         [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],

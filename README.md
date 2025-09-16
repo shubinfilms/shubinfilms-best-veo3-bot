@@ -6,6 +6,7 @@ TELEGRAM_TOKEN=your-telegram-token
 PROMPTS_CHANNEL_URL=https://t.me/bestveo3promts
 STARS_BUY_URL=https://t.me/PremiumBot
 PROMO_ENABLED=true
+MENU_COMPACT=false
 PROMO_CODES=WELCOME50=50,FREE10=10              # опционально: список CODE=AMOUNT через запятую или перенос строки
 PROMO_CODES_JSON={"SPRING200": 200}            # опционально: JSON-словарь с промокодами
 PROMO_CODES_FILE=/app/config/promo_codes.txt    # опционально: путь до файла с промокодами (JSON или CODE=AMOUNT)
