@@ -2864,11 +2864,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"{CE['cross']} ChatGPT недоступен (нет OPENAI_API_KEY).",
                 parse_mode=ParseMode.HTML,
             ); return
+        chat = update.effective_chat
+        typing_task: Optional[asyncio.Task[Any]] = None
+        if chat:
+            async def _typing_loop() -> None:
+                try:
+                    while True:
+                        await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+                        await asyncio.sleep(4.5)
+                except asyncio.CancelledError:
+                    pass
+
+            typing_task = asyncio.create_task(_typing_loop())
         try:
-            await update.message.reply_text(
-                f"{CE['thought']} Думаю над ответом…",
-                parse_mode=ParseMode.HTML,
-            )
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
                 model="gpt-4o-mini",
@@ -2876,14 +2884,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                           {"role":"user","content":text}],
                 temperature=0.5, max_tokens=700,
             )
-            answer = resp["choices"][0]["message"]["content"].strip()
-            await update.message.reply_text(answer)
+            answer = (resp["choices"][0]["message"]["content"] or "").strip()
+            if typing_task:
+                typing_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await typing_task
+                typing_task = None
+            reply_text = f"🤖 {answer}" if answer else "🤖"
+            await update.message.reply_text(reply_text)
         except Exception as e:
             log.exception("Chat error: %s", e)
             await update.message.reply_text(
                 f"{CE['bulb']} Ошибка запроса к ChatGPT.",
                 parse_mode=ParseMode.HTML,
             )
+        finally:
+            if typing_task:
+                typing_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await typing_task
         return
 
     if mode == "mj_txt":
