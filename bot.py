@@ -712,16 +712,28 @@ PROMPT_MASTER_TIMEOUT = 27.0
 PROMPT_MASTER_ERROR_MESSAGE = (
     f"{cemoji('cross')} Не удалось собрать промпт. Попробуй сформулировать короче."
 )
-PROMPT_MASTER_CARD_TEMPLATE = (
-    f"{cemoji('brain')} Карточка Prompt-Master\n"
-    f"{cemoji('paperclip')} Промпт:\n<code>{{prompt}}</code>"
-)
+
+
+def _format_prompt_master_quote(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    quoted = []
+    for line in lines:
+        cleaned = line.rstrip("\r")
+        quoted.append(f"> {cleaned}" if cleaned else ">")
+    return "\n".join(quoted)
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
     for k, v in DEFAULT_STATE.items():
         if k not in ud: ud[k] = [] if isinstance(v, list) else v
     if not isinstance(ud.get("banana_images"), list): ud["banana_images"] = []
     return ud
+
+
+def activate_prompt_master_mode(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    s["mode"] = MODE_PROMPTMASTER
 
 # odex/fix-balance-reset-after-deploy
 # main
@@ -2748,8 +2760,26 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
-        card_text = PROMPT_MASTER_CARD_TEMPLATE.format(prompt=escape(prompt_text))
-        await update.message.reply_text(card_text, parse_mode=ParseMode.HTML)
+        quoted_text = _format_prompt_master_quote(prompt_text)
+        if not quoted_text:
+            quoted_text = prompt_text
+        reply_markup = InlineKeyboardMarkup([
+            [
+                inline_button(
+                    "📋 Скопировать",
+                    api_kwargs={"copy_text": {"text": quoted_text}},
+                ),
+                inline_button(
+                    "🔄 Новый промпт",
+                    callback_data="mode:prompt_master",
+                ),
+            ]
+        ])
+        await update.message.reply_text(
+            quoted_text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
         return
 
     # PROMO
