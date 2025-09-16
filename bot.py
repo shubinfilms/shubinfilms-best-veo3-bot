@@ -468,36 +468,59 @@ def _extract_task_id(j: Dict[str, Any]) -> Optional[str]:
 
 def _coerce_url_list(value) -> List[str]:
     urls: List[str] = []
+
     def add(u: str):
         if isinstance(u, str):
             s = u.strip()
-            if s.startswith("http"): urls.append(s)
-    if not value: return urls
+            if s.startswith("http"):
+                urls.append(s)
+
+    if not value:
+        return urls
+
     if isinstance(value, str):
         s = value.strip()
+        if not s:
+            return urls
+        parsed = False
         if s.startswith("["):
             try:
                 for v in json.loads(s):
-                    if isinstance(v, str): add(v)
+                    if isinstance(v, str):
+                        add(v)
+                parsed = True
             except Exception:
+                parsed = False
+        if not parsed:
+            matches = _MJ_URL_PATTERN.findall(s)
+            if matches:
+                for match in matches:
+                    add(match)
+            else:
                 add(s)
-        else: add(s)
         return urls
+
     if isinstance(value, list):
         for v in value:
-            if isinstance(v, str): add(v)
+            if isinstance(v, str):
+                add(v)
             elif isinstance(v, dict):
                 u = v.get("resultUrl") or v.get("originUrl") or v.get("url")
-                if isinstance(u, str): add(u)
+                if isinstance(u, str):
+                    add(u)
         return urls
+
     if isinstance(value, dict):
         for k in ("resultUrl", "originUrl", "url"):
             u = value.get(k)
-            if isinstance(u, str): add(u)
+            if isinstance(u, str):
+                add(u)
+
     return urls
 
 
 _MJ_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+_MJ_URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+")
 
 
 def _mj_content_type_extension(content_type: Optional[str]) -> Optional[str]:
@@ -1675,14 +1698,19 @@ def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
             text = value.strip()
             if not text:
                 return
-            if text.startswith("http"):
-                if _looks_like_image_url(text) and text not in seen:
-                    seen.add(text)
-                    res.append(text)
-                return
+            found_any = False
+            for match in _MJ_URL_PATTERN.findall(text):
+                if _looks_like_image_url(match) and match not in seen:
+                    seen.add(match)
+                    res.append(match)
+                    found_any = True
             parsed = _maybe_parse_json(text)
             if parsed is not None:
                 _scan(parsed)
+            elif (not found_any) and text.startswith("http"):
+                if _looks_like_image_url(text) and text not in seen:
+                    seen.add(text)
+                    res.append(text)
             return
         if isinstance(value, dict):
             for item in value.values():
@@ -1975,11 +2003,12 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     f"• Промпт: <code>{safe_snip}</code>"
                 )
 
-                downloaded: List[Tuple[bytes, str]] = []
+                downloaded: List[Tuple[bytes, str, str]] = []
                 for idx, u in enumerate(urls[:10]):
                     result = await asyncio.to_thread(_download_mj_image_bytes, u, idx)
                     if result:
-                        downloaded.append(result)
+                        data, filename = result
+                        downloaded.append((data, filename, u))
                     else:
                         log.warning("MJ skip image due to download failure: %s", u)
 
@@ -1994,7 +2023,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
 
                 async def _send_photos_one_by_one() -> bool:
                     sent_any = False
-                    for idx, (data, filename) in enumerate(downloaded):
+                    for idx, (data, filename, _) in enumerate(downloaded):
                         try:
                             await ctx.bot.send_photo(
                                 chat_id=chat_id,
@@ -2010,7 +2039,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 sent_successfully = False
                 if len(downloaded) >= 2:
                     media: List[InputMediaPhoto] = []
-                    for idx, (data, filename) in enumerate(downloaded):
+                    for idx, (data, filename, _) in enumerate(downloaded):
                         media.append(
                             InputMediaPhoto(
                                 media=_make_input_photo(data, filename),
@@ -2036,14 +2065,16 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     )
                     return
 
-                keyboard = InlineKeyboardMarkup([
-                    [inline_button(button_emoji("rocket"), " Повторить", callback_data="mj:repeat")],
-                    [inline_button(button_emoji("sparkles"), " Назад в меню", callback_data="back")],
-                ])
+                open_url = next((src for _, _, src in downloaded if isinstance(src, str) and src.startswith("http")), None)
+                keyboard_rows: List[List[InlineKeyboardButton]] = []
+                if open_url:
+                    keyboard_rows.append([inline_button("🔍 Открыть", url=open_url)])
+                keyboard_rows.append([inline_button("🔄 Повторить", callback_data="mj:repeat")])
+                keyboard_rows.append([inline_button("⬅️ Назад в меню", callback_data="back")])
                 await ctx.bot.send_message(
                     chat_id,
                     f"{CE['sparkles']} Галерея сгенерирована.",
-                    reply_markup=keyboard,
+                    reply_markup=InlineKeyboardMarkup(keyboard_rows),
                     parse_mode=ParseMode.HTML,
                 )
 
