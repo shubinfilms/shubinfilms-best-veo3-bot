@@ -26,7 +26,7 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Conflict
 
 from handlers.prompt_master_handler import PROMPT_MASTER_HINT
 from prompt_master import generate_prompt_master, PM_QUOTE_MODE, ensure_quote_block
@@ -119,16 +119,17 @@ STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 MENU_COMPACT        = _env("MENU_COMPACT", "false").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
-codex/ensure-promo-codes-functionality-and-diagnostics
 _ADMIN_ID_RAW       = _env("ADMIN_ID")
 ADMIN_ID: Optional[int] = None
- main
 
 MENU_COMPACT_ENABLED   = _env("MENU_COMPACT", "false").lower() == "true"
 PM_QUOTE_MODE_ENABLED  = _env("PM_QUOTE_MODE", "false").lower() == "true"
 CHAT_TYPING_ONLY_MODE  = _env("CHAT_TYPING_ONLY", "false").lower() == "true"
 MJ_FOUR_IMAGES_ENABLED = _env("MJ_FOUR_IMAGES", "false").lower() == "true"
-main
+
+RENDER_GIT_COMMIT = _env("RENDER_GIT_COMMIT")
+GIT_SHA = _env("GIT_SHA") or RENDER_GIT_COMMIT
+STARTUP_MODE = "polling"
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -268,12 +269,11 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 PROMO_CODES = load_promo_codes(DEFAULT_PROMO_CODES)
 if PROMO_CODES:
-codex/ensure-promo-codes-functionality-and-diagnostics
     loaded_codes = ", ".join(
         f"{code}={amount}" for code, amount in iter_sorted_promo_codes(PROMO_CODES)
     )
+    _promo_codes_summary = loaded_codes
     log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), loaded_codes)
-main
 else:
     _promo_codes_summary = "none"
     log.warning("No promo codes configured")
@@ -951,7 +951,6 @@ def render_faq_text() -> str:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     if MENU_COMPACT:
- main
         keyboard = [
             [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
             [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
@@ -2940,7 +2939,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
-codex/add-feature-flags-for-new-changes
         if PM_QUOTE_MODE_ENABLED:
             quoted_text = _format_prompt_master_quote(prompt_text)
             if not quoted_text:
@@ -2971,7 +2969,6 @@ codex/add-feature-flags-for-new-changes
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
             )
- main
         return
 
     # PROMO
@@ -3091,7 +3088,6 @@ codex/add-feature-flags-for-new-changes
         thinking_message: Optional[Message] = None
         if chat:
             if CHAT_TYPING_ONLY_MODE:
- main
                 async def _typing_loop() -> None:
                     try:
                         while True:
@@ -3102,7 +3098,6 @@ codex/add-feature-flags-for-new-changes
 
                 typing_task = asyncio.create_task(_typing_loop())
             else:
- codex/remove-unnecessary-chat-message
                 try:
                     thinking_message = await update.message.reply_text(
                         f"{CE['hourglass']} Думаю над ответом…",
@@ -3110,7 +3105,6 @@ codex/add-feature-flags-for-new-changes
                     )
                 except TelegramError as exc:
                     log.warning("Failed to send chat placeholder: %s", exc)
- main
         try:
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
@@ -3638,27 +3632,30 @@ class RedisRunnerLock:
 # ==========================
 #   Entry (fixed for PTB 21.x)
 # ==========================
-async def run_bot_async() -> None:
-    if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
-    if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
-    if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
+def build_application():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+    if not KIE_BASE_URL:
+        raise RuntimeError("KIE_BASE_URL is not set")
+    if not KIE_API_KEY:
+        raise RuntimeError("KIE_API_KEY is not set")
 
-    application = (ApplicationBuilder()
-                   .token(TELEGRAM_TOKEN)
-                   .rate_limiter(AIORateLimiter())
-                   .build())
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .build()
+    )
 
     # Handlers (оставляем как есть)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("faq", faq_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
-# codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
     application.add_handler(CommandHandler("promolist", promo_list))
     application.add_handler(prompt_master_conv, group=10)
-# main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))
@@ -3666,119 +3663,88 @@ async def run_bot_async() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     application.add_error_handler(error_handler)
 
-    lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
-
-    try:
-        async with lock:
-            log.info(
-                "Bot starting… (Redis=%s, lock=%s)",
-                "on" if redis_client else "off",
-                "enabled" if lock.enabled else "disabled",
-            )
-
-            git_sha_for_log = GIT_SHA or "n/a"
-            log.info(
-                "Startup build info | Python=%s | AppVersion=%s | GitSHA=%s | PROMO_ENABLED=%s | PromoCodes=%s",
-                platform.python_version(),
-                APP_VERSION,
-                git_sha_for_log,
-                PROMO_ENABLED,
-                PROMO_CODES_LOG_SUMMARY,
-            )
-
-            loop = asyncio.get_running_loop()
-            stop_event = asyncio.Event()
-            manual_signal_handlers: List[signal.Signals] = []
-
-            def _trigger_stop(sig: Optional[signal.Signals] = None, *, reason: str = "external") -> None:
-                if stop_event.is_set():
-                    return
-                if sig is not None:
-                    sig_name = sig.name if hasattr(sig, "name") else str(sig)
-                    log.info("Stop signal received: %s. Triggering shutdown.", sig_name)
-                else:
-                    log.info("Stop requested (%s). Triggering shutdown.", reason)
-                stop_event.set()
-
-            lock.add_stop_callback(lambda sig: _trigger_stop(sig))
-
-            if not lock.enabled:
-                for sig_name in ("SIGINT", "SIGTERM"):
-                    if not hasattr(signal, sig_name):
-                        continue
-                    sig_obj = getattr(signal, sig_name)
-                    try:
-                        loop.add_signal_handler(sig_obj, lambda s=sig_obj: _trigger_stop(s))
-                        manual_signal_handlers.append(sig_obj)
-                    except (NotImplementedError, RuntimeError):
-                        continue
-
-            previous_post_stop = application.post_stop
-
-            async def _post_stop(app) -> None:
-                _trigger_stop(reason="post_stop")
-                if previous_post_stop:
-                    await previous_post_stop(app)
-
-            application.post_stop = _post_stop
-
-            # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
-            await application.initialize()
-
-            try:
-                try:
-                    await application.bot.delete_webhook(drop_pending_updates=True)
-                    event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-                    log.info("Webhook deleted")
-                except Exception as exc:
-                    event("WEBHOOK_DELETE_ERROR", error=str(exc))
-                    log.warning("Delete webhook failed: %s", exc)
-
-                await application.start()
-                await application.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                )
-
-                log.info("Application started")
-
-                try:
-                    await stop_event.wait()
-                except asyncio.CancelledError:
-                    _trigger_stop(reason="cancelled")
-                    raise
-            finally:
-                for sig_obj in manual_signal_handlers:
-                    try:
-                        loop.remove_signal_handler(sig_obj)
-                    except (NotImplementedError, RuntimeError):
-                        pass
-
-                if application.updater:
-                    try:
-                        await application.updater.stop()
-                    except RuntimeError as exc:
-                        log.warning("Updater stop failed: %s", exc)
-                    except Exception as exc:
-                        log.warning("Updater stop failed with unexpected error: %s", exc)
-
-                try:
-                    await application.stop()
-                except Exception as exc:
-                    log.warning("Application stop failed: %s", exc)
-
-                try:
-                    await application.shutdown()
-                except Exception as exc:
-                    log.warning("Application shutdown failed: %s", exc)
-                application.post_stop = previous_post_stop
-    except RedisLockBusy:
-        log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+    return application
 
 
 def main() -> None:
-    # Единая точка входа: создаём и закрываем цикл здесь
-    asyncio.run(run_bot_async())
+    application = build_application()
+
+    runner_lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
+
+    previous_post_init = application.post_init
+    previous_post_shutdown = application.post_shutdown
+
+    async def _post_init(app) -> None:
+        if previous_post_init:
+            await previous_post_init(app)
+
+        stop_marker = getattr(app, "_Application__stop_running_marker", None)
+        if stop_marker and stop_marker.is_set():
+            return
+
+        try:
+            await runner_lock.__aenter__()
+        except RedisLockBusy:
+            log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+            app.stop_running()
+            return
+
+        log.info(
+            "Bot starting… (Redis=%s, lock=%s)",
+            "on" if redis_client else "off",
+            "enabled" if runner_lock.enabled else "disabled",
+        )
+
+        git_sha_for_log = GIT_SHA or "n/a"
+        log.info(
+            "Startup build info | Python=%s | Mode=%s | AppVersion=%s | GIT_SHA=%s | RENDER_GIT_COMMIT=%s | PROMO_ENABLED=%s | PromoCodes=%s",
+            platform.python_version(),
+            STARTUP_MODE,
+            APP_VERSION,
+            git_sha_for_log,
+            RENDER_GIT_COMMIT or "n/a",
+            PROMO_ENABLED,
+            PROMO_CODES_LOG_SUMMARY,
+        )
+
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+            log.info("Webhook deleted")
+        except Exception as exc:
+            event("WEBHOOK_DELETE_ERROR", error=str(exc))
+            log.warning("Delete webhook failed: %s", exc)
+
+        async def _log_started() -> None:
+            try:
+                for _ in range(240):
+                    if app.running or (app.updater and app.updater.running):
+                        log.info("Application started")
+                        return
+                    await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                return
+
+        app.create_task(_log_started())
+
+    async def _post_shutdown(app) -> None:
+        try:
+            await runner_lock.release()
+        finally:
+            if previous_post_shutdown:
+                await previous_post_shutdown(app)
+
+    application.post_init = _post_init
+    application.post_shutdown = _post_shutdown
+
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    except Conflict as exc:
+        log.error("Telegram conflict detected: %s", exc)
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
