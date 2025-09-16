@@ -3,5 +3,6 @@ python-dotenv==1.0.1
 requests==2.32.3
 openai==0.28.1
 redis==5.0.7
-psycopg[binary]==3.2.1
-psycopg-pool==3.2.1
+# Pin psycopg 3.1.x to ensure binary wheels work on Render's Python 3.11 images.
+psycopg[binary]==3.1.20
+psycopg-pool==3.1.9
