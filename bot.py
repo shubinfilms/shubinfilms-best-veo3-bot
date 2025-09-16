@@ -879,6 +879,23 @@ def render_faq_text() -> str:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
+        [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
+        [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
+        [
+            inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master"),
+            inline_button(button_emoji("speech"), " Обычный чат", callback_data="mode:chat"),
+        ],
+        [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+    ]
+
+    if PROMO_ENABLED:
+        keyboard.append([inline_button("🎁 Активировать промокод", callback_data="promo_open")])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _video_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
         [
             inline_button(
                 button_emoji("clapper"),
@@ -899,6 +916,22 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             inline_button(
+                button_emoji("camera"),
+                " Оживить изображение (Veo) ",
+                button_emoji("diamond"),
+                f" {TOKEN_COSTS['veo_photo']}",
+                callback_data="mode:veo_photo",
+            )
+        ],
+        [inline_button(button_emoji("sparkles"), " Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _image_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            inline_button(
                 button_emoji("frame"),
                 " Генерация изображений (MJ) ",
                 button_emoji("diamond"),
@@ -915,30 +948,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 callback_data="mode:banana",
             )
         ],
-        [
-            inline_button(
-                button_emoji("camera"),
-                " Оживить изображение (Veo) ",
-                button_emoji("diamond"),
-                f" {TOKEN_COSTS['veo_photo']}",
-                callback_data="mode:veo_photo",
-            )
-        ],
-        [inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master")],
-        [inline_button(button_emoji("speech"), " Обычный чат (ChatGPT)", callback_data="mode:chat")],
-        [
-            inline_button(button_emoji("sparkles"), " FAQ", callback_data="faq"),
-            inline_button(button_emoji("sparkles"), " Канал с промптами", url=PROMPTS_CHANNEL_URL),
-        ],
-        [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+        [inline_button(button_emoji("sparkles"), " Назад", callback_data="back")],
     ]
-
-    if PROMO_ENABLED:
-        keyboard.append([
-            inline_button(button_emoji("ticket"), " Активировать промокод", callback_data="promo_open")
-        ])
-
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(rows)
 
 def _short_prompt(prompt: Optional[str], limit: int = 120) -> str:
     txt = (prompt or "").strip()
@@ -2175,6 +2187,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_kb(),
     )
 
+
+async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        render_faq_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_kb(),
+    )
+
+
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{CE['diamond']} Пополнение через <b>Telegram Stars</b>.\nЕсли звёзд не хватает — купите в официальном боте:",
@@ -2293,6 +2314,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["mode"] = "promo"
         await q.message.reply_text(
             f"{CE['ticket']} Введите промокод одним сообщением:",
+            parse_mode=ParseMode.HTML,
+        ); return
+
+    if data == "menu:video":
+        await q.message.reply_text(
+            f"{CE['clapper']} Выберите режим генерации видео:",
+            reply_markup=_video_menu_keyboard(),
+            parse_mode=ParseMode.HTML,
+        ); return
+
+    if data == "menu:image":
+        await q.message.reply_text(
+            f"{CE['frame']} Выберите режим генерации изображений:",
+            reply_markup=_image_menu_keyboard(),
             parse_mode=ParseMode.HTML,
         ); return
 
@@ -3362,6 +3397,7 @@ async def run_bot_async() -> None:
 
     # Handlers (оставляем как есть)
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("faq", faq_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
 # codex/fix-balance-reset-after-deploy
