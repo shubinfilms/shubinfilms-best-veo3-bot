@@ -41,7 +41,12 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
-from promo_codes import DEFAULT_PROMO_CODES, load_promo_codes, normalize_promo_code
+from promo_codes import (
+    DEFAULT_PROMO_CODES,
+    iter_sorted_promo_codes,
+    load_promo_codes,
+    normalize_promo_code,
+)
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -113,7 +118,10 @@ STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 MENU_COMPACT        = _env("MENU_COMPACT", "false").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
-GIT_SHA             = _env("GIT_SHA") or _env("RENDER_GIT_COMMIT") or _env("COMMIT_SHA")
+codex/ensure-promo-codes-functionality-and-diagnostics
+_ADMIN_ID_RAW       = _env("ADMIN_ID")
+ADMIN_ID: Optional[int] = None
+ main
 
 MENU_COMPACT_ENABLED   = _env("MENU_COMPACT", "false").lower() == "true"
 PM_QUOTE_MODE_ENABLED  = _env("PM_QUOTE_MODE", "false").lower() == "true"
@@ -213,6 +221,13 @@ LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("veo3-bot")
 
+if _ADMIN_ID_RAW:
+    try:
+        ADMIN_ID = int(_ADMIN_ID_RAW)
+    except ValueError:
+        log.warning("Invalid ADMIN_ID value provided: %r", _ADMIN_ID_RAW)
+        ADMIN_ID = None
+
 try:
     import telegram as _tg
     log.info("PTB version: %s", getattr(_tg, "__version__", "unknown"))
@@ -249,10 +264,12 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 PROMO_CODES = load_promo_codes(DEFAULT_PROMO_CODES)
 if PROMO_CODES:
-    _promo_codes_summary = ", ".join(
-        f"{code}={amount}" for code, amount in sorted(PROMO_CODES.items())
+codex/ensure-promo-codes-functionality-and-diagnostics
+    loaded_codes = ", ".join(
+        f"{code}={amount}" for code, amount in iter_sorted_promo_codes(PROMO_CODES)
     )
-    log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), _promo_codes_summary)
+    log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), loaded_codes)
+main
 else:
     _promo_codes_summary = "none"
     log.warning("No promo codes configured")
@@ -2309,6 +2326,39 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+
+async def promo_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not message:
+        return
+
+    if ADMIN_ID is None or user_id != ADMIN_ID:
+        await message.reply_text(
+            f"{CE['cross']} Команда доступна только администратору.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not PROMO_CODES:
+        await message.reply_text(
+            f"{CE['ticket']} Активных промокодов нет.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [
+        f"{index + 1}. <code>{escape(code)}</code> — <b>{escape(str(amount))}</b> {CE['diamond']}"
+        for index, (code, amount) in enumerate(iter_sorted_promo_codes(PROMO_CODES))
+    ]
+    text = (
+        f"{CE['ticket']} <b>Активные промокоды</b> ({len(PROMO_CODES)})\n"
+        + "\n".join(lines)
+    )
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
         f"PTB: <code>{escape(str(getattr(_tg, '__version__', 'unknown')))}</code>" if _tg else "PTB: <code>unknown</code>",
@@ -3540,6 +3590,7 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
+    application.add_handler(CommandHandler("promolist", promo_list))
     application.add_handler(prompt_master_conv, group=10)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
