@@ -6,7 +6,7 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 # odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, platform
 from html import escape
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable
@@ -116,9 +116,12 @@ TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
+MENU_COMPACT        = _env("MENU_COMPACT", "false").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
+codex/ensure-promo-codes-functionality-and-diagnostics
 _ADMIN_ID_RAW       = _env("ADMIN_ID")
 ADMIN_ID: Optional[int] = None
+ main
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -256,12 +259,17 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 PROMO_CODES = load_promo_codes(DEFAULT_PROMO_CODES)
 if PROMO_CODES:
+codex/ensure-promo-codes-functionality-and-diagnostics
     loaded_codes = ", ".join(
         f"{code}={amount}" for code, amount in iter_sorted_promo_codes(PROMO_CODES)
     )
     log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), loaded_codes)
+main
 else:
+    _promo_codes_summary = "none"
     log.warning("No promo codes configured")
+
+PROMO_CODES_LOG_SUMMARY = _promo_codes_summary
 
 def promo_amount(code: str) -> Optional[int]:
     normalized = normalize_promo_code(code)
@@ -909,6 +917,22 @@ def render_faq_text() -> str:
     )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    if MENU_COMPACT:
+        keyboard = [
+            [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
+            [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
+            [
+                inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master"),
+                inline_button(button_emoji("speech"), " Обычный чат", callback_data="mode:chat"),
+            ],
+            [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+        ]
+
+        if PROMO_ENABLED:
+            keyboard.append([inline_button("🎁 Активировать промокод", callback_data="promo_open")])
+
+        return InlineKeyboardMarkup(keyboard)
+
     keyboard = [
         [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
         [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
@@ -3534,6 +3558,16 @@ async def run_bot_async() -> None:
                 "Bot starting… (Redis=%s, lock=%s)",
                 "on" if redis_client else "off",
                 "enabled" if lock.enabled else "disabled",
+            )
+
+            git_sha_for_log = GIT_SHA or "n/a"
+            log.info(
+                "Startup build info | Python=%s | AppVersion=%s | GitSHA=%s | PROMO_ENABLED=%s | PromoCodes=%s",
+                platform.python_version(),
+                APP_VERSION,
+                git_sha_for_log,
+                PROMO_ENABLED,
+                PROMO_CODES_LOG_SUMMARY,
             )
 
             loop = asyncio.get_running_loop()
