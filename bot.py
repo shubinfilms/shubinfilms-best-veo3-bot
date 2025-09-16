@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 from handlers.prompt_master_handler import PROMPT_MASTER_HINT
-from prompt_master import generate_prompt_master
+from prompt_master import generate_prompt_master, PM_QUOTE_MODE, ensure_quote_block
 
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
@@ -727,14 +727,20 @@ PROMPT_MASTER_ERROR_MESSAGE = (
 
 
 def _format_prompt_master_quote(text: str) -> str:
-    lines = text.splitlines()
-    if not lines:
-        return ""
-    quoted = []
+    return ensure_quote_block(text)
+
+
+def _is_prompt_master_blockquote(text: str) -> bool:
+    lines = (text or "").splitlines()
+    has_content = False
     for line in lines:
-        cleaned = line.rstrip("\r")
-        quoted.append(f"> {cleaned}" if cleaned else ">")
-    return "\n".join(quoted)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        has_content = True
+        if not stripped.startswith(">"):
+            return False
+    return has_content
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
     for k, v in DEFAULT_STATE.items():
@@ -2846,6 +2852,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
+codex/add-feature-flags-for-new-changes
         if PM_QUOTE_MODE_ENABLED:
             quoted_text = _format_prompt_master_quote(prompt_text)
             if not quoted_text:
@@ -2876,6 +2883,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
             )
+ main
         return
 
     # PROMO
