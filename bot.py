@@ -245,9 +245,7 @@ REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
-DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
+LEDGER_DSN = (_env("DATABASE_URL") or _env("POSTGRES_DSN")) or None
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
@@ -316,8 +314,10 @@ def promo_mark_used(code: str, uid: int):
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
 
-# Ledger storage (Postgres)
-ledger_storage = LedgerStorage(DATABASE_URL)
+# Ledger storage backend
+ledger_storage = LedgerStorage(LEDGER_DSN)
+LEDGER_BACKEND_NAME = ledger_storage.backend_name
+LEDGER_BACKEND_DSN = ledger_storage.safe_dsn
 
 
 def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -3706,6 +3706,10 @@ def main() -> None:
             PROMO_ENABLED,
             PROMO_CODES_LOG_SUMMARY,
         )
+
+        ledger_location = LEDGER_BACKEND_DSN or "(in-memory)"
+        log.info("Ledger backend: %s %s", LEDGER_BACKEND_NAME, ledger_location)
+        log.info("Promo codes loaded: %s", PROMO_CODES_LOG_SUMMARY)
 
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
