@@ -115,6 +115,11 @@ MENU_COMPACT        = _env("MENU_COMPACT", "false").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
 GIT_SHA             = _env("GIT_SHA") or _env("RENDER_GIT_COMMIT") or _env("COMMIT_SHA")
 
+MENU_COMPACT_ENABLED   = _env("MENU_COMPACT", "false").lower() == "true"
+PM_QUOTE_MODE_ENABLED  = _env("PM_QUOTE_MODE", "false").lower() == "true"
+CHAT_TYPING_ONLY_MODE  = _env("CHAT_TYPING_ONLY", "false").lower() == "true"
+MJ_FOUR_IMAGES_ENABLED = _env("MJ_FOUR_IMAGES", "false").lower() == "true"
+
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
     import openai  # type: ignore
@@ -801,6 +806,19 @@ def button_emoji(name: str, fallback: Optional[str] = None) -> EmojiSegment:
     return EmojiSegment(name=name, fallback=fallback)
 
 
+def _button_part_to_text(part: ButtonTextPart) -> str:
+    if part is None:
+        return ""
+    if isinstance(part, EmojiSegment):
+        record = CEMOJI.get(part.name)
+        if not record:
+            raise KeyError(f"Unknown custom emoji for button: {part.name}")
+        _, default = record
+        fallback = part.fallback if part.fallback is not None else default
+        return fallback or ""
+    return str(part)
+
+
 def _button_text_with_entities(parts: Tuple[ButtonTextPart, ...]) -> Tuple[str, List[Dict[str, Any]]]:
     text = ""
     entities: List[Dict[str, Any]] = []
@@ -838,17 +856,22 @@ def _button_text_with_entities(parts: Tuple[ButtonTextPart, ...]) -> Tuple[str, 
 
 
 def inline_button(*parts: ButtonTextPart, **kwargs: Any) -> InlineKeyboardButton:
-    text, entities = _button_text_with_entities(tuple(parts))
     api_kwargs = kwargs.pop("api_kwargs", None)
-    if entities:
-        if api_kwargs is None:
-            api_kwargs = {}
-        else:
-            api_kwargs = dict(api_kwargs)
-        existing = list(api_kwargs.get("text_entities", []))
-        existing.extend(entities)
-        api_kwargs["text_entities"] = existing
-    return InlineKeyboardButton(text or "", api_kwargs=api_kwargs, **kwargs)
+    if MENU_COMPACT_ENABLED:
+        text, entities = _button_text_with_entities(tuple(parts))
+        if entities:
+            if api_kwargs is None:
+                api_kwargs = {}
+            else:
+                api_kwargs = dict(api_kwargs)
+            existing = list(api_kwargs.get("text_entities", []))
+            existing.extend(entities)
+            api_kwargs["text_entities"] = existing
+    else:
+        text = "".join(_button_part_to_text(part) for part in parts)
+    if api_kwargs is not None:
+        kwargs["api_kwargs"] = api_kwargs
+    return InlineKeyboardButton(text or "", **kwargs)
 
 
 WELCOME_TEMPLATE = (
@@ -907,6 +930,7 @@ def render_faq_text() -> str:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     if MENU_COMPACT:
+ main
         keyboard = [
             [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
             [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
@@ -923,17 +947,15 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(keyboard)
 
     keyboard = [
-        [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
-        [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
-        [
-            inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master"),
-            inline_button(button_emoji("speech"), " Обычный чат", callback_data="mode:chat"),
-        ],
-        [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+        [InlineKeyboardButton("🎬 Генерация видео", callback_data="menu:video")],
+        [InlineKeyboardButton("🖼️ Генерация изображений", callback_data="menu:image")],
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("💬 Обычный чат", callback_data="mode:chat")],
+        [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
     ]
 
     if PROMO_ENABLED:
-        keyboard.append([inline_button("🎁 Активировать промокод", callback_data="promo_open")])
+        keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -2059,8 +2081,9 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     f"• Промпт: <code>{safe_snip}</code>"
                 )
 
+                max_images = 4 if MJ_FOUR_IMAGES_ENABLED else 1
                 downloaded: List[Tuple[bytes, str, str]] = []
-                for idx, u in enumerate(urls[:10]):
+                for idx, u in enumerate(urls[:max_images]):
                     result = await asyncio.to_thread(_download_mj_image_bytes, u, idx)
                     if result:
                         data, filename = result
@@ -2093,7 +2116,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     return sent_any
 
                 sent_successfully = False
-                if len(downloaded) >= 2:
+                if MJ_FOUR_IMAGES_ENABLED and len(downloaded) >= 2:
                     media: List[InputMediaPhoto] = []
                     for idx, (data, filename, _) in enumerate(downloaded):
                         media.append(
@@ -2127,9 +2150,14 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     keyboard_rows.append([inline_button("🔍 Открыть", url=open_url)])
                 keyboard_rows.append([inline_button("🔄 Повторить", callback_data="mj:repeat")])
                 keyboard_rows.append([inline_button("⬅️ Назад в меню", callback_data="back")])
+                success_message = (
+                    f"{CE['sparkles']} Галерея сгенерирована."
+                    if MJ_FOUR_IMAGES_ENABLED and len(downloaded) > 1
+                    else f"{CE['sparkles']} Изображение готово."
+                )
                 await ctx.bot.send_message(
                     chat_id,
-                    f"{CE['sparkles']} Галерея сгенерирована.",
+                    success_message,
                     reply_markup=InlineKeyboardMarkup(keyboard_rows),
                     parse_mode=ParseMode.HTML,
                 )
@@ -2824,37 +2852,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
-        formatted_text = prompt_text
-        if PM_QUOTE_MODE == "bot":
-            candidate = _format_prompt_master_quote(prompt_text)
-            if candidate:
-                formatted_text = candidate
-        elif PM_QUOTE_MODE == "off":
-            formatted_text = prompt_text
-        else:  # default behaviour — expect generator to quote
-            if not _is_prompt_master_blockquote(prompt_text):
-                candidate = _format_prompt_master_quote(prompt_text)
-                if candidate:
-                    formatted_text = candidate
-        if not formatted_text:
-            formatted_text = prompt_text
-        reply_markup = InlineKeyboardMarkup([
-            [
-                inline_button(
-                    "📋 Скопировать",
-                    api_kwargs={"copy_text": {"text": formatted_text}},
-                ),
-                inline_button(
-                    "🔄 Новый промпт",
-                    callback_data="mode:prompt_master",
-                ),
-            ]
-        ])
-        await update.message.reply_text(
-            formatted_text,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+codex/add-feature-flags-for-new-changes
+        if PM_QUOTE_MODE_ENABLED:
+            quoted_text = _format_prompt_master_quote(prompt_text)
+            if not quoted_text:
+                quoted_text = prompt_text
+            reply_markup = InlineKeyboardMarkup([
+                [
+                    inline_button(
+                        "📋 Скопировать",
+                        api_kwargs={"copy_text": {"text": quoted_text}},
+                    ),
+                    inline_button(
+                        "🔄 Новый промпт",
+                        callback_data="mode:prompt_master",
+                    ),
+                ]
+            ])
+            await update.message.reply_text(
+                quoted_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        else:
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Новый промпт", callback_data="mode:prompt_master")]
+            ])
+            await update.message.reply_text(
+                prompt_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+ main
         return
 
     # PROMO
@@ -2972,15 +3001,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         typing_task: Optional[asyncio.Task[Any]] = None
         if chat:
-            async def _typing_loop() -> None:
-                try:
-                    while True:
-                        await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-                        await asyncio.sleep(4.5)
-                except asyncio.CancelledError:
-                    pass
+            if CHAT_TYPING_ONLY_MODE:
+                async def _typing_loop() -> None:
+                    try:
+                        while True:
+                            await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+                            await asyncio.sleep(4.5)
+                    except asyncio.CancelledError:
+                        pass
 
-            typing_task = asyncio.create_task(_typing_loop())
+                typing_task = asyncio.create_task(_typing_loop())
+            else:
+                with suppress(Exception):
+                    await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
         try:
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
