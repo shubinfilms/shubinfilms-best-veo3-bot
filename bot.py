@@ -6,7 +6,7 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 # odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, platform
 from html import escape
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable
@@ -112,6 +112,7 @@ PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
+GIT_SHA             = _env("GIT_SHA") or _env("RENDER_GIT_COMMIT") or _env("COMMIT_SHA")
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -242,10 +243,15 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 PROMO_CODES = load_promo_codes(DEFAULT_PROMO_CODES)
 if PROMO_CODES:
-    loaded_codes = ", ".join(f"{code}={amount}" for code, amount in sorted(PROMO_CODES.items()))
-    log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), loaded_codes)
+    _promo_codes_summary = ", ".join(
+        f"{code}={amount}" for code, amount in sorted(PROMO_CODES.items())
+    )
+    log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), _promo_codes_summary)
 else:
+    _promo_codes_summary = "none"
     log.warning("No promo codes configured")
+
+PROMO_CODES_LOG_SUMMARY = _promo_codes_summary
 
 def promo_amount(code: str) -> Optional[int]:
     normalized = normalize_promo_code(code)
@@ -3484,6 +3490,16 @@ async def run_bot_async() -> None:
                 "Bot starting… (Redis=%s, lock=%s)",
                 "on" if redis_client else "off",
                 "enabled" if lock.enabled else "disabled",
+            )
+
+            git_sha_for_log = GIT_SHA or "n/a"
+            log.info(
+                "Startup build info | Python=%s | AppVersion=%s | GitSHA=%s | PROMO_ENABLED=%s | PromoCodes=%s",
+                platform.python_version(),
+                APP_VERSION,
+                git_sha_for_log,
+                PROMO_ENABLED,
+                PROMO_CODES_LOG_SUMMARY,
             )
 
             loop = asyncio.get_running_loop()
