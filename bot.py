@@ -19,13 +19,14 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, LabeledPrice, InputMediaPhoto
+    InputFile, LabeledPrice, InputMediaPhoto, Message
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
+from telegram.error import TelegramError
 
 from handlers.prompt_master_handler import PROMPT_MASTER_HINT
 from prompt_master import generate_prompt_master
@@ -112,6 +113,7 @@ PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
+CHAT_TYPING_ONLY    = _env("CHAT_TYPING_ONLY", "false").lower() == "true"
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -2931,16 +2933,26 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ); return
         chat = update.effective_chat
         typing_task: Optional[asyncio.Task[Any]] = None
+        thinking_message: Optional[Message] = None
         if chat:
-            async def _typing_loop() -> None:
-                try:
-                    while True:
-                        await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-                        await asyncio.sleep(4.5)
-                except asyncio.CancelledError:
-                    pass
+            if CHAT_TYPING_ONLY:
+                async def _typing_loop() -> None:
+                    try:
+                        while True:
+                            await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+                            await asyncio.sleep(4.5)
+                    except asyncio.CancelledError:
+                        pass
 
-            typing_task = asyncio.create_task(_typing_loop())
+                typing_task = asyncio.create_task(_typing_loop())
+            else:
+                try:
+                    thinking_message = await update.message.reply_text(
+                        f"{CE['hourglass']} Думаю над ответом…",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError as exc:
+                    log.warning("Failed to send chat placeholder: %s", exc)
         try:
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
@@ -2956,13 +2968,32 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await typing_task
                 typing_task = None
             reply_text = f"🤖 {answer}" if answer else "🤖"
-            await update.message.reply_text(reply_text)
+            sent_via_placeholder = False
+            if not CHAT_TYPING_ONLY and thinking_message:
+                try:
+                    await thinking_message.edit_text(reply_text)
+                except TelegramError as exc:
+                    log.warning("Failed to edit chat placeholder: %s", exc)
+                else:
+                    sent_via_placeholder = True
+            if not sent_via_placeholder:
+                await update.message.reply_text(reply_text)
         except Exception as e:
             log.exception("Chat error: %s", e)
-            await update.message.reply_text(
-                f"{CE['bulb']} Ошибка запроса к ChatGPT.",
-                parse_mode=ParseMode.HTML,
-            )
+            if typing_task:
+                typing_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await typing_task
+                typing_task = None
+            error_text = f"{CE['bulb']} Ошибка запроса к ChatGPT."
+            if not CHAT_TYPING_ONLY and thinking_message:
+                try:
+                    await thinking_message.edit_text(error_text, parse_mode=ParseMode.HTML)
+                except TelegramError as exc:
+                    log.warning("Failed to edit chat placeholder with error: %s", exc)
+                    await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
         finally:
             if typing_task:
                 typing_task.cancel()
