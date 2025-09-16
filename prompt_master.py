@@ -27,6 +27,28 @@ except Exception:
     except Exception:
         _client = None
 
+_DEFAULT_QUOTE_MODE = "generator"
+
+
+def _normalize_quote_mode(value: str | None) -> str:
+    if value is None:
+        return _DEFAULT_QUOTE_MODE
+    text = value.strip().lower()
+    if not text or text in {"auto", "default"}:
+        return _DEFAULT_QUOTE_MODE
+    if text in {"generator", "gen", "g", "on", "1", "true", "yes"}:
+        return "generator"
+    if text in {"bot"}:
+        return "bot"
+    if text in {"off", "0", "false", "no"}:
+        return "off"
+    return _DEFAULT_QUOTE_MODE
+
+
+PM_QUOTE_MODE = _normalize_quote_mode(os.getenv("PM_QUOTE_MODE"))
+
+_PM_HEADER_RE = re.compile(r"^\s*>?\s*Карточка Prompt-Master\b", re.IGNORECASE)
+
 SYSTEM_PROMPT = """You are Prompt-Master 2.0 — a creative cinematic prompt writer.
 GOALS:
 - Keep the user's core idea intact.
@@ -103,6 +125,55 @@ def _cam_tokens(text: str) -> str:
             seen.add(t); tokens.append(t)
     return ", ".join(tokens)
 
+
+def _strip_prompt_master_header(text: str) -> str:
+    lines = (text or "").splitlines()
+    idx = 0
+    total = len(lines)
+
+    while idx < total and not lines[idx].strip():
+        idx += 1
+
+    if idx < total and _PM_HEADER_RE.match(lines[idx]):
+        idx += 1
+        while idx < total and not lines[idx].strip():
+            idx += 1
+
+    remainder = "\n".join(lines[idx:])
+    return remainder.strip()
+
+
+def ensure_quote_block(text: str) -> str:
+    content = (text or "").strip()
+    if not content:
+        return ""
+
+    result = []
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            result.append(">")
+            continue
+        if stripped.startswith(">"):
+            inner = stripped.lstrip(">").lstrip()
+            result.append(f"> {inner}" if inner else ">")
+        else:
+            result.append(f"> {stripped}")
+    return "\n".join(result)
+
+
+def _postprocess_output(text: str) -> tuple[str, str]:
+    cleaned = _strip_prompt_master_header(text)
+
+    if PM_QUOTE_MODE == "bot":
+        formatted = cleaned
+    elif PM_QUOTE_MODE == "off":
+        formatted = cleaned
+    else:  # default behaviour — quote in generator
+        formatted = ensure_quote_block(cleaned)
+
+    return formatted, cleaned
+
 def _build_user_instruction(text: str, lang: str, v_req: bool, m_req: bool) -> str:
     lines = ["USER IDEA:", text.strip(), "", "CONSTRAINTS:",
              "- Keep realism, clean motion, plausible physics.",
@@ -156,7 +227,7 @@ def generate_prompt(user_text: str) -> Dict[str, Any]:
     Вход: текст пользователя.
     Выход:
       - text_markdown: Markdown промпт
-      - meta: {lang, voice_requested, music_requested, camera_hints}
+      - meta: {lang, voice_requested, music_requested, camera_hints, quote_mode, raw_text_markdown}
     """
     txt = (user_text or "").strip()
     lang = _lang(txt)
@@ -165,13 +236,16 @@ def generate_prompt(user_text: str) -> Dict[str, Any]:
 
     user_instr = _build_user_instruction(txt, lang, vreq, mreq)
     out = _ask_openai(SYSTEM_PROMPT, user_instr, lang)
+    formatted, cleaned = _postprocess_output(out)
     return {
-        "text_markdown": out,
+        "text_markdown": formatted,
         "meta": {
             "lang": lang,
             "voice_requested": vreq,
             "music_requested": mreq,
             "camera_hints": _cam_tokens(txt),
+            "quote_mode": PM_QUOTE_MODE,
+            "raw_text_markdown": cleaned,
         },
     }
 

@@ -6,7 +6,7 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 # odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, platform
 from html import escape
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable
@@ -29,7 +29,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 from handlers.prompt_master_handler import PROMPT_MASTER_HINT
-from prompt_master import generate_prompt_master
+from prompt_master import generate_prompt_master, PM_QUOTE_MODE, ensure_quote_block
 
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
@@ -42,7 +42,12 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
-from promo_codes import DEFAULT_PROMO_CODES, load_promo_codes, normalize_promo_code
+from promo_codes import (
+    DEFAULT_PROMO_CODES,
+    iter_sorted_promo_codes,
+    load_promo_codes,
+    normalize_promo_code,
+)
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -112,8 +117,18 @@ TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
+MENU_COMPACT        = _env("MENU_COMPACT", "false").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
-CHAT_TYPING_ONLY    = _env("CHAT_TYPING_ONLY", "false").lower() == "true"
+codex/ensure-promo-codes-functionality-and-diagnostics
+_ADMIN_ID_RAW       = _env("ADMIN_ID")
+ADMIN_ID: Optional[int] = None
+ main
+
+MENU_COMPACT_ENABLED   = _env("MENU_COMPACT", "false").lower() == "true"
+PM_QUOTE_MODE_ENABLED  = _env("PM_QUOTE_MODE", "false").lower() == "true"
+CHAT_TYPING_ONLY_MODE  = _env("CHAT_TYPING_ONLY", "false").lower() == "true"
+MJ_FOUR_IMAGES_ENABLED = _env("MJ_FOUR_IMAGES", "false").lower() == "true"
+main
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -208,6 +223,13 @@ LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("veo3-bot")
 
+if _ADMIN_ID_RAW:
+    try:
+        ADMIN_ID = int(_ADMIN_ID_RAW)
+    except ValueError:
+        log.warning("Invalid ADMIN_ID value provided: %r", _ADMIN_ID_RAW)
+        ADMIN_ID = None
+
 try:
     import telegram as _tg
     log.info("PTB version: %s", getattr(_tg, "__version__", "unknown"))
@@ -244,10 +266,17 @@ CHAT_UNLOCK_PRICE = 0
 # ==========================
 PROMO_CODES = load_promo_codes(DEFAULT_PROMO_CODES)
 if PROMO_CODES:
-    loaded_codes = ", ".join(f"{code}={amount}" for code, amount in sorted(PROMO_CODES.items()))
+codex/ensure-promo-codes-functionality-and-diagnostics
+    loaded_codes = ", ".join(
+        f"{code}={amount}" for code, amount in iter_sorted_promo_codes(PROMO_CODES)
+    )
     log.info("Promo codes loaded (%s): %s", len(PROMO_CODES), loaded_codes)
+main
 else:
+    _promo_codes_summary = "none"
     log.warning("No promo codes configured")
+
+PROMO_CODES_LOG_SUMMARY = _promo_codes_summary
 
 def promo_amount(code: str) -> Optional[int]:
     normalized = normalize_promo_code(code)
@@ -717,14 +746,20 @@ PROMPT_MASTER_ERROR_MESSAGE = (
 
 
 def _format_prompt_master_quote(text: str) -> str:
-    lines = text.splitlines()
-    if not lines:
-        return ""
-    quoted = []
+    return ensure_quote_block(text)
+
+
+def _is_prompt_master_blockquote(text: str) -> bool:
+    lines = (text or "").splitlines()
+    has_content = False
     for line in lines:
-        cleaned = line.rstrip("\r")
-        quoted.append(f"> {cleaned}" if cleaned else ">")
-    return "\n".join(quoted)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        has_content = True
+        if not stripped.startswith(">"):
+            return False
+    return has_content
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
     for k, v in DEFAULT_STATE.items():
@@ -790,6 +825,19 @@ def button_emoji(name: str, fallback: Optional[str] = None) -> EmojiSegment:
     return EmojiSegment(name=name, fallback=fallback)
 
 
+def _button_part_to_text(part: ButtonTextPart) -> str:
+    if part is None:
+        return ""
+    if isinstance(part, EmojiSegment):
+        record = CEMOJI.get(part.name)
+        if not record:
+            raise KeyError(f"Unknown custom emoji for button: {part.name}")
+        _, default = record
+        fallback = part.fallback if part.fallback is not None else default
+        return fallback or ""
+    return str(part)
+
+
 def _button_text_with_entities(parts: Tuple[ButtonTextPart, ...]) -> Tuple[str, List[Dict[str, Any]]]:
     text = ""
     entities: List[Dict[str, Any]] = []
@@ -827,17 +875,22 @@ def _button_text_with_entities(parts: Tuple[ButtonTextPart, ...]) -> Tuple[str, 
 
 
 def inline_button(*parts: ButtonTextPart, **kwargs: Any) -> InlineKeyboardButton:
-    text, entities = _button_text_with_entities(tuple(parts))
     api_kwargs = kwargs.pop("api_kwargs", None)
-    if entities:
-        if api_kwargs is None:
-            api_kwargs = {}
-        else:
-            api_kwargs = dict(api_kwargs)
-        existing = list(api_kwargs.get("text_entities", []))
-        existing.extend(entities)
-        api_kwargs["text_entities"] = existing
-    return InlineKeyboardButton(text or "", api_kwargs=api_kwargs, **kwargs)
+    if MENU_COMPACT_ENABLED:
+        text, entities = _button_text_with_entities(tuple(parts))
+        if entities:
+            if api_kwargs is None:
+                api_kwargs = {}
+            else:
+                api_kwargs = dict(api_kwargs)
+            existing = list(api_kwargs.get("text_entities", []))
+            existing.extend(entities)
+            api_kwargs["text_entities"] = existing
+    else:
+        text = "".join(_button_part_to_text(part) for part in parts)
+    if api_kwargs is not None:
+        kwargs["api_kwargs"] = api_kwargs
+    return InlineKeyboardButton(text or "", **kwargs)
 
 
 WELCOME_TEMPLATE = (
@@ -895,18 +948,33 @@ def render_faq_text() -> str:
     )
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    if MENU_COMPACT:
+ main
+        keyboard = [
+            [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
+            [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
+            [
+                inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master"),
+                inline_button(button_emoji("speech"), " Обычный чат", callback_data="mode:chat"),
+            ],
+            [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+        ]
+
+        if PROMO_ENABLED:
+            keyboard.append([inline_button("🎁 Активировать промокод", callback_data="promo_open")])
+
+        return InlineKeyboardMarkup(keyboard)
+
     keyboard = [
-        [inline_button(button_emoji("clapper"), " Генерация видео", callback_data="menu:video")],
-        [inline_button(button_emoji("frame"), " Генерация изображений", callback_data="menu:image")],
-        [
-            inline_button(button_emoji("brain"), " Prompt-Master", callback_data="mode:prompt_master"),
-            inline_button(button_emoji("speech"), " Обычный чат", callback_data="mode:chat"),
-        ],
-        [inline_button(button_emoji("diamond"), " Пополнить баланс", callback_data="topup_open")],
+        [InlineKeyboardButton("🎬 Генерация видео", callback_data="menu:video")],
+        [InlineKeyboardButton("🖼️ Генерация изображений", callback_data="menu:image")],
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("💬 Обычный чат", callback_data="mode:chat")],
+        [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
     ]
 
     if PROMO_ENABLED:
-        keyboard.append([inline_button("🎁 Активировать промокод", callback_data="promo_open")])
+        keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -2032,8 +2100,9 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     f"• Промпт: <code>{safe_snip}</code>"
                 )
 
+                max_images = 4 if MJ_FOUR_IMAGES_ENABLED else 1
                 downloaded: List[Tuple[bytes, str, str]] = []
-                for idx, u in enumerate(urls[:10]):
+                for idx, u in enumerate(urls[:max_images]):
                     result = await asyncio.to_thread(_download_mj_image_bytes, u, idx)
                     if result:
                         data, filename = result
@@ -2066,7 +2135,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     return sent_any
 
                 sent_successfully = False
-                if len(downloaded) >= 2:
+                if MJ_FOUR_IMAGES_ENABLED and len(downloaded) >= 2:
                     media: List[InputMediaPhoto] = []
                     for idx, (data, filename, _) in enumerate(downloaded):
                         media.append(
@@ -2100,9 +2169,14 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     keyboard_rows.append([inline_button("🔍 Открыть", url=open_url)])
                 keyboard_rows.append([inline_button("🔄 Повторить", callback_data="mj:repeat")])
                 keyboard_rows.append([inline_button("⬅️ Назад в меню", callback_data="back")])
+                success_message = (
+                    f"{CE['sparkles']} Галерея сгенерирована."
+                    if MJ_FOUR_IMAGES_ENABLED and len(downloaded) > 1
+                    else f"{CE['sparkles']} Изображение готово."
+                )
                 await ctx.bot.send_message(
                     chat_id,
-                    f"{CE['sparkles']} Галерея сгенерирована.",
+                    success_message,
                     reply_markup=InlineKeyboardMarkup(keyboard_rows),
                     parse_mode=ParseMode.HTML,
                 )
@@ -2253,6 +2327,39 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{CE['check']} Баланс актуален: {escape(str(result.calculated))} {CE['diamond']}",
             parse_mode=ParseMode.HTML,
         )
+
+
+async def promo_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not message:
+        return
+
+    if ADMIN_ID is None or user_id != ADMIN_ID:
+        await message.reply_text(
+            f"{CE['cross']} Команда доступна только администратору.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not PROMO_CODES:
+        await message.reply_text(
+            f"{CE['ticket']} Активных промокодов нет.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [
+        f"{index + 1}. <code>{escape(code)}</code> — <b>{escape(str(amount))}</b> {CE['diamond']}"
+        for index, (code, amount) in enumerate(iter_sorted_promo_codes(PROMO_CODES))
+    ]
+    text = (
+        f"{CE['ticket']} <b>Активные промокоды</b> ({len(PROMO_CODES)})\n"
+        + "\n".join(lines)
+    )
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
+
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
@@ -2797,26 +2904,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE, parse_mode=ParseMode.HTML)
             return
 
-        quoted_text = _format_prompt_master_quote(prompt_text)
-        if not quoted_text:
-            quoted_text = prompt_text
-        reply_markup = InlineKeyboardMarkup([
-            [
-                inline_button(
-                    "📋 Скопировать",
-                    api_kwargs={"copy_text": {"text": quoted_text}},
-                ),
-                inline_button(
-                    "🔄 Новый промпт",
-                    callback_data="mode:prompt_master",
-                ),
-            ]
-        ])
-        await update.message.reply_text(
-            quoted_text,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+codex/add-feature-flags-for-new-changes
+        if PM_QUOTE_MODE_ENABLED:
+            quoted_text = _format_prompt_master_quote(prompt_text)
+            if not quoted_text:
+                quoted_text = prompt_text
+            reply_markup = InlineKeyboardMarkup([
+                [
+                    inline_button(
+                        "📋 Скопировать",
+                        api_kwargs={"copy_text": {"text": quoted_text}},
+                    ),
+                    inline_button(
+                        "🔄 Новый промпт",
+                        callback_data="mode:prompt_master",
+                    ),
+                ]
+            ])
+            await update.message.reply_text(
+                quoted_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        else:
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Новый промпт", callback_data="mode:prompt_master")]
+            ])
+            await update.message.reply_text(
+                prompt_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+ main
         return
 
     # PROMO
@@ -2935,7 +3054,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         typing_task: Optional[asyncio.Task[Any]] = None
         thinking_message: Optional[Message] = None
         if chat:
-            if CHAT_TYPING_ONLY:
+            if CHAT_TYPING_ONLY_MODE:
+ main
                 async def _typing_loop() -> None:
                     try:
                         while True:
@@ -2946,6 +3066,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 typing_task = asyncio.create_task(_typing_loop())
             else:
+ codex/remove-unnecessary-chat-message
                 try:
                     thinking_message = await update.message.reply_text(
                         f"{CE['hourglass']} Думаю над ответом…",
@@ -2953,6 +3074,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
                 except TelegramError as exc:
                     log.warning("Failed to send chat placeholder: %s", exc)
+ main
         try:
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
@@ -3498,6 +3620,7 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
+    application.add_handler(CommandHandler("promolist", promo_list))
     application.add_handler(prompt_master_conv, group=10)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -3515,6 +3638,16 @@ async def run_bot_async() -> None:
                 "Bot starting… (Redis=%s, lock=%s)",
                 "on" if redis_client else "off",
                 "enabled" if lock.enabled else "disabled",
+            )
+
+            git_sha_for_log = GIT_SHA or "n/a"
+            log.info(
+                "Startup build info | Python=%s | AppVersion=%s | GitSHA=%s | PROMO_ENABLED=%s | PromoCodes=%s",
+                platform.python_version(),
+                APP_VERSION,
+                git_sha_for_log,
+                PROMO_ENABLED,
+                PROMO_CODES_LOG_SUMMARY,
             )
 
             loop = asyncio.get_running_loop()

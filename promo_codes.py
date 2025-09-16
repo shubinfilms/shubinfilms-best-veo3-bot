@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -151,5 +151,18 @@ def load_promo_codes(defaults: Dict[str, int] | None = None) -> Dict[str, int]:
     return merged
 
 
-__all__ = ["DEFAULT_PROMO_CODES", "load_promo_codes", "normalize_promo_code"]
+
+
+def iter_sorted_promo_codes(codes: Dict[str, int]) -> List[Tuple[str, int]]:
+    """Return promo codes sorted by their normalized code."""
+
+    return sorted(codes.items())
+
+
+__all__ = [
+    "DEFAULT_PROMO_CODES",
+    "iter_sorted_promo_codes",
+    "load_promo_codes",
+    "normalize_promo_code",
+]
 
