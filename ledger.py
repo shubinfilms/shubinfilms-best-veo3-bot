@@ -10,12 +10,21 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-import psycopg
-from psycopg.errors import UniqueViolation
-from psycopg_pool import ConnectionPool
+try:  # pragma: no cover - optional dependency
+    import psycopg  # type: ignore[import]
+    from psycopg.errors import UniqueViolation  # type: ignore[import]
+    from psycopg_pool import ConnectionPool  # type: ignore[import]
+except ModuleNotFoundError:  # pragma: no cover - fallback for tests
+    psycopg = None  # type: ignore[assignment]
+    UniqueViolation = Exception  # type: ignore[assignment]
+    ConnectionPool = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - typing helpers
+    import psycopg
+    from psycopg_pool import ConnectionPool
 
 log = logging.getLogger(__name__)
 
@@ -396,6 +405,10 @@ class _PostgresLedger(_BaseLedgerBackend):
         super().__init__()
         if not dsn:
             raise RuntimeError("DATABASE_URL is required for ledger storage")
+        if ConnectionPool is None or psycopg is None:
+            raise RuntimeError(
+                "psycopg and psycopg_pool must be installed for PostgreSQL ledger support"
+            )
         self.dsn = dsn
         self.safe_dsn = _sanitize_postgres_dsn(dsn)
         self.pool = ConnectionPool(conninfo=dsn, max_size=10, kwargs={"autocommit": False})
