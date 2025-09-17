@@ -18,6 +18,11 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 
+try:  # pragma: no cover - optional dependency for health endpoint
+    from aiohttp import web
+except Exception:  # pragma: no cover - fallback when aiohttp is missing
+    web = None  # type: ignore
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice, InputMediaPhoto, Message
@@ -227,6 +232,17 @@ LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("veo3-bot")
 
+_HEALTHZ_PORT_RAW = _env("HEALTHZ_PORT") or _env("PORT") or "8080"
+try:
+    HEALTHZ_PORT = int(_HEALTHZ_PORT_RAW)
+except ValueError:
+    HEALTHZ_PORT = 8080
+    log.warning("Invalid HEALTHZ_PORT=%r. Falling back to 8080.", _HEALTHZ_PORT_RAW)
+HEALTHZ_HOST = _env("HEALTHZ_HOST", "0.0.0.0")
+HEALTHZ_ENABLED = web is not None and _env("HEALTHZ_ENABLED", "true").lower() != "false"
+if web is None:
+    log.warning("aiohttp is not installed; /healthz endpoint disabled")
+
 if _ADMIN_ID_RAW:
     try:
         ADMIN_ID = int(_ADMIN_ID_RAW)
@@ -246,7 +262,13 @@ REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
-LEDGER_DSN = (_env("DATABASE_URL") or _env("POSTGRES_DSN")) or None
+_LEDGER_BACKEND_FLAG = _env("LEDGER_BACKEND")
+_LEDGER_DSN_RAW = (_env("DATABASE_URL") or _env("POSTGRES_DSN")) or None
+if not _LEDGER_DSN_RAW:
+    if _LEDGER_BACKEND_FLAG and _LEDGER_BACKEND_FLAG.lower() not in {"", "memory"}:
+        raise RuntimeError("DATABASE_URL required")
+    os.environ.setdefault("LEDGER_BACKEND", "memory")
+LEDGER_DSN = _LEDGER_DSN_RAW
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
@@ -319,6 +341,78 @@ app_cache: Dict[Any, Any] = {}
 ledger_storage = LedgerStorage(LEDGER_DSN)
 LEDGER_BACKEND_NAME = ledger_storage.backend_name
 LEDGER_BACKEND_DSN = ledger_storage.safe_dsn
+
+
+_healthz_runner: Optional[Any] = None
+_healthz_site: Optional[Any] = None
+
+
+def _healthz_component_status() -> Tuple[str, str, bool]:
+    redis_status = "disabled"
+    redis_ok = True
+    if redis_client:
+        try:
+            if redis_client.ping():
+                redis_status = "ok"
+            else:
+                redis_status = "no pong"
+                redis_ok = False
+        except Exception as exc:  # pragma: no cover - defensive
+            redis_status = f"error: {exc}"
+            redis_ok = False
+
+    db_status = "memory" if LEDGER_BACKEND_NAME == "memory" else "ok"
+    db_ok = True
+    if LEDGER_BACKEND_NAME != "memory":
+        try:
+            if ledger_storage.ping():
+                db_status = "ok"
+            else:
+                db_status = "error: ping failed"
+                db_ok = False
+        except Exception as exc:  # pragma: no cover - defensive
+            db_status = f"error: {exc}"
+            db_ok = False
+
+    overall_ok = redis_ok and db_ok
+    return redis_status, db_status, overall_ok
+
+
+async def _healthz_handler(request):  # type: ignore[no-untyped-def]
+    redis_status, db_status, overall_ok = _healthz_component_status()
+    return web.json_response({"ok": overall_ok, "redis": redis_status, "db": db_status})
+
+
+async def _ensure_healthz_endpoint() -> None:
+    global _healthz_runner, _healthz_site
+    if not HEALTHZ_ENABLED or web is None:
+        return
+    if _healthz_runner is not None:
+        return
+
+    app = web.Application()
+    app.router.add_get("/healthz", _healthz_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HEALTHZ_HOST, HEALTHZ_PORT)
+    await site.start()
+
+    _healthz_runner = runner
+    _healthz_site = site
+    log.info("/healthz endpoint started on %s:%s", HEALTHZ_HOST, HEALTHZ_PORT)
+
+
+async def _shutdown_healthz_endpoint() -> None:
+    global _healthz_runner, _healthz_site
+    if _healthz_site is not None:
+        with suppress(Exception):
+            await _healthz_site.stop()
+        _healthz_site = None
+    if _healthz_runner is not None:
+        with suppress(Exception):
+            await _healthz_runner.cleanup()
+        _healthz_runner = None
 
 
 def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -3714,6 +3808,8 @@ def main() -> None:
         log.info("Ledger backend: %s %s", LEDGER_BACKEND_NAME, ledger_location)
         log.info("Promo codes loaded: %s", PROMO_CODES_LOG_SUMMARY)
 
+        await _ensure_healthz_endpoint()
+
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
             event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
@@ -3736,10 +3832,13 @@ def main() -> None:
 
     async def _post_shutdown(app) -> None:
         try:
-            await runner_lock.release()
+            await _shutdown_healthz_endpoint()
         finally:
-            if previous_post_shutdown:
-                await previous_post_shutdown(app)
+            try:
+                await runner_lock.release()
+            finally:
+                if previous_post_shutdown:
+                    await previous_post_shutdown(app)
 
     application.post_init = _post_init
     application.post_shutdown = _post_shutdown
