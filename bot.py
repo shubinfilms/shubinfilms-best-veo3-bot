@@ -8,8 +8,9 @@
 # odex/fix-balance-reset-after-deploy
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, platform
 from html import escape
+from pathlib import Path
 # main
-from typing import Dict, Any, Optional, List, Tuple, Callable
+from typing import Dict, Any, Optional, List, Tuple, Callable, NamedTuple, Union
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse
@@ -742,9 +743,6 @@ DEFAULT_STATE = {
 
 MODE_PROMPTMASTER = "MODE_PROMPTMASTER"
 PROMPT_MASTER_TIMEOUT = 27.0
-PROMPT_MASTER_ERROR_MESSAGE = (
-    f"{cemoji('cross')} Не удалось собрать промпт. Попробуй сформулировать короче."
-)
 
 
 def _format_prompt_master_quote(text: str) -> str:
@@ -874,6 +872,11 @@ def _button_text_with_entities(parts: Tuple[ButtonTextPart, ...]) -> Tuple[str, 
             offset += len(piece)
 
     return text, entities
+
+
+PROMPT_MASTER_ERROR_MESSAGE = (
+    f"{cemoji('cross')} Не удалось собрать промпт. Попробуй сформулировать короче."
+)
 
 
 def inline_button(*parts: ButtonTextPart, **kwargs: Any) -> InlineKeyboardButton:
