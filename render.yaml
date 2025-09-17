@@ -4,7 +4,7 @@ services:
     env: python
     pythonVersion: 3.11.9
     buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
-    startCommand: python -u bot.py
+    startCommand: python preflight.py && python bot.py
     plan: starter
     region: frankfurt
     autoDeploy: true

@@ -3,6 +3,7 @@ python-dotenv==1.0.1
 requests==2.32.3
 openai==0.28.1
 redis==5.0.7
+aiohttp>=3.9.5,<4.0
 # Compatible with Python 3.11 runtime on Render.
 psycopg2-binary>=2.9,<3.0
 psycopg-pool>=3.2.0,<3.3

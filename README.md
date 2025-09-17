@@ -50,6 +50,29 @@ REDIS_PREFIX=veo3:prod
 # Postgres ledger storage (обязательно)
 DATABASE_URL=postgresql://user:password@host:5432/database
 
+## Быстрая диагностика
+
+Обязательные переменные окружения:
+
+- `TELEGRAM_BOT_TOKEN` (или `TELEGRAM_TOKEN`) — токен бота;
+- `ADMIN_CHAT_ID` (или `ADMIN_ID`) — чат/пользователь для сервисных сообщений;
+- `DATABASE_URL` или `POSTGRES_DSN` — строка подключения Postgres. При отсутствии укажите `LEDGER_BACKEND=memory` для in-memory-режима;
+- `REDIS_URL` — строка подключения Redis;
+- `OPENAI_API_KEY` — ключ OpenAI для Prompt Master;
+- `KIE_API_KEY` — ключ KIE API.
+
+Примеры строк подключения:
+
+```
+DATABASE_URL=postgresql://user:password@host:5432/database
+REDIS_URL=redis://:password@host:6379/0
+```
+
+Диагностические скрипты:
+
+- `python preflight.py` — проверяет наличие обязательных ENV, соединение с Postgres и Redis, отправляет тестовое сообщение админу. При успехе завершится с кодом `0`, при проблеме покажет понятную ошибку и завершится `1`.
+- `python smoke_test.py` — пингует `http://127.0.0.1:{HEALTHZ_PORT}/healthz`, отправляет тестовое сообщение админу и делает пробный вызов режимов генерации (через моки). Требует запущенный бот с /healthz. По завершении выводит отчёт и возвращает `0`/`1`.
+
 ## Redis runner lock mechanics
 
 * При запуске бот ставит ключ `{REDIS_PREFIX}:lock:runner` в Redis (`SET NX EX=60`). Значение — JSON с `host`, `pid`, `started_at`, `heartbeat_at`, `version`.
