@@ -23,8 +23,8 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 OPTIONAL_TOKEN_KEYS = ["TELEGRAM_TOKEN"]
 ADMIN_FALLBACK_KEYS = ["ADMIN_ID"]
-DB_ENV_KEYS = ["DATABASE_URL", "POSTGRES_DSN"]
 LEDGER_BACKEND_KEY = "LEDGER_BACKEND"
+REDIS_LOCK_ENABLED_KEY = "REDIS_LOCK_ENABLED"
 
 
 def _load_env() -> None:
@@ -51,15 +51,29 @@ def _require_env(name: str, *, allow_fallback: Optional[list[str]] = None) -> st
 
 
 def _resolve_db_url() -> Optional[str]:
-    for key in DB_ENV_KEYS:
-        value = os.getenv(key)
-        if value and value.strip():
-            return value.strip()
     backend = (os.getenv(LEDGER_BACKEND_KEY) or "").strip().lower()
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+
+    if backend == "postgres":
+        if not db_url:
+            raise CheckError("DATABASE_URL is required when LEDGER_BACKEND=postgres")
+        return db_url
+
+    if db_url:
+        return db_url
+
     if backend and backend != "memory":
         raise CheckError("DATABASE_URL required (set LEDGER_BACKEND=memory to skip Postgres)")
+
     os.environ.setdefault(LEDGER_BACKEND_KEY, "memory")
     return None
+
+
+def _is_redis_lock_enabled() -> bool:
+    value = (os.getenv(REDIS_LOCK_ENABLED_KEY) or "").strip().lower()
+    if not value:
+        return True
+    return value not in {"0", "false", "no", "off"}
 
 
 def _check_postgres(dsn: str) -> str:
@@ -73,7 +87,7 @@ def _check_postgres(dsn: str) -> str:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()
-            return "connected"
+            return "OK"
         except Exception as exc:
             raise CheckError(f"Postgres connection failed: {exc}") from exc
     try:
@@ -87,7 +101,7 @@ def _check_postgres(dsn: str) -> str:
         cur.fetchone()
         cur.close()
         conn.close()
-        return "connected"
+        return "OK"
     except Exception as exc:
         raise CheckError(f"Postgres connection failed: {exc}") from exc
 
@@ -135,7 +149,6 @@ def main() -> int:
     try:
         token = _require_env("TELEGRAM_BOT_TOKEN", allow_fallback=OPTIONAL_TOKEN_KEYS)
         admin_chat = _require_env("ADMIN_CHAT_ID", allow_fallback=ADMIN_FALLBACK_KEYS)
-        redis_url = _require_env("REDIS_URL")
         _require_env("OPENAI_API_KEY")
         _require_env("KIE_API_KEY")
 
@@ -144,8 +157,14 @@ def main() -> int:
         db_status = "skipped (memory mode)"
         if db_url:
             db_status = _check_postgres(db_url)
+            LOG.info("DB=%s", db_status)
 
-        redis_status = _check_redis(redis_url)
+        redis_status = "disabled"
+        if _is_redis_lock_enabled():
+            redis_url = _require_env("REDIS_URL")
+            redis_status = _check_redis(redis_url)
+        else:
+            LOG.info("Redis lock disabled — skipping")
         telegram_status = _send_test_message(token, admin_chat)
 
     except CheckError as exc:
