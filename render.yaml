@@ -2,7 +2,7 @@ services:
   - type: worker
     name: best-veo3-bot
     env: python
-    pythonVersion: 3.11.9
+    pythonVersion: 3.10.12
     buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
     startCommand: python preflight.py && python bot.py
     plan: starter
