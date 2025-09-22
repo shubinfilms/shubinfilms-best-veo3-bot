@@ -6,12 +6,7 @@ TELEGRAM_TOKEN=your-telegram-token
 PROMPTS_CHANNEL_URL=https://t.me/bestveo3promts
 STARS_BUY_URL=https://t.me/PremiumBot
 PROMO_ENABLED=true
-MENU_COMPACT=false
-PROMO_CODES=WELCOME50=50,FREE10=10              # опционально: список CODE=AMOUNT через запятую или перенос строки
-PROMO_CODES_JSON={"SPRING200": 200}            # опционально: JSON-словарь с промокодами
-PROMO_CODES_FILE=/app/config/promo_codes.txt    # опционально: путь до файла с промокодами (JSON или CODE=AMOUNT)
 DEV_MODE=false
-ADMIN_ID=123456789                              # опционально: ID администратора для /promolist
 
 # OpenAI / Prompt Master (optional)
 OPENAI_API_KEY=
@@ -49,29 +44,6 @@ REDIS_PREFIX=veo3:prod
 
 # Postgres ledger storage (обязательно)
 DATABASE_URL=postgresql://user:password@host:5432/database
-
-## Быстрая диагностика
-
-Обязательные переменные окружения:
-
-- `TELEGRAM_BOT_TOKEN` (или `TELEGRAM_TOKEN`) — токен бота;
-- `ADMIN_CHAT_ID` (или `ADMIN_ID`) — чат/пользователь для сервисных сообщений;
-- `DATABASE_URL` или `POSTGRES_DSN` — строка подключения Postgres. При отсутствии укажите `LEDGER_BACKEND=memory` для in-memory-режима;
-- `REDIS_URL` — строка подключения Redis;
-- `OPENAI_API_KEY` — ключ OpenAI для Prompt Master;
-- `KIE_API_KEY` — ключ KIE API.
-
-Примеры строк подключения:
-
-```
-DATABASE_URL=postgresql://user:password@host:5432/database
-REDIS_URL=redis://:password@host:6379/0
-```
-
-Диагностические скрипты:
-
-- `python preflight.py` — проверяет наличие обязательных ENV, соединение с Postgres и Redis, отправляет тестовое сообщение админу. При успехе завершится с кодом `0`, при проблеме покажет понятную ошибку и завершится `1`.
-- `python smoke_test.py` — пингует `http://127.0.0.1:{HEALTHZ_PORT}/healthz`, отправляет тестовое сообщение админу и делает пробный вызов режимов генерации (через моки). Требует запущенный бот с /healthz. По завершении выводит отчёт и возвращает `0`/`1`.
 
 ## Redis runner lock mechanics
 

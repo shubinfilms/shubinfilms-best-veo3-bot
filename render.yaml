@@ -3,8 +3,8 @@ services:
     name: best-veo3-bot
     env: python
     pythonVersion: 3.11.9
-    buildCommand: python -m pip install --upgrade pip && python -m pip install --upgrade wheel setuptools && python -m pip install -r requirements.txt --no-cache-dir
-    startCommand: python preflight.py && python bot.py
+    buildCommand: pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+    startCommand: python -u bot.py
     plan: starter
     region: frankfurt
     autoDeploy: true
