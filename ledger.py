@@ -5,12 +5,21 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-import psycopg
-from psycopg.errors import UniqueViolation
-from psycopg_pool import ConnectionPool
+try:  # psycopg is optional when using the in-memory backend
+    import psycopg
+    from psycopg.errors import UniqueViolation
+    from psycopg_pool import ConnectionPool
+except ImportError:  # pragma: no cover - optional dependency handling
+    psycopg = None  # type: ignore
+
+    class UniqueViolation(Exception):  # type: ignore[override]
+        pass
+
+    ConnectionPool = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +54,53 @@ class InsufficientBalance(RuntimeError):
         self.required = required
 
 
-class LedgerStorage:
+class _LedgerHelpers:
+    """Utility helpers shared by ledger backends."""
+
+    @staticmethod
+    def _json_meta(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not meta:
+            return None
+        return json.dumps(meta, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _log_operation(
+        op_type: str,
+        user_id: int,
+        op_id: str,
+        amount: int,
+        reason: str,
+        old_balance: int,
+        new_balance: int,
+        meta: Optional[Dict[str, Any]],
+    ) -> None:
+        try:
+            meta_repr = json.dumps(meta or {}, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            meta_repr = "{}"
+        log.info(
+            "ledger %s user=%s op_id=%s amount=%s reason=%s old=%s new=%s meta=%s",
+            op_type,
+            user_id,
+            op_id,
+            amount,
+            reason,
+            old_balance,
+            new_balance,
+            meta_repr,
+        )
+
+
+class _PostgresLedgerStorage(_LedgerHelpers):
     """Ledger-backed balance storage with atomic operations."""
 
     def __init__(self, dsn: str):
         if not dsn:
             raise RuntimeError("DATABASE_URL is required for ledger storage")
+        if psycopg is None or ConnectionPool is None:
+            raise RuntimeError(
+                "Postgres ledger backend requires psycopg and psycopg_pool to be installed"
+            )
         self.dsn = dsn
         self.pool = ConnectionPool(conninfo=dsn, max_size=10, kwargs={"autocommit": False})
         self.pool.wait()
@@ -104,39 +154,6 @@ class LedgerStorage:
                 cur.execute(ddl_ledger_idx)
                 cur.execute(ddl_promo)
             conn.commit()
-
-    @staticmethod
-    def _json_meta(meta: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not meta:
-            return None
-        return json.dumps(meta, ensure_ascii=False, sort_keys=True)
-
-    @staticmethod
-    def _log_operation(
-        op_type: str,
-        user_id: int,
-        op_id: str,
-        amount: int,
-        reason: str,
-        old_balance: int,
-        new_balance: int,
-        meta: Optional[Dict[str, Any]],
-    ) -> None:
-        try:
-            meta_repr = json.dumps(meta or {}, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            meta_repr = "{}"
-        log.info(
-            "ledger %s user=%s op_id=%s amount=%s reason=%s old=%s new=%s meta=%s",
-            op_type,
-            user_id,
-            op_id,
-            amount,
-            reason,
-            old_balance,
-            new_balance,
-            meta_repr,
-        )
 
     @staticmethod
     def _ensure_user(cur: psycopg.Cursor[Any], uid: int) -> None:
@@ -479,3 +496,278 @@ class LedgerStorage:
                 "ledger recalc user=%s previous=%s calculated=%s", uid, previous, calculated
             )
         return BalanceRecalcResult(previous=previous, calculated=calculated, updated=updated)
+
+
+class _MemoryLedgerStorage(_LedgerHelpers):
+    """In-memory ledger implementation for environments without Postgres."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._users: Dict[int, Dict[str, Any]] = {}
+        self._ledger: Dict[str, Dict[str, Any]] = {}
+        self._ledger_order: list[str] = []
+        self._promo_first_owner: Dict[str, int] = {}
+        self._promo_usages: set[tuple[int, str]] = set()
+
+    # ------------------------------------------------------------------
+    #   Internal helpers
+    # ------------------------------------------------------------------
+    def _ensure_user(self, uid: int) -> Dict[str, Any]:
+        return self._users.setdefault(
+            uid,
+            {
+                "balance": 0,
+                "signup_bonus_granted": False,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    #   Public API
+    # ------------------------------------------------------------------
+    def ping(self) -> bool:
+        return True
+
+    def get_promo_owner(self, promo_code: str) -> Optional[int]:
+        with self._lock:
+            owner = self._promo_first_owner.get(promo_code)
+            return int(owner) if owner is not None else None
+
+    def get_balance(self, uid: int) -> int:
+        with self._lock:
+            user = self._ensure_user(uid)
+            return int(user["balance"])
+
+    def credit(
+        self,
+        uid: int,
+        amount: int,
+        reason: str,
+        op_id: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> LedgerOpResult:
+        amount = int(amount)
+        with self._lock:
+            user = self._ensure_user(uid)
+            old_balance = int(user["balance"])
+
+            if amount <= 0:
+                return LedgerOpResult(False, old_balance, op_id, reason, old_balance, duplicate=True)
+
+            if op_id in self._ledger:
+                return LedgerOpResult(False, old_balance, op_id, reason, old_balance, duplicate=True)
+
+            new_balance = old_balance + amount
+            user["balance"] = new_balance
+
+            self._ledger[op_id] = {
+                "user_id": uid,
+                "type": "credit",
+                "amount": amount,
+                "reason": reason,
+                "meta": meta or {},
+            }
+            self._ledger_order.append(op_id)
+
+        self._log_operation("credit", uid, op_id, amount, reason, old_balance, new_balance, meta)
+        return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
+
+    def debit(
+        self,
+        uid: int,
+        amount: int,
+        reason: str,
+        op_id: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> LedgerOpResult:
+        amount = int(amount)
+        with self._lock:
+            user = self._ensure_user(uid)
+            old_balance = int(user["balance"])
+
+            if amount <= 0:
+                return LedgerOpResult(False, old_balance, op_id, reason, old_balance, duplicate=True)
+
+            if op_id in self._ledger:
+                return LedgerOpResult(False, old_balance, op_id, reason, old_balance, duplicate=True)
+
+            if old_balance < amount:
+                raise InsufficientBalance(old_balance, amount)
+
+            new_balance = old_balance - amount
+            user["balance"] = new_balance
+
+            self._ledger[op_id] = {
+                "user_id": uid,
+                "type": "debit",
+                "amount": amount,
+                "reason": reason,
+                "meta": meta or {},
+            }
+            self._ledger_order.append(op_id)
+
+        self._log_operation("debit", uid, op_id, amount, reason, old_balance, new_balance, meta)
+        return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
+
+    def grant_signup_bonus(
+        self, uid: int, amount: int, meta: Optional[Dict[str, Any]] = None
+    ) -> LedgerOpResult:
+        amount = int(amount)
+        op_id = f"signup:{uid}"
+        with self._lock:
+            user = self._ensure_user(uid)
+            old_balance = int(user["balance"])
+
+            if user.get("signup_bonus_granted"):
+                return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
+
+            if op_id in self._ledger:
+                user["signup_bonus_granted"] = True
+                return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
+
+            if amount <= 0:
+                user["signup_bonus_granted"] = True
+                return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
+
+            new_balance = old_balance + amount
+            user["balance"] = new_balance
+            user["signup_bonus_granted"] = True
+
+            self._ledger[op_id] = {
+                "user_id": uid,
+                "type": "credit",
+                "amount": amount,
+                "reason": "signup_bonus",
+                "meta": meta or {},
+            }
+            self._ledger_order.append(op_id)
+
+        self._log_operation(
+            "credit", uid, op_id, amount, "signup_bonus", old_balance, new_balance, meta
+        )
+        return LedgerOpResult(True, new_balance, op_id, "signup_bonus", old_balance)
+
+    def apply_promo(
+        self,
+        uid: int,
+        promo_code: str,
+        amount: int,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> LedgerOpResult:
+        op_id = f"promo:{promo_code}:{uid}"
+        meta = dict(meta or {})
+        meta.setdefault("promo_code", promo_code)
+        amount = int(amount)
+
+        with self._lock:
+            user = self._ensure_user(uid)
+            old_balance = int(user["balance"])
+
+            owner = self._promo_first_owner.get(promo_code)
+            if owner is not None and owner != uid:
+                return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+
+            if (uid, promo_code) in self._promo_usages:
+                return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+
+            if op_id in self._ledger or amount <= 0:
+                return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+
+            self._promo_usages.add((uid, promo_code))
+            self._promo_first_owner.setdefault(promo_code, uid)
+
+            new_balance = old_balance + amount
+            user["balance"] = new_balance
+
+            self._ledger[op_id] = {
+                "user_id": uid,
+                "type": "credit",
+                "amount": amount,
+                "reason": "promo",
+                "meta": meta,
+            }
+            self._ledger_order.append(op_id)
+
+        self._log_operation("credit", uid, op_id, amount, "promo", old_balance, new_balance, meta)
+        return LedgerOpResult(True, new_balance, op_id, "promo", old_balance)
+
+    def rename_operation(
+        self,
+        old_op_id: str,
+        new_op_id: str,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if old_op_id == new_op_id:
+            return True
+
+        with self._lock:
+            if new_op_id in self._ledger:
+                log.warning("ledger rename conflict for %s -> %s", old_op_id, new_op_id)
+                return False
+
+            entry = self._ledger.get(old_op_id)
+            if not entry:
+                return False
+
+            entry = dict(entry)
+            entry["op_id"] = new_op_id
+            if extra_meta:
+                current_meta = dict(entry.get("meta") or {})
+                current_meta.update(extra_meta)
+                entry["meta"] = current_meta
+
+            index = None
+            try:
+                index = self._ledger_order.index(old_op_id)
+            except ValueError:
+                pass
+
+            del self._ledger[old_op_id]
+            self._ledger[new_op_id] = entry
+            if index is not None:
+                self._ledger_order[index] = new_op_id
+
+        log.info("ledger rename op_id %s -> %s", old_op_id, new_op_id)
+        return True
+
+    def recalc_user_balance(self, uid: int) -> BalanceRecalcResult:
+        with self._lock:
+            user = self._ensure_user(uid)
+            previous = int(user["balance"])
+            calculated = 0
+            for entry in self._ledger.values():
+                if entry.get("user_id") != uid:
+                    continue
+                if entry.get("type") == "credit":
+                    calculated += int(entry.get("amount", 0))
+                else:
+                    calculated -= int(entry.get("amount", 0))
+
+            updated = calculated != previous
+            if updated:
+                user["balance"] = calculated
+
+        if updated:
+            log.info(
+                "ledger recalc user=%s previous=%s calculated=%s", uid, previous, calculated
+            )
+        return BalanceRecalcResult(previous=previous, calculated=calculated, updated=updated)
+
+
+class LedgerStorage:
+    """Facade that selects the appropriate ledger backend."""
+
+    def __init__(self, dsn: Optional[str], *, backend: str = "postgres") -> None:
+        backend = (backend or "postgres").lower()
+        self.backend = backend
+
+        if backend == "memory":
+            self._impl = _MemoryLedgerStorage()
+        else:
+            if not dsn:
+                raise RuntimeError(
+                    "DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage"
+                )
+            self._impl = _PostgresLedgerStorage(dsn)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._impl, name)
