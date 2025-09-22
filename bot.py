@@ -1788,7 +1788,6 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(f"✅ Баланс актуален: {result.calculated} 💎")
-main
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = [
