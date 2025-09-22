@@ -216,8 +216,9 @@ REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
+LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
 DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
-if not DATABASE_URL:
+if LEDGER_BACKEND != "memory" and not DATABASE_URL:
     raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
@@ -279,8 +280,8 @@ def promo_mark_used(code: str, uid: int):
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
 
-# Ledger storage (Postgres)
-ledger_storage = LedgerStorage(DATABASE_URL)
+# Ledger storage (Postgres / memory)
+ledger_storage = LedgerStorage(DATABASE_URL, backend=LEDGER_BACKEND)
 
 
 def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
