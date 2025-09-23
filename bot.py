@@ -56,6 +56,7 @@ from redis_utils import (
     get_all_user_ids,
     get_users_count,
     load_task_meta,
+    mark_user_dead,
     remove_user,
     save_task_meta,
     user_exists,
@@ -2621,7 +2622,7 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     async def _update_progress(current: int) -> None:
         nonlocal status_msg
-        text_progress = f"Прогресс: {current}/{total} (ok: {sent}, err: {errors})"
+        text_progress = f"{current}/{total} (ok {sent}, err {errors})"
         if status_msg:
             try:
                 await status_msg.edit_text(text_progress)
@@ -2662,7 +2663,23 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 continue
             except Forbidden:
                 errors += 1
-                await remove_user(redis_client, target_id)
+                await mark_user_dead(redis_client, target_id)
+                return
+            except BadRequest as exc:
+                errors += 1
+                message_text = getattr(exc, "message", "") or ""
+                lowered = message_text.lower()
+                dead_markers = (
+                    "chat not found",
+                    "user is deactivated",
+                    "not found",
+                    "peer_id_invalid",
+                    "bot was blocked",
+                )
+                if any(marker in lowered for marker in dead_markers):
+                    await mark_user_dead(redis_client, target_id)
+                    return
+                log.warning("Broadcast send failed for %s: %s", target_id, exc)
                 return
             except Exception as exc:
                 errors += 1
@@ -2674,15 +2691,27 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         action = "copy" if is_reply_broadcast else "send"
         log.warning("Broadcast %s failed for %s after retries: %s", action, target_id, last_retry_error)
 
-    for idx, target_id in enumerate(user_ids, start=1):
-        await _send_payload(target_id)
+    batch_size = 30
+    delay_between = 0.12
+    progress_step = 500
 
-        if idx % 25 == 0:
-            await _update_progress(idx)
+    for batch_start in range(0, total, batch_size):
+        batch = user_ids[batch_start : batch_start + batch_size]
+        for idx_offset, target_id in enumerate(batch, start=1):
+            current_index = batch_start + idx_offset
+            await _send_payload(target_id)
 
-        await asyncio.sleep(0.12)
+            if current_index % progress_step == 0:
+                await _update_progress(current_index)
 
-    final_text = f"Готово ✅ Отправлено: {sent}, ошибок: {errors}"
+            await asyncio.sleep(delay_between)
+
+        if batch_start + batch_size < total:
+            await asyncio.sleep(0.15)
+
+    await _update_progress(total)
+
+    final_text = f"Готово: OK={sent}, Ошибок={errors}"
     if status_msg:
         try:
             await status_msg.edit_text(final_text)
