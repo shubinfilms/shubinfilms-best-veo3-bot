@@ -51,8 +51,12 @@ from kie_banana import (
 import redis
 
 from redis_utils import (
+    credit,
+    debit_try,
+    ensure_user,
     add_user,
     clear_task_meta,
+    get_balance,
     get_all_user_ids,
     get_users_count,
     load_task_meta,
@@ -265,6 +269,11 @@ def _parse_admin_ids(raw: str) -> set[int]:
 
 ADMIN_IDS = _parse_admin_ids(_env("ADMIN_IDS"))
 
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
 DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
 if LEDGER_BACKEND != "memory" and not DATABASE_URL:
@@ -409,6 +418,10 @@ _CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
 async def ensure_user_record(update: Optional[Update]) -> None:
     if update is None or update.effective_user is None:
         return
+    try:
+        ensure_user(update.effective_user.id)
+    except Exception as exc:
+        log.warning("ensure_user failed for %s: %s", update.effective_user.id, exc)
     if redis_client is None:
         return
     try:
@@ -2518,6 +2531,61 @@ async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
 
 
+async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    balance = get_balance(user.id)
+    await message.reply_text(f"💎 Ваш баланс: {balance}")
+
+
+async def add_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if not _is_admin(user.id):
+        await message.reply_text("⛔️ Только для админа.")
+        return
+    text = (message.text or "").partition(" ")[2].strip()
+    try:
+        amount = int(text)
+        if amount <= 0:
+            raise ValueError
+    except Exception:
+        await message.reply_text("Использование: /add_balance 10")
+        return
+    new_balance = credit(user.id, amount, "admin topup", {"admin_id": user.id})
+    await message.reply_text(f"✅ Начислено {amount}. Новый баланс: {new_balance}")
+
+
+async def sub_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if not _is_admin(user.id):
+        await message.reply_text("⛔️ Только для админа.")
+        return
+    text = (message.text or "").partition(" ")[2].strip()
+    try:
+        amount = int(text)
+        if amount <= 0:
+            raise ValueError
+    except Exception:
+        await message.reply_text("Использование: /sub_balance 10")
+        return
+    ok, balance = debit_try(user.id, amount, "admin debit", {"admin_id": user.id})
+    if ok:
+        await message.reply_text(f"✅ Списано {amount}. Баланс: {balance}")
+    else:
+        await message.reply_text(f"⚠️ Недостаточно средств. На счету: {balance}")
+
+
 async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     uid = update.effective_user.id
@@ -3817,6 +3885,9 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("users_count", users_count_command))
     application.add_handler(CommandHandler("whoami", whoami_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("my_balance", my_balance_command))
+    application.add_handler(CommandHandler("add_balance", add_balance_command))
+    application.add_handler(CommandHandler("sub_balance", sub_balance_command))
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
