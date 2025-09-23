@@ -28,7 +28,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
-from handlers import prompt_master_conv
+from handlers import activate_prompt_master_mode, prompt_master_conv, PROMPT_MASTER_HINT
 from prompt_master import generate_prompt_master
 
 # === KIE Banana wrapper ===
@@ -118,7 +118,6 @@ STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
 
-PROMPT_MASTER_HINT = "Пришлите текст промпта. /cancel — выход."
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -1938,7 +1937,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("mode:"):
         selected_mode = data.split(":", 1)[1]
         if selected_mode == "prompt_master":
-            activate_prompt_master_mode(ctx)
+            activate_prompt_master_mode(update, ctx)
             await q.message.reply_text(PROMPT_MASTER_HINT)
             return
         s["mode"] = selected_mode
