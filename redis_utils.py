@@ -28,6 +28,7 @@ _PFX = os.getenv("REDIS_PREFIX", "veo3")
 _TTL = 24 * 60 * 60
 
 _USERS_SET_KEY = f"{_PFX}:users"
+_DEAD_USERS_SET_KEY = f"{_PFX}:users:dead"
 
 
 def _user_profile_key(user_id: int) -> str:
@@ -209,6 +210,24 @@ async def remove_user(redis_conn: Optional["redis.Redis"], user_id: int) -> None
             pipe.execute()
         except Exception as exc:  # pragma: no cover - network failure path
             _logger.warning("Failed to remove user %s from Redis: %s", user_id, exc)
+
+    await asyncio.to_thread(_call)
+
+
+async def mark_user_dead(redis_conn: Optional["redis.Redis"], user_id: int) -> None:
+    if not redis_conn:
+        _logger.warning("mark_user_dead: Redis client is not configured; user_id=%s", user_id)
+        return
+
+    def _call() -> None:
+        try:
+            pipe = redis_conn.pipeline()
+            pipe.sadd(_DEAD_USERS_SET_KEY, int(user_id))
+            pipe.srem(_USERS_SET_KEY, int(user_id))
+            pipe.delete(_user_profile_key(int(user_id)))
+            pipe.execute()
+        except Exception as exc:  # pragma: no cover - network failure path
+            _logger.warning("Failed to mark user %s as dead: %s", user_id, exc)
 
     await asyncio.to_thread(_call)
 
