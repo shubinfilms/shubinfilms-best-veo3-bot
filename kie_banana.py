@@ -19,8 +19,10 @@ import os
 import json
 import time
 import logging
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 
+import aiohttp
 import requests
 
 KIE_BASE_URL = (os.getenv("KIE_BASE_URL", "https://api.kie.ai") or "").strip()
@@ -218,3 +220,79 @@ def wait_for_banana_result(task_id: str, timeout_sec: int = 480, poll_sec: int =
         time.sleep(poll_sec)
 
     raise KieBananaError(f"banana timeout; last_state={last_state}")
+
+
+log = logging.getLogger("kie")
+
+KIE_OK_STATES = {"done", "finished", "success", "completed"}
+KIE_WAIT_STATES = {"queued", "processing", "running", "pending", "started"}
+KIE_BAD_STATES = {"failed", "error", "canceled", "cancelled", "timeout"}
+
+
+async def poll_veo_status(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    status_path: str,
+    task_id: str,
+    api_key: str,
+    *,
+    timeout_sec: int = 15 * 60,
+    start_delay: float = 2.0,
+    max_delay: float = 20.0,
+) -> str:
+    """
+    Ждёт готовности задачи и возвращает прямой URL видео.
+    Бросает исключение при ошибке / таймауте.
+    """
+
+    headers = {"Accept": "application/json"}
+    if api_key:
+        token = api_key
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
+
+    url = f"{base_url.rstrip('/')}{status_path}" if status_path.startswith("/") else _join(base_url, status_path)
+
+    t0 = time.time()
+    delay = start_delay
+    last_status: Optional[str] = None
+
+    while True:
+        params = {"id": task_id, "taskId": task_id}
+        async with session.get(url, params=params, headers=headers, timeout=60) as response:
+            data: Dict[str, Any] = await response.json(content_type=None)
+
+        status = (data.get("status") or data.get("state") or "").lower()
+
+        if status != last_status:
+            log.info("KIE status %s -> %s (task=%s)", last_status, status, task_id)
+            last_status = status
+
+        if status in KIE_OK_STATES:
+            result = data.get("result") or {}
+            file_url = (
+                result.get("file_url")
+                or result.get("video_url")
+                or data.get("file_url")
+                or data.get("video_url")
+            )
+            if file_url:
+                return file_url
+            raise RuntimeError(f"KIE returned '{status}' without file_url: {data}")
+
+        if not status or status in KIE_WAIT_STATES:
+            if time.time() - t0 > timeout_sec:
+                raise TimeoutError(f"KIE polling timeout after {timeout_sec}s, last={status}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, max_delay)
+            continue
+
+        if status in KIE_BAD_STATES:
+            raise RuntimeError(f"KIE failed with status '{status}': {data}")
+
+        log.warning("Unknown KIE status '%s': %s", status, data)
+        if time.time() - t0 > timeout_sec:
+            raise TimeoutError(f"KIE polling timeout after {timeout_sec}s, last={status}")
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, max_delay)
