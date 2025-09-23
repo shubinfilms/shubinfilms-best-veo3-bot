@@ -224,7 +224,7 @@ def wait_for_banana_result(task_id: str, timeout_sec: int = 480, poll_sec: int =
 
 log = logging.getLogger("kie")
 
-KIE_OK_STATES = {"done", "finished", "success", "completed"}
+KIE_OK_STATES = {"done", "finished", "success", "completed", "ready"}
 KIE_WAIT_STATES = {"queued", "processing", "running", "pending", "started"}
 KIE_BAD_STATES = {"failed", "error", "canceled", "cancelled", "timeout"}
 
@@ -266,7 +266,7 @@ async def poll_veo_status(
         status = (data.get("status") or data.get("state") or "").lower()
 
         if status != last_status:
-            log.info("KIE status %s -> %s (task=%s)", last_status, status, task_id)
+            log.info("KIE STATUS | task=%s | %s -> %s", task_id, last_status or "?", status or "?")
             last_status = status
 
         if status in KIE_OK_STATES:
@@ -278,8 +278,14 @@ async def poll_veo_status(
                 or data.get("video_url")
             )
             if file_url:
+                log.info("KIE READY | task=%s | url=%s", task_id, file_url)
                 return file_url
-            raise RuntimeError(f"KIE returned '{status}' without file_url: {data}")
+            log.info("KIE READY | task=%s | empty url, waiting", task_id)
+            if time.time() - t0 > timeout_sec:
+                raise TimeoutError(f"KIE polling timeout after {timeout_sec}s, last={status}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, max_delay)
+            continue
 
         if not status or status in KIE_WAIT_STATES:
             if time.time() - t0 > timeout_sec:
