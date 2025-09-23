@@ -316,7 +316,8 @@ def get_cached_pm_prompt(chat_id: int) -> Optional[str]:
 
 CB_MODE_CHAT = "mode:chat"
 CB_MODE_PM = "mode:pm"
-CB_PM_INSERT_VEO = "pm:insert_to_veo"
+CB_PM_INSERT_VEO = "pm_insert_veo"
+CB_GO_HOME = "go_home"
 
 # ==========================
 #   Tokens / Pricing
@@ -2446,10 +2447,6 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     await set_veo_card_prompt(chat_id, kino_prompt, ctx)
     await q.answer("Промпт вставлен в карточку VEO")
-    await q.edit_message_text(
-        "Промпт добавлен в карточку VEO. Можно запускать генерацию. ✨",
-        reply_markup=main_menu_kb(),
-    )
 
 
 configure_prompt_master(update_veo_card=show_or_update_veo_card)
@@ -2476,7 +2473,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if message is not None:
             await q.edit_message_text(
                 "Режим переключён: теперь это обычный чат. Напишите сообщение.",
-                reply_markup=main_menu_kb(),
             )
         return
 
@@ -2488,8 +2484,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if message is not None:
             await q.edit_message_text(
                 "Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
-                reply_markup=main_menu_kb(),
             )
+        return
+
+    if data == CB_GO_HOME:
+        if chat_id is not None:
+            _mode_set(chat_id, MODE_CHAT)
+        s.update({**DEFAULT_STATE})
+        await q.answer()
+        if message is not None:
+            with suppress(BadRequest):
+                await q.edit_message_reply_markup(reply_markup=None)
+            await message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb())
         return
 
     if data.startswith(CB_PM_INSERT_VEO):
@@ -2924,16 +2930,52 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         from prompt_master import build_cinema_prompt
 
-        kino_prompt, _ = await build_cinema_prompt(text, user_lang=detect_lang(text))
+        status_msg = await msg.reply_text("🧠 Пишу промпт…")
+        with suppress(Exception):
+            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        try:
+            kino_prompt, _ = await build_cinema_prompt(text, user_lang=detect_lang(text))
+        except Exception as exc:
+            log.exception("Prompt-Master generation failed: %s", exc)
+            err_text = "⚠️ Не удалось сгенерировать промпт, попробуйте ещё раз."
+            if status_msg:
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg.message_id,
+                        text=err_text,
+                    )
+                except BadRequest:
+                    await msg.reply_text(err_text)
+            else:
+                await msg.reply_text(err_text)
+            return
+
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎬 Вставить в VEO", callback_data=f"{CB_PM_INSERT_VEO}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=CB_MODE_CHAT)],
+            [InlineKeyboardButton("🎬 Вставить в VEO", callback_data=CB_PM_INSERT_VEO)],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=CB_GO_HOME)],
         ])
-        await msg.reply_text(
-            f"🧠 Готово! Вот ваш кинопромпт:\n\n{kino_prompt}",
-            reply_markup=kb,
-        )
-        cache_pm_prompt(chat_id, kino_prompt)
+        block = f"```\n{kino_prompt.strip()}\n```"
+        final_text = f"🧠 Готово! Вот ваш кинопромпт:\n\n{block}"
+
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                text=final_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            await msg.reply_text(
+                final_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        cache_pm_prompt(chat_id, kino_prompt.strip())
         return
 
     low = text.lower()
@@ -2988,7 +3030,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.exception("Chat error: %s", exc)
             await msg.reply_text("⚠️ Ошибка запроса к ChatGPT.")
             return
-        await msg.reply_text(answer, reply_markup=main_menu_kb())
+        await msg.reply_text(
+            answer,
+            reply_markup=None,
+            disable_web_page_preview=True,
+        )
         return
 
     # Если режим не распознан — по умолчанию обновляем карточку VEO
