@@ -28,6 +28,7 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
+from telegram.error import BadRequest, RetryAfter
 
 from handlers import (
     PROMPT_MASTER_CANCEL,
@@ -1101,6 +1102,7 @@ def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key
     kie_event("SUBMIT", request_id=req_id, status=status, code=code, task_id=tid, message=message)
     if status == 200 and code == 200:
         if tid:
+            log.info("KIE_SUBMIT ok: task_id=%s", tid)
             _remember_kie_request_id(tid, req_id)
             return True, tid, "Задача создана."
         return False, None, "Ответ сервиса без taskId."
@@ -1807,42 +1809,212 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
         with suppress(Exception):
             clear_task_meta(task_id)
 
-    video_url: Optional[str] = None
-    asset_meta: Dict[str, Any] = {}
-    asset_ok = False
+    async def _send_message_with_retry(
+        dest_chat_id: int,
+        text: str,
+        *,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+        reply_to: Optional[int] = None,
+    ):
+        params: Dict[str, Any] = {}
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
+        if reply_to:
+            params["reply_to_message_id"] = reply_to
+            params["allow_sending_without_reply"] = True
+        while True:
+            try:
+                return await ctx.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=text,
+                    **params,
+                )
+            except RetryAfter as exc:
+                delay = getattr(exc, "retry_after", None)
+                sleep_for = max(1, int(delay) if delay else 1)
+                await asyncio.sleep(sleep_for)
+            except BadRequest as exc:
+                if "message is the same" in str(exc).lower() and "reply_to_message_id" in params:
+                    params.pop("reply_to_message_id", None)
+                    params.pop("allow_sending_without_reply", None)
+                    continue
+                raise
+
+    async def _send_media_with_retry(
+        dest_chat_id: int,
+        file_path: Path,
+        file_size: int,
+        *,
+        reply_to: Optional[int] = None,
+    ):
+        params: Dict[str, Any] = {}
+        if reply_to:
+            params["reply_to_message_id"] = reply_to
+            params["allow_sending_without_reply"] = True
+        limit_bytes = 48 * 1024 * 1024
+        while True:
+            try:
+                with file_path.open("rb") as fh:
+                    input_file = InputFile(fh, filename=file_path.name)
+                    if file_size <= limit_bytes:
+                        return await ctx.bot.send_video(
+                            chat_id=dest_chat_id,
+                            video=input_file,
+                            supports_streaming=True,
+                            **params,
+                        )
+                    return await ctx.bot.send_document(
+                        chat_id=dest_chat_id,
+                        document=input_file,
+                        **params,
+                    )
+            except RetryAfter as exc:
+                delay = getattr(exc, "retry_after", None)
+                sleep_for = max(1, int(delay) if delay else 1)
+                await asyncio.sleep(sleep_for)
+            except BadRequest as exc:
+                if "message is the same" in str(exc).lower() and "reply_to_message_id" in params:
+                    params.pop("reply_to_message_id", None)
+                    params.pop("allow_sending_without_reply", None)
+                    continue
+                raise
+
+    async def _poll_record_info() -> str:
+        delay = 2.0
+        max_delay = 60.0
+        deadline = time.monotonic() + 15 * 60
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError("KIE polling timeout after 900s")
+            try:
+                ok, flag, message, url = await asyncio.to_thread(get_kie_veo_status, task_id)
+            except Exception as exc:
+                ok, flag, message, url = False, None, str(exc), None
+            if ok:
+                if flag == 1:
+                    status_label = "success"
+                elif flag in (2, 3):
+                    status_label = "failed"
+                elif flag == 0:
+                    status_label = "waiting"
+                elif flag is None:
+                    status_label = "unknown"
+                else:
+                    status_label = str(flag)
+            else:
+                status_label = "error"
+            log.info("KIE_STATUS task_id=%s status=%s msg=%s", task_id, status_label, (message or ""))
+            if ok and flag == 1:
+                if url:
+                    return url
+                raise RuntimeError("KIE success without result url")
+            if ok and flag in (2, 3):
+                raise RuntimeError(f"KIE task failed: {message or flag}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+
+    async def _download_video(session: aiohttp.ClientSession, url: str) -> Tuple[Path, int]:
+        target_path = Path(f"/tmp/{task_id}.mp4")
+        if target_path.exists():
+            with suppress(Exception):
+                target_path.unlink()
+        chunk_size = 1024 * 1024
+        try:
+            async with session.get(url, timeout=ClientTimeout(total=600)) as response:
+                response.raise_for_status()
+                with target_path.open("wb") as fh:
+                    async for chunk in response.content.iter_chunked(chunk_size):
+                        if chunk:
+                            fh.write(chunk)
+        except Exception:
+            with suppress(Exception):
+                target_path.unlink()
+            raise
+        file_size = target_path.stat().st_size
+        log.info("KIE_RESULT saved: path=%s, size=%s", target_path, file_size)
+        return target_path, file_size
+
+    temp_file: Optional[Path] = None
 
     try:
-        async with aiohttp.ClientSession() as session:
-            if KIE_STRICT_POLLING:
-                video_url, _ = await _strict_poll_kie(
-                    session,
-                    task_id,
-                    timeout_sec=min(POLL_TIMEOUT_SECS, 15 * 60),
-                    status_path=KIE_VEO_STATUS_PATH,
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=600)) as session:
+            try:
+                video_url = await _poll_record_info()
+            except TimeoutError as exc:
+                log_evt("KIE_TIMEOUT", task_id=task_id, reason="poll_exception", message=str(exc))
+                refund(
+                    ctx,
+                    price,
+                    f"refund:{task_id}:timeout",
+                    {"reason": "timeout"},
                 )
-            else:
-                video_url = await poll_veo_status(
-                    session,
-                    base_url=KIE_BASE_URL,
-                    status_path=KIE_VEO_STATUS_PATH,
-                    task_id=task_id,
-                    api_key=KIE_API_KEY,
-                    timeout_sec=min(POLL_TIMEOUT_SECS, 15 * 60),
-                    start_delay=2.0,
-                    max_delay=20.0,
+                await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
+                return
+            except Exception as exc:
+                log.exception("VEO status polling failed: %s", exc)
+                refund(
+                    ctx,
+                    price,
+                    f"refund:{task_id}:poll_exception",
+                    {"reason": "poll_exception", "message": str(exc)},
                 )
-            asset_ok, asset_meta = await _validate_kie_video_asset(session, video_url)
+                await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
+                return
+
+            if s.get("generation_id") != gen_id:
+                return
+
+            try:
+                meta = load_task_meta(task_id)
+            except Exception:
+                log.exception("Failed to load task meta for %s", task_id)
+                meta = None
+            if not meta:
+                log.error("TASK_META missing: task_id=%s", task_id)
+                raise RuntimeError("task meta missing")
+
+            target_chat_id = int(meta.get("chat_id", original_chat_id))
+            reply_to_id_raw = meta.get("message_id")
+            try:
+                reply_to_id = int(reply_to_id_raw) if reply_to_id_raw is not None else None
+            except (TypeError, ValueError):
+                reply_to_id = None
+
+            kie_event(
+                "FINAL_URL",
+                request_id=_get_kie_request_id(task_id),
+                task_id=task_id,
+                final_url=video_url,
+            )
+
+            temp_file, file_size = await _download_video(session, video_url)
+
+            await _send_message_with_retry(target_chat_id, "🎞️ Рендер завершён — отправляю файл…", reply_to=reply_to_id)
+            sent_message = await _send_media_with_retry(target_chat_id, temp_file, file_size, reply_to=reply_to_id)
+            media_kind = "video" if file_size <= 48 * 1024 * 1024 else "document"
+            log.info(
+                "TG_SENT %s: chat_id=%s, message_id=%s",
+                media_kind,
+                target_chat_id,
+                getattr(sent_message, "message_id", None),
+            )
+
+            await _send_message_with_retry(
+                target_chat_id,
+                "✅ Готово!",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
+                ),
+            )
     except TimeoutError as exc:
-        log_evt("KIE_TIMEOUT", task_id=task_id, reason="poll_exception", message=str(exc))
+        log_evt("KIE_TIMEOUT", task_id=task_id, reason="timeout", message=str(exc))
         refund(
             ctx,
             price,
-            f"refund:{task_id}:timeout",
+            f"refund:{task_id}:timeout_final",
             {"reason": "timeout"},
         )
-        await ctx.bot.send_message(chat_id, RENDER_FAIL_MESSAGE)
-        _cleanup()
-        return
+        await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     except Exception as exc:
         log.exception("VEO render failed: %s", exc)
         refund(
@@ -1851,86 +2023,11 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             f"refund:{task_id}:exception",
             {"reason": "exception", "message": str(exc)},
         )
-        await ctx.bot.send_message(chat_id, RENDER_FAIL_MESSAGE)
-        _cleanup()
-        return
-
-    if s.get("generation_id") != gen_id:
-        _cleanup()
-        return
-
-    asset_status = asset_meta.get("status") if isinstance(asset_meta, dict) else None
-    asset_method = asset_meta.get("method") if isinstance(asset_meta, dict) else None
-
-    if not video_url or not asset_ok:
-        reason = "empty_result" if not video_url else "asset_invalid"
-        log_evt(
-            "KIE_RESULT_EMPTY",
-            task_id=task_id,
-            reason=reason,
-            status=asset_status,
-            method=asset_method,
-        )
-        refund_meta: Dict[str, Any] = {"reason": reason}
-        if asset_status is not None:
-            refund_meta["status"] = asset_status
-        if asset_method is not None:
-            refund_meta["method"] = asset_method
-        if isinstance(asset_meta, dict):
-            if "content_length" in asset_meta:
-                refund_meta["content_length"] = asset_meta["content_length"]
-            if "error" in asset_meta:
-                refund_meta["error"] = asset_meta["error"]
-        refund(ctx, price, f"refund:{task_id}:{reason}", refund_meta)
-        await ctx.bot.send_message(chat_id, RENDER_FAIL_MESSAGE)
-        _cleanup()
-        return
-
-    try:
-        meta = load_task_meta(task_id)
-        if meta:
-            log.info("task-meta loaded | task=%s", task_id)
-            chat_id = int(meta.get("chat_id", chat_id))
-        else:
-            log.info("task-meta missing | task=%s", task_id)
-    except Exception:
-        log.exception("Failed to load task meta for %s", task_id)
-
-    success_meta: Dict[str, Any] = {"task_id": task_id}
-    if asset_status is not None:
-        success_meta["status"] = asset_status
-    if asset_method is not None:
-        success_meta["method"] = asset_method
-    if isinstance(asset_meta, dict) and "content_length" in asset_meta:
-        success_meta["content_length"] = asset_meta["content_length"]
-    log_evt("KIE_RESULT_OK", **success_meta)
-
-    try:
-        kie_event(
-            "FINAL_URL",
-            request_id=_get_kie_request_id(task_id),
-            task_id=task_id,
-            final_url=video_url,
-        )
-
-        await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
-        sent = await send_kie_1080p_to_tg(
-            ctx,
-            chat_id,
-            task_id,
-            index=None,
-            fallback_url=video_url,
-            is_vertical=(s.get("aspect") == "9:16"),
-        )
-        if sent:
-            await ctx.bot.send_message(
-                chat_id,
-                "✅ Готово!",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
-                ),
-            )
+        await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     finally:
+        if temp_file and temp_file.exists():
+            with suppress(Exception):
+                temp_file.unlink()
         _cleanup()
 
 # ==========================
@@ -2593,9 +2690,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             effective_message = update.effective_message
             message_id = effective_message.message_id if effective_message else 0
-            user_id = update.effective_user.id if update.effective_user else 0
             mode = s.get("mode") or ""
-            save_task_meta(task_id, chat_id, int(message_id), mode, int(user_id))
+            aspect_for_meta = s.get("aspect") or "16:9"
+            save_task_meta(task_id, chat_id, int(message_id), mode, aspect_for_meta)
             log.info("task-meta saved | task=%s chat=%s", task_id, chat_id)
         except Exception:
             log.exception("Failed to save task meta for %s", task_id)
