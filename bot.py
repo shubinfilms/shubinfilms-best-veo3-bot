@@ -28,8 +28,12 @@ from telegram.ext import (
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
-from handlers import activate_prompt_master_mode, prompt_master_conv, PROMPT_MASTER_HINT
-from prompt_master import generate_prompt_master
+from handlers import (
+    PROMPT_MASTER_CANCEL,
+    PROMPT_MASTER_OPEN,
+    configure_prompt_master,
+    prompt_master_conv,
+)
 
 # === KIE Banana wrapper ===
 from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError, poll_veo_status
@@ -683,14 +687,6 @@ DEFAULT_STATE = {
     "mj_active_op_key": None,
     "banana_active_op_key": None,
 }
-
-MODE_PROMPTMASTER = "MODE_PROMPTMASTER"
-PROMPT_MASTER_TIMEOUT = 27.0
-PROMPT_MASTER_ERROR_MESSAGE = "❌ Не удалось собрать промпт. Попробуй сформулировать короче."
-PROMPT_MASTER_CARD_TEMPLATE = (
-    "🟦 Карточка Prompt-Master\n"
-    "✍️ Промпт:\n{prompt}"
-)
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
     for k, v in DEFAULT_STATE.items():
@@ -724,7 +720,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:prompt_master")],
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data=PROMPT_MASTER_OPEN)],
         [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
@@ -1869,10 +1865,17 @@ async def show_or_update_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning("veo card edit/send failed: %s", e)
 
+
+configure_prompt_master(update_veo_card=show_or_update_veo_card)
+
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; data = (q.data or "").strip()
-    await q.answer()
     s = state(ctx)
+
+    if data in (PROMPT_MASTER_OPEN, PROMPT_MASTER_CANCEL):
+        return
+
+    await q.answer()
 
     if data == "promo_open":
         if not PROMO_ENABLED:
@@ -1936,10 +1939,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Режимы
     if data.startswith("mode:"):
         selected_mode = data.split(":", 1)[1]
-        if selected_mode == "prompt_master":
-            activate_prompt_master_mode(update, ctx)
-            await q.message.reply_text(PROMPT_MASTER_HINT)
-            return
         s["mode"] = selected_mode
         if selected_mode in ("veo_text_fast", "veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
@@ -2238,38 +2237,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     text = (update.message.text or "").strip()
     mode = s.get("mode")
-
-    if mode == MODE_PROMPTMASTER:
-        if not text:
-            return
-        chat = update.effective_chat
-        if chat:
-            with suppress(Exception):
-                await ctx.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-        user_id = update.effective_user.id if update.effective_user else None
-        try:
-            prompt_text = await asyncio.wait_for(
-                asyncio.to_thread(generate_prompt_master, text),
-                timeout=PROMPT_MASTER_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            log.error("PromptMaster timeout: uid=%s len=%s", user_id, len(text))
-            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
-            return
-        except Exception:
-            log.exception("PromptMaster error: uid=%s", user_id)
-            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
-            return
-
-        prompt_text = (prompt_text or "").strip()
-        if not prompt_text:
-            log.error("PromptMaster empty response: uid=%s", user_id)
-            await update.message.reply_text(PROMPT_MASTER_ERROR_MESSAGE)
-            return
-
-        card_text = PROMPT_MASTER_CARD_TEMPLATE.format(prompt=prompt_text)
-        await update.message.reply_text(card_text)
-        return
 
     # PROMO
     if mode == "promo":
@@ -2788,7 +2755,7 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-    application.add_handler(prompt_master_conv, group=10)
+    application.add_handler(prompt_master_conv)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

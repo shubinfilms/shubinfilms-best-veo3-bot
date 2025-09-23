@@ -1,7 +1,15 @@
 from .prompt_master_handler import (  # noqa: F401
-    activate_prompt_master_mode,
+    PM_WAITING,
+    PROMPT_MASTER_CANCEL,
+    PROMPT_MASTER_OPEN,
+    configure_prompt_master,
     prompt_master_conv,
-    PROMPT_MASTER_HINT,
 )
 
-__all__ = ["activate_prompt_master_mode", "prompt_master_conv", "PROMPT_MASTER_HINT"]
+__all__ = [
+    "prompt_master_conv",
+    "configure_prompt_master",
+    "PROMPT_MASTER_OPEN",
+    "PROMPT_MASTER_CANCEL",
+    "PM_WAITING",
+]
