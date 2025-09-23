@@ -1088,6 +1088,12 @@ def _build_payload_for_veo(prompt: str, aspect: str, image_url: Optional[str], m
 
 def submit_kie_veo(prompt: str, aspect: str, image_url: Optional[str], model_key: str) -> Tuple[bool, Optional[str], str]:
     payload = _build_payload_for_veo(prompt, aspect, image_url, model_key)
+    log.info(
+        "KIE SUBMIT | model=%s | aspect=%s | has_image=%s",
+        payload.get("model"),
+        payload.get("aspectRatio"),
+        bool(image_url),
+    )
     status, resp, req_id = _kie_request("POST", KIE_VEO_GEN_PATH, json_payload=payload)
     code = _extract_response_code(resp, status)
     tid = _extract_task_id(resp)
@@ -1185,15 +1191,51 @@ def fetch_1080p_result_url(task_id: str, index: Optional[int] = None) -> Tuple[O
     return None, meta
 
 
-def download_file(url: str) -> Path:
-    tmp_path = Path(tempfile.gettempdir()) / f"{uuid.uuid4()}.mp4"
-    with KIE_1080_SESSION.get(url, stream=True, timeout=600) as resp:
-        resp.raise_for_status()
-        with tmp_path.open("wb") as fh:
-            for chunk in resp.iter_content(1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
-    return tmp_path
+def download_file(url: str, *, task_id: Optional[str] = None, max_attempts: int = 3) -> Path:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        tmp_path = Path(tempfile.gettempdir()) / f"{uuid.uuid4()}.mp4"
+        total_bytes = 0
+        try:
+            with KIE_1080_SESSION.get(url, stream=True, timeout=600) as resp:
+                resp.raise_for_status()
+                with tmp_path.open("wb") as fh:
+                    for chunk in resp.iter_content(1024 * 1024):
+                        if chunk:
+                            total_bytes += len(chunk)
+                            fh.write(chunk)
+            if total_bytes > 0:
+                log.info(
+                    "KIE DOWNLOAD | task=%s | attempt=%d | bytes=%d",
+                    task_id or "?",
+                    attempt,
+                    total_bytes,
+                )
+                return tmp_path
+            log.warning(
+                "KIE DOWNLOAD empty | task=%s | attempt=%d | url=%s",
+                task_id or "?",
+                attempt,
+                url,
+            )
+            last_error = RuntimeError("empty download")
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "KIE DOWNLOAD fail | task=%s | attempt=%d | error=%s",
+                task_id or "?",
+                attempt,
+                exc,
+            )
+        finally:
+            if total_bytes == 0 and tmp_path.exists():
+                with suppress(Exception):
+                    tmp_path.unlink()
+        if attempt < max_attempts:
+            time.sleep(1)
+    if last_error:
+        raise RuntimeError("Failed to download file") from last_error
+    raise RuntimeError("Failed to download file")
 
 
 def probe_size(path: Path) -> Optional[Tuple[int, int]]:
@@ -1248,7 +1290,7 @@ async def send_kie_1080p_to_tg(
         return False
 
     try:
-        path = download_file(chosen_url)
+        path = download_file(chosen_url, task_id=task_id)
     except Exception as exc:
         kie_event("1080_DOWNLOAD_FAIL", taskId=task_id, index=index, error=str(exc))
         await ctx.bot.send_message(chat_id, "❌ Не удалось отправить видео.")
@@ -1282,11 +1324,35 @@ async def send_kie_1080p_to_tg(
         )
 
         with path.open("rb") as fh:
-            await ctx.bot.send_video(
-                chat_id=chat_id,
-                video=InputFile(fh, filename="veo_result.mp4"),
-                supports_streaming=True,
-            )
+            input_file = InputFile(fh, filename="veo_result.mp4")
+            try:
+                await ctx.bot.send_video(
+                    chat_id=chat_id,
+                    video=input_file,
+                    supports_streaming=True,
+                )
+                log.info(
+                    "TG SEND_VIDEO OK | task=%s | chat=%s | method=video",
+                    task_id,
+                    chat_id,
+                )
+            except Exception as send_exc:
+                log.warning("send_video failed, fallback to document: %s", send_exc)
+                fh.seek(0)
+                try:
+                    await ctx.bot.send_document(
+                        chat_id=chat_id,
+                        document=InputFile(fh, filename="veo_result.mp4"),
+                    )
+                    log.info(
+                        "TG SEND_VIDEO OK | task=%s | chat=%s | method=document",
+                        task_id,
+                        chat_id,
+                    )
+                except Exception as doc_exc:
+                    log.exception("send_document fallback failed: %s", doc_exc)
+                    await ctx.bot.send_message(chat_id, "❌ Не удалось отправить видео.")
+                    return False
         return True
     finally:
         with suppress(Exception):
