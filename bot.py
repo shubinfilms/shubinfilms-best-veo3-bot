@@ -2597,13 +2597,17 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("⚠️ Redis недоступен, рассылка невозможна.")
         return
 
-    text = message.text or message.caption or ""
-    payload = text.partition(" ")[2].strip()
-    if not payload and message.reply_to_message:
-        payload = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
-    if not payload:
-        await message.reply_text("⚠️ Использование: /broadcast текст или ответьте на сообщение.")
-        return
+    is_reply_broadcast = message.reply_to_message is not None
+    payload = ""
+    fallback_reply_payload = ""
+    if not is_reply_broadcast:
+        text = message.text or message.caption or ""
+        payload = text.partition(" ")[2].strip()
+        if not payload:
+            await message.reply_text("⚠️ Использование: /broadcast текст или ответьте на сообщение.")
+            return
+    elif message.reply_to_message:
+        fallback_reply_payload = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
 
     user_ids = await get_all_user_ids(redis_client)
     if not user_ids:
@@ -2626,38 +2630,52 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 pass
         status_msg = await message.reply_text(text_progress)
 
-    for idx, target_id in enumerate(user_ids, start=1):
-        try:
-            await ctx.bot.send_message(target_id, payload)
-            sent += 1
-        except RetryAfter as exc:
-            await asyncio.sleep(exc.retry_after + 0.1)
-            try:
+    source_chat_id = message.reply_to_message.chat_id if is_reply_broadcast and message.reply_to_message else None
+    source_message_id = message.reply_to_message.message_id if is_reply_broadcast and message.reply_to_message else None
+
+    async def _send_payload(target_id: int) -> None:
+        nonlocal sent, errors
+
+        async def _deliver() -> None:
+            if is_reply_broadcast and source_chat_id is not None and source_message_id is not None:
+                await ctx.bot.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                )
+            elif is_reply_broadcast and fallback_reply_payload:
+                await ctx.bot.send_message(target_id, fallback_reply_payload)
+            else:
                 await ctx.bot.send_message(target_id, payload)
+
+        attempts = 0
+        last_retry_error: Optional[Exception] = None
+        while attempts < 3:
+            attempts += 1
+            try:
+                await _deliver()
                 sent += 1
-            except RetryAfter as exc_retry:
-                await asyncio.sleep(exc_retry.retry_after + 0.1)
-                try:
-                    await ctx.bot.send_message(target_id, payload)
-                    sent += 1
-                except Forbidden:
-                    errors += 1
-                    await remove_user(redis_client, target_id)
-                except Exception as exc_final:
-                    errors += 1
-                    log.warning("Broadcast send failed for %s after retries: %s", target_id, exc_final)
+                return
+            except RetryAfter as exc:
+                last_retry_error = exc
+                await asyncio.sleep(exc.retry_after + 0.1)
+                continue
             except Forbidden:
                 errors += 1
                 await remove_user(redis_client, target_id)
-            except Exception as exc_retry:
+                return
+            except Exception as exc:
                 errors += 1
-                log.warning("Broadcast retry failed for %s: %s", target_id, exc_retry)
-        except Forbidden:
-            errors += 1
-            await remove_user(redis_client, target_id)
-        except Exception as exc:
-            errors += 1
-            log.warning("Broadcast send failed for %s: %s", target_id, exc)
+                action = "copy" if is_reply_broadcast else "send"
+                log.warning("Broadcast %s failed for %s: %s", action, target_id, exc)
+                return
+
+        errors += 1
+        action = "copy" if is_reply_broadcast else "send"
+        log.warning("Broadcast %s failed for %s after retries: %s", action, target_id, last_retry_error)
+
+    for idx, target_id in enumerate(user_ids, start=1):
+        await _send_payload(target_id)
 
         if idx % 25 == 0:
             await _update_progress(idx)
