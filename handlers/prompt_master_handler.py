@@ -88,9 +88,12 @@ async def _send_request_message(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(chat.id, REQUEST_MESSAGE)
 
 
-def _store_prompt(context: ContextTypes.DEFAULT_TYPE, prompt_text: str) -> None:
-    context.chat_data.setdefault("veo_card", {})["prompt"] = prompt_text
+def _remember_prompt(context: ContextTypes.DEFAULT_TYPE, prompt_text: str) -> None:
     context.chat_data.setdefault("prompt_master", {})["last_prompt"] = prompt_text
+
+
+def _apply_prompt_to_card(context: ContextTypes.DEFAULT_TYPE, prompt_text: str) -> None:
+    context.chat_data.setdefault("veo_card", {})["prompt"] = prompt_text
     context.user_data["last_prompt"] = prompt_text
 
 
@@ -171,7 +174,8 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if reapply:
         prompt = _stored_prompt(context)
         if prompt:
-            _store_prompt(context, prompt)
+            _remember_prompt(context, prompt)
+            _apply_prompt_to_card(context, prompt)
             await _update_veo_card_if_visible(update, context)
             answer_text = "Промпт вставлен в карточку VEO."
 
@@ -187,7 +191,8 @@ async def prompt_master_reapply(update: Update, context: ContextTypes.DEFAULT_TY
     if query:
         prompt = _stored_prompt(context)
         if prompt:
-            _store_prompt(context, prompt)
+            _remember_prompt(context, prompt)
+            _apply_prompt_to_card(context, prompt)
             await _update_veo_card_if_visible(update, context)
             await query.answer("Промпт вставлен в карточку VEO.")
         else:
@@ -211,8 +216,7 @@ async def prompt_master_generate(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text(ERROR_MESSAGE)
         return _PM_STATE
 
-    _store_prompt(context, prompt_text)
-    await _update_veo_card_if_visible(update, context)
+    _remember_prompt(context, prompt_text)
 
     await message.reply_html(
         f"{READY_MESSAGE_PREFIX}\n<pre>{html.escape(prompt_text)}</pre>",
