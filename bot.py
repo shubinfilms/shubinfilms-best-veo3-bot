@@ -21,7 +21,8 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, LabeledPrice, InputMediaPhoto
+    InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
+    KeyboardButton, BotCommand
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -865,31 +866,84 @@ WELCOME = (
     "Выберите режим 👇"
 )
 
+MENU_BTN_VIDEO = "🎬 ГЕНЕРАЦИЯ ВИДЕО"
+MENU_BTN_IMAGE = "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"
+MENU_BTN_PM = "🧠 Prompt-Master"
+MENU_BTN_CHAT = "💬 Обычный чат"
+MENU_BTN_BALANCE = "💎 Баланс"
+
 def render_welcome_for(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
     return WELCOME.format(balance=get_user_balance_value(ctx), prompts_url=PROMPTS_CHANNEL_URL)
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb() -> ReplyKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("🧠 Prompt-Master", callback_data=CB_MODE_PM)],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data=CB_MODE_CHAT)],
-        [InlineKeyboardButton(f"🎬 Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}", callback_data="mode:veo_text_fast")],
-        [InlineKeyboardButton(f"🎬 Генерация видео (Veo Quality) 💎 {TOKEN_COSTS['veo_quality']}", callback_data="mode:veo_text_quality")],
-        [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
-        [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
-        [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [
-            InlineKeyboardButton("❓ FAQ", callback_data="faq"),
-            InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
-        ],
-        [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
+        [KeyboardButton(MENU_BTN_VIDEO)],
+        [KeyboardButton(MENU_BTN_IMAGE)],
+        [KeyboardButton(MENU_BTN_PM)],
+        [KeyboardButton(MENU_BTN_CHAT)],
+        [KeyboardButton(MENU_BTN_BALANCE)],
     ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-    if PROMO_ENABLED:
-        keyboard.append([
-            InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")
-        ])
 
+def video_menu_kb() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(
+            f"🎬 Генерация видео (Veo Fast) — 💎 {TOKEN_COSTS['veo_fast']}",
+            callback_data="mode:veo_text_fast",
+        )],
+        [InlineKeyboardButton(
+            f"🎬 Генерация видео (Veo Quality) — 💎 {TOKEN_COSTS['veo_quality']}",
+            callback_data="mode:veo_text_quality",
+        )],
+        [InlineKeyboardButton(
+            f"🖼️ Оживить изображение (Veo) — 💎 {TOKEN_COSTS['veo_photo']}",
+            callback_data="mode:veo_photo",
+        )],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def image_menu_kb() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(
+            f"🖼️ Генерация изображений (MJ) — 💎 {TOKEN_COSTS['mj']}",
+            callback_data="mode:mj_txt",
+        )],
+        [InlineKeyboardButton(
+            f"🍌 Редактор изображений (Banana) — 💎 {TOKEN_COSTS['banana']}",
+            callback_data="mode:banana",
+        )],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def balance_menu_kb() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
+        [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def render_faq_text() -> str:
+    return (
+        "📘 *FAQ*\n"
+        "— *Как начать с VEO?*\n"
+        "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом и/или фото. "
+        "3) Карточка откроется автоматически — проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
+        "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
+        "— *Форматы VEO?* 16:9 и 9:16. Готовые клипы загружаем в чат как видеофайлы.\n\n"
+        "— *MJ:* 16:9 или 9:16, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
+        "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
+        "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
+        "— *Токены/возвраты:* списываются при старте; при ошибке/таймауте бот автоматически возвращает 💎.\n\n"
+        f"— *Пополнение:* через Stars в меню. Где купить: {STARS_BUY_URL}\n"
+        f"— *Примеры и идеи:* {PROMPTS_CHANNEL_URL}."
+    )
 
 def _short_prompt(prompt: Optional[str], limit: int = 120) -> str:
     txt = (prompt or "").strip()
@@ -2342,6 +2396,63 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_kb(),
     )
 
+async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    state(ctx).update({**DEFAULT_STATE})
+    uid = update.effective_user.id if update.effective_user else 0
+    await message.reply_text(
+        render_welcome_for(uid, ctx),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
+async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    state(ctx)["mode"] = None
+    await message.reply_text("🎬 Выберите тип генерации видео:", reply_markup=video_menu_kb())
+
+
+async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    state(ctx)["mode"] = None
+    await message.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
+
+
+async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await topup(update, ctx)
+
+
+async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text("🌍 Переключение языка будет доступно в ближайшее время.")
+
+
+async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text("🆘 Поддержка появится скоро. Напишите сюда свой вопрос, и мы ответим позже.")
+
+
+async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        render_faq_text(),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💳 Пополнение через *Telegram Stars*.\nЕсли звёзд не хватает — купите в официальном боте:",
@@ -2516,20 +2627,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "faq":
         await q.message.reply_text(
-            "📘 *FAQ*\n"
-            "— *Как начать с VEO?*\n"
-            "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом и/или фото. "
-            "3) Карточка откроется автоматически — проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
-            "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация. Оба: 16:9 и 9:16.\n\n"
-            "— *Форматы VEO?* 16:9 и 9:16. Готовые клипы загружаем в чат как видеофайлы.\n\n"
-            "— *MJ:* 16:9 или 9:16, цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
-            "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
-            "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
-            "— *Токены/возвраты:* списываются при старте; при ошибке/таймауте бот автоматически возвращает 💎.\n\n"
-            f"— *Пополнение:* через Stars в меню. Где купить: {STARS_BUY_URL}\n"
-            "— *Примеры и идеи:* кнопка «Канал с промптами».",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb()
-        ); return
+            render_faq_text(),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_kb(),
+        )
+        return
 
     if data == "back":
         s.update({**DEFAULT_STATE})
@@ -2877,6 +2979,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
+
+    if text == MENU_BTN_VIDEO:
+        s["mode"] = None
+        await msg.reply_text("🎬 Выберите тип генерации видео:", reply_markup=video_menu_kb())
+        return
+
+    if text == MENU_BTN_IMAGE:
+        s["mode"] = None
+        await msg.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
+        return
+
+    if text == MENU_BTN_BALANCE:
+        balance = get_user_balance_value(ctx, force_refresh=True)
+        await msg.reply_text(f"💎 Ваш баланс: {balance} 💎", reply_markup=balance_menu_kb())
+        return
+
+    if text == MENU_BTN_PM:
+        _mode_set(chat_id, MODE_PM)
+        s["mode"] = None
+        await msg.reply_text("Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.")
+        return
+
+    if text == MENU_BTN_CHAT:
+        _mode_set(chat_id, MODE_CHAT)
+        s["mode"] = None
+        await msg.reply_text("Режим переключён: Обычный чат. Напишите сообщение.")
+        return
 
     if state_mode == "promo":
         if not PROMO_ENABLED:
@@ -3453,6 +3582,13 @@ async def run_bot_async() -> None:
 
     # Handlers (оставляем как есть)
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("buy", buy_command))
+    application.add_handler(CommandHandler("video", video_command))
+    application.add_handler(CommandHandler("image", image_command))
+    application.add_handler(CommandHandler("lang", lang_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("faq", faq_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
 # codex/fix-balance-reset-after-deploy
@@ -3515,6 +3651,19 @@ async def run_bot_async() -> None:
 
             # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
             await application.initialize()
+
+            try:
+                await application.bot.set_my_commands([
+                    BotCommand("menu", "⭐ Главное меню"),
+                    BotCommand("buy", "💎 Купить генерации"),
+                    BotCommand("video", "🎬 Генерация видео"),
+                    BotCommand("image", "🎨 Генерация изображений"),
+                    BotCommand("lang", "🌍 Изменить язык"),
+                    BotCommand("help", "🆘 Поддержка"),
+                    BotCommand("faq", "❓ FAQ"),
+                ])
+            except Exception as exc:
+                log.warning("Failed to set bot commands: %s", exc)
 
             try:
                 try:
