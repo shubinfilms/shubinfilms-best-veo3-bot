@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse
 
+import aiohttp
 import requests
 from dotenv import load_dotenv
 
@@ -31,7 +32,7 @@ from handlers import prompt_master_conv
 from prompt_master import generate_prompt_master
 
 # === KIE Banana wrapper ===
-from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError
+from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError, poll_veo_status
 
 import redis
 
@@ -50,6 +51,9 @@ except Exception:  # pragma: no cover - fallback if asyncio interface unavailabl
 #   ENV / INIT
 # ==========================
 APP_VERSION = "2025-09-14r4"
+
+
+ACTIVE_TASKS: Dict[int, str] = {}
 
 
 def _utcnow_iso() -> str:
@@ -205,6 +209,7 @@ POLL_TIMEOUT_SECS  = int(_env("POLL_TIMEOUT_SECS", str(20 * 60)))
 
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.getLogger("kie").setLevel(logging.INFO)
 log = logging.getLogger("veo3-bot")
 
 try:
@@ -1472,7 +1477,6 @@ def _mj_should_retry(msg: Optional[str]) -> bool:
 # ==========================
 async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
-    start_ts = time.time()
     price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
     op_key = s.get("active_generation_op")
 
@@ -1486,63 +1490,8 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
         except Exception as exc:
             log.exception("VEO refund %s failed: %s", reason_tag, exc)
 
-    try:
-        while True:
-            if s.get("generation_id") != gen_id: return
-            ok, flag, msg, res_url = await asyncio.to_thread(get_kie_veo_status, task_id)
-            if not ok:
-                _refund("status_error", msg)
-                await ctx.bot.send_message(chat_id, f"❌ Ошибка статуса VEO. 💎 Токены возвращены.\n{msg or ''}")
-                break
-            if isinstance(res_url, str) and res_url.startswith("http"):
-                # 🔄 освежаем ссылку непосредственно перед отправкой
-                final_url = res_url
-                if (s.get("aspect") or "16:9") == "9:16":
-                    ok_r2, _, _, u2 = await asyncio.to_thread(get_kie_veo_status, task_id)
-                    if ok_r2 and isinstance(u2, str) and u2.startswith("http"):
-                        final_url = u2
-
-                kie_event(
-                    "FINAL_URL",
-                    request_id=_get_kie_request_id(task_id),
-                    task_id=task_id,
-                    final_url=final_url,
-                )
-                await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
-                sent = await send_kie_1080p_to_tg(
-                    ctx,
-                    chat_id,
-                    task_id,
-                    index=None,
-                    fallback_url=final_url,
-                    is_vertical=(s.get("aspect") == "9:16"),
-                )
-                if sent:
-                    await ctx.bot.send_message(
-                        chat_id,
-                        "✅ Готово!",
-                        reply_markup=InlineKeyboardMarkup(
-                            [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
-                        ),
-                    )
-                break
-            if flag in (2, 3):
-# codex/update-video-file-sending-logic
-                add_tokens(ctx, TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast'])
-                await ctx.bot.send_message(chat_id, f"❌ Не удалось получить видео. 💎 Токены возвращены.\n{msg or ''}")
-# main
-                break
-            if (time.time() - start_ts) > POLL_TIMEOUT_SECS:
-                _refund("timeout")
-                await ctx.bot.send_message(chat_id, "⌛ Превышено время ожидания VEO. 💎 Токены возвращены.")
-                break
-            await asyncio.sleep(POLL_INTERVAL_SECS)
-    except Exception as e:
-        log.exception("VEO poll crash: %s", e)
-        _refund("exception", str(e))
-        try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка при опросе VEO. 💎 Токены возвращены.")
-        except Exception: pass
-    finally:
+    def _cleanup() -> None:
+        ACTIVE_TASKS.pop(chat_id, None)
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
@@ -1550,6 +1499,64 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             _clear_operation(ctx, op_key)
         s.pop("active_generation_op", None)
         _clear_kie_request_id(task_id)
+
+    video_url: Optional[str] = None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            video_url = await poll_veo_status(
+                session,
+                base_url=KIE_BASE_URL,
+                status_path=KIE_VEO_STATUS_PATH,
+                task_id=task_id,
+                api_key=KIE_API_KEY,
+                timeout_sec=min(POLL_TIMEOUT_SECS, 15 * 60),
+                start_delay=2.0,
+                max_delay=20.0,
+            )
+    except TimeoutError:
+        _refund("timeout")
+        await ctx.bot.send_message(chat_id, "⏳ Рендер занимает слишком долго. 💎 Токены возвращены.")
+        _cleanup()
+        return
+    except Exception as exc:
+        log.exception("VEO render failed: %s", exc)
+        _refund("exception", str(exc))
+        await ctx.bot.send_message(chat_id, "⚠️ Не удалось получить результат рендера. 💎 Токены возвращены.")
+        _cleanup()
+        return
+
+    if s.get("generation_id") != gen_id:
+        _cleanup()
+        return
+
+    try:
+        kie_event(
+            "FINAL_URL",
+            request_id=_get_kie_request_id(task_id),
+            task_id=task_id,
+            final_url=video_url,
+        )
+
+        await ctx.bot.send_message(chat_id, "🎞️ Рендер завершён — отправляю файл…")
+        sent = await send_kie_1080p_to_tg(
+            ctx,
+            chat_id,
+            task_id,
+            index=None,
+            fallback_url=video_url,
+            is_vertical=(s.get("aspect") == "9:16"),
+        )
+        if sent:
+            await ctx.bot.send_message(
+                chat_id,
+                "✅ Готово!",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
+                ),
+            )
+    finally:
+        _cleanup()
 
 # ==========================
 #   MJ poll (1 авторетрай)
@@ -2119,6 +2126,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not prompt:
             await q.message.reply_text("⚠️ Сначала пришлите текстовый промпт."); return
         price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
+        chat_id = update.effective_chat.id
+        if ACTIVE_TASKS.get(chat_id):
+            await q.message.reply_text("⏳ Уже рендерю вашу предыдущую задачу. Подождите, пожалуйста.")
+            return
         uid = update.effective_user.id
         fingerprint = _make_fingerprint({
             "prompt": prompt,
@@ -2144,14 +2155,33 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if status == "duplicate":
             await q.message.reply_text("⏳ Уже выполняю предыдущий запрос. Дождитесь результата.")
             return
+        ACTIVE_TASKS[chat_id] = "__pending__"
         await q.message.reply_text("🎬 Отправляю задачу в VEO…")
-        ok, task_id, msg = await asyncio.to_thread(
-            submit_kie_veo,
-            prompt,
-            (s.get("aspect") or "16:9"),
-            s.get("last_image_url"),
-            s.get("model") or "veo3_fast",
-        )
+        try:
+            ok, task_id, msg = await asyncio.to_thread(
+                submit_kie_veo,
+                prompt,
+                (s.get("aspect") or "16:9"),
+                s.get("last_image_url"),
+                s.get("model") or "veo3_fast",
+            )
+        except Exception as exc:
+            log.exception("VEO submit crashed: %s", exc)
+            refund_id = f"refund:{op_id}:submit_exc"
+            try:
+                credit_tokens(
+                    ctx,
+                    price,
+                    "veo_refund",
+                    refund_id,
+                    {"reason": "submit_exception", "message": str(exc)},
+                )
+            except Exception as refund_exc:
+                log.exception("VEO submit crash refund failed for %s: %s", uid, refund_exc)
+            _clear_operation(ctx, op_key)
+            ACTIVE_TASKS.pop(chat_id, None)
+            await q.message.reply_text("⚠️ Не удалось создать VEO-задачу. 💎 Токены возвращены.")
+            return
         if not ok or not task_id:
             refund_id = f"refund:{op_id}:submit"
             try:
@@ -2165,6 +2195,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as exc:
                 log.exception("VEO submit refund failed for %s: %s", uid, exc)
             _clear_operation(ctx, op_key)
+            ACTIVE_TASKS.pop(chat_id, None)
             await q.message.reply_text(
                 f"❌ Не удалось создать VEO-задачу: {msg}\n💎 Токены возвращены.",
             )
@@ -2176,7 +2207,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["active_generation_op"] = op_key
         gen_id = uuid.uuid4().hex
         s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
-        await q.message.reply_text(f"🆔 VEO taskId: `{task_id}`\n🎞 Рендер начат — вернусь с готовым видео.", parse_mode=ParseMode.MARKDOWN)
+        ACTIVE_TASKS[chat_id] = task_id
+        await q.message.reply_text("🎬 Рендер начат — вернусь с готовым видео.")
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
