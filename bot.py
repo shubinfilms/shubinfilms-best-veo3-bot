@@ -15,6 +15,7 @@ from contextlib import suppress
 from urllib.parse import urlparse
 
 import aiohttp
+from aiohttp import ClientError, ClientResponseError, ClientTimeout
 import requests
 from dotenv import load_dotenv
 
@@ -36,7 +37,14 @@ from handlers import (
 )
 
 # === KIE Banana wrapper ===
-from kie_banana import create_banana_task, wait_for_banana_result, KieBananaError, poll_veo_status
+from kie_banana import (
+    create_banana_task,
+    wait_for_banana_result,
+    KieBananaError,
+    poll_veo_status,
+    KIE_BAD_STATES,
+    KIE_OK_STATES,
+)
 
 import redis
 
@@ -211,6 +219,7 @@ ALWAYS_FORCE_FHD          = _env("ALWAYS_FORCE_FHD", "true").lower() == "true"
 MAX_TG_VIDEO_MB           = int(_env("MAX_TG_VIDEO_MB", "48"))
 POLL_INTERVAL_SECS = int(_env("POLL_INTERVAL_SECS", "6"))
 POLL_TIMEOUT_SECS  = int(_env("POLL_TIMEOUT_SECS", str(20 * 60)))
+KIE_STRICT_POLLING = _env("KIE_STRICT_POLLING", "false").lower() == "true"
 
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -292,6 +301,18 @@ def promo_mark_used(code: str, uid: int):
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
+
+
+def _acquire_click_lock(user_id: Optional[int], action: str) -> bool:
+    if not user_id or not REDIS_LOCK_ENABLED or not redis_client:
+        return True
+    key = _rk("lock", str(user_id), action)
+    try:
+        acquired = redis_client.set(key, str(int(time.time())), nx=True, px=10_000)
+        return bool(acquired)
+    except Exception as exc:
+        log.warning("redis click lock error: %s", exc)
+        return True
 
 # Ledger storage (Postgres / memory)
 ledger_storage = LedgerStorage(DATABASE_URL, backend=LEDGER_BACKEND)
@@ -378,6 +399,30 @@ def credit_tokens(
     result = ledger_storage.credit(uid, amount, reason, op_id, meta)
     _set_cached_balance(ctx, result.balance)
     return result
+
+
+def refund(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    amount: int,
+    op_id: str,
+    meta: Optional[Dict[str, Any]] = None,
+    *,
+    ledger_reason: str = "veo_refund",
+) -> Optional[LedgerOpResult]:
+    meta = meta or {}
+    try:
+        result = credit_tokens(ctx, amount, ledger_reason, op_id, meta)
+        log_evt(
+            "KIE_REFUND",
+            op_id=op_id,
+            amount=amount,
+            ledger_reason=ledger_reason,
+            reason=meta.get("reason"),
+        )
+        return result
+    except Exception as exc:
+        log.exception("Refund failed (op=%s): %s", op_id, exc)
+        return None
 
 
 def try_charge(
@@ -662,12 +707,20 @@ def _get_kie_request_id(task_id: str) -> Optional[str]:
 def _clear_kie_request_id(task_id: str):
     app_cache.pop(_kie_req_cache_key(str(task_id)), None)
 
+def log_evt(name: str, **kw) -> None:
+    try:
+        payload = json.dumps(kw, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        payload = str(kw)
+    log.info("EVT_%s | %s", name, payload)
+
+
 def event(tag: str, **kw):
-    try: log.info("EVT %s | %s", tag, json.dumps(kw, ensure_ascii=False))
-    except Exception: log.info("EVT %s | %s", tag, kw)
+    log_evt(tag, **kw)
+
 
 def kie_event(stage: str, **kw):
-    event(f"KIE_{stage}", **kw)
+    log_evt(f"KIE_{stage}", **kw)
 
 def tg_direct_file_url(bot_token: str, file_path: str) -> str:
     p = (file_path or "").strip()
@@ -1470,6 +1523,204 @@ def _mj_should_retry(msg: Optional[str]) -> bool:
     return any(token in m for token in retry_tokens)
 
 # ==========================
+#   VEO strict polling utils
+# ==========================
+STRICT_POLL_INITIAL_DELAY = 2.0
+STRICT_POLL_MAX_DELAY = 20.0
+RENDER_FAIL_MESSAGE = "⚠️ Рендер не удался. 💎 Токены возвращены."
+
+
+async def _strict_poll_kie(
+    session: aiohttp.ClientSession,
+    task_id: str,
+    *,
+    timeout_sec: int,
+    status_path: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    url = join_url(KIE_BASE_URL, status_path)
+    headers = {**_kie_auth_header(), "Accept": "application/json"}
+    params = {"taskId": task_id, "id": task_id}
+    timeout_sec = max(5, int(timeout_sec))
+    deadline = time.monotonic() + timeout_sec
+    delay = STRICT_POLL_INITIAL_DELAY
+    attempt = 0
+    last_status: Optional[str] = None
+    last_flag: Optional[int] = None
+    request_timeout = ClientTimeout(total=60)
+
+    while True:
+        attempt += 1
+        now = time.monotonic()
+        if now >= deadline:
+            log_evt(
+                "KIE_TIMEOUT",
+                task_id=task_id,
+                last_status=last_status,
+                last_flag=last_flag,
+                attempts=attempt,
+                reason="deadline",
+            )
+            raise TimeoutError(f"KIE polling timeout after {timeout_sec}s")
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=request_timeout,
+            ) as response:
+                http_status = response.status
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception:
+                    payload = {"raw": await response.text()}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("KIE status request error (task=%s): %s", task_id, exc)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, STRICT_POLL_MAX_DELAY)
+            continue
+
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        raw_data = payload.get("data")
+        data_section = raw_data if isinstance(raw_data, dict) else payload
+
+        status_raw = (
+            data_section.get("status")
+            or data_section.get("state")
+            or payload.get("status")
+            or payload.get("state")
+            or data_section.get("taskStatus")
+            or payload.get("taskStatus")
+        )
+        status = str(status_raw).strip().lower() if status_raw not in (None, "") else ""
+        flag = _parse_success_flag(data_section if isinstance(data_section, dict) else {})
+
+        log_evt(
+            "KIE_STATUS",
+            task_id=task_id,
+            status=status or "unknown",
+            flag=flag,
+            http_status=http_status,
+            attempt=attempt,
+        )
+
+        if status in KIE_OK_STATES or flag == 1:
+            data_for_url = data_section if isinstance(data_section, dict) else {}
+            result_url = _extract_result_url(data_for_url)
+            if not result_url:
+                log_evt(
+                    "KIE_RESULT_EMPTY",
+                    task_id=task_id,
+                    status=status or "flag_success",
+                    flag=flag,
+                )
+            return result_url, payload
+
+        if status == "timeout":
+            log_evt("KIE_TIMEOUT", task_id=task_id, reported=True, flag=flag)
+            raise TimeoutError("KIE reported timeout")
+
+        if status in KIE_BAD_STATES or flag in (2, 3):
+            log_evt(
+                "KIE_RESULT_EMPTY",
+                task_id=task_id,
+                status=status or "flag_fail",
+                flag=flag,
+            )
+            raise RuntimeError(f"KIE failed with status '{status or flag}'")
+
+        last_status = status or last_status
+        last_flag = flag if flag is not None else last_flag
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, STRICT_POLL_MAX_DELAY)
+
+
+async def _validate_kie_video_asset(
+    session: aiohttp.ClientSession,
+    video_url: Optional[str],
+) -> Tuple[bool, Dict[str, Any]]:
+    if not video_url or not isinstance(video_url, str):
+        return False, {"reason": "missing"}
+    target = video_url.strip()
+    if not target or not target.lower().startswith("http"):
+        return False, {"reason": "invalid_url"}
+
+    info: Dict[str, Any] = {"url": target}
+    fallback_needed = False
+    request_timeout = ClientTimeout(total=60)
+
+    try:
+        async with session.head(
+            target,
+            allow_redirects=True,
+            timeout=request_timeout,
+        ) as resp:
+            status = resp.status
+            info.update({"status": status, "method": "HEAD"})
+            if status >= 400:
+                if status in (405, 501):
+                    fallback_needed = True
+                else:
+                    info["error"] = f"head_status_{status}"
+                    return False, info
+            else:
+                length_header = resp.headers.get("Content-Length")
+                if length_header is not None:
+                    try:
+                        length_val = int(length_header)
+                        info["content_length"] = length_val
+                        if length_val <= 0:
+                            info["error"] = "empty_length"
+                            return False, info
+                    except ValueError:
+                        info["content_length"] = length_header
+                return True, info
+    except ClientResponseError as exc:
+        if exc.status in (405, 501):
+            fallback_needed = True
+            info.update({"status": exc.status, "method": "HEAD"})
+        else:
+            info.update({"status": exc.status, "error": str(exc), "method": "HEAD"})
+            return False, info
+    except ClientError as exc:
+        fallback_needed = True
+        info.update({"error": str(exc), "method": "HEAD"})
+    except Exception as exc:
+        fallback_needed = True
+        info.update({"error": str(exc), "method": "HEAD"})
+
+    if not fallback_needed:
+        return False, info
+
+    try:
+        headers = {"Range": "bytes=0-0"}
+        async with session.get(
+            target,
+            headers=headers,
+            allow_redirects=True,
+            timeout=request_timeout,
+        ) as resp:
+            status = resp.status
+            info.update({"status": status, "method": "GET", "range": True})
+            if status >= 400:
+                info.setdefault("error", f"get_status_{status}")
+                return False, info
+            chunk = await resp.content.read(1)
+            has_chunk = bool(chunk)
+            info["has_chunk"] = has_chunk
+            if not has_chunk:
+                info.setdefault("error", "empty_chunk")
+            return has_chunk, info
+    except ClientError as exc:
+        info.update({"error": str(exc), "method": "GET"})
+        return False, info
+    except Exception as exc:
+        info.update({"error": str(exc), "method": "GET"})
+        return False, info
+
+# ==========================
 #   VEO polling
 # ==========================
 async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1477,16 +1728,6 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
     s = state(ctx)
     price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
     op_key = s.get("active_generation_op")
-
-    def _refund(reason_tag: str, message: Optional[str] = None) -> None:
-        meta: Dict[str, Any] = {"reason": reason_tag}
-        if message:
-            meta["message"] = message
-        refund_op_id = f"refund:{task_id}:{reason_tag}"
-        try:
-            credit_tokens(ctx, price, "veo_refund", refund_op_id, meta)
-        except Exception as exc:
-            log.exception("VEO refund %s failed: %s", reason_tag, exc)
 
     def _cleanup() -> None:
         ACTIVE_TASKS.pop(original_chat_id, None)
@@ -1501,32 +1742,81 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             clear_task_meta(task_id)
 
     video_url: Optional[str] = None
+    asset_meta: Dict[str, Any] = {}
+    asset_ok = False
 
     try:
         async with aiohttp.ClientSession() as session:
-            video_url = await poll_veo_status(
-                session,
-                base_url=KIE_BASE_URL,
-                status_path=KIE_VEO_STATUS_PATH,
-                task_id=task_id,
-                api_key=KIE_API_KEY,
-                timeout_sec=min(POLL_TIMEOUT_SECS, 15 * 60),
-                start_delay=2.0,
-                max_delay=20.0,
-            )
-    except TimeoutError:
-        _refund("timeout")
-        await ctx.bot.send_message(chat_id, "⏳ Рендер занимает слишком долго. 💎 Токены возвращены.")
+            if KIE_STRICT_POLLING:
+                video_url, _ = await _strict_poll_kie(
+                    session,
+                    task_id,
+                    timeout_sec=min(POLL_TIMEOUT_SECS, 15 * 60),
+                    status_path=KIE_VEO_STATUS_PATH,
+                )
+            else:
+                video_url = await poll_veo_status(
+                    session,
+                    base_url=KIE_BASE_URL,
+                    status_path=KIE_VEO_STATUS_PATH,
+                    task_id=task_id,
+                    api_key=KIE_API_KEY,
+                    timeout_sec=min(POLL_TIMEOUT_SECS, 15 * 60),
+                    start_delay=2.0,
+                    max_delay=20.0,
+                )
+            asset_ok, asset_meta = await _validate_kie_video_asset(session, video_url)
+    except TimeoutError as exc:
+        log_evt("KIE_TIMEOUT", task_id=task_id, reason="poll_exception", message=str(exc))
+        refund(
+            ctx,
+            price,
+            f"refund:{task_id}:timeout",
+            {"reason": "timeout"},
+        )
+        await ctx.bot.send_message(chat_id, RENDER_FAIL_MESSAGE)
         _cleanup()
         return
     except Exception as exc:
         log.exception("VEO render failed: %s", exc)
-        _refund("exception", str(exc))
-        await ctx.bot.send_message(chat_id, "⚠️ Не удалось получить результат рендера. 💎 Токены возвращены.")
+        refund(
+            ctx,
+            price,
+            f"refund:{task_id}:exception",
+            {"reason": "exception", "message": str(exc)},
+        )
+        await ctx.bot.send_message(chat_id, RENDER_FAIL_MESSAGE)
         _cleanup()
         return
 
     if s.get("generation_id") != gen_id:
+        _cleanup()
+        return
+
+    asset_status = asset_meta.get("status") if isinstance(asset_meta, dict) else None
+    asset_method = asset_meta.get("method") if isinstance(asset_meta, dict) else None
+
+    if not video_url or not asset_ok:
+        reason = "empty_result" if not video_url else "asset_invalid"
+        log_evt(
+            "KIE_RESULT_EMPTY",
+            task_id=task_id,
+            reason=reason,
+            status=asset_status,
+            method=asset_method,
+        )
+        refund_meta: Dict[str, Any] = {"reason": reason}
+        if asset_status is not None:
+            refund_meta["status"] = asset_status
+        if asset_method is not None:
+            refund_meta["method"] = asset_method
+        if isinstance(asset_meta, dict):
+            if "content_length" in asset_meta:
+                refund_meta["content_length"] = asset_meta["content_length"]
+            if "error" in asset_meta:
+                refund_meta["error"] = asset_meta["error"]
+        refund(ctx, price, f"refund:{task_id}:{reason}", refund_meta)
+        await ctx.bot.send_message(chat_id, RENDER_FAIL_MESSAGE)
         _cleanup()
         return
 
@@ -1539,6 +1829,15 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             log.info("task-meta missing | task=%s", task_id)
     except Exception:
         log.exception("Failed to load task meta for %s", task_id)
+
+    success_meta: Dict[str, Any] = {"task_id": task_id}
+    if asset_status is not None:
+        success_meta["status"] = asset_status
+    if asset_method is not None:
+        success_meta["method"] = asset_method
+    if isinstance(asset_meta, dict) and "content_length" in asset_meta:
+        success_meta["content_length"] = asset_meta["content_length"]
+    log_evt("KIE_RESULT_OK", **success_meta)
 
     try:
         kie_event(
@@ -2138,12 +2437,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prompt = (s.get("last_prompt") or "").strip()
         if not prompt:
             await q.message.reply_text("⚠️ Сначала пришлите текстовый промпт."); return
+        user = update.effective_user
+        user_id_for_lock = user.id if user else None
+        if not _acquire_click_lock(user_id_for_lock, "veo:start"):
+            return
         price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
         chat_id = update.effective_chat.id
         if ACTIVE_TASKS.get(chat_id):
             await q.message.reply_text("⏳ Уже рендерю вашу предыдущую задачу. Подождите, пожалуйста.")
             return
-        uid = update.effective_user.id
+        uid = user.id if user else 0
         fingerprint = _make_fingerprint({
             "prompt": prompt,
             "image": s.get("last_image_url"),
