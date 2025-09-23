@@ -19,6 +19,7 @@ LOGGER = logging.getLogger(__name__)
 
 ASK_PROMPT = 1
 START_MESSAGE = "Пришлите текст промпта. /cancel — выход."
+PROMPT_MASTER_HINT = START_MESSAGE
 ACCEPT_TEMPLATE = "Принято: {text}"
 ERROR_MESSAGE = "⚠️ Системная ошибка. Попробуйте ещё раз."
 CANCEL_MESSAGE = "Диалог завершён."
@@ -133,3 +134,25 @@ prompt_master_conv = ConversationHandler(
     fallbacks=[CommandHandler("cancel", prompt_master_cancel)],
     name="prompt_master",
 )
+
+
+def activate_prompt_master_mode(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Force Prompt-Master conversation state for the user triggered via inline button."""
+
+    del context  # Context is not used but kept for compatibility.
+
+    try:
+        key = prompt_master_conv._get_key(update)  # type: ignore[attr-defined]
+    except Exception:
+        _log_exception("Failed to compute Prompt-Master conversation key")
+        return
+
+    try:
+        prompt_master_conv._update_state(ASK_PROMPT, key)  # type: ignore[attr-defined]
+    except Exception:
+        _log_exception("Failed to activate Prompt-Master conversation state")
+
+
+__all__ = ["activate_prompt_master_mode", "prompt_master_conv", "PROMPT_MASTER_HINT"]
