@@ -244,3 +244,130 @@ async def user_exists(redis_conn: Optional["redis.Redis"], user_id: int) -> bool
             return False
 
     return await asyncio.to_thread(_call)
+
+
+# === Users & Balance ===
+USERS_KEY = f"{_PFX}:users"
+
+
+def _bal_key(uid: int) -> str:
+    return f"{_PFX}:bal:{uid}"
+
+
+def _ledger_key(uid: int) -> str:
+    return f"{_PFX}:ledger:{uid}"
+
+
+def ensure_user(user_id: int) -> None:
+    if not _r:
+        return
+    p = _r.pipeline()
+    p.sadd(USERS_KEY, user_id)
+    p.setnx(_bal_key(user_id), 0)
+    p.execute()
+
+
+def users_count() -> int:
+    if not _r:
+        return 0
+    return _r.scard(USERS_KEY)
+
+
+def all_user_ids() -> List[int]:
+    if not _r:
+        return []
+    raw = _r.smembers(USERS_KEY)
+    return [int(x) for x in raw] if raw else []
+
+
+def get_balance(user_id: int) -> int:
+    if not _r:
+        return 0
+    v = _r.get(_bal_key(user_id))
+    return int(v) if v is not None else 0
+
+
+def add_ledger(user_id: int, entry: Dict[str, Any]) -> None:
+    if not _r:
+        return
+    ensure_user(user_id)
+    _r.rpush(_ledger_key(user_id), json.dumps(entry, ensure_ascii=False))
+
+
+def credit(
+    user_id: int,
+    amount: int,
+    reason: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> int:
+    if not _r:
+        return 0
+    ensure_user(user_id)
+    amount = int(amount)
+    now = int(time.time())
+    bal_key = _bal_key(user_id)
+    ledger_key = _ledger_key(user_id)
+
+    while True:
+        try:
+            with _r.pipeline() as pipe:
+                pipe.watch(bal_key)
+                current = pipe.get(bal_key)
+                current_balance = int(current) if current is not None else 0
+                new_balance = current_balance + amount
+                entry = {
+                    "ts": now,
+                    "type": "credit",
+                    "amount": int(amount),
+                    "reason": reason,
+                    "meta": meta or {},
+                    "balance_after": new_balance,
+                }
+                pipe.multi()
+                pipe.set(bal_key, new_balance)
+                pipe.rpush(ledger_key, json.dumps(entry, ensure_ascii=False))
+                pipe.execute()
+                return new_balance
+        except redis.WatchError:
+            continue
+
+
+def debit_try(
+    user_id: int,
+    amount: int,
+    reason: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, int]:
+    if not _r:
+        return False, 0
+    ensure_user(user_id)
+    amount = int(amount)
+    now = int(time.time())
+    bal_key = _bal_key(user_id)
+    ledger_key = _ledger_key(user_id)
+
+    while True:
+        try:
+            with _r.pipeline() as pipe:
+                pipe.watch(bal_key)
+                current = pipe.get(bal_key)
+                current_balance = int(current) if current is not None else 0
+                if current_balance < amount:
+                    pipe.unwatch()
+                    return False, current_balance
+                new_balance = current_balance - amount
+                entry = {
+                    "ts": now,
+                    "type": "debit",
+                    "amount": amount,
+                    "reason": reason,
+                    "meta": meta or {},
+                    "balance_after": new_balance,
+                }
+                pipe.multi()
+                pipe.set(bal_key, new_balance)
+                pipe.rpush(ledger_key, json.dumps(entry, ensure_ascii=False))
+                pipe.execute()
+                return True, new_balance
+        except redis.WatchError:
+            continue
