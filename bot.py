@@ -36,6 +36,8 @@ from kie_banana import create_banana_task, wait_for_banana_result, KieBananaErro
 
 import redis
 
+from redis_utils import clear_task_meta, load_task_meta, save_task_meta
+
 from ledger import (
     LedgerStorage,
     LedgerOpResult,
@@ -1476,6 +1478,7 @@ def _mj_should_retry(msg: Optional[str]) -> bool:
 #   VEO polling
 # ==========================
 async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
+    original_chat_id = chat_id
     s = state(ctx)
     price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
     op_key = s.get("active_generation_op")
@@ -1491,7 +1494,7 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             log.exception("VEO refund %s failed: %s", reason_tag, exc)
 
     def _cleanup() -> None:
-        ACTIVE_TASKS.pop(chat_id, None)
+        ACTIVE_TASKS.pop(original_chat_id, None)
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
@@ -1499,6 +1502,8 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             _clear_operation(ctx, op_key)
         s.pop("active_generation_op", None)
         _clear_kie_request_id(task_id)
+        with suppress(Exception):
+            clear_task_meta(task_id)
 
     video_url: Optional[str] = None
 
@@ -1529,6 +1534,16 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
     if s.get("generation_id") != gen_id:
         _cleanup()
         return
+
+    try:
+        meta = load_task_meta(task_id)
+        if meta:
+            log.info("task-meta loaded | task=%s", task_id)
+            chat_id = int(meta.get("chat_id", chat_id))
+        else:
+            log.info("task-meta missing | task=%s", task_id)
+    except Exception:
+        log.exception("Failed to load task meta for %s", task_id)
 
     try:
         kie_event(
@@ -2208,6 +2223,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         gen_id = uuid.uuid4().hex
         s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
         ACTIVE_TASKS[chat_id] = task_id
+        try:
+            effective_message = update.effective_message
+            message_id = effective_message.message_id if effective_message else 0
+            user_id = update.effective_user.id if update.effective_user else 0
+            mode = s.get("mode") or ""
+            save_task_meta(task_id, chat_id, int(message_id), mode, int(user_id))
+            log.info("task-meta saved | task=%s chat=%s", task_id, chat_id)
+        except Exception:
+            log.exception("Failed to save task meta for %s", task_id)
         await q.message.reply_text("🎬 Рендер начат — вернусь с готовым видео.")
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
