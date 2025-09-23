@@ -773,8 +773,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("🧠 Prompt-Master", callback_data=PROMPT_MASTER_OPEN)],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode:chat")],
+        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data=PROMPT_MASTER_OPEN)],
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
