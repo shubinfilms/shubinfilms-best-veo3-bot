@@ -27,10 +27,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
-try:
-    from handlers.prompt_master_handler import prompt_master_conv
-except Exception:  # pragma: no cover - optional handler
-    prompt_master_conv = None
+from handlers import prompt_master_conv
 from prompt_master import generate_prompt_master
 
 # === KIE Banana wrapper ===
@@ -2736,11 +2733,7 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-    try:
-        if prompt_master_conv:
-            application.add_handler(prompt_master_conv, group=10)
-    except Exception:
-        pass
+    application.add_handler(prompt_master_conv, group=10)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
