@@ -1,31 +1,34 @@
 # -*- coding: utf-8 -*-
-"""
-Prompt-Master 2.0 — структурный генератор кинематографичных промптов.
-ENV:
-- OPENAI_API_KEY
-Зависимости: openai (любой из SDK: новый или старый).
-"""
+"""Prompt-Master core: generate structured cinematic prompts."""
 
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
 import re
-import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
-# ---------- OpenAI client (new/old) ----------
-_USE_NEW = False
-_client = None
-try:
-    from openai import OpenAI  # new SDK
+LOGGER = logging.getLogger(__name__)
+
+_USE_NEW_CLIENT = False
+_client: Any = None
+try:  # pragma: no cover - optional dependency
+    from openai import OpenAI  # type: ignore
+
     _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
-    _USE_NEW = True
-except Exception:
+    _USE_NEW_CLIENT = True
+except Exception:  # pragma: no cover - fallback to legacy SDK
     try:
-        import openai  # old SDK
+        import openai  # type: ignore
+
         openai.api_key = os.getenv("OPENAI_API_KEY", "")
         _client = openai
-        _USE_NEW = False
-    except Exception:
+        _USE_NEW_CLIENT = False
+    except Exception:  # pragma: no cover - no client available
         _client = None
+        _USE_NEW_CLIENT = False
+
 
 SYSTEM_PROMPT = """You are Prompt-Master 2.0 — a creative cinematic prompt writer.
 GOALS:
@@ -63,129 +66,203 @@ OUTPUT FORMAT (strict):
 Keep it under ~2200 characters unless the user explicitly asks for long form.
 """
 
-# ---------- Helpers: lang/intent/camera ----------
+
 _CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
 VOICE_HINT_RE = re.compile(r"\b(voice|озвучк|диктор|голос|озвучить|озвучка|narration)\b", re.IGNORECASE)
 MUSIC_HINT_RE = re.compile(r"\b(music|музык|бит|саунд|soundtrack|score|beat)\b", re.IGNORECASE)
 
 CAMERA_HINTS = [
-    r"\b(\d{2,3}mm)\b", r"\bprime lens\b", r"\bshallow depth of field\b", r"\bDOF\b",
-    r"\banamorphic\b", r"\bhandheld\b", r"\bsteadycam\b", r"\bgimbal\b", r"\bdrone\b", r"\bFPV\b",
-    r"\bclose[- ]?up\b", r"\bmacro\b", r"\bwide[- ]?shot\b", r"\bmedium\b",
-    r"\bslow[- ]?motion\b", r"\bslow[- ]?mo\b", r"\breal[- ]?time\b", r"\btime[- ]?remap\b",
-    r"\btilt[- ]?shift\b", r"\bpan\b", r"\btilt\b", r"\bzoom\b", r"\bdolly\b", r"\bpush[- ]?in\b", r"\bpull[- ]?back\b",
+    r"\b(\d{2,3}mm)\b",
+    r"\bprime lens\b",
+    r"\bshallow depth of field\b",
+    r"\bDOF\b",
+    r"\banamorphic\b",
+    r"\bhandheld\b",
+    r"\bsteadycam\b",
+    r"\bgimbal\b",
+    r"\bdrone\b",
+    r"\bFPV\b",
+    r"\bclose[- ]?up\b",
+    r"\bmacro\b",
+    r"\bwide[- ]?shot\b",
+    r"\bmedium\b",
+    r"\bslow[- ]?motion\b",
+    r"\bslow[- ]?mo\b",
+    r"\breal[- ]?time\b",
+    r"\btime[- ]?remap\b",
+    r"\btilt[- ]?shift\b",
+    r"\bpan\b",
+    r"\btilt\b",
+    r"\bzoom\b",
+    r"\bdolly\b",
+    r"\bpush[- ]?in\b",
+    r"\bpull[- ]?back\b",
 ]
+
 
 def _lang(text: str) -> str:
     return "ru" if _CYRILLIC_RE.search(text or "") else "en"
 
+
 def _voice_req(text: str) -> bool:
     return bool(VOICE_HINT_RE.search(text or ""))
+
 
 def _music_req(text: str) -> bool:
     return bool(MUSIC_HINT_RE.search(text or ""))
 
+
 def _cam_tokens(text: str) -> str:
     found = []
     for pat in CAMERA_HINTS:
-        m = re.findall(pat, text, flags=re.IGNORECASE)
-        if m:
-            if isinstance(m[0], tuple):
-                for tup in m:
-                    for x in tup:
-                        if x:
-                            found.append(x)
-            else:
-                found.extend(m)
+        matches = re.findall(pat, text, flags=re.IGNORECASE)
+        if not matches:
+            continue
+        if isinstance(matches[0], tuple):
+            for tup in matches:
+                for token in tup:
+                    if token:
+                        found.append(token)
+        else:
+            found.extend(matches)
     tokens, seen = [], set()
-    for t in (x.strip().lower() for x in found if x):
-        if t and t not in seen:
-            seen.add(t); tokens.append(t)
+    for token in (item.strip().lower() for item in found if item):
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
     return ", ".join(tokens)
 
-def _build_user_instruction(text: str, lang: str, v_req: bool, m_req: bool) -> str:
-    lines = ["USER IDEA:", text.strip(), "", "CONSTRAINTS:",
-             "- Keep realism, clean motion, plausible physics.",
-             "- No TV/news tone. Be modern, stylish, emotional."]
+
+def _build_user_instruction(
+    text: str,
+    lang: str,
+    v_req: bool,
+    m_req: bool,
+    camera_tokens: Optional[str] = None,
+) -> str:
+    lines = [
+        "USER IDEA:",
+        text.strip(),
+        "",
+        "CONSTRAINTS:",
+        "- Keep realism, clean motion, plausible physics.",
+        "- No TV/news tone. Be modern, stylish, emotional.",
+    ]
     if m_req:
         lines.append("- Provide modern music suggestion that fits mood (hip-hop/ambient/cinematic/electronic).")
     if v_req:
-        lines.append("- Add Russian voiceover only, natural and expressive (no radio anchor)." if lang=="ru"
-                     else "- Add English voiceover only, natural and expressive (no radio anchor).")
+        lines.append(
+            "- Add Russian voiceover only, natural and expressive (no radio anchor)."
+            if lang == "ru"
+            else "- Add English voiceover only, natural and expressive (no radio anchor)."
+        )
     lines.append("- If user forbids text/logos/subtitles — keep none.")
-    cams = _cam_tokens(text)
+    cams = camera_tokens if camera_tokens is not None else _cam_tokens(text)
     if cams:
         lines.append(f"- Camera technical hints to respect: {cams}")
     return "\n".join(lines)
 
-def _ask_openai(system_prompt: str, user_prompt: str, lang: str) -> str:
+
+def _fallback_prompt(raw_text: str, lang: str) -> str:
+    snippet = raw_text.strip()
+    if len(snippet) > 180:
+        snippet = snippet[:180].rstrip() + "…"
+    voice_line = (
+        "🎙 Озвучка: русский, тёплый, живой"
+        if lang == "ru"
+        else "🎙 Voice: English, warm, natural"
+    )
+    return (
+        f"🎬 Сцена: {snippet}\n"
+        "🎭 Действие: Плавные, реалистичные, без артефактов.\n"
+        "🌌 Атмосфера: Современная, эмоциональная, кинематографичная.\n"
+        "🎥 Камера: 85mm prime, shallow DOF, плавные панорамы.\n"
+        "💡 Свет: Мягкий, объёмный, с аккуратными бликами.\n"
+        "🌍 Окружение: Детально, но без перегруза, фокус на главном.\n"
+        "🔊 Звук/Музыка: Современная подача (ambient/hip-hop/cinematic), без TV-подложки.\n"
+        f"{voice_line}\n"
+        "🎨 Стиль: Премиальный, гиперреалистичный, рекламный.\n"
+        "📝 Текст/субтитры: нет\n"
+    )
+
+
+async def _ask_openai(system_prompt: str, user_prompt: str, lang: str, raw_text: str) -> str:
     if _client is None:
-        # Fallback без API — минимальный шаблон, чтобы UX не ломался
-        voice = "🎙 Озвучка: русский, тёплый, живой" if lang=="ru" else "🎙 Voice: English, warm, natural"
-        return (
-            "🎬 Сцена: " + (user_prompt[:180]) + "...\n"
-            "🎭 Действие: Плавные, реалистичные, без артефактов.\n"
-            "🌌 Атмосфера: Современная, эмоциональная, кинематографичная.\n"
-            "🎥 Камера: 85mm prime, shallow DOF, плавные панорамы.\n"
-            "💡 Свет: Мягкий, объёмный, с аккуратными бликами.\n"
-            "🌍 Окружение: Детально, но без перегруза, фокус на главном.\n"
-            "🔊 Звук/Музыка: Современная подача (ambient/hip-hop/cinematic), без TV-подложки.\n"
-            f"{voice}\n"
-            "🎨 Стиль: Премиальный, гиперреалистичный, рекламный.\n"
-            "📝 Текст/субтитры: нет\n"
-        )
-    if _USE_NEW:
-        resp = _client.chat.completions.create(
+        return _fallback_prompt(raw_text, lang)
+
+    def _call_sync() -> str:
+        if _USE_NEW_CLIENT:
+            response = _client.chat.completions.create(  # type: ignore[union-attr]
+                model="gpt-4o-mini",
+                temperature=0.6,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            return (response.choices[0].message.content or "").strip()
+
+        response = _client.ChatCompletion.create(  # type: ignore[union-attr]
             model="gpt-4o-mini",
             temperature=0.6,
-            messages=[{"role":"system","content":system_prompt},
-                      {"role":"user","content":user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        return (resp.choices[0].message.content or "").strip()
-    else:
-        resp = _client.ChatCompletion.create(
-            model="gpt-4o-mini",
-            temperature=0.6,
-            messages=[{"role":"system","content":system_prompt},
-                      {"role":"user","content":user_prompt}],
-        )
-        return (resp["choices"][0]["message"]["content"] or "").strip()
+        return (response["choices"][0]["message"]["content"] or "").strip()
 
-def generate_prompt(user_text: str) -> Dict[str, Any]:
-    """
-    Вход: текст пользователя.
-    Выход:
-      - text_markdown: Markdown промпт
-      - meta: {lang, voice_requested, music_requested, camera_hints}
-    """
-    txt = (user_text or "").strip()
-    lang = _lang(txt)
-    vreq = _voice_req(txt)
-    mreq = _music_req(txt)
+    try:
+        return await asyncio.to_thread(_call_sync)
+    except Exception:  # pragma: no cover - network issues fallback
+        LOGGER.exception("Prompt-Master LLM call failed")
+        return _fallback_prompt(raw_text, lang)
 
-    user_instr = _build_user_instruction(txt, lang, vreq, mreq)
-    out = _ask_openai(SYSTEM_PROMPT, user_instr, lang)
-    return {
-        "text_markdown": out,
-        "meta": {
-            "lang": lang,
-            "voice_requested": vreq,
-            "music_requested": mreq,
-            "camera_hints": _cam_tokens(txt),
-        },
+
+async def call_llm_to_make_kino_prompt(
+    user_text: str,
+    user_lang: str = "ru",
+    *,
+    voice_requested: Optional[bool] = None,
+    music_requested: Optional[bool] = None,
+    camera_hints: Optional[str] = None,
+) -> str:
+    text = (user_text or "").strip()
+    lang = user_lang or _lang(text)
+    v_req = voice_requested if voice_requested is not None else _voice_req(text)
+    m_req = music_requested if music_requested is not None else _music_req(text)
+    cams = camera_hints if camera_hints is not None else _cam_tokens(text)
+    user_prompt = _build_user_instruction(text, lang, v_req, m_req, cams)
+    return await _ask_openai(SYSTEM_PROMPT, user_prompt, lang, text)
+
+
+async def build_cinema_prompt(user_text: str, user_lang: str = "ru") -> Tuple[str, Dict[str, Any]]:
+    """
+    Возвращает (kino_prompt_text, meta).
+    Никаких отправок в Telegram здесь нет.
+    """
+
+    text = (user_text or "").strip()
+    lang = user_lang or _lang(text)
+    voice_requested = _voice_req(text)
+    music_requested = _music_req(text)
+    camera_tokens = _cam_tokens(text)
+
+    prompt_text = await call_llm_to_make_kino_prompt(
+        text,
+        user_lang=lang,
+        voice_requested=voice_requested,
+        music_requested=music_requested,
+        camera_hints=camera_tokens,
+    )
+
+    meta: Dict[str, Any] = {
+        "lang": lang,
+        "voice_requested": voice_requested,
+        "music_requested": music_requested,
+        "camera_hints": camera_tokens,
     }
+    return prompt_text, meta
 
 
-def generate_prompt_master(user_text: str) -> str:
-    """Return only the Prompt-Master text block."""
-
-    result = generate_prompt(user_text)
-    if isinstance(result, dict):
-        return (result.get("text_markdown") or "").strip()
-    if isinstance(result, str):
-        return result.strip()
-    return ""
-
-if __name__ == "__main__":
-    demo = "High-quality cinematic 4K. 85mm prime lens for shallow DOF. Озвучка по-русски, современная музыка."
-    print(json.dumps(generate_prompt(demo), ensure_ascii=False, indent=2))
+__all__ = ["build_cinema_prompt", "call_llm_to_make_kino_prompt"]
