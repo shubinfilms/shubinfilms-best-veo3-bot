@@ -2171,7 +2171,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; data = (q.data or "").strip()
     s = state(ctx)
 
-    if data in (PROMPT_MASTER_OPEN, PROMPT_MASTER_CANCEL):
+    if data.startswith("pm:"):
         return
 
     await q.answer()
@@ -2607,6 +2607,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if openai is None or not OPENAI_API_KEY:
             await update.message.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY)."); return
         try:
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            user_id = update.effective_user.id if update.effective_user else None
+            log.info(
+                "CHAT_REQUEST | chat_id=%s user_id=%s text=%s",
+                chat_id,
+                user_id,
+                _short_prompt(text, 160),
+            )
             await update.message.reply_text("💬 Думаю над ответом…")
             resp = await asyncio.to_thread(
                 openai.ChatCompletion.create,
@@ -2617,6 +2625,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             answer = resp["choices"][0]["message"]["content"].strip()
             await update.message.reply_text(answer)
+            log.info(
+                "CHAT_RESPONSE | chat_id=%s user_id=%s length=%d",
+                chat_id,
+                user_id,
+                len(answer),
+            )
         except Exception as e:
             log.exception("Chat error: %s", e)
             await update.message.reply_text("⚠️ Ошибка запроса к ChatGPT.")
@@ -3058,13 +3072,13 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-    application.add_handler(prompt_master_conv)
+    application.add_handler(prompt_master_conv, group=0)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=50)
     application.add_error_handler(error_handler)
 
     lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
