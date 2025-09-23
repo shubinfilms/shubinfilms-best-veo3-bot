@@ -29,7 +29,7 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, Forbidden, RetryAfter
 
 from handlers import (
     PROMPT_MASTER_CANCEL,
@@ -50,7 +50,16 @@ from kie_banana import (
 
 import redis
 
-from redis_utils import clear_task_meta, load_task_meta, save_task_meta
+from redis_utils import (
+    add_user,
+    clear_task_meta,
+    get_all_user_ids,
+    get_users_count,
+    load_task_meta,
+    remove_user,
+    save_task_meta,
+    user_exists,
+)
 
 from ledger import (
     LedgerStorage,
@@ -240,6 +249,21 @@ REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
+def _parse_admin_ids(raw: str) -> set[int]:
+    result: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            log.warning("Invalid ADMIN_IDS entry skipped: %s", part)
+    return result
+
+
+ADMIN_IDS = _parse_admin_ids(_env("ADMIN_IDS"))
+
 LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
 DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
 if LEDGER_BACKEND != "memory" and not DATABASE_URL:
@@ -379,6 +403,17 @@ app_cache: Dict[Any, Any] = {}
 
 
 _CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+
+
+async def ensure_user_record(update: Optional[Update]) -> None:
+    if update is None or update.effective_user is None:
+        return
+    if redis_client is None:
+        return
+    try:
+        await add_user(redis_client, update.effective_user)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("Failed to store user %s in Redis: %s", update.effective_user.id, exc)
 
 
 def detect_lang(text: str) -> str:
@@ -2385,6 +2420,7 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     s = state(ctx); s.update({**DEFAULT_STATE})
     uid = update.effective_user.id
 
@@ -2403,6 +2439,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
@@ -2416,6 +2453,7 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
@@ -2424,6 +2462,7 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
@@ -2432,10 +2471,12 @@ async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     await topup(update, ctx)
 
 
 async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
@@ -2443,6 +2484,7 @@ async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
@@ -2450,6 +2492,7 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
@@ -2460,6 +2503,7 @@ async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     await update.message.reply_text(
         "💳 Пополнение через *Telegram Stars*.\nЕсли звёзд не хватает — купите в официальном боте:",
         parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
@@ -2468,11 +2512,13 @@ async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     balance = get_user_balance_value(ctx, force_refresh=True)
     await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
 
 
 async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     uid = update.effective_user.id
     try:
         result = ledger_storage.recalc_user_balance(uid)
@@ -2489,6 +2535,7 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Баланс актуален: {result.calculated} 💎")
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     parts = [
         f"PTB: `{getattr(_tg, '__version__', 'unknown')}`" if _tg else "PTB: `unknown`",
         f"KIEBASEURL: `{KIE_BASE_URL}`",
@@ -2507,6 +2554,124 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts.append(f"LOCK: `{json.dumps(lock_payload, ensure_ascii=False)}`")
     await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
 
+
+async def users_count_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    if message is None:
+        return
+    count = await get_users_count(redis_client)
+    if count is None:
+        await message.reply_text("⚠️ Redis недоступен.")
+        return
+    await message.reply_text(f"👥 Пользователей: {count}")
+
+
+async def whoami_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if redis_client is None:
+        status = "⚠️ Redis недоступен"
+    else:
+        exists = await user_exists(redis_client, user.id)
+        status = "✅ Запись найдена" if exists else "⚠️ Запись не найдена"
+    await message.reply_text(
+        f"🆔 Ваш Telegram ID: {user.id}\n💾 В Redis: {status}"
+    )
+
+
+async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if user.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    if redis_client is None:
+        await message.reply_text("⚠️ Redis недоступен, рассылка невозможна.")
+        return
+
+    text = message.text or message.caption or ""
+    payload = text.partition(" ")[2].strip()
+    if not payload and message.reply_to_message:
+        payload = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    if not payload:
+        await message.reply_text("⚠️ Использование: /broadcast текст или ответьте на сообщение.")
+        return
+
+    user_ids = await get_all_user_ids(redis_client)
+    if not user_ids:
+        await message.reply_text("⚠️ Нет пользователей для рассылки.")
+        return
+
+    total = len(user_ids)
+    sent = 0
+    errors = 0
+    status_msg = await message.reply_text(f"🚀 Рассылка началась. Всего получателей: {total}")
+
+    async def _update_progress(current: int) -> None:
+        nonlocal status_msg
+        text_progress = f"Прогресс: {current}/{total} (ok: {sent}, err: {errors})"
+        if status_msg:
+            try:
+                await status_msg.edit_text(text_progress)
+                return
+            except BadRequest:
+                pass
+        status_msg = await message.reply_text(text_progress)
+
+    for idx, target_id in enumerate(user_ids, start=1):
+        try:
+            await ctx.bot.send_message(target_id, payload)
+            sent += 1
+        except RetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 0.1)
+            try:
+                await ctx.bot.send_message(target_id, payload)
+                sent += 1
+            except RetryAfter as exc_retry:
+                await asyncio.sleep(exc_retry.retry_after + 0.1)
+                try:
+                    await ctx.bot.send_message(target_id, payload)
+                    sent += 1
+                except Forbidden:
+                    errors += 1
+                    await remove_user(redis_client, target_id)
+                except Exception as exc_final:
+                    errors += 1
+                    log.warning("Broadcast send failed for %s after retries: %s", target_id, exc_final)
+            except Forbidden:
+                errors += 1
+                await remove_user(redis_client, target_id)
+            except Exception as exc_retry:
+                errors += 1
+                log.warning("Broadcast retry failed for %s: %s", target_id, exc_retry)
+        except Forbidden:
+            errors += 1
+            await remove_user(redis_client, target_id)
+        except Exception as exc:
+            errors += 1
+            log.warning("Broadcast send failed for %s: %s", target_id, exc)
+
+        if idx % 25 == 0:
+            await _update_progress(idx)
+
+        await asyncio.sleep(0.12)
+
+    final_text = f"Готово ✅ Отправлено: {sent}, ошибок: {errors}"
+    if status_msg:
+        try:
+            await status_msg.edit_text(final_text)
+        except BadRequest:
+            await message.reply_text(final_text)
+    else:
+        await message.reply_text(final_text)
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
     try:
@@ -2569,6 +2734,7 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 configure_prompt_master(update_veo_card=show_or_update_veo_card)
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     q = update.callback_query
     if not q:
         return
@@ -2976,6 +3142,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     msg = update.message
     if msg is None:
         return
@@ -3240,6 +3407,7 @@ async def _banana_run_and_send(
         s.pop("banana_active_op_key", None)
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     s = state(ctx)
     photos = update.message.photo
     if not photos: return
@@ -3267,11 +3435,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Payments: Stars (XTR) ----------
 async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     try: await update.pre_checkout_query.answer(ok=True)
     except Exception:
         await update.pre_checkout_query.answer(ok=False, error_message=f"Платёж отклонён. Пополните Stars в {STARS_BUY_URL}")
 
 async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
     sp = update.message.successful_payment
     try: meta = json.loads(sp.invoice_payload)
     except Exception: meta = {}
@@ -3597,6 +3767,9 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("faq", faq_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
+    application.add_handler(CommandHandler("users_count", users_count_command))
+    application.add_handler(CommandHandler("whoami", whoami_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
