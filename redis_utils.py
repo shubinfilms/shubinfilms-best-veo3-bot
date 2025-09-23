@@ -12,6 +12,7 @@ _logger = logging.getLogger("redis-utils")
 
 _redis_url = os.getenv("REDIS_URL")
 _r = redis.from_url(_redis_url) if _redis_url else None
+rds = _r
 _PFX = os.getenv("REDIS_PREFIX", "veo3")
 _TTL = 24 * 60 * 60
 

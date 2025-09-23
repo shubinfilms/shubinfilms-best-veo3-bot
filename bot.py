@@ -246,6 +246,78 @@ if LEDGER_BACKEND != "memory" and not DATABASE_URL:
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
+# --- User mode routing ---
+MODE_CHAT = "chat"
+MODE_PM = "prompt_master"
+MODE_KEY_FMT = f"{REDIS_PREFIX}:mode:{{chat_id}}"
+
+# Если Redis подключен — используем его; иначе fallback на память процесса.
+_inmem_modes: Dict[Any, Any] = {}
+
+
+def _mode_get(chat_id: int) -> Optional[str]:
+    from redis_utils import rds  # локальный импорт, чтобы избежать циклов
+
+    if rds:
+        key = MODE_KEY_FMT.format(chat_id=chat_id)
+        try:
+            val = rds.get(key)
+        except Exception as exc:
+            log.warning("mode-get redis error: %s", exc)
+        else:
+            if val:
+                return val.decode("utf-8") if isinstance(val, bytes) else str(val)
+        return None
+    return _inmem_modes.get(chat_id)
+
+
+def _mode_set(chat_id: int, mode: str) -> None:
+    from redis_utils import rds
+
+    if rds:
+        key = MODE_KEY_FMT.format(chat_id=chat_id)
+        try:
+            rds.setex(key, 30 * 24 * 3600, mode)
+            return
+        except Exception as exc:
+            log.warning("mode-set redis error: %s", exc)
+    _inmem_modes[chat_id] = mode
+
+
+CACHE_PM_KEY_FMT = f"{REDIS_PREFIX}:pm:last:{{chat_id}}"
+
+
+def cache_pm_prompt(chat_id: int, text: str) -> None:
+    from redis_utils import rds
+
+    if rds:
+        try:
+            rds.setex(CACHE_PM_KEY_FMT.format(chat_id=chat_id), 3600, text)
+            return
+        except Exception as exc:
+            log.warning("pm-cache redis error: %s", exc)
+    _inmem_modes[f"pm:{chat_id}"] = text
+
+
+def get_cached_pm_prompt(chat_id: int) -> Optional[str]:
+    from redis_utils import rds
+
+    if rds:
+        try:
+            v = rds.get(CACHE_PM_KEY_FMT.format(chat_id=chat_id))
+        except Exception as exc:
+            log.warning("pm-cache redis get error: %s", exc)
+        else:
+            if v:
+                return v.decode("utf-8") if isinstance(v, bytes) else str(v)
+        return None
+    return _inmem_modes.get(f"pm:{chat_id}")
+
+
+CB_MODE_CHAT = "mode:chat"
+CB_MODE_PM = "mode:pm"
+CB_PM_INSERT_VEO = "pm:insert_to_veo"
+
 # ==========================
 #   Tokens / Pricing
 # ==========================
@@ -302,6 +374,34 @@ def promo_mark_used(code: str, uid: int):
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
+
+
+_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+
+
+def detect_lang(text: str) -> str:
+    return "ru" if _CYRILLIC_RE.search(text or "") else "en"
+
+
+async def chatgpt_smalltalk(text: str, chat_id: int) -> str:
+    if openai is None or not OPENAI_API_KEY:
+        raise RuntimeError("ChatGPT is not configured")
+
+    log.debug("chat-smalltalk | chat=%s", chat_id)
+
+    def _sync_call() -> str:
+        response = openai.ChatCompletion.create(  # type: ignore[union-attr]
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful, concise assistant."},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.5,
+            max_tokens=700,
+        )
+        return response["choices"][0]["message"]["content"].strip()
+
+    return await asyncio.to_thread(_sync_call)
 
 
 def _acquire_click_lock(user_id: Optional[int], action: str) -> bool:
@@ -769,13 +869,13 @@ def render_welcome_for(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data=CB_MODE_PM)],
+        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data=CB_MODE_CHAT)],
         [InlineKeyboardButton(f"🎬 Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}", callback_data="mode:veo_text_fast")],
         [InlineKeyboardButton(f"🎬 Генерация видео (Veo Quality) 💎 {TOKEN_COSTS['veo_quality']}", callback_data="mode:veo_text_quality")],
         [InlineKeyboardButton(f"🖼️ Генерация изображений (MJ) 💎 {TOKEN_COSTS['mj']}", callback_data="mode:mj_txt")],
         [InlineKeyboardButton(f"🍌 Редактор изображений (Banana) 💎 {TOKEN_COSTS['banana']}", callback_data="mode:banana")],
         [InlineKeyboardButton(f"📸 Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}", callback_data="mode:veo_photo")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data=PROMPT_MASTER_OPEN)],
-        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="mode:chat")],
         [
             InlineKeyboardButton("❓ FAQ", callback_data="faq"),
             InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL_URL),
@@ -2328,11 +2428,73 @@ async def show_or_update_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
         log.warning("veo card edit/send failed: %s", e)
 
 
+async def set_veo_card_prompt(chat_id: int, prompt_text: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    s["last_prompt"] = prompt_text
+    await show_or_update_veo_card(chat_id, ctx)
+
+
+async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    q = update.callback_query
+    if not q or not q.message:
+        return
+    chat_id = q.message.chat_id
+    kino_prompt = get_cached_pm_prompt(chat_id)
+    if not kino_prompt:
+        await q.answer("Промпт не найден — пришлите идею заново.", show_alert=True)
+        return
+
+    await set_veo_card_prompt(chat_id, kino_prompt, ctx)
+    await q.answer("Промпт вставлен в карточку VEO")
+    await q.edit_message_text(
+        "Промпт добавлен в карточку VEO. Можно запускать генерацию. ✨",
+        reply_markup=main_menu_kb(),
+    )
+
+
 configure_prompt_master(update_veo_card=show_or_update_veo_card)
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; data = (q.data or "").strip()
+    q = update.callback_query
+    if not q:
+        return
+    data = (q.data or "").strip()
     s = state(ctx)
+    message = q.message
+    chat = update.effective_chat
+    chat_id = None
+    if message is not None:
+        chat_id = message.chat_id
+    elif chat is not None:
+        chat_id = chat.id
+
+    if data == CB_MODE_CHAT:
+        if chat_id is not None:
+            _mode_set(chat_id, MODE_CHAT)
+        s["mode"] = None
+        await q.answer("Режим: Обычный чат")
+        if message is not None:
+            await q.edit_message_text(
+                "Режим переключён: теперь это обычный чат. Напишите сообщение.",
+                reply_markup=main_menu_kb(),
+            )
+        return
+
+    if data == CB_MODE_PM:
+        if chat_id is not None:
+            _mode_set(chat_id, MODE_PM)
+        s["mode"] = None
+        await q.answer("Режим: Prompt-Master")
+        if message is not None:
+            await q.edit_message_text(
+                "Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
+                reply_markup=main_menu_kb(),
+            )
+        return
+
+    if data.startswith(CB_PM_INSERT_VEO):
+        await handle_pm_insert_to_veo(update, ctx, data)
+        return
 
     if data in (PROMPT_MASTER_OPEN, PROMPT_MASTER_CANCEL):
         return
@@ -2700,26 +2862,31 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    s = state(ctx)
-    text = (update.message.text or "").strip()
-    mode = s.get("mode")
+    msg = update.message
+    if msg is None:
+        return
 
-    # PROMO
-    if mode == "promo":
+    s = state(ctx)
+    text = (msg.text or "").strip()
+    chat_id = msg.chat_id
+    state_mode = s.get("mode")
+    user_mode = _mode_get(chat_id) or MODE_CHAT
+
+    if state_mode == "promo":
         if not PROMO_ENABLED:
-            await update.message.reply_text("🎟️ Промокоды временно отключены.")
+            await msg.reply_text("🎟️ Промокоды временно отключены.")
             s["mode"] = None
             return
         code = text.upper()
         uid = update.effective_user.id
         bonus = promo_amount(code)
         if not bonus:
-            await update.message.reply_text("❌ Неверный промокод.")
+            await msg.reply_text("❌ Неверный промокод.")
             s["mode"] = None
             return
         used_by = promo_used_global(code)
         if used_by and used_by != uid:
-            await update.message.reply_text("❌ Этот промокод уже использован.")
+            await msg.reply_text("❌ Этот промокод уже использован.")
             s["mode"] = None
             return
         try:
@@ -2732,77 +2899,101 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _set_cached_balance(ctx, result.balance)
             if not result.applied:
                 if used_by == uid or result.duplicate:
-                    await update.message.reply_text("❌ Этот промокод уже использован.")
+                    await msg.reply_text("❌ Этот промокод уже использован.")
                 else:
-                    await update.message.reply_text("⚠️ Промокод сейчас недоступен. Попробуйте другой.")
+                    await msg.reply_text("⚠️ Промокод сейчас недоступен. Попробуйте другой.")
                 s["mode"] = None
                 return
         except Exception as exc:
             log.exception("Promo apply failed for %s (%s): %s", uid, code, exc)
-            await update.message.reply_text("⚠️ Не удалось применить промокод. Попробуйте позже.")
+            await msg.reply_text("⚠️ Не удалось применить промокод. Попробуйте позже.")
             s["mode"] = None
             return
 
         promo_mark_used(code, uid)
         get_user_balance_value(ctx, force_refresh=True)
-        await update.message.reply_text(
+        await msg.reply_text(
             f"✅ Промокод активирован! Вам начислено {bonus} токенов."
         )
         s["mode"] = None
         return
 
-    # Ссылка на картинку как текст
-    low = text.lower()
-    if low.startswith(("http://", "https://")) and any(low.split("?")[0].endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".heic")):
-        if mode == "banana":
-            if len(s["banana_images"]) >= 4:
-                await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
-            s["banana_images"].append(text.strip())
-            await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
-            await show_or_update_banana_card(update.effective_chat.id, ctx); return
-        s["last_image_url"] = text.strip()
-        await update.message.reply_text("🧷 Ссылка на изображение принята.")
-        if mode in ("veo_text_fast","veo_text_quality","veo_photo"):
-            await show_or_update_veo_card(update.effective_chat.id, ctx)
-        return
-
-    if mode == "chat":
-        if openai is None or not OPENAI_API_KEY:
-            await update.message.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY)."); return
-        try:
-            await update.message.reply_text("💬 Думаю над ответом…")
-            resp = await asyncio.to_thread(
-                openai.ChatCompletion.create,
-                model="gpt-4o-mini",
-                messages=[{"role":"system","content":"You are a helpful, concise assistant."},
-                          {"role":"user","content":text}],
-                temperature=0.5, max_tokens=700,
-            )
-            answer = resp["choices"][0]["message"]["content"].strip()
-            await update.message.reply_text(answer)
-        except Exception as e:
-            log.exception("Chat error: %s", e)
-            await update.message.reply_text("⚠️ Ошибка запроса к ChatGPT.")
-        return
-
-    if mode == "mj_txt":
+    if user_mode == MODE_PM:
         if not text:
-            await update.message.reply_text("⚠️ Отправьте текстовый промпт.")
+            await msg.reply_text("⚠️ Пришлите идею или сцену для Prompt-Master.")
+            return
+        from prompt_master import build_cinema_prompt
+
+        kino_prompt, _ = await build_cinema_prompt(text, user_lang=detect_lang(text))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎬 Вставить в VEO", callback_data=f"{CB_PM_INSERT_VEO}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=CB_MODE_CHAT)],
+        ])
+        await msg.reply_text(
+            f"🧠 Готово! Вот ваш кинопромпт:\n\n{kino_prompt}",
+            reply_markup=kb,
+        )
+        cache_pm_prompt(chat_id, kino_prompt)
+        return
+
+    low = text.lower()
+    if low.startswith(("http://", "https://")) and any(
+        low.split("?")[0].endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".heic")
+    ):
+        if state_mode == "banana":
+            if len(s["banana_images"]) >= 4:
+                await msg.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
+                return
+            s["banana_images"].append(text.strip())
+            await msg.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
+            await show_or_update_banana_card(chat_id, ctx)
+            return
+        s["last_image_url"] = text.strip()
+        await msg.reply_text("🧷 Ссылка на изображение принята.")
+        if state_mode in ("veo_text_fast", "veo_text_quality", "veo_photo"):
+            await show_or_update_veo_card(chat_id, ctx)
+        return
+
+    if state_mode == "mj_txt":
+        if not text:
+            await msg.reply_text("⚠️ Отправьте текстовый промпт.")
             return
         s["last_prompt"] = text
-        await show_mj_prompt_card(update.effective_chat.id, ctx)
-        await update.message.reply_text("📝 Промпт сохранён. Нажмите «Подтвердить».")
+        await show_mj_prompt_card(chat_id, ctx)
+        await msg.reply_text("📝 Промпт сохранён. Нажмите «Подтвердить».")
         return
 
-    if mode == "banana":
+    if state_mode == "banana":
         s["last_prompt"] = text
-        await update.message.reply_text("✍️ Промпт сохранён.")
-        await show_or_update_banana_card(update.effective_chat.id, ctx)
+        await msg.reply_text("✍️ Промпт сохранён.")
+        await show_or_update_banana_card(chat_id, ctx)
         return
 
-    # VEO по умолчанию: сохраняем prompt и мгновенно обновляем карточку
+    if state_mode in ("veo_text_fast", "veo_text_quality", "veo_photo"):
+        s["last_prompt"] = text
+        await show_or_update_veo_card(chat_id, ctx)
+        return
+
+    if user_mode == MODE_CHAT:
+        if not text:
+            await msg.reply_text("⚠️ Отправьте сообщение.")
+            return
+        if openai is None or not OPENAI_API_KEY:
+            await msg.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY).")
+            return
+        await msg.reply_text("💬 Думаю над ответом…")
+        try:
+            answer = await chatgpt_smalltalk(text, chat_id)
+        except Exception as exc:
+            log.exception("Chat error: %s", exc)
+            await msg.reply_text("⚠️ Ошибка запроса к ChatGPT.")
+            return
+        await msg.reply_text(answer, reply_markup=main_menu_kb())
+        return
+
+    # Если режим не распознан — по умолчанию обновляем карточку VEO
     s["last_prompt"] = text
-    await show_or_update_veo_card(update.effective_chat.id, ctx)
+    await show_or_update_veo_card(chat_id, ctx)
 
 async def _banana_run_and_send(
     chat_id: int,
