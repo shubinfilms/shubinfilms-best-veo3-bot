@@ -27,7 +27,10 @@ from telegram.ext import (
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 
-from handlers.prompt_master_handler import PROMPT_MASTER_HINT
+try:
+    from handlers.prompt_master_handler import prompt_master_conv
+except Exception:  # pragma: no cover - optional handler
+    prompt_master_conv = None
 from prompt_master import generate_prompt_master
 
 # === KIE Banana wrapper ===
@@ -111,6 +114,8 @@ PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
 DEV_MODE            = _env("DEV_MODE", "false").lower() == "true"
+
+PROMPT_MASTER_HINT = "Пришлите текст промпта. /cancel — выход."
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 try:
@@ -2731,7 +2736,11 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-    application.add_handler(prompt_master_conv, group=10)
+    try:
+        if prompt_master_conv:
+            application.add_handler(prompt_master_conv, group=10)
+    except Exception:
+        pass
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
