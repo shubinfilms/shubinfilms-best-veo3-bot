@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -31,39 +32,31 @@ except Exception:  # pragma: no cover - fallback to legacy SDK
 
 
 SYSTEM_PROMPT = """You are Prompt-Master 2.0 — a creative cinematic prompt writer.
-GOALS:
+TASK:
 - Keep the user's core idea intact.
-- Transform it into a premium, cinematic, hyper-realistic breakdown.
-- Absolutely avoid "TV/news" tone. Be modern, stylish, emotional, yet plausible.
-- Shots must be clean, realistic, smooth; avoid artifacts or broken logic.
-- No subtitles, no on-screen text, no logos unless explicitly requested.
+- Deliver cinematic, premium, hyper-realistic descriptions.
+- No TV/news vibe. Be modern, stylish, emotional, yet plausible.
+- Respect any explicit technical hints (camera, format, speed).
+- No subtitles, on-screen text or logos unless explicitly requested.
 
-LANGUAGE & VOICE:
-- If the user writes in Russian or asks for Russian voice-over — keep Russian voiceover with natural emotionality (not a radio anchor).
-- If language is English — keep English voiceover.
-- If voice/voiceover is mentioned, include a concise 🎙 Озвучка/Voice block with language, character, emotion.
-- If not mentioned, omit the voice block.
+LANGUAGE:
+- Detect whether the user idea is Russian or English.
+- Respond in that language only (section titles + content).
+- Never mix languages. No emojis.
 
-MUSIC:
-- If music is requested or implied, propose modern genres fitting the mood (hip-hop, ambient, cinematic score, electronic, atmospheric) — never "TV bed".
+OUTPUT STRICTLY AS JSON with keys:
+{
+  "scene": "...",
+  "camera": "...",
+  "action": "...",
+  "dialogue": "...",
+  "atmosphere": "...",
+  "lighting": "...",
+  "wardrobe_props": "...",
+  "framing": "..."
+}
 
-TECH:
-- Detect technical camera hints in the user text (e.g., 85mm prime, shallow DOF, drone shot, handheld, FPV, timelapse/real-time, anamorphic).
-- Normalize them into the 🎥 Camera block. Respect real-time vs slow-mo if explicitly requested.
-
-OUTPUT FORMAT (strict):
-- 🎬 Сцена: ...
-- 🎭 Действие: ...
-- 🌌 Атмосфера: ...
-- 🎥 Камера: ...   (lens, movement, framing, speed)
-- 💡 Свет: ...
-- 🌍 Окружение: ...
-- 🔊 Звук/Музыка: ...   (modern styles only, if relevant)
-- 🎙 Озвучка: ...       (only if requested or clearly implied)
-- 🎨 Стиль: ...
-- 📝 Текст/субтитры: ... (usually "нет"/"none")
-
-Keep it under ~2200 characters unless the user explicitly asks for long form.
+Each value must be a concise paragraph (<= 260 chars) with rich cinematic detail. Mention sound/voice only if user clearly implies dialogue or voiceover. Keep authenticity and realism.
 """
 
 
@@ -162,33 +155,108 @@ def _build_user_instruction(
         lines.append(f"- Camera technical hints to respect: {cams}")
     return "\n".join(lines)
 
+SECTION_ORDER = [
+    "scene",
+    "camera",
+    "action",
+    "dialogue",
+    "atmosphere",
+    "lighting",
+    "wardrobe_props",
+    "framing",
+]
 
-def _fallback_prompt(raw_text: str, lang: str) -> str:
+
+SECTION_LABELS = {
+    "ru": {
+        "scene": "Сцена",
+        "camera": "Камера",
+        "action": "Действие",
+        "dialogue": "Диалог",
+        "atmosphere": "Атмосфера",
+        "lighting": "Свет",
+        "wardrobe_props": "Костюмы и реквизит",
+        "framing": "Кадрирование",
+    },
+    "en": {
+        "scene": "Scene",
+        "camera": "Camera",
+        "action": "Action",
+        "dialogue": "Dialogue",
+        "atmosphere": "Atmosphere",
+        "lighting": "Lighting",
+        "wardrobe_props": "Wardrobe/props",
+        "framing": "Framing",
+    },
+}
+
+
+def _clean_value(value: str) -> str:
+    return value.replace("```", "``\`").strip()
+
+
+def _fallback_sections(raw_text: str, lang: str) -> Dict[str, str]:
     snippet = raw_text.strip()
     if len(snippet) > 180:
         snippet = snippet[:180].rstrip() + "…"
-    voice_line = (
-        "🎙 Озвучка: русский, тёплый, живой"
-        if lang == "ru"
-        else "🎙 Voice: English, warm, natural"
-    )
-    return (
-        f"🎬 Сцена: {snippet}\n"
-        "🎭 Действие: Плавные, реалистичные, без артефактов.\n"
-        "🌌 Атмосфера: Современная, эмоциональная, кинематографичная.\n"
-        "🎥 Камера: 85mm prime, shallow DOF, плавные панорамы.\n"
-        "💡 Свет: Мягкий, объёмный, с аккуратными бликами.\n"
-        "🌍 Окружение: Детально, но без перегруза, фокус на главном.\n"
-        "🔊 Звук/Музыка: Современная подача (ambient/hip-hop/cinematic), без TV-подложки.\n"
-        f"{voice_line}\n"
-        "🎨 Стиль: Премиальный, гиперреалистичный, рекламный.\n"
-        "📝 Текст/субтитры: нет\n"
-    )
+
+    if lang == "ru":
+        return {
+            "scene": snippet or "Коротко опишите ключевые персонажи и место действия.",
+            "camera": "85 мм, плавные панорамы, лёгкий хэндхелд для живости.",
+            "action": "Реалистичное, пластичное движение без артефактов.",
+            "dialogue": "Естественные реплики в тон сцены; при отсутствии диалогов — сделать акцент на эмоциях героев.",
+            "atmosphere": "Современное кинематографичное настроение с вниманием к деталям.",
+            "lighting": "Мягкий объёмный свет, акцентирующий лица и фактуру.",
+            "wardrobe_props": "Стильные костюмы и реквизит, поддерживающие идею.",
+            "framing": "Комбинация средних и крупных планов, аккуратные движения камеры.",
+        }
+
+    return {
+        "scene": snippet or "Outline the key characters and location succinctly.",
+        "camera": "85mm lens feel, smooth pans, subtle handheld for realism.",
+        "action": "Grounded, fluid motion with natural pacing and clean choreography.",
+        "dialogue": "Conversational lines that match the tone; if none, highlight emotional beats.",
+        "atmosphere": "Modern cinematic mood with polished yet believable detail.",
+        "lighting": "Soft volumetric lighting that sculpts faces and textures.",
+        "wardrobe_props": "Stylish wardrobe and props reinforcing the concept.",
+        "framing": "Mix of medium and close shots with deliberate camera moves.",
+    }
 
 
-async def _ask_openai(system_prompt: str, user_prompt: str, lang: str, raw_text: str) -> str:
+def _format_sections(sections: Dict[str, str], lang: str) -> str:
+    labels = SECTION_LABELS["ru" if lang == "ru" else "en"]
+    defaults = _fallback_sections("", lang)
+    lines = []
+    for key in SECTION_ORDER:
+        value = sections.get(key, "").strip()
+        if not value:
+            value = defaults[key]
+        lines.append(f"{labels[key]}: {_clean_value(value)}")
+    return "\n".join(lines)
+
+
+def _parse_sections(text: str) -> Optional[Dict[str, str]]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    sections: Dict[str, str] = {}
+    for key in SECTION_ORDER:
+        value = data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            value = str(value)
+        sections[key] = value.strip()
+    return sections if sections else None
+
+
+async def _ask_openai(system_prompt: str, user_prompt: str, lang: str, raw_text: str) -> Dict[str, str]:
     if _client is None:
-        return _fallback_prompt(raw_text, lang)
+        return _fallback_sections(raw_text, lang)
 
     def _call_sync() -> str:
         if _USE_NEW_CLIENT:
@@ -213,10 +281,16 @@ async def _ask_openai(system_prompt: str, user_prompt: str, lang: str, raw_text:
         return (response["choices"][0]["message"]["content"] or "").strip()
 
     try:
-        return await asyncio.to_thread(_call_sync)
+        raw = await asyncio.to_thread(_call_sync)
     except Exception:  # pragma: no cover - network issues fallback
         LOGGER.exception("Prompt-Master LLM call failed")
-        return _fallback_prompt(raw_text, lang)
+        return _fallback_sections(raw_text, lang)
+
+    sections = _parse_sections(raw)
+    if not sections:
+        LOGGER.warning("Prompt-Master response is not valid JSON")
+        return _fallback_sections(raw_text, lang)
+    return sections
 
 
 async def call_llm_to_make_kino_prompt(
@@ -233,7 +307,8 @@ async def call_llm_to_make_kino_prompt(
     m_req = music_requested if music_requested is not None else _music_req(text)
     cams = camera_hints if camera_hints is not None else _cam_tokens(text)
     user_prompt = _build_user_instruction(text, lang, v_req, m_req, cams)
-    return await _ask_openai(SYSTEM_PROMPT, user_prompt, lang, text)
+    sections = await _ask_openai(SYSTEM_PROMPT, user_prompt, lang, text)
+    return _format_sections(sections, lang)
 
 
 async def build_cinema_prompt(user_text: str, user_lang: str = "ru") -> Tuple[str, Dict[str, Any]]:
