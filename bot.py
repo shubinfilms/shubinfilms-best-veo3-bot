@@ -9,7 +9,7 @@
 import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, html
 from pathlib import Path
 # main
-from typing import Dict, Any, Optional, List, Tuple, Callable
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse
@@ -50,7 +50,12 @@ from kie_banana import (
 
 import redis
 
-from ui_helpers import upsert_card, refresh_balance_card_if_open, show_referral_card
+from ui_helpers import (
+    upsert_card,
+    refresh_balance_card_if_open,
+    refresh_suno_card,
+    show_referral_card,
+)
 
 from redis_utils import (
     credit,
@@ -124,6 +129,15 @@ def _env(k: str, d: str = "") -> str:
     v = os.getenv(k)
     return (v if v is not None else d).strip()
 
+def _env_int(k: str, default: int) -> int:
+    raw = _env(k, str(default))
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
 def _normalize_endpoint_values(*values: Any) -> List[str]:
     """Collect endpoint path candidates from strings / iterables."""
 
@@ -154,6 +168,15 @@ def _normalize_endpoint_values(*values: Any) -> List[str]:
     for v in values:
         _add(v)
     return result
+
+SUNO_API_KEY = _env("SUNO_API_KEY")
+KIE_SUNO_BASE = _env("KIE_SUNO_BASE")
+SUNO_MODEL = _env("SUNO_MODEL", "suno-v5") or "suno-v5"
+SUNO_PRICE = _env_int("SUNO_PRICE", 30)
+SUNO_GENERATE_PATH = _env("SUNO_GENERATE_PATH", "/generate-music")
+SUNO_DETAILS_PATH = _env("SUNO_DETAILS_PATH", "/get-music-details")
+SUNO_POLL_INTERVAL = 3.0
+SUNO_POLL_TIMEOUT = 120.0
 
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
@@ -377,6 +400,7 @@ PRICE_BANANA = 5
 PRICE_VEO_FAST = 50
 PRICE_VEO_QUALITY = 150
 PRICE_VEO_ANIMATE = 50
+PRICE_SUNO = SUNO_PRICE
 
 TOKEN_COSTS = {
     "veo_fast": PRICE_VEO_FAST,
@@ -384,6 +408,7 @@ TOKEN_COSTS = {
     "veo_photo": PRICE_VEO_ANIMATE,
     "mj": PRICE_MJ,          # 16:9 или 9:16
     "banana": PRICE_BANANA,
+    "suno": PRICE_SUNO,
     "chat": 0,
 }
 CHAT_UNLOCK_PRICE = 0
@@ -697,6 +722,32 @@ def join_url(base: str, path: str) -> str:
     u = f"{base.rstrip('/')}/{path.lstrip('/')}"
     return u.replace("://", "§§").replace("//", "/").replace("§§", "://")
 
+
+async def _send_with_retry(func: Callable[[], Awaitable[Any]], *, attempts: int = 3):
+    delay = 0.0
+    for attempt in range(attempts):
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            return await func()
+        except RetryAfter as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            try:
+                delay = float(retry_after) if retry_after is not None else 3.0
+            except (TypeError, ValueError):
+                delay = 3.0
+            if delay <= 0:
+                delay = 3.0
+            continue
+        except Forbidden as exc:
+            log.warning("Telegram send forbidden: %s", exc)
+            return None
+        except BadRequest as exc:
+            log.warning("Telegram send bad request: %s", exc)
+            return None
+    return None
+
+
 def _kie_auth_header() -> Dict[str, str]:
     tok = (KIE_API_KEY or "").strip()
     if tok and not tok.lower().startswith("bearer "):
@@ -975,6 +1026,7 @@ DEFAULT_STATE = {
     "last_ui_msg_id_menu": None,
     "last_ui_msg_id_balance": None,
     "last_ui_msg_id_veo": None, "last_ui_msg_id_banana": None, "last_ui_msg_id_mj": None,
+    "last_ui_msg_id_suno": None,
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
     "mj_generating": False, "last_mj_task_id": None,
@@ -984,8 +1036,18 @@ DEFAULT_STATE = {
     "_last_text_veo": None,
     "_last_text_banana": None,
     "_last_text_mj": None,
+    "_last_text_suno": None,
     "msg_ids": {},
     "last_panel": None,
+    "suno_title": None,
+    "suno_style": None,
+    "suno_lyrics": None,
+    "suno_instrumental": True,
+    "suno_waiting_field": None,
+    "suno_generating": False,
+    "suno_last_task_id": None,
+    "suno_last_params": None,
+    "suno_balance": None,
 }
 
 
@@ -1150,6 +1212,7 @@ WELCOME = (
 
 MENU_BTN_VIDEO = "🎬 ГЕНЕРАЦИЯ ВИДЕО"
 MENU_BTN_IMAGE = "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"
+MENU_BTN_SUNO = "🎵 Генерация музыки (Suno)"
 MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
@@ -1179,6 +1242,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(MENU_BTN_VIDEO)],
         [KeyboardButton(MENU_BTN_IMAGE)],
+        [KeyboardButton(MENU_BTN_SUNO)],
         [KeyboardButton(MENU_BTN_PM)],
         [KeyboardButton(MENU_BTN_CHAT)],
         [KeyboardButton(MENU_BTN_BALANCE)],
@@ -1622,6 +1686,440 @@ def banana_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+# --------- Suno Helpers ----------
+
+
+class SunoConfigError(RuntimeError):
+    pass
+
+
+class SunoApiError(RuntimeError):
+    def __init__(self, message: str, *, status: Optional[int] = None, payload: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.status = status
+        self.payload = payload or {}
+
+
+def _suno_configured() -> bool:
+    return bool(SUNO_API_KEY and KIE_SUNO_BASE)
+
+
+def _suno_headers() -> Dict[str, str]:
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    token = (SUNO_API_KEY or "").strip()
+    if token and not token.lower().startswith("bearer"):
+        token = f"Bearer {token}"
+    if token:
+        headers["Authorization"] = token
+    return headers
+
+
+async def _suno_request(
+    method: str,
+    path: str,
+    *,
+    json_payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 40.0,
+) -> Dict[str, Any]:
+    if not _suno_configured():
+        raise SunoConfigError("Suno API is not configured")
+
+    url = join_url(KIE_SUNO_BASE, path)
+    headers = _suno_headers()
+    if method.upper() in {"POST", "PUT", "PATCH"}:
+        headers.setdefault("Content-Type", "application/json")
+
+    timeout_cfg = ClientTimeout(total=timeout)
+    attempt = 0
+
+    async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+        while True:
+            attempt += 1
+            try:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    json=json_payload,
+                    params=params,
+                ) as resp:
+                    text_payload = await resp.text()
+                    if resp.status == 429 and attempt < 6:
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            delay = float(retry_after) if retry_after else SUNO_POLL_INTERVAL
+                        except (TypeError, ValueError):
+                            delay = SUNO_POLL_INTERVAL
+                        await asyncio.sleep(max(delay, 1.0))
+                        continue
+
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = {"raw": text_payload} if text_payload else {}
+
+                    if resp.status >= 400:
+                        raise SunoApiError(
+                            f"Suno API error: {resp.status}",
+                            status=resp.status,
+                            payload=data if isinstance(data, dict) else {"raw": text_payload},
+                        )
+
+                    if isinstance(data, dict):
+                        return data
+                    raise SunoApiError(
+                        "Unexpected response payload",
+                        status=resp.status,
+                        payload={"raw": data},
+                    )
+            except aiohttp.ClientError as exc:
+                if attempt >= 5:
+                    raise SunoApiError("Network error", payload={"error": str(exc)}) from exc
+                await asyncio.sleep(min(2.0 * attempt, 10.0))
+
+
+async def suno_create_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await _suno_request("POST", SUNO_GENERATE_PATH, json_payload=payload, timeout=40.0)
+
+
+async def suno_get_details(task_id: str) -> Dict[str, Any]:
+    return await _suno_request("GET", SUNO_DETAILS_PATH, params={"task_id": task_id}, timeout=40.0)
+
+
+def _suno_collect_params(state_obj: Dict[str, Any]) -> Dict[str, Any]:
+    title = (state_obj.get("suno_title") or "").strip()
+    style = (state_obj.get("suno_style") or "").strip()
+    lyrics = state_obj.get("suno_lyrics") or ""
+    instrumental = bool(state_obj.get("suno_instrumental", True))
+    return {
+        "title": title,
+        "style": style,
+        "lyrics": lyrics,
+        "instrumental": instrumental,
+    }
+
+
+def _suno_result_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔁 Повторить", callback_data="suno:repeat")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
+        ]
+    )
+
+
+async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_balance: bool = True) -> None:
+    s = state(ctx)
+    s["suno_waiting_field"] = None
+    if not _suno_configured():
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "⚠️ Suno API не настроен. Обратитесь к поддержке.",
+        )
+        return
+    if refresh_balance:
+        uid = get_user_id(ctx) or chat_id
+        if uid:
+            s["suno_balance"] = _safe_get_balance(int(uid))
+    s["mode"] = "suno"
+    s.setdefault("suno_instrumental", True)
+    s["_last_text_suno"] = None
+    await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+
+
+async def _suno_notify(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    *,
+    reply_to: Optional["telegram.Message"] = None,
+    parse_mode: Optional[ParseMode] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    if reply_to is not None:
+        await _send_with_retry(
+            lambda: reply_to.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        )
+    else:
+        await _send_with_retry(
+            lambda: ctx.bot.send_message(
+                chat_id,
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        )
+
+
+async def _launch_suno_generation(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    params: Dict[str, Any],
+    user_id: Optional[int],
+    reply_to: Optional["telegram.Message"],
+    trigger: str,
+) -> None:
+    s = state(ctx)
+    if s.get("suno_generating"):
+        await _suno_notify(ctx, chat_id, "⏳ Уже идёт генерация Suno — дождитесь завершения.", reply_to=reply_to)
+        return
+
+    if not _suno_configured():
+        await _suno_notify(ctx, chat_id, "⚠️ Suno API не настроен. Обратитесь к поддержке.", reply_to=reply_to)
+        return
+
+    if not user_id:
+        await _suno_notify(ctx, chat_id, "⚠️ Не удалось определить пользователя.", reply_to=reply_to)
+        return
+
+    try:
+        ensure_user(user_id)
+    except Exception as exc:
+        log.exception("Suno ensure_user failed | user=%s err=%s", user_id, exc)
+        await _suno_notify(ctx, chat_id, "⚠️ Ошибка доступа к балансу. Попробуйте позже.", reply_to=reply_to)
+        return
+
+    current_balance = _safe_get_balance(user_id)
+    if current_balance < PRICE_SUNO:
+        await show_balance_notification(
+            chat_id,
+            ctx,
+            user_id,
+            f"🙇 Недостаточно токенов. Нужно: {PRICE_SUNO}💎, у вас: {current_balance}💎.",
+            reply_markup=inline_topup_keyboard(),
+        )
+        return
+
+    payload: Dict[str, Any] = {
+        "model": SUNO_MODEL,
+        "instrumental": bool(params.get("instrumental", True)),
+    }
+    title = (params.get("title") or "").strip()
+    style = (params.get("style") or "").strip()
+    lyrics = params.get("lyrics") or ""
+
+    if title:
+        payload["title"] = title
+    if style:
+        payload["style"] = style
+    if not payload["instrumental"] and lyrics:
+        payload["lyrics"] = lyrics
+
+    try:
+        response = await suno_create_task(payload)
+    except SunoConfigError as exc:
+        log.warning("Suno config error: %s", exc)
+        await _suno_notify(ctx, chat_id, "⚠️ Suno API недоступен.", reply_to=reply_to)
+        return
+    except SunoApiError as exc:
+        log.warning("Suno create failed | status=%s payload=%s", exc.status, exc.payload)
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "❌ Не удалось создать задачу Suno. Попробуйте позже.",
+            reply_to=reply_to,
+        )
+        return
+    except Exception as exc:
+        log.exception("Suno create crashed: %s", exc)
+        await _suno_notify(ctx, chat_id, "❌ Не удалось связаться с Suno. Попробуйте позже.", reply_to=reply_to)
+        return
+
+    task_id = str(response.get("task_id") or "").strip()
+    if not task_id:
+        log.warning("Suno create response missing task_id | resp=%s", response)
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "❌ Suno вернул некорректный ответ без task_id.",
+            reply_to=reply_to,
+        )
+        return
+
+    meta = {
+        "task_id": task_id,
+        "model": SUNO_MODEL,
+        "instrumental": bool(payload.get("instrumental", True)),
+        "has_lyrics": bool(payload.get("lyrics")),
+        "title": title,
+        "style": style,
+        "trigger": trigger,
+    }
+
+    ok, new_balance = debit_try(user_id, PRICE_SUNO, "suno:start", meta=meta)
+    if not ok:
+        balance_after = new_balance if isinstance(new_balance, int) else current_balance
+        await show_balance_notification(
+            chat_id,
+            ctx,
+            user_id,
+            f"🙇 Недостаточно токенов. Нужно: {PRICE_SUNO}💎, у вас: {balance_after}💎.",
+            reply_markup=inline_topup_keyboard(),
+        )
+        return
+
+    s["suno_generating"] = True
+    s["suno_last_task_id"] = task_id
+    s["suno_last_params"] = {
+        "title": title,
+        "style": style,
+        "lyrics": lyrics,
+        "instrumental": bool(payload.get("instrumental", True)),
+    }
+    s["suno_balance"] = new_balance
+    s["_last_text_suno"] = None
+    s["suno_waiting_field"] = None
+
+    await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+    await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
+
+    await _suno_notify(
+        ctx,
+        chat_id,
+        f"🎧 Задача создана: {task_id}. Жду результат…",
+        reply_to=reply_to,
+    )
+
+    asyncio.create_task(
+        _poll_suno_and_send(
+            chat_id,
+            ctx,
+            user_id,
+            task_id,
+            s["suno_last_params"],
+            meta,
+        )
+    )
+
+
+async def _poll_suno_and_send(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    task_id: str,
+    params: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> None:
+    start_time = time.monotonic()
+    refunded = False
+
+    async def _refund(reason: str, error_text: str) -> None:
+        nonlocal refunded
+        refunded = True
+        meta_with_error = dict(meta)
+        if error_text:
+            meta_with_error["error"] = error_text
+        refund_reason = f"suno:refund:{reason}"
+        try:
+            new_balance = credit_balance(user_id, PRICE_SUNO, refund_reason, meta=meta_with_error)
+        except Exception as exc:
+            log.exception("Suno refund failed | task=%s reason=%s err=%s", task_id, reason, exc)
+            new_balance = None
+
+        s = state(ctx)
+        if isinstance(new_balance, int):
+            s["suno_balance"] = new_balance
+        s["_last_text_suno"] = None
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
+
+        balance_display = (
+            new_balance
+            if isinstance(new_balance, int)
+            else _safe_get_balance(user_id)
+        )
+        reason_text = ""
+        if error_text and error_text not in {"", "timeout", "poll_timeout"}:
+            reason_text = f" Причина: {error_text}."
+        await _suno_notify(
+            ctx,
+            chat_id,
+            f"❌ Suno не смог завершить задачу.{reason_text} Баланс: {balance_display}💎.",
+            reply_markup=_suno_result_keyboard(),
+        )
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed > SUNO_POLL_TIMEOUT:
+                await _refund("timeout", "poll_timeout")
+                return
+
+            try:
+                details = await suno_get_details(task_id)
+            except SunoApiError as exc:
+                log.warning("Suno status error | task=%s status=%s payload=%s", task_id, exc.status, exc.payload)
+                await asyncio.sleep(SUNO_POLL_INTERVAL)
+                continue
+            except Exception as exc:
+                log.exception("Suno status crash | task=%s err=%s", task_id, exc)
+                await asyncio.sleep(SUNO_POLL_INTERVAL)
+                continue
+
+            status = (details.get("status") or "").lower()
+            if status == "succeeded":
+                audio_url = details.get("audio_url") or ""
+                if not audio_url:
+                    await _refund("error", "missing_audio_url")
+                    return
+
+                title = details.get("title") or params.get("title") or "Без названия"
+                style = details.get("style") or params.get("style") or "—"
+                current_balance = _safe_get_balance(user_id)
+
+                caption = (
+                    f"🎵 {html.escape(title)}\n"
+                    f"Стиль: {html.escape(style)}\n"
+                    "Модель: Suno V5\n"
+                    f"Списано: {PRICE_SUNO}💎\n"
+                    f"Баланс: {current_balance}💎"
+                )
+
+                keyboard = _suno_result_keyboard()
+
+                await _send_with_retry(
+                    lambda: ctx.bot.send_audio(
+                        chat_id,
+                        audio=audio_url,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                    ),
+                    attempts=4,
+                )
+
+                s = state(ctx)
+                s["suno_generating"] = False
+                s["suno_last_task_id"] = None
+                s["suno_balance"] = current_balance
+                s["_last_text_suno"] = None
+                await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+                await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
+                return
+
+            if status in {"failed", "timeout"}:
+                await _refund("timeout" if status == "timeout" else "error", details.get("error") or status)
+                return
+
+            await asyncio.sleep(SUNO_POLL_INTERVAL)
+
+    except Exception as exc:
+        log.exception("Suno poll unexpected failure | task=%s err=%s", task_id, exc)
+        await _refund("error", str(exc))
+    finally:
+        if not refunded:
+            s = state(ctx)
+            if s.get("suno_last_task_id") == task_id:
+                s["suno_last_task_id"] = None
+            s["suno_generating"] = False
+            s["_last_text_suno"] = None
+            await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+
 
 # --------- VEO Card ----------
 def veo_card_text(s: Dict[str, Any]) -> str:
@@ -2970,6 +3468,25 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(chat_id, ctx)
 
 
+async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
+    message = update.effective_message
+    chat = update.effective_chat
+    if chat is None:
+        return
+
+    if not _suno_configured():
+        await _suno_notify(
+            ctx,
+            chat.id,
+            "⚠️ Suno API не настроен. Обратитесь к поддержке.",
+            reply_to=message,
+        )
+        return
+
+    await suno_entry(chat.id, ctx)
+
+
 async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     message = update.effective_message
@@ -3844,6 +4361,88 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             );
             return
 
+    if data.startswith("suno:"):
+        parts = data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        argument = parts[2] if len(parts) > 2 else ""
+        chat = update.effective_chat
+        chat_id = chat.id if chat else None
+        user = update.effective_user
+        uid = user.id if user else None
+        s["mode"] = "suno"
+
+        if action == "edit":
+            field = argument
+            if field not in {"title", "style", "lyrics"}:
+                await q.answer("Недоступное поле", show_alert=True)
+                return
+            s["suno_waiting_field"] = field
+            prompts = {
+                "title": "Введите название трека. Для очистки отправьте «-». Отмена — /cancel.",
+                "style": "Опишите стиль музыки. Для очистки отправьте «-». Отмена — /cancel.",
+                "lyrics": "Пришлите текст песни (8–16 строк). Для очистки отправьте «-». Отмена — /cancel.",
+            }
+            msg_text = prompts.get(field, "Введите значение.")
+            await q.answer()
+            target_chat = chat_id
+            if target_chat is None and q.message is not None:
+                target_chat = q.message.chat_id
+            if target_chat is None and uid is not None:
+                target_chat = uid
+            if target_chat is None:
+                await q.answer("Нет чата", show_alert=True)
+                return
+            await _suno_notify(ctx, target_chat, msg_text, reply_to=q.message)
+            return
+
+        if action == "toggle" and argument == "instrumental":
+            new_value = not bool(s.get("suno_instrumental", True))
+            s["suno_instrumental"] = new_value
+            s["suno_waiting_field"] = None
+            s["_last_text_suno"] = None
+            if chat_id is not None:
+                await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+            await q.answer("Режим: " + ("Инструментал" if new_value else "Со словами"))
+            return
+
+        if action == "start":
+            if chat_id is None:
+                await q.answer("Нет чата", show_alert=True)
+                return
+            await q.answer()
+            params = _suno_collect_params(s)
+            await _launch_suno_generation(
+                chat_id,
+                ctx,
+                params=params,
+                user_id=uid,
+                reply_to=q.message,
+                trigger="start",
+            )
+            return
+
+        if action == "repeat":
+            if chat_id is None:
+                await q.answer("Нет чата", show_alert=True)
+                return
+            params = s.get("suno_last_params")
+            if not isinstance(params, dict) or not params:
+                await q.answer("Нет предыдущих параметров", show_alert=True)
+                return
+            await q.answer()
+            await _launch_suno_generation(
+                chat_id,
+                ctx,
+                params=params,
+                user_id=uid,
+                reply_to=q.message,
+                trigger="repeat",
+            )
+            return
+
+        await q.answer()
+        return
+
     # -------- VEO card actions --------
     if data.startswith("veo:set_ar:"):
         s["aspect"] = "9:16" if data.endswith("9:16") else "16:9"
@@ -3996,10 +4595,42 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     s = state(ctx)
-    text = (msg.text or "").strip()
+    raw_text = msg.text or ""
+    text = raw_text.strip()
     chat_id = msg.chat_id
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
+
+    waiting_field = s.get("suno_waiting_field")
+    if waiting_field:
+        lowered = text.lower()
+        if lowered == "/cancel":
+            s["suno_waiting_field"] = None
+            await msg.reply_text("✏️ Изменение отменено.")
+            return
+
+        clear_requested = text in {"-", "—"}
+        updated_message = "Обновлено."
+        if waiting_field == "title":
+            new_value = "" if clear_requested else text
+            s["suno_title"] = new_value or None
+            updated_message = "Название обновлено." if new_value else "Название очищено."
+        elif waiting_field == "style":
+            new_value = "" if clear_requested else text
+            s["suno_style"] = new_value or None
+            updated_message = "Стиль обновлён." if new_value else "Стиль очищен."
+        elif waiting_field == "lyrics":
+            new_value = "" if clear_requested else raw_text.strip()
+            s["suno_lyrics"] = new_value or None
+            updated_message = "Текст песни обновлён." if new_value else "Текст песни очищен."
+        else:
+            new_value = text
+
+        s["suno_waiting_field"] = None
+        s["_last_text_suno"] = None
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await _send_with_retry(lambda: msg.reply_text(updated_message))
+        return
 
     if text == MENU_BTN_VIDEO:
         s["mode"] = None
@@ -4009,6 +4640,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == MENU_BTN_IMAGE:
         s["mode"] = None
         await msg.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
+        return
+
+    if text == MENU_BTN_SUNO:
+        await suno_entry(chat_id, ctx)
         return
 
     if text == MENU_BTN_BALANCE:
@@ -4859,6 +5494,7 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("buy", buy_command))
     application.add_handler(CommandHandler("video", video_command))
     application.add_handler(CommandHandler("image", image_command))
+    application.add_handler(CommandHandler("suno", suno_command))
     application.add_handler(CommandHandler("lang", lang_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("faq", faq_command))
