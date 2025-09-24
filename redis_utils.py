@@ -371,3 +371,27 @@ def debit_try(
                 return True, new_balance
         except redis.WatchError:
             continue
+
+
+def debit_balance(user_id: int, amount: int, reason: Optional[str] = None) -> int:
+    """Debit ``amount`` from ``user_id`` balance and return the new balance."""
+
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
+
+    ensure_user(user_id)
+    ok, new_balance = debit_try(user_id, amount, reason or "debit")
+    if not ok:
+        raise RuntimeError(
+            f"insufficient balance for user {user_id}: need {amount}, have {new_balance}"
+        )
+    return new_balance
+
+
+def credit_balance(user_id: int, amount: int, reason: Optional[str] = None) -> int:
+    """Credit ``amount`` to ``user_id`` balance and return the new balance."""
+
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
+
+    return credit(user_id, amount, reason or "credit")
