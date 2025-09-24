@@ -21,6 +21,14 @@ KIE_MJ_GENERATE=/api/v1/mj/generate
 KIE_MJ_STATUS=/api/v1/mj/recordInfo
 KIE_BANANA_MODEL=google/nano-banana-edit
 
+# Suno API
+SUNO_ENABLED=true
+SUNO_API_URL=https://api.kie.ai/suno-api
+SUNO_GEN_PATH=/api/v1/generate
+SUNO_STATUS_PATH=/api/v1/generate/record-info
+SUNO_EXTEND_PATH=/api/v1/generate/extend
+SUNO_LYRICS_PATH=/api/v1/lyrics
+
 # Дополнительные KIE настройки (опционально)
 KIE_ENABLE_FALLBACK=false         # true только если надо включать fallback при 16:9
 KIE_DEFAULT_SEED=                 # опционально: число 10000–99999

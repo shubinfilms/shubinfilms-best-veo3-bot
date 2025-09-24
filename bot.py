@@ -174,6 +174,8 @@ class SunoConfig:
     base: str
     gen_path: str
     status_path: str
+    extend_path: str
+    lyrics_path: str
     model: str
     price: int
     timeout_sec: int
@@ -204,8 +206,16 @@ def _compose_suno_url(base: str, path: str) -> str:
 
 def _load_suno_config() -> SunoConfig:
     base = (_env("SUNO_API_URL", "https://api.kie.ai/suno-api") or "https://api.kie.ai/suno-api").strip().rstrip("/")
-    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/generate-music"), "/generate-music")
-    status_path = _normalize_suno_path(_env("SUNO_STATUS_PATH", "/record-info"), "/record-info")
+    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/api/v1/generate"), "/api/v1/generate")
+    status_path = _normalize_suno_path(
+        _env("SUNO_STATUS_PATH", "/api/v1/generate/record-info"),
+        "/api/v1/generate/record-info",
+    )
+    extend_path = _normalize_suno_path(
+        _env("SUNO_EXTEND_PATH", "/api/v1/generate/extend"),
+        "/api/v1/generate/extend",
+    )
+    lyrics_path = _normalize_suno_path(_env("SUNO_LYRICS_PATH", "/api/v1/lyrics"), "/api/v1/lyrics")
     model = (_env("SUNO_MODEL", "V5") or "V5").strip() or "V5"
     price = _env_int("SUNO_PRICE", 30)
     timeout_sec = _env_int("SUNO_TIMEOUT_SEC", 180)
@@ -215,6 +225,8 @@ def _load_suno_config() -> SunoConfig:
         base=base,
         gen_path=gen_path,
         status_path=status_path,
+        extend_path=extend_path,
+        lyrics_path=lyrics_path,
         model=model,
         price=price,
         timeout_sec=timeout_sec,
@@ -229,8 +241,12 @@ SUNO_MODEL_LABEL = SUNO_MODEL
 SUNO_BASE_URL = SUNO_CONFIG.base or "https://api.kie.ai/suno-api"
 SUNO_GEN_PATH = SUNO_CONFIG.gen_path
 SUNO_STATUS_PATH = SUNO_CONFIG.status_path
+SUNO_EXTEND_PATH = SUNO_CONFIG.extend_path
+SUNO_LYRICS_PATH = SUNO_CONFIG.lyrics_path
 SUNO_GEN_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_GEN_PATH)
 SUNO_STATUS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_STATUS_PATH)
+SUNO_EXTEND_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_EXTEND_PATH)
+SUNO_LYRICS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_LYRICS_PATH)
 SUNO_PRICE = SUNO_CONFIG.price
 SUNO_POLL_INTERVAL = 3.0
 SUNO_POLL_TIMEOUT = float(SUNO_CONFIG.timeout_sec)
@@ -1983,6 +1999,32 @@ async def suno_poll_task(task_id: str, *, user_id: Optional[int]) -> Dict[str, A
     )
 
 
+async def suno_extend_track(payload: Dict[str, Any], *, user_id: Optional[int]) -> Dict[str, Any]:
+    timeout = float(SUNO_CONFIG.timeout_sec or 60)
+    return await _suno_request(
+        "POST",
+        SUNO_CONFIG.extend_path,
+        json_payload=payload,
+        params=None,
+        timeout=timeout,
+        log_user_id=user_id,
+        log_phase="extend",
+    )
+
+
+async def suno_generate_lyrics(payload: Dict[str, Any], *, user_id: Optional[int]) -> Dict[str, Any]:
+    timeout = float(SUNO_CONFIG.timeout_sec or 60)
+    return await _suno_request(
+        "POST",
+        SUNO_CONFIG.lyrics_path,
+        json_payload=payload,
+        params=None,
+        timeout=timeout,
+        log_user_id=user_id,
+        log_phase="lyrics",
+    )
+
+
 async def _run_suno_probe() -> None:
     if not SUNO_CONFIG.enabled:
         return
@@ -2396,7 +2438,7 @@ async def _poll_suno_and_send(
     start_time = time.monotonic()
     refunded = False
 
-    async def _refund(error_text: str) -> None:
+    async def _refund(error_text: str, *, reason: str = "suno:refund:timeout") -> None:
         nonlocal refunded
         if refunded:
             return
@@ -2415,7 +2457,7 @@ async def _poll_suno_and_send(
             base_meta=meta,
             task_id=task_id,
             error_text=error_text,
-            reason="suno:refund:timeout",
+            reason=reason,
             reply_markup=_suno_result_keyboard(),
         )
 
@@ -2429,7 +2471,22 @@ async def _poll_suno_and_send(
             try:
                 details = await suno_poll_task(task_id, user_id=user_id)
             except SunoApiError as exc:
-                log.warning("Suno status error | task=%s status=%s payload=%s", task_id, exc.status, exc.payload)
+                log.warning(
+                    "Suno status error | task=%s status=%s payload=%s",
+                    task_id,
+                    exc.status,
+                    exc.payload,
+                )
+                status_code = exc.status or 0
+                if status_code in {400, 401, 402, 404}:
+                    error_details = exc.payload or {}
+                    error_text = (
+                        error_details.get("message")
+                        or error_details.get("error")
+                        or f"status_{status_code}"
+                    )
+                    await _refund(str(error_text), reason="suno:refund:status_err")
+                    return
                 await asyncio.sleep(SUNO_POLL_INTERVAL)
                 continue
             except Exception as exc:
@@ -2467,6 +2524,20 @@ async def _poll_suno_and_send(
                 safe_preview = html.escape(lyrics_preview) if lyrics_preview else "—"
                 current_balance = _safe_get_balance(user_id)
 
+                cover_url = (
+                    details.get("image_url")
+                    or details.get("imageUrl")
+                    or details.get("cover_url")
+                    or details.get("coverUrl")
+                    or ""
+                )
+                if not cover_url:
+                    for key in ("imageUrls", "imageUrlList", "images"):
+                        maybe_urls = details.get(key)
+                        if isinstance(maybe_urls, list) and maybe_urls:
+                            cover_url = maybe_urls[0]
+                            break
+
                 caption_lines = [
                     f"🎵 {html.escape(title)}",
                     f"Режим: {html.escape(mode_label)}",
@@ -2480,6 +2551,23 @@ async def _poll_suno_and_send(
                 caption = "\n".join(caption_lines)
 
                 keyboard = _suno_result_keyboard()
+
+                if cover_url:
+                    await _send_with_retry(
+                        lambda: ctx.bot.send_photo(
+                            chat_id,
+                            photo=cover_url,
+                            caption="🎨 Обложка трека",
+                        ),
+                        attempts=3,
+                    )
+                    _suno_log(
+                        user_id=user_id,
+                        phase="cover",
+                        request_url=cover_url,
+                        http_status=200,
+                        response_snippet="delivered",
+                    )
 
                 await _send_with_retry(
                     lambda: ctx.bot.send_audio(
