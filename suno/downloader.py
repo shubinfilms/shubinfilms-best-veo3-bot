@@ -12,6 +12,8 @@ from requests import Response
 
 from ._retry import RetryError, Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+_RETRYABLE_STATUS = {408, 429, 455, 500}
+
 
 class DownloadError(RuntimeError):
     """Raised when a file cannot be downloaded."""
@@ -54,7 +56,8 @@ def resolve_destination(dest_path: str | Path, url: str, base_dir: Optional[Path
 
 
 def _is_retryable(response: Response) -> bool:
-    return response.status_code >= 500 or response.status_code == 429
+    status = response.status_code
+    return status in _RETRYABLE_STATUS or status >= 500
 
 
 def download_file(url: str, dest_path: str | Path, base_dir: Optional[Path] = None) -> Path:
@@ -65,7 +68,7 @@ def download_file(url: str, dest_path: str | Path, base_dir: Optional[Path] = No
 
     destination = resolve_destination(dest_path, url, base_dir=base_dir)
     retryer = Retrying(
-        stop=stop_after_attempt(4),
+        stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type((requests.RequestException, DownloadError)),
         reraise=True,
