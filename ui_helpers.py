@@ -20,6 +20,16 @@ _SUNO_MODEL_LABEL = _SUNO_MODEL_RAW.upper() if _SUNO_MODEL_RAW else "V5"
 _COPY_TEXT_SUPPORTED = "copy_text" in inspect.signature(InlineKeyboardButton.__init__).parameters
 
 
+def _suno_preview(text: str, limit: int = 160) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= limit:
+        return raw
+    clipped = raw[: limit - 1].rstrip()
+    return clipped + "…"
+
+
 async def upsert_card(
     ctx: Any,
     chat_id: int,
@@ -146,7 +156,7 @@ def _suno_keyboard(state: dict[str, Any], price: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📝 Текст песни", callback_data="suno:edit:lyrics")
         ])
 
-    generate_caption = "⏳ Генерация…" if generating else f"🚀 Генерировать — {price}💎"
+    generate_caption = "⏳ Генерация…" if generating else f"🎵 Генерация музыки — {price}💎"
     rows.append([
         InlineKeyboardButton(generate_caption, callback_data="suno:start")
     ])
@@ -165,12 +175,19 @@ def render_suno_card(state: dict[str, Any], *, price: int) -> Tuple[str, InlineK
     safe_title = html.escape(title) if title else "—"
     safe_style = html.escape(style) if style else "—"
     mode_label = "Инструментал" if instrumental else "Со словами"
+    lyrics_preview = _suno_preview(lyrics)
+    if lyrics_preview:
+        safe_preview = html.escape(lyrics_preview)
+    else:
+        safe_preview = "—"
 
     lines = [
-        f"🎵 <b>Генерация музыки — Suno {html.escape(_SUNO_MODEL_LABEL)}</b>",
+        "🎵 <b>Генерация музыки</b>",
+        f"• Модель: <b>{html.escape(_SUNO_MODEL_LABEL)}</b>",
+        f"• Режим: <b>{mode_label}</b>",
         f"• Название: <b>{safe_title}</b>",
         f"• Стиль: <b>{safe_style}</b>",
-        f"• Режим: <b>{mode_label}</b>",
+        f"• Текст: <code>{safe_preview}</code>",
     ]
 
     if balance is not None:
@@ -179,12 +196,6 @@ def render_suno_card(state: dict[str, Any], *, price: int) -> Tuple[str, InlineK
             lines.insert(1, f"💎 Баланс: <b>{balance_val}</b>")
         except Exception:
             pass
-
-    if not instrumental:
-        safe_lyrics = html.escape(lyrics) if lyrics else "—"
-        lines.append("")
-        lines.append("📝 <b>Текст песни:</b>")
-        lines.append(f"<code>{safe_lyrics}</code>")
 
     lines.append("")
     lines.append(f"💎 Цена: <b>{price}💎</b> за попытку")
