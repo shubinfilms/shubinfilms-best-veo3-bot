@@ -50,7 +50,7 @@ from kie_banana import (
 
 import redis
 
-from ui_helpers import upsert_card
+from ui_helpers import upsert_card, refresh_balance_card_if_open
 
 from redis_utils import (
     credit,
@@ -892,6 +892,7 @@ DEFAULT_STATE = {
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
     "last_ui_msg_id_menu": None,
+    "last_ui_msg_id_balance": None,
     "last_ui_msg_id_veo": None, "last_ui_msg_id_banana": None, "last_ui_msg_id_mj": None,
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
@@ -902,13 +903,35 @@ DEFAULT_STATE = {
     "_last_text_veo": None,
     "_last_text_banana": None,
     "_last_text_mj": None,
+    "msg_ids": {},
+    "last_panel": None,
 }
+
+
+def _apply_state_defaults(target: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in DEFAULT_STATE.items():
+        if key not in target:
+            if isinstance(value, list):
+                target[key] = list(value)
+            elif isinstance(value, dict):
+                target[key] = dict(value)
+            else:
+                target[key] = value
+            continue
+        if isinstance(value, list) and not isinstance(target[key], list):
+            target[key] = []
+        elif isinstance(value, dict) and not isinstance(target[key], dict):
+            target[key] = {}
+    if not isinstance(target.get("banana_images"), list):
+        target["banana_images"] = []
+    if not isinstance(target.get("msg_ids"), dict):
+        target["msg_ids"] = {}
+    return target
+
+
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
-    for k, v in DEFAULT_STATE.items():
-        if k not in ud: ud[k] = [] if isinstance(v, list) else v
-    if not isinstance(ud.get("banana_images"), list): ud["banana_images"] = []
-    return ud
+    return _apply_state_defaults(ud)
 
 # odex/fix-balance-reset-after-deploy
 # main
@@ -937,6 +960,7 @@ MENU_BTN_IMAGE = "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"
 MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
+BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 
 def _safe_get_balance(user_id: int) -> int:
     try:
@@ -1026,6 +1050,32 @@ def balance_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+async def show_balance_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    s = state(ctx)
+    uid = get_user_id(ctx) or chat_id
+    balance = _safe_get_balance(uid)
+    _set_cached_balance(ctx, balance)
+    text = f"💎 Ваш баланс: {balance}"
+    mid = await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        BALANCE_CARD_STATE_KEY,
+        text,
+        reply_markup=balance_menu_kb(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+    if mid:
+        msg_ids = s.get("msg_ids")
+        if not isinstance(msg_ids, dict):
+            msg_ids = {}
+            s["msg_ids"] = msg_ids
+        msg_ids["balance"] = mid
+        s["last_panel"] = "balance"
+    return mid
 
 
 def render_faq_text() -> str:
@@ -2473,7 +2523,7 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    s = state(ctx); s.update({**DEFAULT_STATE})
+    s = state(ctx); s.update({**DEFAULT_STATE}); _apply_state_defaults(s)
     uid = update.effective_user.id
 
     try:
@@ -2492,7 +2542,9 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
-    state(ctx).update({**DEFAULT_STATE})
+    s = state(ctx)
+    s.update({**DEFAULT_STATE})
+    _apply_state_defaults(s)
     uid = update.effective_user.id if update.effective_user else 0
     chat_id = update.effective_chat.id if update.effective_chat else uid
     await show_main_menu(chat_id, ctx)
@@ -2559,12 +2611,17 @@ async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    user = update.effective_user
-    if user is None:
+    chat = update.effective_chat
+    if chat is None:
         return
-    balance = _safe_get_balance(user.id)
-    _set_cached_balance(ctx, balance)
-    await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+    mid = await show_balance_card(chat.id, ctx)
+    if mid is None:
+        user = update.effective_user
+        if user is None or update.message is None:
+            return
+        balance = _safe_get_balance(user.id)
+        _set_cached_balance(ctx, balance)
+        await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
 
 
 async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2951,6 +3008,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if chat_id is not None:
             _mode_set(chat_id, MODE_CHAT)
         s.update({**DEFAULT_STATE})
+        _apply_state_defaults(s)
         await q.answer()
         if message is not None:
             with suppress(BadRequest):
@@ -2984,10 +3042,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "back":
         s.update({**DEFAULT_STATE})
+        _apply_state_defaults(s)
         await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
 
     if data == "start_new_cycle":
         s.update({**DEFAULT_STATE})
+        _apply_state_defaults(s)
         await q.message.reply_text("Выберите режим:", reply_markup=main_menu_kb()); return
 
     if data == "topup_open":
@@ -3232,8 +3292,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             s["banana_balance"] = new_balance
             s["_last_text_banana"] = None
-            await show_banana_card(update.effective_chat.id, ctx)
-            await show_main_menu(update.effective_chat.id, ctx)
+            chat_id = update.effective_chat.id
+            await show_banana_card(chat_id, ctx)
+            await show_main_menu(chat_id, ctx)
+            await refresh_balance_card_if_open(
+                uid,
+                chat_id,
+                ctx=ctx,
+                state_dict=s,
+                reply_markup=balance_menu_kb(),
+            )
             await q.message.reply_text(
                 f"✅ Списано {PRICE_BANANA}💎. Текущий баланс: {new_balance} — запускаю обработку…"
             )
@@ -3387,8 +3455,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == MENU_BTN_BALANCE:
-        balance = get_user_balance_value(ctx, force_refresh=True)
-        await msg.reply_text(f"💎 Ваш баланс: {balance} 💎", reply_markup=balance_menu_kb())
+        chat_id = msg.chat_id
+        mid = await show_balance_card(chat_id, ctx)
+        if mid is None:
+            balance = get_user_balance_value(ctx, force_refresh=True)
+            await msg.reply_text(
+                f"💎 Ваш баланс: {balance} 💎",
+                reply_markup=balance_menu_kb(),
+            )
         return
 
     if text == MENU_BTN_PM:
@@ -3585,6 +3659,13 @@ async def _banana_run_and_send(
         s["_last_text_banana"] = None
         await show_banana_card(chat_id, ctx)
         await show_main_menu(chat_id, ctx)
+        await refresh_balance_card_if_open(
+            user_id,
+            chat_id,
+            ctx=ctx,
+            state_dict=s,
+            reply_markup=balance_menu_kb(),
+        )
         return new_balance
 
     try:
@@ -3685,6 +3766,7 @@ STARS_PACK_ORDER = [50, 100, 200, 300, 400, 500]
 
 async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
+    s = state(ctx)
 
     message = update.message
     if message is None or message.successful_payment is None:
@@ -3835,6 +3917,13 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
 
     chat_id = update.effective_chat.id if update.effective_chat else user_id
     await show_main_menu(chat_id, ctx)
+    await refresh_balance_card_if_open(
+        user_id,
+        chat_id,
+        ctx=ctx,
+        state_dict=s,
+        reply_markup=balance_menu_kb(),
+    )
 
 # ==========================
 #   Redis runner lock
