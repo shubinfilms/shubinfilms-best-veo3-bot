@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
 from datetime import datetime, timezone
 from contextlib import suppress
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from dataclasses import dataclass
 
 import aiohttp
@@ -206,17 +206,17 @@ def _compose_suno_url(base: str, path: str) -> str:
 
 def _load_suno_config() -> SunoConfig:
     base = (_env("SUNO_API_URL", "https://api.kie.ai/suno-api") or "https://api.kie.ai/suno-api").strip().rstrip("/")
-    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/api/v1/generate"), "/api/v1/generate")
+    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/generate-music"), "/generate-music")
     status_path = _normalize_suno_path(
-        _env("SUNO_STATUS_PATH", "/api/v1/generate/record-info"),
-        "/api/v1/generate/record-info",
+        _env("SUNO_STATUS_PATH", "/get-music-details"),
+        "/get-music-details",
     )
     extend_path = _normalize_suno_path(
         _env("SUNO_EXTEND_PATH", "/api/v1/generate/extend"),
         "/api/v1/generate/extend",
     )
     lyrics_path = _normalize_suno_path(_env("SUNO_LYRICS_PATH", "/api/v1/lyrics"), "/api/v1/lyrics")
-    model = (_env("SUNO_MODEL", "V5") or "V5").strip() or "V5"
+    model = os.getenv("SUNO_MODEL", "V5").upper()  # всегда "V5"
     price = _env_int("SUNO_PRICE", 30)
     timeout_sec = _env_int("SUNO_TIMEOUT_SEC", 180)
     enabled = _env("SUNO_ENABLED", "false").lower() == "true"
@@ -1841,11 +1841,10 @@ def _suno_sanitize_log_payload(payload: Any) -> Any:
 
 
 def _suno_headers() -> Dict[str, str]:
-    headers: Dict[str, str] = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    headers.update(_kie_auth_header())
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    auth_header = _kie_auth_header()
+    if auth_header:
+        headers.update(auth_header)
     return headers
 
 
@@ -1862,20 +1861,23 @@ async def _suno_request(
     if not _suno_configured():
         raise SunoConfigError("Suno API is not configured")
 
-    url = join_url(SUNO_CONFIG.base, path)
+    url = _compose_suno_url(SUNO_CONFIG.base, path)
     headers = _suno_headers()
     method_upper = method.upper()
+    request_params: Optional[Dict[str, Any]] = None
+    if params:
+        request_params = {k: v for k, v in params.items() if v is not None}
 
-    if method_upper == "POST":
+    payload_keys: List[str] = []
+    if json_payload:
+        payload_keys = sorted(json_payload.keys())
+
+    display_url = url
+    if request_params:
         try:
-            log_payload = json.dumps(_suno_sanitize_log_payload(json_payload or {}), ensure_ascii=False)
+            display_url = f"{url}?{urlencode(request_params, doseq=True)}"
         except Exception:
-            log_payload = repr(json_payload)
-        if log_payload is None:
-            log_payload = "{}"
-        if len(log_payload) > 200:
-            log_payload = log_payload[:197] + "…"
-        log.info("[SUNO] POST %s body=%s", url, log_payload)
+            display_url = url
 
     timeout_cfg = ClientTimeout(total=timeout)
     attempt = 0
@@ -1885,13 +1887,14 @@ async def _suno_request(
     async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
         while attempt < max_attempts:
             attempt += 1
+            log.info("[SUNO] %s %s payload_keys=%s", method_upper, display_url, payload_keys)
             try:
                 async with session.request(
                     method_upper,
                     url,
                     headers=headers,
                     json=json_payload,
-                    params=params,
+                    params=request_params,
                 ) as resp:
                     text_payload = await resp.text()
                     if resp.status == 429 and attempt < max_attempts:
@@ -1987,7 +1990,7 @@ async def suno_create_task(payload: Dict[str, Any], *, user_id: Optional[int]) -
 
 async def suno_poll_task(task_id: str, *, user_id: Optional[int]) -> Dict[str, Any]:
     timeout = float(SUNO_CONFIG.timeout_sec or 60)
-    params = {"task_id": task_id, "id": task_id, "taskId": task_id}
+    params = {"id": task_id}
     return await _suno_request(
         "GET",
         SUNO_CONFIG.status_path,
@@ -2042,7 +2045,6 @@ async def _run_suno_probe() -> None:
             "model": SUNO_MODEL,
             "title": "Probe",
             "style": "Electro-pop",
-            "prompt": "",
             "instrumental": True,
         },
         ensure_ascii=False,
@@ -2268,16 +2270,17 @@ async def _launch_suno_generation(
         "model": SUNO_MODEL,
         "title": title,
         "style": style,
-        "prompt": lyrics or "",
         "instrumental": instrumental,
     }
+    if not instrumental:
+        payload["lyrics"] = lyrics
 
     meta: Dict[str, Any] = {
         "task_id": None,
         "model": SUNO_MODEL,
         "instrumental": instrumental,
-        "has_lyrics": bool(lyrics),
-        "prompt_len": len(lyrics or ""),
+        "has_lyrics": bool(lyrics) if not instrumental else False,
+        "prompt_len": len(lyrics or "") if not instrumental else 0,
         "title": title,
         "style": style,
         "trigger": trigger,
@@ -2324,7 +2327,7 @@ async def _launch_suno_generation(
         _suno_log(
             user_id=user_id,
             phase="error",
-            request_url=join_url(SUNO_CONFIG.base, SUNO_CONFIG.gen_path),
+            request_url=SUNO_GEN_URL,
             http_status=None,
             response_snippet="config_error",
         )
@@ -2357,7 +2360,7 @@ async def _launch_suno_generation(
         _suno_log(
             user_id=user_id,
             phase="error",
-            request_url=join_url(SUNO_CONFIG.base, SUNO_CONFIG.gen_path),
+            request_url=SUNO_GEN_URL,
             http_status=None,
             response_snippet=f"exception:{exc}",
         )
@@ -2387,7 +2390,7 @@ async def _launch_suno_generation(
         _suno_log(
             user_id=user_id,
             phase="error",
-            request_url=join_url(SUNO_CONFIG.base, SUNO_CONFIG.gen_path),
+            request_url=SUNO_GEN_URL,
             http_status=None,
             response_snippet="missing_task_id",
         )
