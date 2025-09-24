@@ -185,11 +185,28 @@ class SunoConfig:
         return self.enabled and self.has_key and bool(self.base)
 
 
+def _normalize_suno_path(raw: str, default: str) -> str:
+    text = (raw or default).strip() or default
+    if "://" in text:
+        return text
+    if not text.startswith("/"):
+        text = f"/{text}"
+    return text
+
+
+def _compose_suno_url(base: str, path: str) -> str:
+    if not path:
+        return base
+    if "://" in path:
+        return path
+    return f"{(base or '').rstrip('/')}{path}"
+
+
 def _load_suno_config() -> SunoConfig:
-    base = (_env("SUNO_API_URL") or "").strip().rstrip("/")
-    gen_path = _env("SUNO_GEN_PATH", "/generate-music") or "/generate-music"
-    status_path = _env("SUNO_STATUS_PATH", "/get-music-details") or "/get-music-details"
-    model = _env("SUNO_MODEL", "v5") or "v5"
+    base = (_env("SUNO_API_URL", "https://api.kie.ai/suno-api") or "https://api.kie.ai/suno-api").strip().rstrip("/")
+    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/generate-music"), "/generate-music")
+    status_path = _normalize_suno_path(_env("SUNO_STATUS_PATH", "/record-info"), "/record-info")
+    model = (_env("SUNO_MODEL", "V5") or "V5").strip() or "V5"
     price = _env_int("SUNO_PRICE", 30)
     timeout_sec = _env_int("SUNO_TIMEOUT_SEC", 180)
     enabled = _env("SUNO_ENABLED", "false").lower() == "true"
@@ -207,8 +224,13 @@ def _load_suno_config() -> SunoConfig:
 
 
 SUNO_CONFIG = _load_suno_config()
-SUNO_MODEL = SUNO_CONFIG.model
-SUNO_MODEL_LABEL = SUNO_MODEL.upper() if SUNO_MODEL else "V5"
+SUNO_MODEL = (SUNO_CONFIG.model or "V5").upper()
+SUNO_MODEL_LABEL = SUNO_MODEL
+SUNO_BASE_URL = SUNO_CONFIG.base or "https://api.kie.ai/suno-api"
+SUNO_GEN_PATH = SUNO_CONFIG.gen_path
+SUNO_STATUS_PATH = SUNO_CONFIG.status_path
+SUNO_GEN_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_GEN_PATH)
+SUNO_STATUS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_STATUS_PATH)
 SUNO_PRICE = SUNO_CONFIG.price
 SUNO_POLL_INTERVAL = 3.0
 SUNO_POLL_TIMEOUT = float(SUNO_CONFIG.timeout_sec)
@@ -1803,7 +1825,10 @@ def _suno_sanitize_log_payload(payload: Any) -> Any:
 
 
 def _suno_headers() -> Dict[str, str]:
-    headers: Dict[str, str] = {"Accept": "application/json"}
+    headers: Dict[str, str] = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
     headers.update(_kie_auth_header())
     return headers
 
@@ -1823,8 +1848,18 @@ async def _suno_request(
 
     url = join_url(SUNO_CONFIG.base, path)
     headers = _suno_headers()
-    if method.upper() in {"POST", "PUT", "PATCH"}:
-        headers.setdefault("Content-Type", "application/json")
+    method_upper = method.upper()
+
+    if method_upper == "POST":
+        try:
+            log_payload = json.dumps(_suno_sanitize_log_payload(json_payload or {}), ensure_ascii=False)
+        except Exception:
+            log_payload = repr(json_payload)
+        if log_payload is None:
+            log_payload = "{}"
+        if len(log_payload) > 200:
+            log_payload = log_payload[:197] + "…"
+        log.info("[SUNO] POST %s body=%s", url, log_payload)
 
     timeout_cfg = ClientTimeout(total=timeout)
     attempt = 0
@@ -1836,7 +1871,7 @@ async def _suno_request(
             attempt += 1
             try:
                 async with session.request(
-                    method.upper(),
+                    method_upper,
                     url,
                     headers=headers,
                     json=json_payload,
@@ -1946,6 +1981,69 @@ async def suno_poll_task(task_id: str, *, user_id: Optional[int]) -> Dict[str, A
         log_user_id=user_id,
         log_phase="poll",
     )
+
+
+async def _run_suno_probe() -> None:
+    if not SUNO_CONFIG.enabled:
+        return
+    if not SUNO_CONFIG.configured:
+        log.info("SUNO probe skipped: configuration incomplete")
+        return
+
+    auth_header = _kie_auth_header().get("Authorization")
+    if not auth_header:
+        log.info("SUNO probe skipped: missing authorization header")
+        return
+
+    probe_payload = json.dumps(
+        {
+            "model": SUNO_MODEL,
+            "title": "Probe",
+            "style": "Electro-pop",
+            "prompt": "",
+            "instrumental": True,
+        },
+        ensure_ascii=False,
+    )
+
+    cmd = [
+        "curl",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "SUNO_PROBE:%{http_code}\\n",
+        "-H",
+        f"Authorization: {auth_header}",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        probe_payload,
+        SUNO_GEN_URL,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.warning("SUNO probe skipped: curl not available")
+        return
+    except Exception as exc:
+        log.warning("SUNO probe failed to start: %s", exc)
+        return
+
+    stdout, stderr = await proc.communicate()
+    if stdout:
+        text = stdout.decode().strip()
+        if text:
+            log.info(text)
+    if stderr:
+        err_text = stderr.decode().strip()
+        if err_text:
+            log.warning("SUNO probe stderr: %s", err_text)
 
 
 def _suno_collect_params(state_obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -2126,13 +2224,11 @@ async def _launch_suno_generation(
 
     payload: Dict[str, Any] = {
         "model": SUNO_MODEL,
-        "customMode": True,
-        "instrumental": instrumental,
         "title": title,
         "style": style,
+        "prompt": lyrics or "",
+        "instrumental": instrumental,
     }
-    if not instrumental:
-        payload["prompt"] = lyrics or ""
 
     meta: Dict[str, Any] = {
         "task_id": None,
@@ -5917,6 +6013,11 @@ async def run_bot_async() -> None:
                 "on" if redis_client else "off",
                 "enabled" if lock.enabled else "disabled",
             )
+
+            try:
+                await _run_suno_probe()
+            except Exception as exc:
+                log.warning("SUNO probe execution failed: %s", exc)
 
             loop = asyncio.get_running_loop()
             stop_event = asyncio.Event()
