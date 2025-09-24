@@ -67,8 +67,11 @@ from redis_utils import (
     get_users_count,
     load_task_meta,
     mark_user_dead,
+    mark_promo_used,
     remove_user,
     save_task_meta,
+    is_promo_used,
+    unmark_promo_used,
     user_exists,
     rds,
 )
@@ -377,45 +380,60 @@ TOKEN_COSTS = {
 CHAT_UNLOCK_PRICE = 0
 
 # ==========================
-#   Promo codes (one-time / global)
+#   Promo code (fixed)
 # ==========================
-PROMO_CODES = {
-    "WELCOME50": 50,
-    "FREE10": 10,
-    "LABACCENT100": 100,
-    "BONUS50": 50,
-    "FRIENDS150": 150,
-}
+FIXED_PROMO_CODE = "PROMOCODE100"
+FIXED_PROMO_BONUS = 100
+FIXED_PROMO_REASON = "promo_bonus"
 
-def promo_amount(code: str) -> Optional[int]:
-    code = (code or "").strip().upper()
-    if not code: return None
-    if redis_client:
-        v = redis_client.get(_rk("promo", "amount", code))
-        if v:
-            try: return int(v)
-            except: pass
-    return PROMO_CODES.get(code)
 
-def promo_used_global(code: str) -> Optional[int]:
-    code = (code or "").strip().upper()
-    if not code: return None
-    if redis_client:
-        u = redis_client.get(_rk("promo", "used_by", code))
-        try: return int(u) if u is not None else None
-        except: return None
+def _normalize_promo_code(value: str) -> str:
+    return (value or "").strip().upper()
+
+
+def activate_fixed_promo(user_id: int, raw_code: str) -> Tuple[str, Optional[int]]:
+    code = _normalize_promo_code(raw_code)
+    if code != FIXED_PROMO_CODE:
+        return "invalid", None
+
     try:
-        owner = ledger_storage.get_promo_owner(code)
-        return owner
+        ensure_user(user_id)
     except Exception as exc:
-        log.warning("Failed to fetch promo owner for %s: %s", code, exc)
-        return None
+        log.exception("ensure_user failed before promo activation for %s: %s", user_id, exc)
+        return "error", None
 
-def promo_mark_used(code: str, uid: int):
-    code = (code or "").strip().upper()
-    if not code: return
-    if redis_client:
-        redis_client.setnx(_rk("promo", "used_by", code), str(uid))
+    try:
+        if is_promo_used(user_id, code):
+            return "already_used", None
+    except Exception as exc:
+        log.exception("is_promo_used failed for %s: %s", user_id, exc)
+        return "error", None
+
+    try:
+        added = mark_promo_used(user_id, code)
+    except Exception as exc:
+        log.exception("mark_promo_used failed for %s: %s", user_id, exc)
+        return "error", None
+
+    if not added:
+        return "already_used", None
+
+    try:
+        balance_after = credit_balance(
+            user_id,
+            FIXED_PROMO_BONUS,
+            reason=FIXED_PROMO_REASON,
+            meta={"code": code},
+        )
+    except Exception as exc:
+        log.exception("credit_balance failed during promo activation for %s: %s", user_id, exc)
+        try:
+            unmark_promo_used(user_id, code)
+        except Exception as rollback_exc:
+            log.exception("failed to rollback promo flag for %s: %s", user_id, rollback_exc)
+        return "error", None
+
+    return "ok", balance_after
 
 # локальный кэш процесса (если Redis выключен)
 app_cache: Dict[Any, Any] = {}
@@ -437,6 +455,58 @@ async def ensure_user_record(update: Optional[Update]) -> None:
         await add_user(redis_client, update.effective_user)
     except Exception as exc:  # pragma: no cover - defensive logging
         log.warning("Failed to store user %s in Redis: %s", update.effective_user.id, exc)
+
+
+async def process_promo_submission(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    code_input: str,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    state_dict = state(ctx)
+    state_dict["mode"] = None
+
+    if message is None or chat is None or user is None:
+        return
+
+    status, balance_after = activate_fixed_promo(user.id, code_input)
+
+    if status == "invalid":
+        await message.reply_text("Такого промокода нет.")
+        return
+
+    if status == "already_used":
+        await message.reply_text("⚠️ Этот промокод уже был использован.")
+        return
+
+    if status != "ok" or balance_after is None:
+        await message.reply_text("⚠️ Временная ошибка, попробуйте позже.")
+        return
+
+    _set_cached_balance(ctx, balance_after)
+
+    await message.reply_text(
+        "✅ Промокод активирован!\nНачислено: +100 💎\nНовый баланс: "
+        f"{balance_after} 💎"
+    )
+
+    try:
+        await show_main_menu(chat.id, ctx)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("Failed to refresh main menu after promo for %s: %s", user.id, exc)
+
+    try:
+        await refresh_balance_card_if_open(
+            user.id,
+            chat.id,
+            ctx=ctx,
+            state_dict=state_dict,
+            reply_markup=balance_menu_kb(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("Failed to refresh balance card after promo for %s: %s", user.id, exc)
 
 
 def detect_lang(text: str) -> str:
@@ -2770,6 +2840,25 @@ async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def promo_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    if message is None:
+        return
+
+    if not PROMO_ENABLED:
+        await message.reply_text("🎟️ Промокоды временно отключены.")
+        return
+
+    args = getattr(ctx, "args", None) or []
+    if args:
+        await process_promo_submission(update, ctx, " ".join(args))
+        return
+
+    state(ctx)["mode"] = "promo"
+    await message.reply_text("Введите промокод одним сообщением…")
+
+
 # codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -3237,7 +3326,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("🎟️ Промокоды временно отключены.")
             return
         s["mode"] = "promo"
-        await q.message.reply_text("🎟️ Введите промокод одним сообщением:"); return
+        await q.message.reply_text("Введите промокод одним сообщением…")
+        return
 
     if data == "faq":
         await q.message.reply_text(
@@ -3689,45 +3779,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("🎟️ Промокоды временно отключены.")
             s["mode"] = None
             return
-        code = text.upper()
-        uid = update.effective_user.id
-        bonus = promo_amount(code)
-        if not bonus:
-            await msg.reply_text("❌ Неверный промокод.")
-            s["mode"] = None
-            return
-        used_by = promo_used_global(code)
-        if used_by and used_by != uid:
-            await msg.reply_text("❌ Этот промокод уже использован.")
-            s["mode"] = None
-            return
-        try:
-            result = ledger_storage.apply_promo(
-                uid,
-                code,
-                bonus,
-                {"source": "promo_command"},
-            )
-            _set_cached_balance(ctx, result.balance)
-            if not result.applied:
-                if used_by == uid or result.duplicate:
-                    await msg.reply_text("❌ Этот промокод уже использован.")
-                else:
-                    await msg.reply_text("⚠️ Промокод сейчас недоступен. Попробуйте другой.")
-                s["mode"] = None
-                return
-        except Exception as exc:
-            log.exception("Promo apply failed for %s (%s): %s", uid, code, exc)
-            await msg.reply_text("⚠️ Не удалось применить промокод. Попробуйте позже.")
-            s["mode"] = None
-            return
-
-        promo_mark_used(code, uid)
-        get_user_balance_value(ctx, force_refresh=True)
-        await msg.reply_text(
-            f"✅ Промокод активирован! Вам начислено {bonus} токенов."
-        )
-        s["mode"] = None
+        await process_promo_submission(update, ctx, text)
         return
 
     if user_mode == MODE_PM:
@@ -4428,6 +4480,7 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("faq", faq_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
+    application.add_handler(CommandHandler("promo", promo_command))
     application.add_handler(CommandHandler("users_count", users_count_command))
     application.add_handler(CommandHandler("whoami", whoami_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))

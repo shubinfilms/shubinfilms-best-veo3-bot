@@ -29,10 +29,15 @@ _TTL = 24 * 60 * 60
 
 _USERS_SET_KEY = f"{_PFX}:users"
 _DEAD_USERS_SET_KEY = f"{_PFX}:users:dead"
+_PROMO_USED_SET_KEY = f"{_PFX}:promo:used"
 
 
 def _user_profile_key(user_id: int) -> str:
     return f"{_PFX}:user:{user_id}"
+
+
+def _promo_member(user_id: int, code: str) -> str:
+    return f"{int(user_id)}:{code.strip().upper()}"
 
 _memory_store: Dict[str, Tuple[float, str]] = {}
 _memory_lock = Lock()
@@ -120,6 +125,27 @@ def clear_task_meta(task_id: str) -> None:
         _r.delete(key)
     else:
         _memory_delete(key)
+
+
+def is_promo_used(user_id: int, code: str) -> bool:
+    if not _r:
+        raise RuntimeError("Redis client is not configured")
+    member = _promo_member(user_id, code)
+    return bool(_r.sismember(_PROMO_USED_SET_KEY, member))
+
+
+def mark_promo_used(user_id: int, code: str) -> bool:
+    if not _r:
+        raise RuntimeError("Redis client is not configured")
+    member = _promo_member(user_id, code)
+    return bool(_r.sadd(_PROMO_USED_SET_KEY, member))
+
+
+def unmark_promo_used(user_id: int, code: str) -> bool:
+    if not _r:
+        return False
+    member = _promo_member(user_id, code)
+    return bool(_r.srem(_PROMO_USED_SET_KEY, member))
 
 
 async def add_user(redis_conn: Optional["redis.Redis"], user: "TelegramUser") -> bool:
