@@ -258,6 +258,73 @@ def _ledger_key(uid: int) -> str:
     return f"{_PFX}:ledger:{uid}"
 
 
+def get_ledger_entries(user_id: int, offset: int = 0, limit: int = 10) -> List[Dict[str, Any]]:
+    """Return a slice of ledger entries for ``user_id``.
+
+    Entries are returned as a list of dictionaries ordered from newest to
+    oldest. The ``offset`` parameter is applied from the most recent entry and
+    ``limit`` controls the number of items to fetch (defaults to 10).
+    """
+
+    if not _r:
+        return []
+    try:
+        offset = max(int(offset), 0)
+        limit = max(int(limit), 0)
+    except (TypeError, ValueError):
+        return []
+
+    if limit <= 0:
+        return []
+
+    key = _ledger_key(user_id)
+
+    try:
+        total = int(_r.llen(key) or 0)
+    except Exception:
+        _logger.exception("Failed to read ledger length for user %s", user_id)
+        return []
+
+    if total <= 0 or offset >= total:
+        return []
+
+    end_index = total - offset - 1
+    start_index = max(end_index - limit + 1, 0)
+
+    try:
+        raw_items = _r.lrange(key, start_index, end_index)
+    except Exception:
+        _logger.exception("Failed to read ledger entries for user %s", user_id)
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for raw in raw_items:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            _logger.debug("Skipping malformed ledger entry for user %s", user_id)
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
+
+    entries.reverse()
+    return entries
+
+
+def get_ledger_count(user_id: int) -> int:
+    """Return the total number of ledger entries for ``user_id``."""
+
+    if not _r:
+        return 0
+    try:
+        return int(_r.llen(_ledger_key(user_id)) or 0)
+    except Exception:
+        _logger.exception("Failed to count ledger entries for user %s", user_id)
+        return 0
+
+
 def ensure_user(user_id: int) -> None:
     if not _r:
         return

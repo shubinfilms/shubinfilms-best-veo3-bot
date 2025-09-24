@@ -61,6 +61,8 @@ from redis_utils import (
     add_user,
     clear_task_meta,
     get_balance,
+    get_ledger_count,
+    get_ledger_entries,
     get_all_user_ids,
     get_users_count,
     load_task_meta,
@@ -961,6 +963,7 @@ MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
+LEDGER_PAGE_SIZE = 10
 
 def _safe_get_balance(user_id: int) -> int:
     try:
@@ -1045,7 +1048,10 @@ def image_menu_kb() -> InlineKeyboardMarkup:
 
 def balance_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
+        [
+            InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open"),
+            InlineKeyboardButton("🧾 История операций", callback_data="tx:open"),
+        ],
         [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
@@ -1076,6 +1082,162 @@ async def show_balance_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Opt
         msg_ids["balance"] = mid
         s["last_panel"] = "balance"
     return mid
+
+
+def _ledger_reason(entry: Dict[str, Any]) -> str:
+    reason = entry.get("reason")
+    if isinstance(reason, str):
+        reason = reason.strip()
+    else:
+        reason = ""
+
+    if not reason:
+        meta = entry.get("meta")
+        if isinstance(meta, dict):
+            meta_reason = meta.get("model")
+            if isinstance(meta_reason, str):
+                reason = meta_reason.strip()
+
+    reason = (reason or "").strip()
+    if not reason:
+        return "—"
+    return " ".join(reason.split())
+
+
+def _ledger_timestamp(entry: Dict[str, Any]) -> str:
+    ts = entry.get("ts")
+    try:
+        ts_value = float(ts)
+    except (TypeError, ValueError):
+        return "—"
+    dt = datetime.fromtimestamp(ts_value)
+    return dt.strftime("%d.%m %H:%M")
+
+
+def _ledger_amount_parts(entry_type: str, amount: int) -> tuple[str, str]:
+    if entry_type == "debit":
+        return "➖", f"−{amount}"
+    if entry_type == "refund":
+        return "↩️", f"+{amount}"
+    return "➕", f"+{amount}"
+
+
+def _format_ledger_entry(entry: Dict[str, Any]) -> Optional[str]:
+    try:
+        entry_type = str(entry.get("type", "")).strip().lower()
+    except Exception:
+        entry_type = ""
+
+    amount_raw = entry.get("amount")
+    try:
+        amount = abs(int(amount_raw))
+    except (TypeError, ValueError):
+        amount = 0
+
+    icon, amount_text = _ledger_amount_parts(entry_type, amount)
+    reason = _ledger_reason(entry)
+    ts_text = _ledger_timestamp(entry)
+    balance_after = entry.get("balance_after")
+    try:
+        balance_text = f"{int(balance_after)}"
+    except (TypeError, ValueError):
+        balance_text = "—"
+
+    return f"{icon} {amount_text}💎 • {reason} • {ts_text} • Баланс: {balance_text}💎"
+
+
+def _build_transactions_view(user_id: int, offset: int) -> tuple[str, InlineKeyboardMarkup, int]:
+    try:
+        entries = get_ledger_entries(user_id, offset=offset, limit=LEDGER_PAGE_SIZE)
+    except Exception:
+        log.exception("ledger_entries_failed | user=%s offset=%s", user_id, offset)
+        entries = []
+
+    lines: List[str] = ["🧾 История операций (последние 10)", ""]
+
+    formatted: List[str] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            row = _format_ledger_entry(entry)
+            if row:
+                formatted.append(row)
+
+    if formatted:
+        lines.extend(formatted)
+    else:
+        lines.append("Пока нет операций.")
+
+    shown = len(formatted)
+
+    total = None
+    try:
+        total = get_ledger_count(user_id)
+    except Exception:
+        log.exception("ledger_count_failed | user=%s", user_id)
+
+    has_more = False
+    if total is not None:
+        has_more = total > offset + shown
+    else:
+        has_more = shown >= LEDGER_PAGE_SIZE
+
+    keyboard: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("◀️ Назад", callback_data="tx:back")]
+    ]
+    if has_more:
+        next_offset = offset + shown
+        keyboard[0].append(
+            InlineKeyboardButton("Показать ещё", callback_data=f"tx:page:{next_offset}")
+        )
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard), shown
+
+
+async def _edit_transactions_message(
+    query: "telegram.CallbackQuery",
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    offset: int,
+) -> None:
+    message = query.message
+    if message is None:
+        return
+
+    text, keyboard, _ = _build_transactions_view(user_id, offset)
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+    s = state(ctx)
+    s["last_panel"] = "balance_history"
+    msg_ids = s.get("msg_ids")
+    if not isinstance(msg_ids, dict):
+        msg_ids = {}
+        s["msg_ids"] = msg_ids
+    msg_ids["balance"] = message.message_id
+
+
+async def _edit_balance_from_history(
+    query: "telegram.CallbackQuery", ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> None:
+    message = query.message
+    if message is None:
+        return
+
+    balance = _safe_get_balance(user_id)
+    _set_cached_balance(ctx, balance)
+    await query.edit_message_text(
+        f"💎 Ваш баланс: {balance}",
+        reply_markup=balance_menu_kb(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
+    s = state(ctx)
+    s["last_panel"] = "balance"
+    msg_ids = s.get("msg_ids")
+    if not isinstance(msg_ids, dict):
+        msg_ids = {}
+        s["msg_ids"] = msg_ids
+    msg_ids["balance"] = message.message_id
 
 
 def render_faq_text() -> str:
@@ -2624,6 +2786,26 @@ async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
 
 
+async def transactions_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    text, keyboard, _ = _build_transactions_view(user.id, 0)
+    sent = await message.reply_text(text, reply_markup=keyboard)
+
+    if sent is not None:
+        s = state(ctx)
+        s["last_panel"] = "balance_history"
+        msg_ids = s.get("msg_ids")
+        if not isinstance(msg_ids, dict):
+            msg_ids = {}
+            s["msg_ids"] = msg_ids
+        msg_ids["balance"] = sent.message_id
+
+
 async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -3024,6 +3206,31 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer()
+
+    if data.startswith("tx:"):
+        user = update.effective_user
+        uid = get_user_id(ctx) or (user.id if user else None)
+        if uid is None:
+            return
+
+        if data == "tx:open":
+            await _edit_transactions_message(q, ctx, uid, 0)
+            return
+
+        if data.startswith("tx:page:"):
+            try:
+                offset_text = data.split(":", 2)[2]
+                offset = int(offset_text)
+            except (IndexError, ValueError):
+                offset = 0
+            if offset < 0:
+                offset = 0
+            await _edit_transactions_message(q, ctx, uid, offset)
+            return
+
+        if data == "tx:back":
+            await _edit_balance_from_history(q, ctx, uid)
+            return
 
     if data == "promo_open":
         if not PROMO_ENABLED:
@@ -4227,6 +4434,7 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("my_balance", my_balance_command))
     application.add_handler(CommandHandler("add_balance", add_balance_command))
     application.add_handler(CommandHandler("sub_balance", sub_balance_command))
+    application.add_handler(CommandHandler("transactions", transactions_command))
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
