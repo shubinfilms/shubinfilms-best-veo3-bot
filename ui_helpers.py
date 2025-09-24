@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import Any, Optional, Tuple
 
 from urllib.parse import quote_plus
@@ -12,6 +13,9 @@ from telegram.constants import ParseMode
 from redis_utils import get_balance
 
 import html
+
+_SUNO_MODEL_RAW = (os.getenv("SUNO_MODEL") or "v5").strip()
+_SUNO_MODEL_LABEL = _SUNO_MODEL_RAW.upper() if _SUNO_MODEL_RAW else "V5"
 
 _COPY_TEXT_SUPPORTED = "copy_text" in inspect.signature(InlineKeyboardButton.__init__).parameters
 
@@ -163,7 +167,7 @@ def render_suno_card(state: dict[str, Any], *, price: int) -> Tuple[str, InlineK
     mode_label = "Инструментал" if instrumental else "Со словами"
 
     lines = [
-        "🎵 <b>Генерация музыки — Suno V5</b>",
+        f"🎵 <b>Генерация музыки — Suno {html.escape(_SUNO_MODEL_LABEL)}</b>",
         f"• Название: <b>{safe_title}</b>",
         f"• Стиль: <b>{safe_style}</b>",
         f"• Режим: <b>{mode_label}</b>",
