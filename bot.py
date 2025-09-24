@@ -6,7 +6,7 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 # odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, html
 from pathlib import Path
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable
@@ -49,6 +49,8 @@ from kie_banana import (
 )
 
 import redis
+
+from ui_helpers import upsert_card
 
 from redis_utils import (
     credit,
@@ -884,13 +886,16 @@ DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
-    "last_ui_msg_id": None, "last_ui_msg_id_banana": None,
+    "last_ui_msg_id_veo": None, "last_ui_msg_id_banana": None, "last_ui_msg_id_mj": None,
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
-    "mj_generating": False, "last_mj_task_id": None, "last_mj_msg_id": None,
+    "mj_generating": False, "last_mj_task_id": None,
     "active_generation_op": None,
     "mj_active_op_key": None,
     "banana_active_op_key": None,
+    "_last_text_veo": None,
+    "_last_text_banana": None,
+    "_last_text_mj": None,
 }
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     ud = ctx.user_data
@@ -1013,11 +1018,11 @@ def _mj_format_card_text(aspect: str) -> str:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     choice = "Горизонтальный (16:9)" if aspect == "16:9" else "Вертикальный (9:16)"
     return (
-        "🖼 Midjourney\n"
+        "🖼 <b>Midjourney</b>\n"
         "Выберите формат изображения.\n\n"
         "• Горизонтальный — 16:9\n"
         "• Вертикальный — 9:16\n\n"
-        f"Текущий выбор: {choice}"
+        f"Текущий выбор: <b>{choice}</b>"
     )
 
 def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
@@ -1035,14 +1040,14 @@ def _mj_format_keyboard(aspect: str) -> InlineKeyboardMarkup:
 def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
     aspect = "9:16" if aspect == "9:16" else "16:9"
     lines = [
-        "🖼 Midjourney",
+        "🖼 <b>Midjourney</b>",
         "",
-        'Введите промпт сообщением. После этого нажмите "Подтвердить".',
-        f"Текущий формат: {aspect}",
+        'Введите промпт сообщением. После этого нажмите «Подтвердить».',
+        f"Текущий формат: <b>{aspect}</b>",
     ]
     snippet = _short_prompt(prompt)
     if snippet:
-        lines.extend(["", f'Последний промпт: "{snippet}"'])
+        lines.extend(["", f"Последний промпт: <i>{html.escape(snippet)}</i>"])
     return "\n".join(lines)
 
 def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -1054,84 +1059,71 @@ def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
         ],
     ])
 
-async def _send_or_edit_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: str,
-                                reply_markup: Optional[InlineKeyboardMarkup]) -> None:
+async def _update_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: str,
+                                reply_markup: Optional[InlineKeyboardMarkup], *, force: bool = False) -> None:
     s = state(ctx)
-    mid = s.get("last_mj_msg_id")
-    try:
-        if mid:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=mid,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-        else:
-            msg = await ctx.bot.send_message(
-                chat_id,
-                text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-            s["last_mj_msg_id"] = msg.message_id
-    except Exception as e:
-        if "message is not modified" in str(e).lower():
-            return
-        log.warning("MJ card send/edit failed: %s", e)
-        try:
-            msg = await ctx.bot.send_message(
-                chat_id,
-                text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-            s["last_mj_msg_id"] = msg.message_id
-        except Exception as e2:
-            log.warning("MJ card send fallback failed: %s", e2)
+    if not force and text == s.get("_last_text_mj"):
+        return
+    mid = await upsert_card(ctx, chat_id, s, "last_ui_msg_id_mj", text, reply_markup)
+    if mid:
+        s["_last_text_mj"] = text
+    elif force:
+        s["_last_text_mj"] = None
 
 async def show_mj_format_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
     aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
     s["aspect"] = aspect
     s["last_prompt"] = None
-    await _send_or_edit_mj_card(chat_id, ctx, _mj_format_card_text(aspect), _mj_format_keyboard(aspect))
+    await _update_mj_card(chat_id, ctx, _mj_format_card_text(aspect), _mj_format_keyboard(aspect))
 
 async def show_mj_prompt_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
     aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
     s["aspect"] = aspect
-    await _send_or_edit_mj_card(chat_id, ctx, _mj_prompt_card_text(aspect, s.get("last_prompt")), _mj_prompt_keyboard())
+    await _update_mj_card(chat_id, ctx, _mj_prompt_card_text(aspect, s.get("last_prompt")), _mj_prompt_keyboard())
 
 async def show_mj_generating_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, prompt: str, aspect: str) -> None:
     aspect = "9:16" if aspect == "9:16" else "16:9"
-    snippet = _short_prompt(prompt, 160)
+    snippet = html.escape(_short_prompt(prompt, 160) or "—")
     text = (
         "⏳ Midjourney генерирует изображение…\n"
-        f"Формат: {aspect}\n"
-        f'Промпт: "{snippet}"'
+        f"Формат: <b>{aspect}</b>\n"
+        f"Промпт: <code>{snippet}</code>"
     )
-    await _send_or_edit_mj_card(chat_id, ctx, text, None)
+    await _update_mj_card(chat_id, ctx, text, None)
+
+async def mj_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    mid = s.get("last_ui_msg_id_mj")
+    if mid:
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, mid)
+    s["last_ui_msg_id_mj"] = None
+    s["_last_text_mj"] = None
+    await show_mj_format_card(chat_id, ctx)
 
 def banana_examples_block() -> str:
     return (
-        "💡 *Примеры запросов:*\n"
+        "💡 <b>Примеры запросов:</b>\n"
         "• поменяй фон на городской вечер\n"
         "• смени одежду на чёрный пиджак\n"
         "• добавь лёгкий макияж, подчеркни глаза\n"
         "• убери лишние предметы со стола\n"
-        "• поставь нас на одну фотографию\n"
+        "• поставь нас на одну фотографию"
     )
 
 def banana_card_text(s: Dict[str, Any]) -> str:
     n = len(s.get("banana_images") or [])
-    prompt = (s.get("last_prompt") or "—").strip()
+    prompt = (s.get("last_prompt") or "—").strip() or "—"
+    prompt_html = html.escape(prompt)
+    has_prompt = "есть" if s.get("last_prompt") else "нет"
     lines = [
-        "🍌 *Карточка Banana*",
-        f"🧩 Фото: *{n}/4*  •  Промпт: *{'есть' if s.get('last_prompt') else 'нет'}*",
+        "🍌 <b>Карточка Banana</b>",
+        f"🧩 Фото: <b>{n}/4</b>  •  Промпт: <b>{has_prompt}</b>",
         "",
-        "🖊️ *Промпт:*",
-        f"`{prompt}`",
+        "🖊️ <b>Промпт:</b>",
+        f"<code>{prompt_html}</code>",
         "",
         banana_examples_block()
     ]
@@ -1149,16 +1141,21 @@ def banana_kb() -> InlineKeyboardMarkup:
 
 # --------- VEO Card ----------
 def veo_card_text(s: Dict[str, Any]) -> str:
-    prompt = (s.get("last_prompt") or "—").strip()
+    prompt = (s.get("last_prompt") or "—").strip() or "—"
+    prompt_html = html.escape(prompt)
+    aspect = html.escape(s.get("aspect") or "16:9")
+    model = "Veo Quality" if s.get("model") == "veo3" else "Veo Fast"
     img = "есть" if s.get("last_image_url") else "нет"
-    return (
-        "🟦 *Карточка VEO*\n"
-        f"• Формат: *{s.get('aspect') or '16:9'}*\n"
-        f"• Модель: *{'Veo Quality' if s.get('model')=='veo3' else 'Veo Fast'}*\n"
-        f"• Фото-референс: *{img}*\n\n"
-        "🖊️ *Промпт:*\n"
-        f"`{prompt}`"
-    )
+    lines = [
+        "🟦 <b>Карточка VEO</b>",
+        f"• Формат: <b>{aspect}</b>",
+        f"• Модель: <b>{model}</b>",
+        f"• Фото-референс: <b>{img}</b>",
+        "",
+        "🖊️ <b>Промпт:</b>",
+        f"<code>{prompt_html}</code>",
+    ]
+    return "\n".join(lines)
 
 def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     aspect = s.get("aspect") or "16:9"
@@ -2403,12 +2400,13 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
         s["last_mj_task_id"] = None
         s["mj_last_wait_ts"] = 0.0
         s["last_prompt"] = None
-        mid = s.get("last_mj_msg_id")
+        mid = s.get("last_ui_msg_id_mj")
         if mid:
             final_text = "✅ Midjourney: изображение обработано." if success else "ℹ️ Midjourney: поток завершён."
             try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None)
             except Exception: pass
-            s["last_mj_msg_id"] = None
+            s["last_ui_msg_id_mj"] = None
+            s["_last_text_mj"] = None
         if op_key:
             _clear_operation(ctx, op_key)
         s.pop("mj_active_op_key", None)
@@ -2795,41 +2793,67 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
     except Exception:
         pass
 
-async def show_or_update_banana_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+async def show_banana_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
     text = banana_card_text(s)
+    if text == s.get("_last_text_banana"):
+        return
     kb = banana_kb()
-    mid = s.get("last_ui_msg_id_banana")
-    try:
-        if mid:
-            await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text,
-                                            parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
-        else:
-            m = await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
-            s["last_ui_msg_id_banana"] = m.message_id
-    except Exception as e:
-        log.warning("banana card edit/send failed: %s", e)
+    mid = await upsert_card(ctx, chat_id, s, "last_ui_msg_id_banana", text, kb)
+    if mid:
+        s["_last_text_banana"] = text
+    else:
+        s["_last_text_banana"] = None
 
-async def show_or_update_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    mid = s.get("last_ui_msg_id_banana")
+    if mid:
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, mid)
+    s["last_ui_msg_id_banana"] = None
+    s["_last_text_banana"] = None
+    await show_banana_card(chat_id, ctx)
+
+async def on_banana_photo_received(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+    s = state(ctx)
+    s.setdefault("banana_images", []).append(file_id)
+    s["_last_text_banana"] = None
+    await show_banana_card(chat_id, ctx)
+
+async def on_banana_prompt_saved(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text_prompt: str) -> None:
+    s = state(ctx)
+    s["last_prompt"] = text_prompt
+    s["_last_text_banana"] = None
+    await show_banana_card(chat_id, ctx)
+
+async def show_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
     text = veo_card_text(s)
+    if text == s.get("_last_text_veo"):
+        return
     kb = veo_kb(s)
-    mid = s.get("last_ui_msg_id")
-    try:
-        if mid:
-            await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text,
-                                            parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
-        else:
-            m = await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
-            s["last_ui_msg_id"] = m.message_id
-    except Exception as e:
-        log.warning("veo card edit/send failed: %s", e)
+    mid = await upsert_card(ctx, chat_id, s, "last_ui_msg_id_veo", text, kb)
+    if mid:
+        s["_last_text_veo"] = text
+    else:
+        s["_last_text_veo"] = None
 
+async def veo_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    mid = s.get("last_ui_msg_id_veo")
+    if mid:
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, mid)
+    s["last_ui_msg_id_veo"] = None
+    s["_last_text_veo"] = None
+    await show_veo_card(chat_id, ctx)
 
 async def set_veo_card_prompt(chat_id: int, prompt_text: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
     s["last_prompt"] = prompt_text
-    await show_or_update_veo_card(chat_id, ctx)
+    s["_last_text_veo"] = None
+    await show_veo_card(chat_id, ctx)
 
 
 async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str) -> None:
@@ -2846,7 +2870,7 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await q.answer("Промпт вставлен в карточку VEO")
 
 
-configure_prompt_master(update_veo_card=show_or_update_veo_card)
+configure_prompt_master(update_veo_card=lambda chat_id, context: show_veo_card(chat_id, context))
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -2961,12 +2985,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["mode"] = selected_mode
         if selected_mode in ("veo_text_fast", "veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
-            await show_or_update_veo_card(update.effective_chat.id, ctx)
+            await veo_entry(update.effective_chat.id, ctx)
             await q.message.reply_text("✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.")
             return
         if selected_mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
-            await show_or_update_veo_card(update.effective_chat.id, ctx)
+            await veo_entry(update.effective_chat.id, ctx)
             await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
             return
         if selected_mode == "chat":
@@ -2977,17 +3001,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_generating"] = False
             s["mj_last_wait_ts"] = 0.0
             s["last_mj_task_id"] = None
-            mid = s.get("last_mj_msg_id")
-            if mid:
-                try: await ctx.bot.delete_message(update.effective_chat.id, mid)
-                except Exception: pass
-            s["last_mj_msg_id"] = None
-            await show_mj_format_card(update.effective_chat.id, ctx)
+            await mj_entry(update.effective_chat.id, ctx)
             return
         if selected_mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
             await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
-            await show_or_update_banana_card(update.effective_chat.id, ctx); return
+            await banana_entry(update.effective_chat.id, ctx); return
 
     if data.startswith("mj:"):
         chat = update.effective_chat
@@ -3020,11 +3039,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_generating"] = False
             s["last_mj_task_id"] = None
             s["mj_last_wait_ts"] = 0.0
-            mid = s.get("last_mj_msg_id")
+            mid = s.get("last_ui_msg_id_mj")
             if mid:
                 try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text="❌ Midjourney отменён.", reply_markup=None)
                 except Exception: pass
-            s["last_mj_msg_id"] = None
+            s["last_ui_msg_id_mj"] = None
+            s["_last_text_mj"] = None
             await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
 
         if action == "confirm":
@@ -3110,7 +3130,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("➕ Пришлите ещё фото (всего до 4)."); return
         if act == "reset_imgs":
             s["banana_images"] = []
-            await q.message.reply_text("🧹 Фото очищены."); await show_or_update_banana_card(update.effective_chat.id, ctx); return
+            s["_last_text_banana"] = None
+            await q.message.reply_text("🧹 Фото очищены."); await show_banana_card(update.effective_chat.id, ctx); return
         if act == "edit_prompt":
             await q.message.reply_text("✍️ Пришлите новый промпт для Banana."); return
         if act == "start":
@@ -3146,13 +3167,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # -------- VEO card actions --------
     if data.startswith("veo:set_ar:"):
         s["aspect"] = "9:16" if data.endswith("9:16") else "16:9"
-        await show_or_update_veo_card(update.effective_chat.id, ctx); return
+        await show_veo_card(update.effective_chat.id, ctx); return
     if data.startswith("veo:set_model:"):
         s["model"] = "veo3_fast" if data.endswith("fast") else "veo3"
-        await show_or_update_veo_card(update.effective_chat.id, ctx); return
+        await show_veo_card(update.effective_chat.id, ctx); return
     if data == "veo:clear_img":
         s["last_image_url"] = None
-        await show_or_update_veo_card(update.effective_chat.id, ctx); return
+        await show_veo_card(update.effective_chat.id, ctx); return
     if data == "veo:start":
         prompt = (s.get("last_prompt") or "").strip()
         if not prompt:
@@ -3403,14 +3424,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if len(s["banana_images"]) >= 4:
                 await msg.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
                 return
-            s["banana_images"].append(text.strip())
+            await on_banana_photo_received(chat_id, ctx, text.strip())
             await msg.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
-            await show_or_update_banana_card(chat_id, ctx)
             return
         s["last_image_url"] = text.strip()
         await msg.reply_text("🧷 Ссылка на изображение принята.")
         if state_mode in ("veo_text_fast", "veo_text_quality", "veo_photo"):
-            await show_or_update_veo_card(chat_id, ctx)
+            await show_veo_card(chat_id, ctx)
         return
 
     if state_mode == "mj_txt":
@@ -3423,14 +3443,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if state_mode == "banana":
-        s["last_prompt"] = text
         await msg.reply_text("✍️ Промпт сохранён.")
-        await show_or_update_banana_card(chat_id, ctx)
+        await on_banana_prompt_saved(chat_id, ctx, text)
         return
 
     if state_mode in ("veo_text_fast", "veo_text_quality", "veo_photo"):
         s["last_prompt"] = text
-        await show_or_update_veo_card(chat_id, ctx)
+        await show_veo_card(chat_id, ctx)
         return
 
     if user_mode == MODE_CHAT:
@@ -3456,7 +3475,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Если режим не распознан — по умолчанию обновляем карточку VEO
     s["last_prompt"] = text
-    await show_or_update_veo_card(chat_id, ctx)
+    await show_veo_card(chat_id, ctx)
 
 async def _banana_run_and_send(
     chat_id: int,
@@ -3535,15 +3554,17 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s.get("mode") == "banana":
             if len(s["banana_images"]) >= 4:
                 await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
-            s["banana_images"].append(url)
             cap = (update.message.caption or "").strip()
-            if cap: s["last_prompt"] = cap
+            if cap:
+                s["last_prompt"] = cap
+                s["_last_text_banana"] = None
+            await on_banana_photo_received(update.effective_chat.id, ctx, url)
             await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
-            await show_or_update_banana_card(update.effective_chat.id, ctx); return
+            return
         s["last_image_url"] = url
         await update.message.reply_text("🖼️ Фото принято как референс.")
         if s.get("mode") in ("veo_text_fast","veo_text_quality","veo_photo"):
-            await show_or_update_veo_card(update.effective_chat.id, ctx)
+            await show_veo_card(update.effective_chat.id, ctx)
     except Exception as e:
         log.exception("Get photo failed: %s", e)
         await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
