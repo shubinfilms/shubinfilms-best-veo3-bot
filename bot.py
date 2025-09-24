@@ -53,6 +53,7 @@ import redis
 from ui_helpers import upsert_card
 
 from redis_utils import (
+    add_ledger_entry,
     credit,
     credit_balance,
     debit_balance,
@@ -68,6 +69,7 @@ from redis_utils import (
     remove_user,
     save_task_meta,
     user_exists,
+    rds,
 )
 
 from ledger import (
@@ -890,6 +892,7 @@ DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
+    "last_ui_msg_id_menu": None,
     "last_ui_msg_id_veo": None, "last_ui_msg_id_banana": None, "last_ui_msg_id_mj": None,
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
@@ -948,6 +951,22 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(MENU_BTN_BALANCE)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    s = state(ctx)
+    uid = get_user_id(ctx) or chat_id
+    text = render_welcome_for(uid, ctx)
+    return await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        "last_ui_msg_id_menu",
+        text,
+        reply_markup=main_menu_kb(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
 
 
 def video_menu_kb() -> InlineKeyboardMarkup:
@@ -2451,11 +2470,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         log.exception("Signup bonus failed for %s: %s", uid, exc)
 
-    await update.message.reply_text(
-        render_welcome_for(uid, ctx),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_kb(),
-    )
+    chat_id = update.effective_chat.id if update.effective_chat else uid
+    await show_main_menu(chat_id, ctx)
 
 async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -2464,11 +2480,8 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     state(ctx).update({**DEFAULT_STATE})
     uid = update.effective_user.id if update.effective_user else 0
-    await message.reply_text(
-        render_welcome_for(uid, ctx),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_kb(),
-    )
+    chat_id = update.effective_chat.id if update.effective_chat else uid
+    await show_main_menu(chat_id, ctx)
 
 
 async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3621,36 +3634,157 @@ async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.pre_checkout_query.answer(ok=False, error_message=f"Платёж отклонён. Пополните Stars в {STARS_BUY_URL}")
 
+STARS_PLAN_TO_DIAMONDS = {
+    "VEO_50": 50,
+    "VEO_100": 110,
+    "VEO_200": 220,
+    "VEO_300": 330,
+    "VEO_400": 440,
+    "VEO_500": 550,
+}
+
+STARS_UNITS_PER_STAR = 100
+
+
 async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    sp = update.message.successful_payment
-    try: meta = json.loads(sp.invoice_payload)
-    except Exception: meta = {}
-    stars = int(sp.total_amount)
-    if meta.get("kind") == "stars_pack":
-        tokens = int(meta.get("tokens", 0))
-        if tokens <= 0:
-            mapping = {50:50,100:110,200:220,300:330,400:440,500:550}
-            tokens = mapping.get(stars, 0)
-        if tokens > 0:
-            charge_id = sp.telegram_payment_charge_id or sp.provider_payment_charge_id or uuid.uuid4().hex
-            payment_meta = {
-                "source": "telegram_stars",
-                "stars": stars,
-                "payload": meta,
-            }
-            try:
-                result = credit_tokens(ctx, tokens, "topup_stars", f"payment:{charge_id}", payment_meta)
-            except Exception as exc:
-                log.exception("Top-up credit failed for %s: %s", charge_id, exc)
-                await update.message.reply_text("⚠️ Платёж получен, но обновить баланс не удалось. Свяжитесь с поддержкой.")
-                return
-            balance = result.balance
-            msg = "✅ Оплата учтена повторно." if not result.applied else f"✅ Оплата получена: +{tokens} токенов."
-            await update.message.reply_text(f"{msg}\nБаланс: {balance} 💎")
-            return
+
+    message = update.message
+    if message is None or message.successful_payment is None:
         return
-    await update.message.reply_text("✅ Оплата получена.")
+
+    user = message.from_user
+    if user is None:
+        return
+
+    user_id = user.id
+    try:
+        ensure_user(user_id)
+    except Exception as exc:
+        log.warning("ensure_user failed during payment for %s: %s", user_id, exc)
+
+    sp = message.successful_payment
+    raw_payload = sp.invoice_payload or ""
+    payload: Any = {}
+    if raw_payload:
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            log.warning("Failed to decode invoice payload for %s: %s", user_id, raw_payload)
+            payload = raw_payload
+
+    diamonds = 0
+    if isinstance(payload, dict):
+        for key in ("diamonds", "tokens", "amount", "quantity"):
+            value = payload.get(key)
+            if value is not None:
+                try:
+                    diamonds = int(value)
+                except (TypeError, ValueError):
+                    diamonds = 0
+                else:
+                    if diamonds > 0:
+                        break
+        if diamonds <= 0:
+            plan = str(payload.get("plan", "")).strip().upper()
+            diamonds = STARS_PLAN_TO_DIAMONDS.get(plan, 0)
+    else:
+        diamonds = 0
+
+    total_units = int(sp.total_amount or 0)
+    total_stars = total_units // STARS_UNITS_PER_STAR if total_units % STARS_UNITS_PER_STAR == 0 else total_units
+    if diamonds <= 0 and total_stars > 0:
+        diamonds = total_stars
+
+    redis_ping_status = "not_configured"
+    if rds is not None:
+        try:
+            rds.ping()
+        except Exception as exc:
+            redis_ping_status = f"fail:{exc}".replace("\n", " ")
+        else:
+            redis_ping_status = "ok"
+
+    log.info(
+        "stars_payment_prepare | user=%s payload=%s diamonds=%s redis_ping=%s",
+        user_id,
+        payload,
+        diamonds,
+        redis_ping_status,
+    )
+
+    if diamonds <= 0:
+        log.error(
+            "stars_payment_invalid_amount | user=%s payload=%s total_units=%s",
+            user_id,
+            payload,
+            total_units,
+        )
+        await message.reply_text(
+            "⚠️ Платёж получен, но не удалось определить сумму пополнения. Поддержка уведомлена."
+        )
+        return
+
+    charge_id = (
+        sp.telegram_payment_charge_id
+        or sp.provider_payment_charge_id
+        or uuid.uuid4().hex
+    )
+    ledger_meta = {
+        "source": "telegram_stars",
+        "payload": payload,
+        "payload_raw": raw_payload,
+        "total_amount_units": total_units,
+        "total_stars": total_stars,
+        "redis_ping": redis_ping_status,
+        "telegram_payment_charge_id": sp.telegram_payment_charge_id,
+        "provider_payment_charge_id": sp.provider_payment_charge_id,
+        "charge_id": charge_id,
+    }
+
+    try:
+        new_balance = credit_balance(
+            user_id,
+            diamonds,
+            reason="stars_payment",
+            meta=ledger_meta,
+            write_ledger=False,
+        )
+        entry = {
+            "ts": int(time.time()),
+            "type": "credit",
+            "amount": diamonds,
+            "reason": "stars_payment",
+            "meta": ledger_meta,
+            "balance_after": new_balance,
+        }
+        add_ledger_entry(user_id, entry)
+    except redis.RedisError as exc:
+        log.exception("Redis credit failed for stars payment %s: %s", charge_id, exc)
+        await message.reply_text(
+            "⚠️ Платёж получен, но Redis недоступен, поддержка уведомлена."
+        )
+        return
+    except Exception as exc:
+        log.exception("Stars payment processing failed for %s: %s", charge_id, exc)
+        await message.reply_text(
+            "⚠️ Платёж получен, но обновить баланс не удалось. Поддержка уведомлена."
+        )
+        return
+
+    _set_cached_balance(ctx, new_balance)
+    chat_id = update.effective_chat.id if update.effective_chat else user_id
+    await show_main_menu(chat_id, ctx)
+
+    log.info(
+        "stars_payment_success | user=%s charge_id=%s diamonds=%s balance=%s",
+        user_id,
+        charge_id,
+        diamonds,
+        new_balance,
+    )
+
+    await message.reply_text(f"✅ Пополнено: +{diamonds}. Ваш баланс: {new_balance}")
 
 # ==========================
 #   Redis runner lock
