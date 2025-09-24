@@ -5,11 +5,14 @@ import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence
 
 from .downloader import download_file
 from .schemas import CallbackEnvelope, TaskAsset
 from .store import TaskStore
+
+if TYPE_CHECKING:  # pragma: no cover - only used for typing
+    from .callbacks import MusicCallback, Track
 
 logger = logging.getLogger("suno.service")
 
@@ -40,7 +43,7 @@ class SunoService:
         self.downloader = downloader
         self.executor = executor or ThreadPoolExecutor(max_workers=4)
 
-    def handle_music_callback(self, payload: dict) -> None:
+    def handle_music_callback(self, payload: Any) -> None:
         self._handle_callback("music", payload)
 
     def handle_wav_callback(self, payload: dict) -> None:
@@ -55,34 +58,71 @@ class SunoService:
     def handle_mp4_callback(self, payload: dict) -> None:
         self._handle_callback("mp4", payload)
 
-    def _handle_callback(self, task_kind: str, payload: dict) -> None:
-        envelope = self._parse_payload(payload)
+    def _handle_callback(self, task_kind: str, payload: Any) -> None:
+        raw_payload: dict | None
+        tracks: List["Track"] = []
+        code_override: Optional[int] = None
+        msg_override: Optional[str] = None
+        type_override: Optional[str] = None
+        task_id_override: Optional[str] = None
+        if hasattr(payload, "raw") and isinstance(getattr(payload, "raw"), dict):
+            raw_payload = getattr(payload, "raw")
+        elif isinstance(payload, dict):
+            raw_payload = payload
+        else:
+            raw_payload = None
+        if hasattr(payload, "tracks"):
+            tracks = list(getattr(payload, "tracks") or [])
+        if hasattr(payload, "code"):
+            code_override = getattr(payload, "code")
+        if hasattr(payload, "msg"):
+            msg_override = getattr(payload, "msg")
+        if hasattr(payload, "type"):
+            type_override = getattr(payload, "type")
+        if hasattr(payload, "task_id"):
+            task_id_override = getattr(payload, "task_id")
+
+        envelope = self._parse_payload(raw_payload)
         if envelope is None or envelope.data is None:
             logger.warning("Received invalid callback payload for %s", task_kind)
             return
-        task_id = envelope.data.task_id
-        callback_type = (envelope.data.callback_type or "unknown").lower()
+        task_id = task_id_override or envelope.data.task_id
+        callback_type = (type_override or envelope.data.callback_type or "unknown").lower()
         if not task_id:
             logger.warning("Callback without task_id for %s", task_kind)
             return
         if self.store.is_processed(task_id, callback_type):
             logger.debug("Duplicate callback %s/%s", task_id, callback_type)
             return
-        saved = self.store.save_event(task_id, callback_type, payload)
+        saved = self.store.save_event(task_id, callback_type, raw_payload or {})
         if not saved:
             logger.debug("Callback already saved %s/%s", task_id, callback_type)
             return
-        if envelope.code and envelope.code >= 400:
-            self.store.record_error(task_id, {"code": envelope.code, "message": envelope.msg})
+        code = code_override if code_override is not None else envelope.code or 0
+        message = msg_override or envelope.msg or ""
+        if code and code != 200:
+            self.store.record_error(task_id, {"code": code, "message": message})
             return
         if callback_type == "error":
             error_payload = envelope.data.model_dump() if envelope.data else {}
+            if message:
+                error_payload["message"] = message
+            if code:
+                error_payload["code"] = code
             self.store.record_error(task_id, error_payload)
             return
-        assets = self._extract_assets(task_id, envelope)
+        assets = self._deduplicate_assets(
+            [
+                *self._assets_from_tracks(task_id, tracks),
+                *self._extract_assets(task_id, envelope),
+            ]
+        )
         if assets:
-            self.store.upsert_assets(task_id, [asset.model_dump() for asset in assets])
-            self._download_assets(task_id, assets)
+            new_assets = self.store.upsert_assets(task_id, [asset.model_dump() for asset in assets])
+            if new_assets:
+                self._download_assets(task_id, new_assets)
+            else:
+                logger.debug("No new assets to download for %s/%s", task_id, callback_type)
         else:
             logger.debug("No assets found for callback %s/%s", task_id, callback_type)
 
@@ -163,7 +203,62 @@ class SunoService:
         filename = f"{callback_type or asset_type}_{asset_type}_{identifier}"
         return TaskAsset(task_id=task_id, url=url, asset_type=asset_type, identifier=str(identifier), filename=filename)
 
-    def _download_assets(self, task_id: str, assets: List[TaskAsset]) -> None:
+    def _assets_from_tracks(
+        self,
+        task_id: str,
+        tracks: Sequence["Track"],
+    ) -> List[TaskAsset]:
+        assets: List[TaskAsset] = []
+        for idx, track in enumerate(tracks):
+            identifier = getattr(track, "audio_id", None) or str(idx)
+            audio_url = getattr(track, "audio_url", None)
+            image_url = getattr(track, "image_url", None)
+            video_url = getattr(track, "video_url", None)
+            if audio_url:
+                assets.append(
+                    TaskAsset(
+                        task_id=task_id,
+                        url=audio_url,
+                        asset_type="audio",
+                        identifier=str(identifier),
+                        filename=f"{identifier}.mp3",
+                    )
+                )
+            if image_url:
+                assets.append(
+                    TaskAsset(
+                        task_id=task_id,
+                        url=image_url,
+                        asset_type="image",
+                        identifier=f"{identifier}_image",
+                        filename=f"{identifier}.jpeg",
+                    )
+                )
+            if video_url:
+                assets.append(
+                    TaskAsset(
+                        task_id=task_id,
+                        url=video_url,
+                        asset_type="video",
+                        identifier=f"{identifier}_video",
+                        filename=f"{identifier}.mp4",
+                    )
+                )
+        return assets
+
+    def _deduplicate_assets(self, assets: Iterable[TaskAsset]) -> List[TaskAsset]:
+        seen = set()
+        unique: List[TaskAsset] = []
         for asset in assets:
-            relative_path = Path(task_id) / asset.filename
+            key = (asset.asset_type, asset.identifier or asset.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(asset)
+        return unique
+
+    def _download_assets(self, task_id: str, assets: Sequence[TaskAsset]) -> None:
+        for asset in assets:
+            filename = asset.filename or f"{asset.asset_type}_{asset.identifier or 'asset'}"
+            relative_path = Path(task_id) / filename
             self.executor.submit(self.downloader, asset.url, relative_path, self.download_dir)

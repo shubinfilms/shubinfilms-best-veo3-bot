@@ -11,7 +11,7 @@ from suno.client import SunoClient
 def main() -> None:
     load_dotenv()
     client = SunoClient(
-        base_url=os.environ["SUNO_API_BASE"],
+        base_url=os.environ.get("SUNO_API_BASE"),
         token=os.environ["SUNO_API_TOKEN"],
     )
     callback_url = os.environ["SUNO_CALLBACK_PUBLIC_URL"] + "/music"
@@ -26,7 +26,9 @@ def main() -> None:
     task_id = response.get("data", {}).get("taskId")
     print("Task response:", response)
     if task_id:
-        print("Created task", task_id)
+        print("taskId:", task_id)
+    else:
+        print("No taskId returned")
 
 
 if __name__ == "__main__":  # pragma: no cover - manual demo
