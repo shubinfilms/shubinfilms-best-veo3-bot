@@ -372,13 +372,17 @@ CB_GO_HOME = "go_home"
 # ==========================
 #   Tokens / Pricing
 # ==========================
+PRICE_MJ = 10
 PRICE_BANANA = 5
+PRICE_VEO_FAST = 50
+PRICE_VEO_QUALITY = 150
+PRICE_VEO_ANIMATE = 50
 
 TOKEN_COSTS = {
-    "veo_fast": 50,
-    "veo_quality": 150,
-    "veo_photo": 50,
-    "mj": 10,          # 16:9 или 9:16
+    "veo_fast": PRICE_VEO_FAST,
+    "veo_quality": PRICE_VEO_QUALITY,
+    "veo_photo": PRICE_VEO_ANIMATE,
+    "mj": PRICE_MJ,          # 16:9 или 9:16
     "banana": PRICE_BANANA,
     "chat": 0,
 }
@@ -1233,6 +1237,16 @@ def image_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def inline_topup_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
+            [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+
+
 def balance_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
         [
@@ -1270,6 +1284,34 @@ async def show_balance_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Opt
         msg_ids["balance"] = mid
         s["last_panel"] = "balance"
     return mid
+
+
+async def show_balance_notification(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    s = state(ctx)
+    await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        "last_ui_msg_id_notice",
+        text,
+        reply_markup,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+    await refresh_balance_card_if_open(
+        user_id,
+        chat_id,
+        ctx=ctx,
+        state_dict=s,
+        reply_markup=balance_menu_kb(),
+    )
 
 
 def _ledger_reason(entry: Dict[str, Any]) -> str:
@@ -2440,23 +2482,51 @@ async def _validate_kie_video_asset(
 # ==========================
 #   VEO polling
 # ==========================
-async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: ContextTypes.DEFAULT_TYPE):
+async def poll_veo_and_send(
+    chat_id: int,
+    task_id: str,
+    gen_id: str,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    price: int,
+    service_name: str,
+) -> None:
     original_chat_id = chat_id
     s = state(ctx)
-    price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
-    op_key = s.get("active_generation_op")
-
     def _cleanup() -> None:
         ACTIVE_TASKS.pop(original_chat_id, None)
         if s.get("generation_id") == gen_id:
             s["generating"] = False
             s["generation_id"] = None
-        if op_key:
-            _clear_operation(ctx, op_key)
-        s.pop("active_generation_op", None)
         _clear_kie_request_id(task_id)
         with suppress(Exception):
             clear_task_meta(task_id)
+
+    async def _refund(reason_tag: str, message: Optional[str] = None) -> Optional[int]:
+        meta: Dict[str, Any] = {
+            "service": service_name,
+            "reason": reason_tag,
+            "task_id": task_id,
+        }
+        if message:
+            meta["message"] = message
+        try:
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta=meta,
+            )
+        except Exception as exc:
+            log.exception("VEO refund %s failed for %s: %s", reason_tag, user_id, exc)
+            return None
+        await show_balance_notification(
+            chat_id,
+            ctx,
+            user_id,
+            f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+        )
+        return new_balance
 
     async def _send_message_with_retry(
         dest_chat_id: int,
@@ -2591,22 +2661,12 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
                 video_url = await _poll_record_info()
             except TimeoutError as exc:
                 log_evt("KIE_TIMEOUT", task_id=task_id, reason="poll_exception", message=str(exc))
-                refund(
-                    ctx,
-                    price,
-                    f"refund:{task_id}:timeout",
-                    {"reason": "timeout"},
-                )
+                await _refund("timeout", str(exc))
                 await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
                 return
             except Exception as exc:
                 log.exception("VEO status polling failed: %s", exc)
-                refund(
-                    ctx,
-                    price,
-                    f"refund:{task_id}:poll_exception",
-                    {"reason": "poll_exception", "message": str(exc)},
-                )
+                await _refund("poll_exception", str(exc))
                 await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
                 return
 
@@ -2657,21 +2717,11 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
             )
     except TimeoutError as exc:
         log_evt("KIE_TIMEOUT", task_id=task_id, reason="timeout", message=str(exc))
-        refund(
-            ctx,
-            price,
-            f"refund:{task_id}:timeout_final",
-            {"reason": "timeout"},
-        )
+        await _refund("timeout_final", str(exc))
         await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     except Exception as exc:
         log.exception("VEO render failed: %s", exc)
-        refund(
-            ctx,
-            price,
-            f"refund:{task_id}:exception",
-            {"reason": "exception", "message": str(exc)},
-        )
+        await _refund("exception", str(exc))
         await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     finally:
         if temp_file and temp_file.exists():
@@ -2682,9 +2732,15 @@ async def poll_veo_and_send(chat_id: int, task_id: str, gen_id: str, ctx: Contex
 # ==========================
 #   MJ poll (1 авторетрай)
 # ==========================
-async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.DEFAULT_TYPE,
-                                  prompt: str, aspect: str) -> None:
-    price = TOKEN_COSTS["mj"]
+async def poll_mj_and_send_photos(
+    chat_id: int,
+    task_id: str,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    aspect: str,
+    user_id: int,
+    price: int,
+) -> None:
     start_ts = time.time()
     delay = 12
     max_wait = 12 * 60
@@ -2695,28 +2751,38 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
     s = state(ctx)
     s["last_mj_task_id"] = task_id
 
-    op_key = s.get("mj_active_op_key")
-
-    def _refund(reason_tag: str, message: Optional[str] = None) -> None:
-        meta: Dict[str, Any] = {"reason": reason_tag}
+    async def _refund(reason_tag: str, message: Optional[str] = None) -> Optional[int]:
+        meta: Dict[str, Any] = {"service": "MJ", "reason": reason_tag, "task_id": task_id}
         if message:
             meta["message"] = message
-        refund_op_id = f"refund:{task_id}:{reason_tag}"
         try:
-            credit_tokens(ctx, price, "mj_refund", refund_op_id, meta)
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta=meta,
+            )
         except Exception as exc:
-            log.exception("MJ refund %s failed: %s", reason_tag, exc)
+            log.exception("MJ refund %s failed for %s: %s", reason_tag, user_id, exc)
+            return None
+        await show_balance_notification(
+            chat_id,
+            ctx,
+            user_id,
+            f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+        )
+        return new_balance
 
     try:
         while True:
             ok, flag, data = await asyncio.to_thread(mj_status, task_id)
             if not ok:
-                _refund("status_error")
+                await _refund("status_error")
                 await ctx.bot.send_message(chat_id, "❌ MJ: сервис недоступен. 💎 Токены возвращены.")
                 return
             if flag == 0:
                 if time.time() - start_ts > max_wait:
-                    _refund("timeout")
+                    await _refund("timeout")
                     await ctx.bot.send_message(chat_id, "⌛ MJ долго отвечает. 💎 Токены возвращены.")
                     return
                 await asyncio.sleep(delay)
@@ -2746,7 +2812,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                         start_ts = time.time()
                         delay = 12
                         continue
-                _refund("error", err)
+                await _refund("error", err)
                 await ctx.bot.send_message(chat_id, f"❌ MJ: {err}\n💎 Токены возвращены.")
                 return
             if flag == 1:
@@ -2758,7 +2824,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     urls = [one_url] if one_url else []
 
                 if not urls:
-                    _refund("empty")
+                    await _refund("empty")
                     await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
                     return
 
@@ -2775,7 +2841,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                         log.warning("MJ skip image due to download failure: %s", u)
 
                 if not downloaded:
-                    _refund("download_failed")
+                    await _refund("download_failed")
                     await ctx.bot.send_message(
                         chat_id,
                         "⚠️ MJ вернул результат, но изображения не удалось загрузить. 💎 Токены возвращены.",
@@ -2816,7 +2882,7 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                     sent_successfully = await _send_photos_one_by_one()
 
                 if not sent_successfully:
-                    _refund("send_failed")
+                    await _refund("send_failed")
                     await ctx.bot.send_message(
                         chat_id,
                         "❌ Не удалось отправить изображения MJ. 💎 Токены возвращены.",
@@ -2833,9 +2899,11 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
                 return
     except Exception as e:
         log.exception("MJ poll crash: %s", e)
-        _refund("exception", str(e))
-        try: await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка MJ. 💎 Токены возвращены.")
-        except Exception: pass
+        await _refund("exception", str(e))
+        try:
+            await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка MJ. 💎 Токены возвращены.")
+        except Exception:
+            pass
     finally:
         s = state(ctx)
         s["mj_generating"] = False
@@ -2845,14 +2913,14 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
         mid = s.get("last_ui_msg_id_mj")
         if mid:
             final_text = "✅ Midjourney: изображение обработано." if success else "ℹ️ Midjourney: поток завершён."
-            try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None)
-            except Exception: pass
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None
+                )
+            except Exception:
+                pass
             s["last_ui_msg_id_mj"] = None
             s["_last_text_mj"] = None
-        if op_key:
-            _clear_operation(ctx, op_key)
-        s.pop("mj_active_op_key", None)
-
 # ==========================
 #   Handlers
 # ==========================
@@ -3621,62 +3689,76 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             prompt = (s.get("last_prompt") or "").strip()
             if not prompt:
                 await q.message.reply_text("❌ Промпт не найден, отправьте текст и повторите."); return
-            price = TOKEN_COSTS['mj']
+            price = PRICE_MJ
             aspect_value = "9:16" if s.get("aspect") == "9:16" else "16:9"
-            fingerprint = _make_fingerprint({"prompt": prompt, "aspect": aspect_value})
-            op_key = f"mj:{fingerprint}"
-            op_id, _ = _ensure_operation(ctx, op_key)
-            status, rest, _ = try_charge(
-                ctx,
-                price,
-                "mj_charge",
-                op_id,
-                {"prompt": _short_prompt(prompt, 160), "aspect": aspect_value},
-            )
-            if status == "insufficient":
-                _clear_operation(ctx, op_key)
-                await q.message.reply_text(
-                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
-                    reply_markup=stars_topup_kb(),
-                );
+            user = update.effective_user
+            uid = user.id if user else None
+            if not uid:
+                await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
                 return
-            if status == "duplicate":
-                await q.message.reply_text("⏳ Уже выполняю этот промпт. Дождитесь результата.")
+            try:
+                ensure_user(uid)
+            except Exception as exc:
+                log.exception("MJ ensure_user failed for %s: %s", uid, exc)
+                await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
+                return
+            ok, balance_after = debit_try(
+                uid,
+                price,
+                reason="service:start",
+                meta={"service": "MJ", "aspect": aspect_value, "prompt": _short_prompt(prompt, 160)},
+            )
+            if not ok:
+                current_balance = balance_after if isinstance(balance_after, int) else get_balance(uid)
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    uid,
+                    f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
+                    reply_markup=inline_topup_keyboard(),
+                )
                 return
             await q.message.reply_text("✅ Промпт принят.")
+            await show_balance_notification(
+                chat_id,
+                ctx,
+                uid,
+                f"✅ Списано {price}💎. Текущий баланс: {balance_after}💎 — запускаю…",
+            )
             s["mj_generating"] = True
             s["mj_last_wait_ts"] = time.time()
             await show_mj_generating_card(chat_id, ctx, prompt, aspect_value)
             ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt, aspect_value)
             event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
             if not ok or not task_id:
-                refund_id = f"refund:{op_id}:submit"
                 try:
-                    credit_tokens(
-                        ctx,
+                    new_balance = credit_balance(
+                        uid,
                         price,
-                        "mj_refund",
-                        refund_id,
-                        {"reason": "submit_failed", "message": msg},
+                        reason="service:refund",
+                        meta={"service": "MJ", "reason": "submit_failed", "message": msg},
                     )
                 except Exception as exc:
-                    log.exception("MJ submit refund failed for %s: %s", update.effective_user.id, exc)
-                _clear_operation(ctx, op_key)
+                    log.exception("MJ submit refund failed for %s: %s", uid, exc)
+                    new_balance = None
                 s["mj_generating"] = False
                 s["last_mj_task_id"] = None
                 s["mj_last_wait_ts"] = 0.0
+                if new_balance is not None:
+                    await show_balance_notification(
+                        chat_id,
+                        ctx,
+                        uid,
+                        f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                    )
                 await q.message.reply_text(f"❌ Не удалось создать MJ-задачу: {msg}\n💎 Токены возвращены.")
                 await show_mj_prompt_card(chat_id, ctx)
                 return
-            final_op_id = f"gen:{task_id}"
-            if not rename_operation(op_id, final_op_id, {"task_id": task_id}):
-                log.warning("Failed to rename MJ op %s -> %s", op_id, final_op_id)
-            _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
-            s["mj_active_op_key"] = op_key
             s["last_mj_task_id"] = task_id
-            asyncio.create_task(poll_mj_and_send_photos(chat_id, task_id, ctx, prompt, aspect_value))
+            asyncio.create_task(
+                poll_mj_and_send_photos(chat_id, task_id, ctx, prompt, aspect_value, uid, price)
+            )
             return
-
         if action == "repeat":
             if s.get("mj_generating"):
                 await q.message.reply_text("⏳ Уже идёт генерация. Дождитесь результата."); return
@@ -3705,67 +3787,57 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if act == "start":
             imgs = s.get("banana_images") or []
             prompt = (s.get("last_prompt") or "").strip()
-            if not imgs:   await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото."); return
-            if not prompt: await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить)."); return
-            fingerprint = _make_fingerprint({"prompt": prompt, "images": imgs})
-            op_key = f"banana:{fingerprint}"
-            _op_id, is_new = _ensure_operation(ctx, op_key)
-            if not is_new:
-                await q.message.reply_text("⏳ Уже обрабатываю предыдущий запрос Banana. Дождитесь результата.")
+            if not imgs:
+                await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото.")
+                return
+            if not prompt:
+                await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить).")
                 return
             user = update.effective_user
             uid = user.id if user else None
             if not uid:
-                _clear_operation(ctx, op_key)
                 await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
                 return
             try:
                 ensure_user(uid)
-                balance = get_balance(uid)
             except Exception as exc:
-                _clear_operation(ctx, op_key)
-                log.exception("Banana balance fetch failed for %s: %s", uid, exc)
+                log.exception("Banana ensure_user failed for %s: %s", uid, exc)
                 await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
                 return
-            if balance < PRICE_BANANA:
-                s["banana_balance"] = balance
-                s["_last_text_banana"] = None
-                await show_banana_card(update.effective_chat.id, ctx)
-                _clear_operation(ctx, op_key)
-                await q.message.reply_text(
-                    f"Недостаточно 💎. Нужно {PRICE_BANANA}, у вас {balance}. Пополните баланс.",
+            ok, balance_after = debit_try(
+                uid,
+                PRICE_BANANA,
+                reason="service:start",
+                meta={"service": "BANANA", "images": len(imgs)},
+            )
+            if not ok:
+                current_balance = balance_after if isinstance(balance_after, int) else get_balance(uid)
+                await show_balance_notification(
+                    update.effective_chat.id,
+                    ctx,
+                    uid,
+                    f"🙇 Недостаточно токенов. Нужно: {PRICE_BANANA}💎, у вас: {current_balance}💎.",
+                    reply_markup=inline_topup_keyboard(),
                 )
                 return
-            try:
-                new_balance = debit_balance(uid, PRICE_BANANA, reason="banana:start")
-            except Exception as exc:
-                _clear_operation(ctx, op_key)
-                log.exception("Banana debit failed for %s: %s", uid, exc)
-                await q.message.reply_text("⚠️ Не удалось списать баланс. Попробуйте позже.")
-                return
+            new_balance = balance_after
             s["banana_balance"] = new_balance
             s["_last_text_banana"] = None
             chat_id = update.effective_chat.id
             await show_banana_card(chat_id, ctx)
             await show_main_menu(chat_id, ctx)
-            await refresh_balance_card_if_open(
-                uid,
+            await show_balance_notification(
                 chat_id,
-                ctx=ctx,
-                state_dict=s,
-                reply_markup=balance_menu_kb(),
+                ctx,
+                uid,
+                f"✅ Списано {PRICE_BANANA}💎. Текущий баланс: {new_balance}💎 — запускаю…",
             )
-            await q.message.reply_text(
-                f"✅ Списано {PRICE_BANANA}💎. Текущий баланс: {new_balance} — запускаю обработку…"
-            )
-            s["banana_active_op_key"] = op_key
             asyncio.create_task(
                 _banana_run_and_send(
                     update.effective_chat.id,
                     ctx,
                     imgs,
                     prompt,
-                    op_key,
                     PRICE_BANANA,
                     uid,
                 )
@@ -3790,36 +3862,59 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_id_for_lock = user.id if user else None
         if not _acquire_click_lock(user_id_for_lock, "veo:start"):
             return
-        price = TOKEN_COSTS['veo_quality'] if s.get('model') == 'veo3' else TOKEN_COSTS['veo_fast']
         chat_id = update.effective_chat.id
         if ACTIVE_TASKS.get(chat_id):
             await q.message.reply_text("⏳ Уже рендерю вашу предыдущую задачу. Подождите, пожалуйста.")
             return
-        uid = user.id if user else 0
-        fingerprint = _make_fingerprint({
-            "prompt": prompt,
-            "image": s.get("last_image_url"),
-            "aspect": s.get("aspect"),
-            "model": s.get("model"),
-        })
-        op_key = f"veo:{fingerprint}"
-        op_id, _ = _ensure_operation(ctx, op_key)
+        uid = user.id if user else None
+        if not uid:
+            await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
+            return
+        mode = s.get("mode") or ""
+        if mode == "veo_photo":
+            price = PRICE_VEO_ANIMATE
+            service_name = "VEO_ANIMATE"
+        elif s.get("model") == "veo3":
+            price = PRICE_VEO_QUALITY
+            service_name = "VEO_QUALITY"
+        else:
+            price = PRICE_VEO_FAST
+            service_name = "VEO_FAST"
+        try:
+            ensure_user(uid)
+        except Exception as exc:
+            log.exception("VEO ensure_user failed for %s: %s", uid, exc)
+            await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
+            return
         meta = {
+            "service": service_name,
             "prompt": _short_prompt(prompt, 160),
             "aspect": s.get("aspect") or "16:9",
             "model": s.get("model") or "veo3_fast",
+            "has_image": bool(s.get("last_image_url")),
         }
-        status, rest, _ = try_charge(ctx, price, "veo_charge", op_id, meta)
-        if status == "insufficient":
-            _clear_operation(ctx, op_key)
-            await q.message.reply_text(
-                f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
-                reply_markup=stars_topup_kb(),
-            );
+        ok, balance_after = debit_try(
+            uid,
+            price,
+            reason="service:start",
+            meta=meta,
+        )
+        if not ok:
+            current_balance = balance_after if isinstance(balance_after, int) else get_balance(uid)
+            await show_balance_notification(
+                chat_id,
+                ctx,
+                uid,
+                f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
+                reply_markup=inline_topup_keyboard(),
+            )
             return
-        if status == "duplicate":
-            await q.message.reply_text("⏳ Уже выполняю предыдущий запрос. Дождитесь результата.")
-            return
+        await show_balance_notification(
+            chat_id,
+            ctx,
+            uid,
+            f"✅ Списано {price}💎. Текущий баланс: {balance_after}💎 — запускаю…",
+        )
         ACTIVE_TASKS[chat_id] = "__pending__"
         await q.message.reply_text("🎬 Отправляю задачу в VEO…")
         try:
@@ -3832,46 +3927,53 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as exc:
             log.exception("VEO submit crashed: %s", exc)
-            refund_id = f"refund:{op_id}:submit_exc"
+            ACTIVE_TASKS.pop(chat_id, None)
             try:
-                credit_tokens(
-                    ctx,
+                new_balance = credit_balance(
+                    uid,
                     price,
-                    "veo_refund",
-                    refund_id,
-                    {"reason": "submit_exception", "message": str(exc)},
+                    reason="service:refund",
+                    meta={"service": service_name, "reason": "submit_exception", "message": str(exc)},
                 )
             except Exception as refund_exc:
                 log.exception("VEO submit crash refund failed for %s: %s", uid, refund_exc)
-            _clear_operation(ctx, op_key)
-            ACTIVE_TASKS.pop(chat_id, None)
+                new_balance = None
+            if new_balance is not None:
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    uid,
+                    f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                )
             await q.message.reply_text("⚠️ Не удалось создать VEO-задачу. 💎 Токены возвращены.")
             return
         if not ok or not task_id:
-            refund_id = f"refund:{op_id}:submit"
+            ACTIVE_TASKS.pop(chat_id, None)
             try:
-                credit_tokens(
-                    ctx,
+                new_balance = credit_balance(
+                    uid,
                     price,
-                    "veo_refund",
-                    refund_id,
-                    {"reason": "submit_failed", "message": msg},
+                    reason="service:refund",
+                    meta={"service": service_name, "reason": "submit_failed", "message": msg},
                 )
             except Exception as exc:
                 log.exception("VEO submit refund failed for %s: %s", uid, exc)
-            _clear_operation(ctx, op_key)
-            ACTIVE_TASKS.pop(chat_id, None)
+                new_balance = None
+            if new_balance is not None:
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    uid,
+                    f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                )
             await q.message.reply_text(
                 f"❌ Не удалось создать VEO-задачу: {msg}\n💎 Токены возвращены.",
             )
             return
-        final_op_id = f"gen:{task_id}"
-        if not rename_operation(op_id, final_op_id, {"task_id": task_id}):
-            log.warning("Failed to rename ledger op %s -> %s", op_id, final_op_id)
-        _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
-        s["active_generation_op"] = op_key
         gen_id = uuid.uuid4().hex
-        s["generating"] = True; s["generation_id"] = gen_id; s["last_task_id"] = task_id
+        s["generating"] = True
+        s["generation_id"] = gen_id
+        s["last_task_id"] = task_id
         ACTIVE_TASKS[chat_id] = task_id
         try:
             effective_message = update.effective_message
@@ -3883,7 +3985,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("Failed to save task meta for %s", task_id)
         await q.message.reply_text("🎬 Рендер начат — вернусь с готовым видео.")
-        asyncio.create_task(poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx)); return
+        asyncio.create_task(
+            poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx, uid, price, service_name)
+        ); return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -4058,15 +4162,26 @@ async def _banana_run_and_send(
     ctx: ContextTypes.DEFAULT_TYPE,
     src_urls: List[str],
     prompt: str,
-    op_key: str,
     price: int,
     user_id: int,
 ) -> None:
     s = state(ctx)
+    task_info: Dict[str, Optional[str]] = {"id": None}
 
     async def _refund(reason_tag: str, message: Optional[str] = None) -> Optional[int]:
+        meta: Dict[str, Any] = {"service": "BANANA", "reason": reason_tag}
+        if message:
+            meta["message"] = message
+        task_id_val = task_info.get("id")
+        if task_id_val:
+            meta["task_id"] = task_id_val
         try:
-            new_balance = credit_balance(user_id, price, reason="banana:refund")
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta=meta,
+            )
         except Exception as exc:
             log.exception("Banana refund %s failed: %s", reason_tag, exc)
             return None
@@ -4074,19 +4189,23 @@ async def _banana_run_and_send(
         s["_last_text_banana"] = None
         await show_banana_card(chat_id, ctx)
         await show_main_menu(chat_id, ctx)
-        await refresh_balance_card_if_open(
-            user_id,
+        await show_balance_notification(
             chat_id,
-            ctx=ctx,
-            state_dict=s,
-            reply_markup=balance_menu_kb(),
+            ctx,
+            user_id,
+            f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
         )
         return new_balance
 
     try:
-        task_id = await asyncio.to_thread(create_banana_task, prompt, src_urls, "png", "auto", None, None, 60)
-        s["banana_active_op_key"] = op_key
-        await ctx.bot.send_message(chat_id, f"🍌 Задача Banana создана.\n🆔 taskId={task_id}\nЖдём результат…")
+        task_id = await asyncio.to_thread(
+            create_banana_task, prompt, src_urls, "png", "auto", None, None, 60
+        )
+        task_info["id"] = str(task_id)
+        await ctx.bot.send_message(
+            chat_id,
+            f"🍌 Задача Banana создана.\n🆔 taskId={task_id}\nЖдём результат…",
+        )
         urls = await asyncio.to_thread(wait_for_banana_result, task_id, 8 * 60, 3)
         if not urls:
             new_balance = await _refund("empty")
@@ -4127,9 +4246,6 @@ async def _banana_run_and_send(
         if new_balance is not None:
             msg += f" Текущий баланс: {new_balance}."
         await ctx.bot.send_message(chat_id, msg)
-    finally:
-        _clear_operation(ctx, op_key)
-        s.pop("banana_active_op_key", None)
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
