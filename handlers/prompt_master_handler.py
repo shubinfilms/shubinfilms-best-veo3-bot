@@ -110,7 +110,7 @@ async def _update_veo_card_if_visible(update: Update, context: ContextTypes.DEFA
     chat = update.effective_chat
     if chat is None or not callable(_veo_card_updater):
         return
-    last_ui_msg_id = context.user_data.get("last_ui_msg_id")
+    last_ui_msg_id = context.user_data.get("last_ui_msg_id_veo")
     if not last_ui_msg_id:
         return
     try:
