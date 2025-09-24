@@ -21,8 +21,8 @@ class TaskStore(ABC):
         """Return whether callback with the same type was processed."""
 
     @abstractmethod
-    def upsert_assets(self, task_id: str, assets: List[dict]) -> None:
-        """Store asset descriptors for a task."""
+    def upsert_assets(self, task_id: str, assets: List[dict]) -> List[TaskAsset]:
+        """Store asset descriptors for a task and return newly added assets."""
 
     @abstractmethod
     def record_error(self, task_id: str, error: dict) -> None:
@@ -55,13 +55,17 @@ class InMemoryTaskStore(TaskStore):
         with self._lock:
             return key in self._events
 
-    def upsert_assets(self, task_id: str, assets: List[dict]) -> None:
+    def upsert_assets(self, task_id: str, assets: List[dict]) -> List[TaskAsset]:
+        inserted: List[TaskAsset] = []
         with self._lock:
             bucket = self._assets[task_id]
             for asset in assets:
                 normalized = TaskAsset(**asset)
                 key = f"{normalized.asset_type}:{normalized.identifier or normalized.url}"
+                if key not in bucket:
+                    inserted.append(normalized)
                 bucket[key] = normalized
+        return inserted
 
     def record_error(self, task_id: str, error: dict) -> None:
         with self._lock:
