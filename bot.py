@@ -186,7 +186,7 @@ class SunoConfig:
 
 
 def _load_suno_config() -> SunoConfig:
-    base = _env("SUNO_API_URL")
+    base = (_env("SUNO_API_URL") or "").strip().rstrip("/")
     gen_path = _env("SUNO_GEN_PATH", "/generate-music") or "/generate-music"
     status_path = _env("SUNO_STATUS_PATH", "/get-music-details") or "/get-music-details"
     model = _env("SUNO_MODEL", "v5") or "v5"
@@ -1785,6 +1785,23 @@ def _suno_log(
         log.warning("Suno log store failed | err=%s", exc)
 
 
+def _suno_sanitize_log_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, value in payload.items():
+            lowered = key.lower()
+            if isinstance(value, str) and any(
+                token in lowered for token in ("prompt", "lyrics", "lyric", "text")
+            ):
+                sanitized[key] = f"<len={len(value)}>"
+            else:
+                sanitized[key] = _suno_sanitize_log_payload(value)
+        return sanitized
+    if isinstance(payload, list):
+        return [_suno_sanitize_log_payload(item) for item in payload]
+    return payload
+
+
 def _suno_headers() -> Dict[str, str]:
     headers: Dict[str, str] = {"Accept": "application/json"}
     headers.update(_kie_auth_header())
@@ -1841,12 +1858,23 @@ async def _suno_request(
                         data = {"raw": text_payload} if text_payload else {}
 
                     if resp.status >= 400:
+                        sanitized = (
+                            _suno_sanitize_log_payload(data)
+                            if isinstance(data, dict)
+                            else None
+                        )
+                        if sanitized is not None:
+                            snippet = json.dumps(sanitized, ensure_ascii=False)
+                        elif isinstance(data, dict):
+                            snippet = json.dumps(data, ensure_ascii=False)
+                        else:
+                            snippet = text_payload or ""
                         _suno_log(
                             user_id=log_user_id,
                             phase="error",
                             request_url=url,
                             http_status=resp.status,
-                            response_snippet=text_payload or json.dumps(data, ensure_ascii=False),
+                            response_snippet=snippet,
                         )
                         raise SunoApiError(
                             f"Suno API error: {resp.status}",
@@ -1855,12 +1883,16 @@ async def _suno_request(
                         )
 
                     if isinstance(data, dict):
+                        sanitized = _suno_sanitize_log_payload(data)
                         _suno_log(
                             user_id=log_user_id,
                             phase=log_phase,
                             request_url=url,
                             http_status=resp.status,
-                            response_snippet=json.dumps(data, ensure_ascii=False) if data else text_payload,
+                            response_snippet=
+                            json.dumps(sanitized, ensure_ascii=False)
+                            if sanitized is not None
+                            else text_payload,
                         )
                         return data
                     raise SunoApiError(
@@ -1904,7 +1936,7 @@ async def suno_create_task(payload: Dict[str, Any], *, user_id: Optional[int]) -
 
 async def suno_poll_task(task_id: str, *, user_id: Optional[int]) -> Dict[str, Any]:
     timeout = float(SUNO_CONFIG.timeout_sec or 60)
-    params = {"task_id": task_id, "id": task_id}
+    params = {"task_id": task_id, "id": task_id, "taskId": task_id}
     return await _suno_request(
         "GET",
         SUNO_CONFIG.status_path,
@@ -2094,17 +2126,20 @@ async def _launch_suno_generation(
 
     payload: Dict[str, Any] = {
         "model": SUNO_MODEL,
+        "customMode": True,
+        "instrumental": instrumental,
         "title": title,
         "style": style,
-        "lyrics": lyrics or "",
-        "instrumental": instrumental,
     }
+    if not instrumental:
+        payload["prompt"] = lyrics or ""
 
     meta: Dict[str, Any] = {
         "task_id": None,
         "model": SUNO_MODEL,
         "instrumental": instrumental,
         "has_lyrics": bool(lyrics),
+        "prompt_len": len(lyrics or ""),
         "title": title,
         "style": style,
         "trigger": trigger,
