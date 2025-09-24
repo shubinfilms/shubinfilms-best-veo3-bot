@@ -53,7 +53,6 @@ import redis
 from ui_helpers import upsert_card
 
 from redis_utils import (
-    add_ledger_entry,
     credit,
     credit_balance,
     debit_balance,
@@ -2459,17 +2458,15 @@ async def poll_mj_and_send_photos(chat_id: int, task_id: str, ctx: ContextTypes.
 # ==========================
 def stars_topup_kb() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    packs = [
-        (50, 50, 0),
-        (100, 110, 10),
-        (200, 220, 20),
-        (300, 330, 30),
-        (400, 440, 40),
-        (500, 550, 50),
-    ]
-    for stars, tokens, bonus in packs:
-        cap = f"⭐ {stars} → 💎 {tokens}" + (f" +{bonus}💎 бонус" if bonus else "")
-        rows.append([InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{tokens}")])
+    for stars in STARS_PACK_ORDER:
+        diamonds = STARS_TO_DIAMONDS.get(stars)
+        if not diamonds:
+            continue
+        bonus = max(diamonds - stars, 0)
+        cap = f"⭐ {stars} → 💎 {diamonds}" + (f" +{bonus}💎 бонус" if bonus else "")
+        rows.append(
+            [InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{diamonds}")]
+        )
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
     return InlineKeyboardMarkup(rows)
@@ -2998,10 +2995,27 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Покупка
     if data.startswith("buy:stars:"):
-        _, _, stars_str, tokens_str = data.split(":")
-        stars = int(stars_str); tokens = int(tokens_str)
-        title = f"{stars}⭐ → {tokens}💎"
-        payload = json.dumps({"kind": "stars_pack", "stars": stars, "tokens": tokens})
+        try:
+            _, _, stars_str, diamonds_str = data.split(":")
+            stars = int(stars_str)
+            diamonds = int(diamonds_str)
+        except (ValueError, TypeError):
+            log.warning("stars_purchase_invalid_callback | data=%s", data)
+            await q.message.reply_text(
+                "⚠️ Не удалось определить пакет. Попробуйте выбрать его заново.",
+                reply_markup=stars_topup_kb(),
+            )
+            return
+
+        title = f"{stars}⭐ → {diamonds}💎"
+        payload = json.dumps(
+            {
+                "type": "stars_pack",
+                "stars": stars,
+                "diamonds": diamonds,
+                "bonus": max(diamonds - stars, 0),
+            }
+        )
         try:
             await ctx.bot.send_invoice(
                 chat_id=update.effective_chat.id,
@@ -3666,7 +3680,7 @@ STARS_TO_DIAMONDS = {
     500: 550,
 }
 
-STARS_UNITS_PER_STAR = 100
+STARS_PACK_ORDER = [50, 100, 200, 300, 400, 500]
 
 
 async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3689,21 +3703,79 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
     sp = message.successful_payment
     log.info("stars_payment_received | user=%s payment=%s", user_id, sp.to_dict())
 
-    total_units = int(sp.total_amount or 0)
-    stars = total_units // STARS_UNITS_PER_STAR if STARS_UNITS_PER_STAR else total_units
-    amount = STARS_TO_DIAMONDS.get(stars)
+    payload_raw = sp.invoice_payload or ""
+    parsed_payload: Optional[Dict[str, Any]] = None
 
-    if not amount:
+    def _to_positive_int(value: Any) -> Optional[int]:
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
+    diamonds_to_credit: Optional[int] = None
+    stars_amount: Optional[int] = None
+
+    if payload_raw:
+        try:
+            payload_candidate = json.loads(payload_raw)
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "stars_payment_payload_invalid | user=%s payload=%s err=%s",
+                user_id,
+                payload_raw,
+                exc,
+            )
+        else:
+            if isinstance(payload_candidate, dict):
+                parsed_payload = payload_candidate
+                stars_from_payload = _to_positive_int(parsed_payload.get("stars"))
+                diamonds_from_payload = _to_positive_int(parsed_payload.get("diamonds"))
+                if diamonds_from_payload is None:
+                    diamonds_from_payload = _to_positive_int(parsed_payload.get("tokens"))
+                if stars_from_payload:
+                    stars_amount = stars_from_payload
+                if diamonds_from_payload:
+                    diamonds_to_credit = diamonds_from_payload
+            else:
+                log.warning(
+                    "stars_payment_payload_unexpected | user=%s payload=%s",
+                    user_id,
+                    payload_candidate,
+                )
+
+    currency = (sp.currency or "").upper()
+    total_amount = int(sp.total_amount or 0)
+    fallback_stars: Optional[int] = None
+    if currency == "XTR":
+        if total_amount in STARS_TO_DIAMONDS:
+            fallback_stars = total_amount
+        elif total_amount % 100 == 0:
+            candidate = total_amount // 100
+            if candidate in STARS_TO_DIAMONDS:
+                fallback_stars = candidate
+
+    if fallback_stars:
+        if stars_amount is None:
+            stars_amount = fallback_stars
+        if diamonds_to_credit is None:
+            diamonds_to_credit = STARS_TO_DIAMONDS.get(fallback_stars)
+
+    if not diamonds_to_credit:
         log.error(
-            "stars_payment_invalid_amount | user=%s total_units=%s stars=%s",
+            "stars_payment_unrecognized_pack | user=%s currency=%s total_amount=%s payload=%s",
             user_id,
-            total_units,
-            stars,
+            currency,
+            total_amount,
+            payload_raw,
         )
         await message.reply_text(
-            "⚠️ Платёж получен, но не удалось определить сумму пополнения. Поддержка уведомлена."
+            "⚠️ Платёж получен, но пакет не распознан. Команда уже уведомлена."
         )
         return
+
+    if stars_amount is None and fallback_stars is not None:
+        stars_amount = fallback_stars
 
     charge_id = (
         sp.telegram_payment_charge_id
@@ -3712,34 +3784,31 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
     )
 
     credit_meta = {
-        "stars": stars,
-        "payload": sp.invoice_payload,
-        "provider": "stars",
+        "stars": stars_amount,
+        "diamonds": diamonds_to_credit,
+        "payload": parsed_payload if parsed_payload is not None else payload_raw or None,
+        "provider": "telegram_stars",
         "charge_id": charge_id,
+        "currency": currency,
+        "total_amount": total_amount,
     }
+    credit_meta = {k: v for k, v in credit_meta.items() if v is not None}
 
     try:
         new_balance = credit_balance(
             user_id,
-            amount,
-            reason="stars_purchase",
+            diamonds_to_credit,
+            reason="stars_payment",
             meta=credit_meta,
         )
-        ledger_entry = {
-            "ts": int(time.time()),
-            "type": "credit",
-            "amount": amount,
-            "reason": "stars_purchase",
-            "meta": {"stars": stars},
-            "balance_after": new_balance,
-        }
-        add_ledger_entry(user_id, ledger_entry)
     except KeyError:
         log.exception(
-            "stars_payment_mapping_missing | user=%s stars=%s", user_id, stars
+            "stars_payment_mapping_missing | user=%s stars=%s",
+            user_id,
+            stars_amount,
         )
         await message.reply_text(
-            "⚠️ Платёж получен, но не удалось определить тариф. Поддержка уведомлена."
+            "⚠️ Платёж получен, но пакет не распознан. Команда уже уведомлена."
         )
         return
     except Exception as exc:
@@ -3750,21 +3819,22 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
         return
 
     _set_cached_balance(ctx, new_balance)
-    chat_id = update.effective_chat.id if update.effective_chat else user_id
-    await show_main_menu(chat_id, ctx)
 
     log.info(
-        "stars_payment_success | user=%s charge_id=%s stars=%s amount=%s balance=%s",
+        "stars_payment_success | user=%s charge_id=%s stars=%s diamonds=%s balance=%s",
         user_id,
         charge_id,
-        stars,
-        amount,
+        stars_amount,
+        diamonds_to_credit,
         new_balance,
     )
 
     await message.reply_text(
-        f"✅ Пополнено на {amount} 💎. Новый баланс: {new_balance} 💎."
+        f"✅ Начислено +{diamonds_to_credit} 💎. Новый баланс: {new_balance} 💎."
     )
+
+    chat_id = update.effective_chat.id if update.effective_chat else user_id
+    await show_main_menu(chat_id, ctx)
 
 # ==========================
 #   Redis runner lock
