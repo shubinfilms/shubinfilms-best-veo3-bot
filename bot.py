@@ -18,8 +18,6 @@ from dataclasses import dataclass
 import aiohttp
 from aiohttp import ClientError, ClientResponseError, ClientTimeout
 import requests
-from dotenv import load_dotenv
-
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
@@ -94,6 +92,7 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
+from settings import REDIS_PREFIX, SUNO_LOG_KEY
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -126,7 +125,6 @@ def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-load_dotenv()
 def _env(k: str, d: str = "") -> str:
     v = os.getenv(k)
     return (v if v is not None else d).strip()
@@ -214,8 +212,6 @@ SUNO_MODEL_LABEL = SUNO_MODEL.upper() if SUNO_MODEL else "V5"
 SUNO_PRICE = SUNO_CONFIG.price
 SUNO_POLL_INTERVAL = 3.0
 SUNO_POLL_TIMEOUT = float(SUNO_CONFIG.timeout_sec)
-SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs" if REDIS_PREFIX else "veo3:prod:suno:logs"
-
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
@@ -324,9 +320,20 @@ try:
 except Exception:
     _tg = None
 
+
+async def _safe_edit_message_text(
+    edit_callable: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any
+) -> Optional[Any]:
+    """Execute ``edit_message_text`` calls while downgrading 400 errors to warnings."""
+
+    try:
+        return await edit_callable(*args, **kwargs)
+    except BadRequest as exc:
+        log.warning("edit_message_text ignored (HTTP 400): %s", exc)
+        return exc
+
 # Redis
 REDIS_URL           = _env("REDIS_URL")
-REDIS_PREFIX        = _env("REDIS_PREFIX", "veo3:prod")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
@@ -1536,7 +1543,7 @@ async def _edit_transactions_message(
         return
 
     text, keyboard, _ = _build_transactions_view(user_id, offset)
-    await query.edit_message_text(text, reply_markup=keyboard)
+    await _safe_edit_message_text(query.edit_message_text, text, reply_markup=keyboard)
 
     s = state(ctx)
     s["last_panel"] = "balance_history"
@@ -1556,7 +1563,8 @@ async def _edit_balance_from_history(
 
     balance = _safe_get_balance(user_id)
     _set_cached_balance(ctx, balance)
-    await query.edit_message_text(
+    await _safe_edit_message_text(
+        query.edit_message_text,
         f"💎 Ваш баланс: {balance}",
         reply_markup=balance_menu_kb(),
         parse_mode=ParseMode.MARKDOWN,
@@ -3680,8 +3688,12 @@ async def poll_mj_and_send_photos(
         if mid:
             final_text = "✅ Midjourney: изображение обработано." if success else "ℹ️ Midjourney: поток завершён."
             try:
-                await ctx.bot.edit_message_text(
-                    chat_id=chat_id, message_id=mid, text=final_text, reply_markup=None
+                await _safe_edit_message_text(
+                    ctx.bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=final_text,
+                    reply_markup=None,
                 )
             except Exception:
                 pass
@@ -4283,7 +4295,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["mode"] = None
         await q.answer("Режим: Обычный чат")
         if message is not None:
-            await q.edit_message_text(
+            await _safe_edit_message_text(
+                q.edit_message_text,
                 "Режим переключён: теперь это обычный чат. Напишите сообщение.",
             )
         return
@@ -4294,7 +4307,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["mode"] = None
         await q.answer("Режим: Prompt-Master")
         if message is not None:
-            await q.edit_message_text(
+            await _safe_edit_message_text(
+                q.edit_message_text,
                 "Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
             )
         return
@@ -4513,8 +4527,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_last_wait_ts"] = 0.0
             mid = s.get("last_ui_msg_id_mj")
             if mid:
-                try: await ctx.bot.edit_message_text(chat_id=chat_id, message_id=mid, text="❌ Midjourney отменён.", reply_markup=None)
-                except Exception: pass
+                try:
+                    await _safe_edit_message_text(
+                        ctx.bot.edit_message_text,
+                        chat_id=chat_id,
+                        message_id=mid,
+                        text="❌ Midjourney отменён.",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
             s["last_ui_msg_id_mj"] = None
             s["_last_text_mj"] = None
             await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
@@ -5013,12 +5035,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             err_text = "⚠️ Не удалось сгенерировать промпт, попробуйте ещё раз."
             if status_msg:
                 try:
-                    await ctx.bot.edit_message_text(
+                    result = await _safe_edit_message_text(
+                        ctx.bot.edit_message_text,
                         chat_id=chat_id,
                         message_id=status_msg.message_id,
                         text=err_text,
                     )
-                except BadRequest:
+                    if isinstance(result, BadRequest):
+                        await msg.reply_text(err_text)
+                except Exception:
                     await msg.reply_text(err_text)
             else:
                 await msg.reply_text(err_text)
@@ -5032,7 +5057,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         final_text = f"🧠 Готово! Вот ваш кинопромпт:\n\n{block}"
 
         try:
-            await ctx.bot.edit_message_text(
+            result = await _safe_edit_message_text(
+                ctx.bot.edit_message_text,
                 chat_id=chat_id,
                 message_id=status_msg.message_id,
                 text=final_text,
@@ -5040,7 +5066,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb,
                 disable_web_page_preview=True,
             )
-        except BadRequest:
+            if isinstance(result, BadRequest):
+                await msg.reply_text(
+                    final_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+        except Exception:
             await msg.reply_text(
                 final_text,
                 parse_mode=ParseMode.MARKDOWN,

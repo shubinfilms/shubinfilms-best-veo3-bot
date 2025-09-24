@@ -19,12 +19,14 @@ else:  # pragma: no cover - fallback alias to avoid runtime dependency
 
 import redis
 
+from settings import REDIS_PREFIX
+
 _logger = logging.getLogger("redis-utils")
 
 _redis_url = os.getenv("REDIS_URL")
 _r = redis.from_url(_redis_url) if _redis_url else None
 rds = _r
-_PFX = os.getenv("REDIS_PREFIX", "veo3")
+_PFX = REDIS_PREFIX
 _TTL = 24 * 60 * 60
 
 _USERS_SET_KEY = f"{_PFX}:users"
