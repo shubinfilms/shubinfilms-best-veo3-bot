@@ -294,11 +294,19 @@ def add_ledger(user_id: int, entry: Dict[str, Any]) -> None:
     _r.rpush(_ledger_key(user_id), json.dumps(entry, ensure_ascii=False))
 
 
+def add_ledger_entry(user_id: int, entry: Dict[str, Any]) -> None:
+    """Append a raw ``entry`` to the user's ledger history."""
+
+    add_ledger(user_id, entry)
+
+
 def credit(
     user_id: int,
     amount: int,
     reason: str,
     meta: Optional[Dict[str, Any]] = None,
+    *,
+    write_ledger: bool = True,
 ) -> int:
     if not _r:
         return 0
@@ -315,17 +323,18 @@ def credit(
                 current = pipe.get(bal_key)
                 current_balance = int(current) if current is not None else 0
                 new_balance = current_balance + amount
-                entry = {
-                    "ts": now,
-                    "type": "credit",
-                    "amount": int(amount),
-                    "reason": reason,
-                    "meta": meta or {},
-                    "balance_after": new_balance,
-                }
                 pipe.multi()
                 pipe.set(bal_key, new_balance)
-                pipe.rpush(ledger_key, json.dumps(entry, ensure_ascii=False))
+                if write_ledger:
+                    entry = {
+                        "ts": now,
+                        "type": "credit",
+                        "amount": int(amount),
+                        "reason": reason,
+                        "meta": meta or {},
+                        "balance_after": new_balance,
+                    }
+                    pipe.rpush(ledger_key, json.dumps(entry, ensure_ascii=False))
                 pipe.execute()
                 return new_balance
         except redis.WatchError:
@@ -388,10 +397,23 @@ def debit_balance(user_id: int, amount: int, reason: Optional[str] = None) -> in
     return new_balance
 
 
-def credit_balance(user_id: int, amount: int, reason: Optional[str] = None) -> int:
+def credit_balance(
+    user_id: int,
+    amount: int,
+    reason: Optional[str] = None,
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+    write_ledger: bool = True,
+) -> int:
     """Credit ``amount`` to ``user_id`` balance and return the new balance."""
 
     if amount < 0:
         raise ValueError("amount must be non-negative")
 
-    return credit(user_id, amount, reason or "credit")
+    return credit(
+        user_id,
+        amount,
+        reason or "credit",
+        meta=meta,
+        write_ledger=write_ledger,
+    )
