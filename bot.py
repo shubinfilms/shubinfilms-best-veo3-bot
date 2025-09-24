@@ -54,6 +54,8 @@ from ui_helpers import upsert_card
 
 from redis_utils import (
     credit,
+    credit_balance,
+    debit_balance,
     debit_try,
     ensure_user,
     add_user,
@@ -359,12 +361,14 @@ CB_GO_HOME = "go_home"
 # ==========================
 #   Tokens / Pricing
 # ==========================
+PRICE_BANANA = 5
+
 TOKEN_COSTS = {
     "veo_fast": 50,
     "veo_quality": 150,
     "veo_photo": 50,
     "mj": 10,          # 16:9 или 9:16
-    "banana": 5,
+    "banana": PRICE_BANANA,
     "chat": 0,
 }
 CHAT_UNLOCK_PRICE = 0
@@ -1127,6 +1131,9 @@ def banana_card_text(s: Dict[str, Any]) -> str:
         "",
         banana_examples_block()
     ]
+    balance = s.get("banana_balance")
+    if balance is not None:
+        lines.insert(1, f"💎 Баланс: <b>{balance}</b>")
     return "\n".join(lines)
 
 def banana_kb() -> InlineKeyboardMarkup:
@@ -3139,30 +3146,61 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             prompt = (s.get("last_prompt") or "").strip()
             if not imgs:   await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото."); return
             if not prompt: await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить)."); return
-            price = TOKEN_COSTS['banana']
             fingerprint = _make_fingerprint({"prompt": prompt, "images": imgs})
             op_key = f"banana:{fingerprint}"
-            op_id, _ = _ensure_operation(ctx, op_key)
-            status, rest, _ = try_charge(
-                ctx,
-                price,
-                "banana_charge",
-                op_id,
-                {"prompt": _short_prompt(prompt, 160), "images": len(imgs)},
-            )
-            if status == "insufficient":
-                _clear_operation(ctx, op_key)
-                await q.message.reply_text(
-                    f"💎 Недостаточно токенов: нужно {price}, на балансе {rest}.",
-                    reply_markup=stars_topup_kb(),
-                );
-                return
-            if status == "duplicate":
+            _op_id, is_new = _ensure_operation(ctx, op_key)
+            if not is_new:
                 await q.message.reply_text("⏳ Уже обрабатываю предыдущий запрос Banana. Дождитесь результата.")
                 return
-            await q.message.reply_text("🍌 Запускаю Banana…")
+            user = update.effective_user
+            uid = user.id if user else None
+            if not uid:
+                _clear_operation(ctx, op_key)
+                await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
+                return
+            try:
+                ensure_user(uid)
+                balance = get_balance(uid)
+            except Exception as exc:
+                _clear_operation(ctx, op_key)
+                log.exception("Banana balance fetch failed for %s: %s", uid, exc)
+                await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
+                return
+            if balance < PRICE_BANANA:
+                s["banana_balance"] = balance
+                s["_last_text_banana"] = None
+                await show_banana_card(update.effective_chat.id, ctx)
+                _clear_operation(ctx, op_key)
+                await q.message.reply_text(
+                    f"Недостаточно 💎. Нужно {PRICE_BANANA}, у вас {balance}. Пополните баланс.",
+                )
+                return
+            try:
+                new_balance = debit_balance(uid, PRICE_BANANA, reason="banana:start")
+            except Exception as exc:
+                _clear_operation(ctx, op_key)
+                log.exception("Banana debit failed for %s: %s", uid, exc)
+                await q.message.reply_text("⚠️ Не удалось списать баланс. Попробуйте позже.")
+                return
+            s["banana_balance"] = new_balance
+            s["_last_text_banana"] = None
+            await show_banana_card(update.effective_chat.id, ctx)
+            await q.message.reply_text(
+                f"✅ Списано {PRICE_BANANA}💎. Текущий баланс: {new_balance} — запускаю обработку…"
+            )
             s["banana_active_op_key"] = op_key
-            asyncio.create_task(_banana_run_and_send(update.effective_chat.id, ctx, imgs, prompt, op_key, op_id, price)); return
+            asyncio.create_task(
+                _banana_run_and_send(
+                    update.effective_chat.id,
+                    ctx,
+                    imgs,
+                    prompt,
+                    op_key,
+                    PRICE_BANANA,
+                    uid,
+                )
+            );
+            return
 
     # -------- VEO card actions --------
     if data.startswith("veo:set_ar:"):
@@ -3483,33 +3521,34 @@ async def _banana_run_and_send(
     src_urls: List[str],
     prompt: str,
     op_key: str,
-    op_id: str,
     price: int,
+    user_id: int,
 ) -> None:
     s = state(ctx)
 
-    def _refund(reason_tag: str, message: Optional[str] = None) -> None:
-        meta: Dict[str, Any] = {"reason": reason_tag}
-        if message:
-            meta["message"] = message
-        refund_op_id = f"refund:{op_id}:{reason_tag}"
+    async def _refund(reason_tag: str, message: Optional[str] = None) -> Optional[int]:
         try:
-            credit_tokens(ctx, price, "banana_refund", refund_op_id, meta)
+            new_balance = credit_balance(user_id, price, reason="banana:refund")
         except Exception as exc:
             log.exception("Banana refund %s failed: %s", reason_tag, exc)
+            return None
+        s["banana_balance"] = new_balance
+        s["_last_text_banana"] = None
+        await show_banana_card(chat_id, ctx)
+        return new_balance
 
     try:
         task_id = await asyncio.to_thread(create_banana_task, prompt, src_urls, "png", "auto", None, None, 60)
-        final_op_id = f"gen:{task_id}"
-        if not rename_operation(op_id, final_op_id, {"task_id": task_id}):
-            log.warning("Failed to rename Banana op %s -> %s", op_id, final_op_id)
-        _update_operation(ctx, op_key, op_id=final_op_id, task_id=task_id, price=price)
         s["banana_active_op_key"] = op_key
         await ctx.bot.send_message(chat_id, f"🍌 Задача Banana создана.\n🆔 taskId={task_id}\nЖдём результат…")
         urls = await asyncio.to_thread(wait_for_banana_result, task_id, 8 * 60, 3)
         if not urls:
-            _refund("empty")
-            await ctx.bot.send_message(chat_id, "⚠️ Banana вернула пустой результат. 💎 Токены возвращены."); return
+            new_balance = await _refund("empty")
+            msg = "⚠️ Banana вернула пустой результат. Произошла ошибка, 5💎 возвращены."
+            if new_balance is not None:
+                msg += f" Текущий баланс: {new_balance}."
+            await ctx.bot.send_message(chat_id, msg)
+            return
         u0 = urls[0]
         try:
             await ctx.bot.send_photo(chat_id=chat_id, photo=u0, caption="✅ Banana готово")
@@ -3530,12 +3569,18 @@ async def _banana_run_and_send(
             except Exception:
                 pass
     except KieBananaError as e:
-        _refund("error", str(e))
-        await ctx.bot.send_message(chat_id, f"❌ Banana ошибка: {e}\n💎 Токены возвращены.")
+        new_balance = await _refund("error", str(e))
+        msg = f"❌ Banana ошибка: {e}\nПроизошла ошибка, 5💎 возвращены."
+        if new_balance is not None:
+            msg += f" Текущий баланс: {new_balance}."
+        await ctx.bot.send_message(chat_id, msg)
     except Exception as e:
-        _refund("exception", str(e))
+        new_balance = await _refund("exception", str(e))
         log.exception("BANANA unexpected: %s", e)
-        await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка Banana. 💎 Токены возвращены.")
+        msg = "💥 Внутренняя ошибка Banana. Произошла ошибка, 5💎 возвращены."
+        if new_balance is not None:
+            msg += f" Текущий баланс: {new_balance}."
+        await ctx.bot.send_message(chat_id, msg)
     finally:
         _clear_operation(ctx, op_key)
         s.pop("banana_active_op_key", None)
