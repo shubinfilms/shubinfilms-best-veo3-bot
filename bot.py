@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
-    KeyboardButton, BotCommand
+    KeyboardButton, BotCommand, User
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -50,7 +50,7 @@ from kie_banana import (
 
 import redis
 
-from ui_helpers import upsert_card, refresh_balance_card_if_open
+from ui_helpers import upsert_card, refresh_balance_card_if_open, show_referral_card
 
 from redis_utils import (
     credit,
@@ -74,6 +74,11 @@ from redis_utils import (
     unmark_promo_used,
     user_exists,
     rds,
+    get_inviter,
+    set_inviter,
+    add_ref_user,
+    incr_ref_earned,
+    get_ref_stats,
 )
 
 from ledger import (
@@ -1008,6 +1013,118 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 # odex/fix-balance-reset-after-deploy
 # main
 # ==========================
+
+_BOT_USERNAME_CACHE_KEY = "_bot_username"
+_REF_SHARE_TEXT = "Присоединяйся к Best VEO3 Bot!"
+
+
+async def _get_bot_username(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    bot_username = None
+    try:
+        bot_username = ctx.bot.username
+    except Exception:
+        bot_username = None
+    app = getattr(ctx, "application", None)
+    bot_data = getattr(app, "bot_data", None) if app is not None else None
+    if bot_username:
+        if isinstance(bot_data, dict):
+            bot_data[_BOT_USERNAME_CACHE_KEY] = bot_username
+        return bot_username
+
+    cached = None
+    if isinstance(bot_data, dict):
+        cached = bot_data.get(_BOT_USERNAME_CACHE_KEY)
+    if isinstance(cached, str) and cached:
+        return cached
+
+    try:
+        me = await ctx.bot.get_me()
+        username = getattr(me, "username", None)
+    except Exception as exc:
+        log.warning("Failed to fetch bot username: %s", exc)
+        return None
+    if not username:
+        return None
+    if isinstance(bot_data, dict):
+        bot_data[_BOT_USERNAME_CACHE_KEY] = username
+    return username
+
+
+async def _build_referral_link(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    username = await _get_bot_username(ctx)
+    if not username:
+        return None
+    return f"https://t.me/{username}?start=ref_{int(user_id)}"
+
+
+def _format_user_for_notification(user: Optional[User], fallback_id: int) -> str:
+    if user is None:
+        return f"id {fallback_id}"
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    first_name = getattr(user, "first_name", "")
+    last_name = getattr(user, "last_name", "")
+    full_name = " ".join(part for part in [first_name, last_name] if part)
+    return full_name.strip() or f"id {fallback_id}"
+
+
+async def _handle_referral_deeplink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if user is None:
+        return
+
+    args = getattr(ctx, "args", None)
+    payload = args[0] if isinstance(args, list) and args else None
+    if not payload and message is not None:
+        text = message.text or message.caption or ""
+        if text.startswith("/start "):
+            payload = text.split(" ", 1)[1].strip()
+        elif text == "/start":
+            payload = ""
+    if not payload:
+        return
+    if not payload.startswith("ref_"):
+        return
+    try:
+        inviter_id = int(payload.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return
+
+    user_id = user.id
+    if inviter_id == user_id or inviter_id <= 0:
+        return
+
+    try:
+        existing = get_inviter(user_id)
+    except Exception as exc:
+        log.warning("referral_check_failed | user=%s err=%s", user_id, exc)
+        existing = None
+    if existing:
+        return
+
+    try:
+        created = set_inviter(user_id, inviter_id)
+    except Exception as exc:
+        log.warning("referral_bind_failed | user=%s inviter=%s err=%s", user_id, inviter_id, exc)
+        created = False
+    if not created:
+        return
+
+    try:
+        add_ref_user(inviter_id, user_id)
+    except Exception as exc:
+        log.warning("referral_add_user_failed | inviter=%s user=%s err=%s", inviter_id, user_id, exc)
+
+    display = _format_user_for_notification(user, user_id)
+    text = f"👥 Новый реферал: {display} ({user_id})."
+    try:
+        await ctx.bot.send_message(inviter_id, text)
+    except Forbidden:
+        pass
+    except Exception as exc:
+        log.warning("referral_notify_failed | inviter=%s err=%s", inviter_id, exc)
 #   UI / Texts
 # ==========================
 WELCOME = (
@@ -1122,6 +1239,7 @@ def balance_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open"),
             InlineKeyboardButton("🧾 История операций", callback_data="tx:open"),
         ],
+        [InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")],
         [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
@@ -2758,6 +2876,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx); s.update({**DEFAULT_STATE}); _apply_state_defaults(s)
     uid = update.effective_user.id
 
+    await _handle_referral_deeplink(update, ctx)
+
     try:
         bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
         _set_cached_balance(ctx, bonus_result.balance)
@@ -3320,6 +3440,42 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if data == "tx:back":
             await _edit_balance_from_history(q, ctx, uid)
             return
+    if data == "ref:open":
+        user = update.effective_user
+        if user is None:
+            return
+        uid = user.id
+        chat_for_card = chat_id if chat_id is not None else uid
+        try:
+            link = await _build_referral_link(uid, ctx)
+        except Exception as exc:
+            log.warning("referral_link_failed | user=%s err=%s", uid, exc)
+            link = None
+        if not link:
+            if q.message is not None:
+                await q.message.reply_text("⚠️ Не удалось получить ссылку. Попробуйте позже.")
+            return
+        try:
+            referrals, earned = get_ref_stats(uid)
+        except Exception as exc:
+            log.warning("referral_stats_failed | user=%s err=%s", uid, exc)
+            referrals, earned = 0, 0
+        await show_referral_card(
+            ctx,
+            chat_for_card,
+            s,
+            link=link,
+            referrals=referrals,
+            earned=earned,
+            share_text=_REF_SHARE_TEXT,
+        )
+        return
+    if data == "ref:back":
+        target_chat = chat_id if chat_id is not None else (update.effective_user.id if update.effective_user else None)
+        if target_chat is None:
+            return
+        await show_balance_card(target_chat, ctx)
+        return
 
     if data == "promo_open":
         if not PROMO_ENABLED:
@@ -4169,6 +4325,118 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
         diamonds_to_credit,
         new_balance,
     )
+
+    inviter_id: Optional[int] = None
+    try:
+        inviter_id = get_inviter(user_id)
+    except Exception as exc:
+        log.warning("referral_lookup_failed | user=%s err=%s", user_id, exc)
+        inviter_id = None
+    bonus_awarded = False
+    total_ref_earned: Optional[int] = None
+    inviter_new_balance: Optional[int] = None
+    if inviter_id and inviter_id != user_id:
+        bonus = max(int(diamonds_to_credit) // 10, 0)
+        if bonus > 0:
+            try:
+                inviter_new_balance = credit_balance(
+                    inviter_id,
+                    bonus,
+                    reason="ref_bonus",
+                    meta={"from_user": user_id, "charge_id": charge_id},
+                )
+                bonus_awarded = True
+            except Exception as exc:
+                log.warning(
+                    "referral_bonus_credit_failed | inviter=%s user=%s err=%s",
+                    inviter_id,
+                    user_id,
+                    exc,
+                )
+            if bonus_awarded:
+                try:
+                    total_ref_earned = incr_ref_earned(inviter_id, bonus)
+                except Exception as exc:
+                    log.warning(
+                        "referral_earned_increment_failed | inviter=%s err=%s",
+                        inviter_id,
+                        exc,
+                    )
+                    total_ref_earned = None
+                payer_display = _format_user_for_notification(update.effective_user, user_id)
+                total_text = (
+                    f"{total_ref_earned}💎" if isinstance(total_ref_earned, int) else "—"
+                )
+                notify_text = (
+                    f"💎 Реферальный бонус: +{bonus}. За пополнение {payer_display}. "
+                    f"Итого с рефералов: {total_text}."
+                )
+                try:
+                    await ctx.bot.send_message(inviter_id, notify_text)
+                except Forbidden:
+                    pass
+                except Exception as exc:
+                    log.warning(
+                        "referral_bonus_notify_failed | inviter=%s err=%s",
+                        inviter_id,
+                        exc,
+                    )
+                inviter_state = None
+                if ctx.application and isinstance(ctx.application.user_data, dict):
+                    inviter_state = ctx.application.user_data.get(inviter_id)
+                if isinstance(inviter_state, dict):
+                    if inviter_new_balance is not None:
+                        inviter_state["balance"] = inviter_new_balance
+                    try:
+                        await refresh_balance_card_if_open(
+                            inviter_id,
+                            inviter_id,
+                            ctx=ctx,
+                            state_dict=inviter_state,
+                            reply_markup=balance_menu_kb(),
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "referral_balance_refresh_failed | inviter=%s err=%s",
+                            inviter_id,
+                            exc,
+                        )
+                    if inviter_state.get("last_panel") == "referral":
+                        try:
+                            link = await _build_referral_link(inviter_id, ctx)
+                        except Exception as exc:
+                            log.warning(
+                                "referral_card_link_failed | inviter=%s err=%s",
+                                inviter_id,
+                                exc,
+                            )
+                            link = None
+                        try:
+                            stats = get_ref_stats(inviter_id)
+                        except Exception as exc:
+                            log.warning(
+                                "referral_stats_refresh_failed | inviter=%s err=%s",
+                                inviter_id,
+                                exc,
+                            )
+                            stats = None
+                        if link and stats:
+                            try:
+                                await show_referral_card(
+                                    ctx,
+                                    inviter_id,
+                                    inviter_state,
+                                    link=link,
+                                    referrals=stats[0],
+                                    earned=stats[1],
+                                    share_text=_REF_SHARE_TEXT,
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "referral_card_refresh_failed | inviter=%s err=%s",
+                                    inviter_id,
+                                    exc,
+                                )
 
     await message.reply_text(
         f"✅ Начислено +{diamonds_to_credit} 💎. Новый баланс: {new_balance} 💎."

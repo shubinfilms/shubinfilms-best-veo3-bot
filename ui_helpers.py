@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Optional
 
+from urllib.parse import quote_plus
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 
 from redis_utils import get_balance
+
+_COPY_TEXT_SUPPORTED = "copy_text" in inspect.signature(InlineKeyboardButton.__init__).parameters
 
 
 async def upsert_card(
@@ -110,4 +116,68 @@ async def refresh_balance_card_if_open(
                 ctx.user_data["balance"] = balance
         except Exception:
             pass
+    return mid
+
+
+def referral_card_text(link: str, referrals: int, earned: int) -> str:
+    safe_link = link.strip()
+    return (
+        "👥 <b>Рефералов:</b> {referrals}\n"
+        "💎 <b>Заработано:</b> {earned}\n"
+        "🔗 <b>Ваша ссылка:</b> <code>{link}</code>\n\n"
+        "Приглашайте друзей — получайте <b>10%</b> в 💎 от их пополнений Stars."
+    ).format(referrals=int(referrals), earned=int(earned), link=safe_link)
+
+
+def referral_card_keyboard(link: str, *, share_text: Optional[str] = None) -> InlineKeyboardMarkup:
+    share_caption = share_text or "Присоединяйся к Best VEO3 Bot!"
+    url_encoded = quote_plus(link)
+    text_encoded = quote_plus(share_caption)
+    share_url = f"https://t.me/share/url?url={url_encoded}&text={text_encoded}"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if _COPY_TEXT_SUPPORTED:
+        rows.append([InlineKeyboardButton("📋 Скопировать ссылку", copy_text=link)])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                "📋 Скопировать ссылку",
+                switch_inline_query_current_chat=link,
+            )
+        ])
+    rows.append([InlineKeyboardButton("📤 Поделиться", url=share_url)])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="ref:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_referral_card(
+    ctx: Any,
+    chat_id: int,
+    state_dict: dict[str, Any],
+    *,
+    link: str,
+    referrals: int,
+    earned: int,
+    share_text: Optional[str] = None,
+) -> Optional[int]:
+    text = referral_card_text(link, referrals, earned)
+    markup = referral_card_keyboard(link, share_text=share_text)
+    mid = await upsert_card(
+        ctx,
+        chat_id,
+        state_dict,
+        "last_ui_msg_id_balance",
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    if mid:
+        msg_ids_raw = state_dict.get("msg_ids")
+        msg_ids = msg_ids_raw if isinstance(msg_ids_raw, dict) else None
+        if msg_ids is None:
+            msg_ids = {}
+            state_dict["msg_ids"] = msg_ids
+        msg_ids["balance"] = mid
+        state_dict["last_panel"] = "referral"
     return mid

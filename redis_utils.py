@@ -31,6 +31,11 @@ _USERS_SET_KEY = f"{_PFX}:users"
 _DEAD_USERS_SET_KEY = f"{_PFX}:users:dead"
 _PROMO_USED_SET_KEY = f"{_PFX}:promo:used"
 
+_REF_INVITER_KEY_TMPL = f"{_PFX}:ref:inviter_of:{{}}"
+_REF_USERS_KEY_TMPL = f"{_PFX}:ref:users_of:{{}}"
+_REF_EARNED_KEY_TMPL = f"{_PFX}:ref:earned:{{}}"
+_REF_JOINED_AT_TMPL = f"{_PFX}:ref:joined_at:{{}}"
+
 
 def _user_profile_key(user_id: int) -> str:
     return f"{_PFX}:user:{user_id}"
@@ -39,8 +44,30 @@ def _user_profile_key(user_id: int) -> str:
 def _promo_member(user_id: int, code: str) -> str:
     return f"{int(user_id)}:{code.strip().upper()}"
 
+
+def _ref_inviter_key(user_id: int) -> str:
+    return _REF_INVITER_KEY_TMPL.format(int(user_id))
+
+
+def _ref_users_key(inviter_id: int) -> str:
+    return _REF_USERS_KEY_TMPL.format(int(inviter_id))
+
+
+def _ref_earned_key(inviter_id: int) -> str:
+    return _REF_EARNED_KEY_TMPL.format(int(inviter_id))
+
+
+def _ref_joined_at_key(user_id: int) -> str:
+    return _REF_JOINED_AT_TMPL.format(int(user_id))
+
 _memory_store: Dict[str, Tuple[float, str]] = {}
 _memory_lock = Lock()
+
+_ref_lock = Lock()
+_ref_inviter_memory: Dict[int, int] = {}
+_ref_users_memory: Dict[int, set[int]] = {}
+_ref_earned_memory: Dict[int, int] = {}
+_ref_joined_memory: Dict[int, float] = {}
 
 if not _redis_url:
     _logger.warning(
@@ -146,6 +173,93 @@ def unmark_promo_used(user_id: int, code: str) -> bool:
         return False
     member = _promo_member(user_id, code)
     return bool(_r.srem(_PROMO_USED_SET_KEY, member))
+
+
+def get_inviter(user_id: int) -> Optional[int]:
+    if _r:
+        raw = _r.get(_ref_inviter_key(user_id))
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    with _ref_lock:
+        value = _ref_inviter_memory.get(int(user_id))
+    return int(value) if value is not None else None
+
+
+def set_inviter(user_id: int, inviter_id: int) -> bool:
+    if int(user_id) == int(inviter_id):
+        return False
+    if _r:
+        key = _ref_inviter_key(user_id)
+        try:
+            created = bool(_r.setnx(key, int(inviter_id)))
+        except Exception:
+            created = False
+        if created:
+            try:
+                _r.set(_ref_joined_at_key(user_id), int(time.time()))
+            except Exception:
+                pass
+        return created
+    with _ref_lock:
+        uid = int(user_id)
+        if uid in _ref_inviter_memory:
+            return False
+        _ref_inviter_memory[uid] = int(inviter_id)
+        _ref_joined_memory[uid] = time.time()
+    return True
+
+
+def add_ref_user(inviter_id: int, user_id: int) -> bool:
+    if _r:
+        try:
+            return bool(_r.sadd(_ref_users_key(inviter_id), int(user_id)))
+        except Exception:
+            return False
+    with _ref_lock:
+        inv = int(inviter_id)
+        users = _ref_users_memory.setdefault(inv, set())
+        before = len(users)
+        users.add(int(user_id))
+        return len(users) != before
+
+
+def incr_ref_earned(inviter_id: int, amount: int) -> int:
+    amount = int(amount)
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
+    if _r:
+        try:
+            return int(_r.incrby(_ref_earned_key(inviter_id), amount))
+        except Exception:
+            return 0
+    with _ref_lock:
+        inv = int(inviter_id)
+        total = _ref_earned_memory.get(inv, 0) + amount
+        _ref_earned_memory[inv] = total
+        return total
+
+
+def get_ref_stats(inviter_id: int) -> Tuple[int, int]:
+    if _r:
+        try:
+            count = int(_r.scard(_ref_users_key(inviter_id)))
+        except Exception:
+            count = 0
+        try:
+            earned_raw = _r.get(_ref_earned_key(inviter_id))
+            earned = int(earned_raw) if earned_raw is not None else 0
+        except Exception:
+            earned = 0
+        return count, earned
+    with _ref_lock:
+        users = _ref_users_memory.get(int(inviter_id))
+        count = len(users) if users is not None else 0
+        earned = _ref_earned_memory.get(int(inviter_id), 0)
+        return count, int(earned)
 
 
 async def add_user(redis_conn: Optional["redis.Redis"], user: "TelegramUser") -> bool:
