@@ -1,128 +1,108 @@
-"""Data-transfer objects for the Suno integration."""
+"""Pydantic models shared between the Suno bot and callback worker."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Iterable
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
-def _first(mapping: Mapping[str, Any], keys: Sequence[str]) -> Optional[Any]:
+class SunoTrack(BaseModel):
+    """Normalized representation of a single track."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    title: str | None = None
+    audio_url: str | None = None
+    image_url: str | None = None
+
+
+class SunoTask(BaseModel):
+    """Structured payload that the service operates on."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    task_id: str
+    callback_type: str
+    items: list[SunoTrack] = Field(default_factory=list)
+    msg: str | None = None
+    code: int | None = None
+
+    @classmethod
+    def from_envelope(cls, envelope: "CallbackEnvelope") -> "SunoTask":
+        data = envelope.data or {}
+        task_id = _first(data, "task_id", "taskId", "id") or ""
+        callback_type = (
+            _first(data, "callback_type", "callbackType") or "unknown"
+        )
+        raw_items = _extract_items(data)
+        tracks = [_build_track(item, index) for index, item in enumerate(raw_items, start=1)]
+        filtered_tracks = [track for track in tracks if track is not None]
+        return cls(
+            task_id=str(task_id),
+            callback_type=str(callback_type or "unknown"),
+            items=filtered_tracks,
+            msg=envelope.msg,
+            code=envelope.code,
+        )
+
+
+class CallbackEnvelope(BaseModel):
+    """Raw structure coming from the Suno webhook."""
+
+    model_config = ConfigDict(extra="allow")
+
+    code: int | None = None
+    msg: str | None = None
+    data: dict = Field(default_factory=dict)
+
+
+def _first(data: dict[str, Any], *keys: str) -> Any | None:
     for key in keys:
-        if key in mapping and mapping[key] not in (None, ""):
-            return mapping[key]
+        if key in data and data[key] not in (None, ""):
+            return data[key]
     return None
 
 
-def _ensure_mapping(value: Any) -> Mapping[str, Any]:
-    if isinstance(value, Mapping):
-        return value
-    return {}
-
-
-def _ensure_list(value: Any) -> List[Any]:
+def _ensure_iterable(value: Any) -> Iterable[Any]:
     if value is None:
         return []
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set)):
         return value
     return [value]
 
 
-@dataclass(slots=True)
-class SunoTrack:
-    """Normalized track information returned by Suno."""
-
-    id: str
-    title: str
-    audio_url: Optional[str] = None
-    image_url: Optional[str] = None
-    ext: Optional[str] = None
-
-    @classmethod
-    def from_payload(cls, payload: Any, *, fallback_id: str) -> Optional["SunoTrack"]:
-        if payload is None:
-            return None
-        if isinstance(payload, str):
-            return cls(id=fallback_id, title=f"Track {fallback_id}", audio_url=payload, image_url=None, ext=None)
-        if not isinstance(payload, Mapping):
-            return None
-        data: MutableMapping[str, Any] = dict(payload)
-        track_id = _first(data, ("id", "trackId", "track_id", "audioId", "songId")) or fallback_id
-        title = _first(data, ("title", "name")) or f"Track {track_id}"
-        audio_url = _first(
-            data,
-            (
-                "audio_url",
-                "audioUrl",
-                "url",
-                "audio",
-                "mp3Url",
-                "mp3_url",
-                "fileUrl",
-            ),
-        )
-        image_url = _first(data, ("image_url", "imageUrl", "coverUrl", "image", "cover"))
-        ext = _first(data, ("ext", "extension", "audio_extension", "audioExt"))
-        return cls(id=str(track_id), title=str(title), audio_url=_maybe_str(audio_url), image_url=_maybe_str(image_url), ext=_maybe_str(ext))
+def _extract_items(data: dict[str, Any]) -> Iterable[Any]:
+    for key in ("data", "items", "tracks"):
+        maybe = data.get(key)
+        if maybe:
+            return _ensure_iterable(maybe)
+    response = data.get("response")
+    if isinstance(response, dict):
+        for key in ("data", "items", "tracks"):
+            maybe = response.get(key)
+            if maybe:
+                return _ensure_iterable(maybe)
+    return []
 
 
-def _maybe_str(value: Any) -> Optional[str]:
-    if value is None:
+def _build_track(raw: Any, index: int) -> SunoTrack | None:
+    if raw is None:
         return None
-    return str(value)
+    if isinstance(raw, str):
+        return SunoTrack(id=str(index), title=None, audio_url=raw, image_url=None)
+    if not isinstance(raw, dict):
+        return None
+    track_id = _first(raw, "id", "trackId", "audioId", "songId") or str(index)
+    title = _first(raw, "title", "name")
+    audio_url = _first(raw, "audio_url", "audioUrl", "url", "fileUrl", "mp3Url")
+    image_url = _first(raw, "image_url", "imageUrl", "coverUrl", "imgUrl")
+    return SunoTrack(
+        id=str(track_id),
+        title=str(title) if title is not None else None,
+        audio_url=str(audio_url) if audio_url else None,
+        image_url=str(image_url) if image_url else None,
+    )
 
 
-@dataclass(slots=True)
-class SunoTask:
-    """Normalized task representation used across the bot/web."""
-
-    task_id: str
-    status: str
-    message: Optional[str] = None
-    items: List[SunoTrack] = field(default_factory=list)
-
-    @classmethod
-    def from_payload(cls, payload: Any) -> "SunoTask":
-        if not isinstance(payload, Mapping):
-            return cls(task_id="", status="unknown", message=None, items=[])
-        data = _ensure_mapping(payload.get("data"))
-        response = _ensure_mapping(data.get("response"))
-
-        task_id = _first(data, ("task_id", "taskId", "id")) or _first(payload, ("task_id", "taskId", "id")) or ""
-        message = _first(payload, ("message", "msg", "detail", "error"))
-        if not message:
-            message = _first(data, ("message", "msg", "detail", "error"))
-
-        status = _first(data, ("callbackType", "callback_type", "status", "state"))
-        if not status:
-            status = _first(payload, ("status", "state"))
-        if not status:
-            status = _first(response, ("status", "state"))
-        status_text = str(status) if status is not None else "unknown"
-
-        items_section: Iterable[Any] = []
-        for source in (
-            data.get("data"),
-            data.get("items"),
-            data.get("tracks"),
-            data.get("songs"),
-            response.get("data"),
-            response.get("items"),
-            response.get("tracks"),
-        ):
-            if source:
-                items_section = _ensure_list(source)
-                break
-        else:
-            fallback_items = _first(payload, ("items", "tracks"))
-            if fallback_items:
-                items_section = _ensure_list(fallback_items)
-
-        tracks: List[SunoTrack] = []
-        for idx, item in enumerate(items_section, start=1):
-            track = SunoTrack.from_payload(item, fallback_id=str(idx))
-            if track:
-                tracks.append(track)
-
-        return cls(task_id=str(task_id), status=status_text, message=_maybe_str(message), items=tracks)
-
-
-__all__ = ["SunoTask", "SunoTrack"]
+__all__ = ["CallbackEnvelope", "SunoTask", "SunoTrack"]

@@ -2,30 +2,128 @@ import json
 import os
 import sys
 
+import pytest
 import requests
 from fastapi.testclient import TestClient
+from pathlib import Path
+
+os.environ.setdefault("SUNO_API_TOKEN", "test-token")
+os.environ.setdefault("SUNO_CALLBACK_SECRET", "secret-token")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import suno_web
 from suno_web import app
 
 
-def test_suno_e2e_mocked(monkeypatch, caplog, tmp_path):
-    # env
-    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
-    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "test-secret")
+def _build_payload(task_id: str = "task-1", callback_type: str = "complete") -> dict:
+    return {
+        "code": 200,
+        "msg": "ok",
+        "data": {
+            "callbackType": callback_type,
+            "task_id": task_id,
+            "data": [
+                {
+                    "id": "trk1",
+                    "title": "Demo",
+                    "audio_url": "https://cdn.example.com/demo.mp3",
+                    "image_url": "https://cdn.example.com/demo.jpg",
+                }
+            ],
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def _reset_env(monkeypatch):
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "secret-token")
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
     monkeypatch.delenv("ADMIN_IDS", raising=False)
+    suno_web._memory_idempotency.clear()
 
-    caplog.set_level("DEBUG")
 
-    client = TestClient(app)
+def _client():
+    return TestClient(app)
 
-    # mock HTTP GET for downloads
+
+def test_callback_accepts_header_token(monkeypatch):
+    received = {}
+
+    def fake_handle(task):
+        received["task"] = task
+
+    monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
+    client = _client()
+    response = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Token": "secret-token"},
+        json=_build_payload("header-token"),
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert received["task"].task_id == "header-token"
+
+
+def test_callback_accepts_query_token(monkeypatch):
+    received = {}
+
+    def fake_handle(task):
+        received["task"] = task
+
+    monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
+    client = _client()
+    response = client.post(
+        "/suno-callback?token=secret-token",
+        json=_build_payload("query-token"),
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert received["task"].task_id == "query-token"
+
+
+def test_callback_rejects_wrong_token():
+    client = _client()
+    response = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Token": "bad"},
+        json=_build_payload(),
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == "forbidden"
+
+
+def test_duplicate_callbacks_processed_once(monkeypatch):
+    count = {"calls": 0}
+
+    def fake_handle(task):
+        count["calls"] += 1
+
+    monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
+    client = _client()
+    payload = _build_payload("dup-task")
+    for _ in range(2):
+        response = client.post(
+            "/suno-callback",
+            headers={"X-Callback-Token": "secret-token"},
+            json=payload,
+        )
+        assert response.status_code == 200
+    assert count["calls"] == 1
+
+
+def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_handle(task):
+        captured["task"] = task
+
+    monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
+
     class FakeResp:
-        def __init__(self, status=200, body=b"ok", ct="audio/mpeg"):
-            self.status_code = status
-            self.ok = status == 200
+        def __init__(self, status_code: int, body: bytes = b"", ct: str = "application/octet-stream"):
+            self.status_code = status_code
             self.headers = {"Content-Type": ct}
             self._body = body
 
@@ -35,50 +133,26 @@ def test_suno_e2e_mocked(monkeypatch, caplog, tmp_path):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def raise_for_status(self):
-            if not self.ok:
-                raise requests.HTTPError(self.status_code)
-
         def iter_content(self, chunk_size=8192):
             yield self._body
 
-    def fake_get(url, *a, **k):
-        if "forbidden.mp3" in url:
-            return FakeResp(status=403)
-        if url.endswith(".svg"):
-            return FakeResp(body=b"<svg/>", ct="image/svg+xml")
-        return FakeResp(body=b"FAKEAUDIO", ct="audio/mpeg")
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("demo.mp3"):
+            return FakeResp(403)
+        return FakeResp(200, body=b"data", ct="image/jpeg")
 
     monkeypatch.setattr(requests, "get", fake_get)
-
-    # emulate Suno callback
-    payload = {
-        "code": 200,
-        "msg": "ok",
-        "data": {
-            "callbackType": "complete",
-            "task_id": "demo123",
-            "data": [
-                {
-                    "id": "trk1",
-                    "title": "Demo",
-                    "audio_url": "https://host/forbidden.mp3",  # will 403 -> link fallback
-                    "image_url": "https://host/cover.svg",  # will 200 -> saved
-                }
-            ],
-        },
-    }
-
-    r = client.post(
+    suno_web._BASE_DIR = Path(tmp_path)
+    client = _client()
+    response = client.post(
         "/suno-callback",
-        headers={"X-Callback-Token": "test-secret", "Content-Type": "application/json"},
-        data=json.dumps(payload),
+        headers={"X-Callback-Token": "secret-token"},
+        json=_build_payload("asset-task"),
     )
-    assert r.status_code == 200
-    assert r.json().get("status") == "received"
-
-    joined = "\n".join(caplog.messages)
-    assert "callback received" in joined
-    assert "processed |" in joined
-    # проверяем, что сервис не упал без сохранённого чата
-    assert "No chat mapping" in joined
+    assert response.status_code == 200
+    task = captured["task"]
+    assert task.task_id == "asset-task"
+    assert task.items[0].audio_url == "https://cdn.example.com/demo.mp3"
+    image_path = task.items[0].image_url
+    assert image_path
+    assert image_path.startswith(str(tmp_path))
