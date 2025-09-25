@@ -109,6 +109,7 @@ from ledger import (
     InsufficientBalance,
 )
 from settings import REDIS_PREFIX, SUNO_LOG_KEY
+from suno.service import SunoService, SunoAPIError
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -121,6 +122,8 @@ APP_VERSION = "2025-09-14r4"
 
 
 ACTIVE_TASKS: Dict[int, str] = {}
+
+SUNO_SERVICE = SunoService()
 
 
 def _utcnow_iso() -> str:
@@ -2419,20 +2422,19 @@ async def _suno_notify(
     reply_to: Optional["telegram.Message"] = None,
     parse_mode: Optional[ParseMode] = None,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> None:
+) -> Optional["telegram.Message"]:
     if reply_to is not None:
-        await _send_with_retry(
+        return await _send_with_retry(
             lambda: reply_to.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
         )
-    else:
-        await _send_with_retry(
-            lambda: ctx.bot.send_message(
-                chat_id,
-                text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-            )
+    return await _send_with_retry(
+        lambda: ctx.bot.send_message(
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
+    )
 
 
 def _suno_update_last_debit_meta(user_id: int, meta_updates: Dict[str, Any]) -> None:
@@ -2534,19 +2536,11 @@ async def _launch_suno_generation(
     title = (params.get("title") or "").strip()
     style = (params.get("style") or "").strip()
     lyrics = params.get("lyrics") or ""
-
-    payload: Dict[str, Any] = {
-        "model": SUNO_MODEL,
-        "title": title,
-        "style": style,
-        "instrumental": instrumental,
-    }
-    if not instrumental:
-        payload["lyrics"] = lyrics
+    model = SUNO_MODEL or "V5"
 
     meta: Dict[str, Any] = {
         "task_id": None,
-        "model": SUNO_MODEL,
+        "model": model,
         "instrumental": instrumental,
         "has_lyrics": bool(lyrics) if not instrumental else False,
         "prompt_len": len(lyrics or "") if not instrumental else 0,
@@ -2582,37 +2576,36 @@ async def _launch_suno_generation(
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
     await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
 
-    await _suno_notify(
+    notify_text = (
+        f"✅ Списано {PRICE_SUNO}💎. Задача отправлена в Suno. "
+        "Как только получим коллбек — пришлю аудио/ссылки."
+    )
+    ack_message = await _suno_notify(
         ctx,
         chat_id,
-        f"✅ Списано {PRICE_SUNO}💎. Запускаю генерацию музыки…",
+        notify_text,
         reply_to=reply_to,
     )
 
+    reply_message_id = 0
+    if ack_message is not None and getattr(ack_message, "message_id", None):
+        reply_message_id = int(getattr(ack_message, "message_id"))
+    elif reply_to is not None:
+        reply_message_id = int(reply_to.message_id)
+
     try:
-        response = await suno_create_task(payload, user_id=user_id)
-    except SunoConfigError as exc:
-        log.warning("Suno config error: %s", exc)
-        _suno_log(
-            user_id=user_id,
-            phase="error",
-            request_url=SUNO_GEN_URL,
-            http_status=None,
-            response_snippet="config_error",
-        )
-        await _suno_issue_refund(
-            ctx,
+        task = await asyncio.to_thread(
+            SUNO_SERVICE.start_music,
             chat_id,
-            user_id,
-            base_meta=meta,
-            task_id=None,
-            error_text="config_error",
-            reason="suno:refund:create_err",
-            reply_to=reply_to,
+            reply_message_id,
+            title=title or None,
+            style=style or None,
+            lyrics=(lyrics if (lyrics and not instrumental) else None),
+            model=model,
+            instrumental=instrumental,
         )
-        return
-    except SunoApiError as exc:
-        log.warning("Suno create failed | status=%s payload=%s", exc.status, exc.payload)
+    except SunoAPIError as exc:
+        log.warning("Suno start failed | status=%s payload=%s", exc.status, exc.payload)
         await _suno_issue_refund(
             ctx,
             chat_id,
@@ -2623,16 +2616,10 @@ async def _launch_suno_generation(
             reason="suno:refund:create_err",
             reply_to=reply_to,
         )
+        s["suno_generating"] = False
         return
     except Exception as exc:
-        log.exception("Suno create crashed: %s", exc)
-        _suno_log(
-            user_id=user_id,
-            phase="error",
-            request_url=SUNO_GEN_URL,
-            http_status=None,
-            response_snippet=f"exception:{exc}",
-        )
+        log.exception("Suno start crashed: %s", exc)
         await _suno_issue_refund(
             ctx,
             chat_id,
@@ -2643,26 +2630,12 @@ async def _launch_suno_generation(
             reason="suno:refund:create_err",
             reply_to=reply_to,
         )
+        s["suno_generating"] = False
         return
 
-    task_id = (
-        str(
-            response.get("task_id")
-            or response.get("id")
-            or response.get("taskId")
-            or response.get("job_id")
-            or ""
-        ).strip()
-    )
+    task_id = (task.task_id or "").strip()
     if not task_id:
-        log.warning("Suno create response missing task_id | resp=%s", response)
-        _suno_log(
-            user_id=user_id,
-            phase="error",
-            request_url=SUNO_GEN_URL,
-            http_status=None,
-            response_snippet="missing_task_id",
-        )
+        log.warning("Suno start response missing task_id | task=%s", task)
         await _suno_issue_refund(
             ctx,
             chat_id,
@@ -2673,6 +2646,7 @@ async def _launch_suno_generation(
             reason="suno:refund:create_err",
             reply_to=reply_to,
         )
+        s["suno_generating"] = False
         return
 
     meta["task_id"] = task_id
@@ -2685,18 +2659,8 @@ async def _launch_suno_generation(
         "lyrics": lyrics,
         "instrumental": instrumental,
     }
+    s["suno_generating"] = False
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
-
-    asyncio.create_task(
-        _poll_suno_and_send(
-            chat_id,
-            ctx,
-            user_id,
-            task_id,
-            s["suno_last_params"],
-            dict(meta),
-        )
-    )
 
 
 async def _poll_suno_and_send(
