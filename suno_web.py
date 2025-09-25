@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import random
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -34,10 +35,8 @@ REDIS_URL = os.getenv("REDIS_URL")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_IDS = [item.strip() for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip()]
 CALLBACK_SECRET = os.getenv("SUNO_CALLBACK_SECRET", "")
-DOWNLOAD_UA = os.getenv(
-    "SUNO_DOWNLOAD_UA",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-)
+UA = os.getenv("SUNO_DOWNLOAD_UA") or "SunoCallbackBot/1.0 (+render)"
+HEADERS = {"User-Agent": UA, "Accept": "*/*", "Connection": "close"}
 DOWNLOAD_TRIES = int(os.getenv("SUNO_DOWNLOAD_TRIES", "3"))
 DOWNLOAD_TIMEOUT = int(os.getenv("SUNO_DOWNLOAD_TIMEOUT", "60"))
 
@@ -60,8 +59,8 @@ def healthz() -> Dict[str, bool]:
 
 
 @app.get("/")
-def root() -> Dict[str, Any]:
-    return {"ok": True, "endpoint": "suno-callback"}
+def root() -> Dict[str, bool]:
+    return {"ok": True}
 
 
 @app.get("/suno-callback")
@@ -96,19 +95,23 @@ def _ensure_dir(path: pathlib.Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _guess_ext_from_content_type(ct: Optional[str], fallback: str = "") -> str:
-    if not ct:
-        return fallback
-    if "audio/mpeg" in ct:
-        return ".mp3"
-    if "audio/wav" in ct or "audio/x-wav" in ct:
-        return ".wav"
-    if "image/jpeg" in ct or "image/jpg" in ct:
-        return ".jpg"
-    if "image/png" in ct:
-        return ".png"
-    ext = mimetypes.guess_extension(ct.split(";")[0].strip(), strict=False)
-    return ext or fallback
+def _guess_ext_from_headers(resp: requests.Response, url_path: str) -> str:
+    ct = resp.headers.get("Content-Type", "").lower()
+    if ct:
+        ext = mimetypes.guess_extension(ct.split(";")[0].strip(), strict=False)
+        if ext:
+            return ext
+        if "audio/mpeg" in ct:
+            return ".mp3"
+        if "audio/wav" in ct:
+            return ".wav"
+        if "image/jpeg" in ct:
+            return ".jpg"
+        if "image/png" in ct:
+            return ".png"
+
+    path_ext = pathlib.Path(url_path or "").suffix
+    return path_ext if path_ext else ".bin"
 
 
 def _download(url: str, destination: pathlib.Path) -> Optional[pathlib.Path]:
@@ -116,86 +119,65 @@ def _download(url: str, destination: pathlib.Path) -> Optional[pathlib.Path]:
         return None
 
     parsed = urlparse(url)
-    target = destination
-    if not target.suffix:
-        url_ext = pathlib.Path(parsed.path).suffix
-        if url_ext:
-            target = target.with_suffix(url_ext)
-
-    base_headers = {
-        "User-Agent": DOWNLOAD_UA,
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-        "Accept-Encoding": "identity",
-    }
+    referer = ""
     if parsed.scheme and parsed.netloc:
-        base_headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
-
-    headers = {k: v for k, v in base_headers.items() if v}
+        referer = f"{parsed.scheme}://{parsed.netloc}/"
 
     tries = max(1, DOWNLOAD_TRIES)
-    backoff = 1.5
+    delay = 1.0
+    last_err: Optional[Exception] = None
+    url_path = parsed.path
+    dest_with_suffix = destination if destination.suffix else destination.with_suffix(".bin")
 
     for attempt in range(1, tries + 1):
         try:
+            headers = HEADERS.copy()
+            if referer:
+                headers["Referer"] = referer
+
             with requests.get(
                 url,
                 headers=headers,
                 stream=True,
                 timeout=DOWNLOAD_TIMEOUT,
-                allow_redirects=True,
             ) as resp:
-                status = resp.status_code
-                if status == 200:
-                    if not target.suffix:
-                        ct = resp.headers.get("Content-Type", "")
-                        guessed = _guess_ext_from_content_type(ct)
-                        if guessed:
-                            target = target.with_suffix(guessed)
+                if resp.status_code >= 400:
+                    raise requests.HTTPError(f"HTTP {resp.status_code}")
 
-                    _ensure_dir(target.parent)
-                    with target.open("wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                fh.write(chunk)
-                    return target
+                final_dest = dest_with_suffix
+                if not destination.suffix:
+                    guessed = _guess_ext_from_headers(resp, url_path)
+                    final_dest = destination.with_suffix(guessed)
 
-                if status in (403, 406, 415, 416, 429, 500, 502, 503, 504) or attempt == tries:
-                    r2 = requests.get(
-                        url,
-                        headers=headers,
-                        stream=False,
-                        timeout=DOWNLOAD_TIMEOUT,
-                        allow_redirects=True,
-                    )
-                    if r2.status_code == 200:
-                        if not target.suffix:
-                            guessed = _guess_ext_from_content_type(r2.headers.get("Content-Type", ""))
-                            if guessed:
-                                target = target.with_suffix(guessed)
-                        _ensure_dir(target.parent)
-                        target.write_bytes(r2.content)
-                        return target
-
-                    log.warning(
-                        f"Download try#{attempt} failed {url} -> HTTP {status} / {r2.status_code}"
-                    )
-                else:
-                    log.warning(f"Download try#{attempt} failed {url} -> HTTP {status}")
+                _ensure_dir(final_dest.parent)
+                with final_dest.open("wb") as fh:
+                    for chunk in resp.iter_content(8192):
+                        if chunk:
+                            fh.write(chunk)
+                return final_dest
 
         except Exception as exc:
-            if attempt == tries:
-                log.warning(f"Download error {url} on last try: {exc}")
-            else:
-                log.warning(f"Download error {url} on try#{attempt}: {exc}")
+            last_err = exc
+            log.warning(
+                "Download attempt %s/%s failed for %s: %s",
+                attempt,
+                tries,
+                url,
+                exc,
+            )
+            if attempt < tries:
+                time.sleep(delay + random.uniform(0, 0.25))
+                delay *= 1.5
 
-        if attempt < tries:
-            time.sleep(backoff**attempt)
+    log.warning("Download failed permanently for %s: %s", url, last_err)
 
     if suno_download_file is not None:
         try:
-            _ensure_dir(target.parent)
-            downloaded = suno_download_file(url, target.name, base_dir=target.parent)
+            fallback_dest = destination
+            if not fallback_dest.suffix:
+                fallback_dest = dest_with_suffix
+            _ensure_dir(fallback_dest.parent)
+            downloaded = suno_download_file(url, fallback_dest.name, base_dir=fallback_dest.parent)
             if downloaded:
                 return pathlib.Path(downloaded)
         except Exception as exc:  # pragma: no cover - optional helper fallback
@@ -328,6 +310,9 @@ async def suno_callback(
                     )
                     downloaded_assets.append(f"audio-link:{audio_url}")
                     download_errors.append(f"audio:{track_id}:{audio_url}")
+                    tg_statuses.extend(
+                        _tg_send_message(f"Audio link (fallback): {audio_url}")
+                    )
 
             if image_url:
                 dest = base_dir / f"{track_id}_cover"
@@ -344,6 +329,9 @@ async def suno_callback(
                     )
                     downloaded_assets.append(f"image-link:{image_url}")
                     download_errors.append(f"image:{track_id}:{image_url}")
+                    tg_statuses.extend(
+                        _tg_send_message(f"Image link (fallback): {image_url}")
+                    )
 
     if download_errors:
         err_preview = "\n".join(download_errors[:10])
