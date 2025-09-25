@@ -1,9 +1,32 @@
 """Pydantic schemas for Suno callbacks and responses."""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
+
+
+class SunoTrack(BaseModel):
+    """Normalized representation of an item returned by the Suno API."""
+
+    id: Optional[str] = None
+    title: Optional[str] = None
+    audio_url: Optional[str] = Field(default=None, alias="audioUrl")
+    image_url: Optional[str] = Field(default=None, alias="imageUrl")
+    duration_ms: Optional[int] = Field(default=None, alias="durationMs")
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+
+class SunoTask(BaseModel):
+    """Normalized task response returned by :class:`SunoService`."""
+
+    code: int = 0
+    message: Optional[str] = None
+    task_id: Optional[str] = Field(default=None, alias="taskId")
+    items: List[SunoTrack] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
 
 
 class CallbackResponse(BaseModel):
