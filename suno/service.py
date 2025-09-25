@@ -16,6 +16,18 @@ if TYPE_CHECKING:  # pragma: no cover - only used for typing
 
 logger = logging.getLogger("suno.service")
 
+
+def _warn_env() -> None:
+    base = os.getenv("SUNO_API_BASE", "")
+    gen = os.getenv("SUNO_GEN_PATH", "")
+    if "suno-api" in (base or "") or "suno-api" in (gen or ""):
+        logging.warning(
+            "ENV contains 'suno-api' in BASE or PATH. We normalize it, but please remove the segment from ENV.",
+        )
+
+
+_warn_env()
+
 _DEFAULT_DOWNLOAD_DIR = Path(os.getenv("SUNO_DOWNLOAD_DIR", "downloads"))
 
 

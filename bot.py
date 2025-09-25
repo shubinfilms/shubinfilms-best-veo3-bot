@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
 from datetime import datetime, timezone
 from contextlib import suppress
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlunparse, urlencode
 from dataclasses import dataclass
 
 import aiohttp
@@ -172,6 +172,7 @@ def _normalize_endpoint_values(*values: Any) -> List[str]:
 @dataclass(frozen=True)
 class SunoConfig:
     base: str
+    prefix: str
     gen_path: str
     status_path: str
     extend_path: str
@@ -196,17 +197,49 @@ def _normalize_suno_path(raw: str, default: str) -> str:
     return text
 
 
-def _compose_suno_url(base: str, path: str) -> str:
-    if not path:
-        return base
-    if "://" in path:
-        return path
-    return f"{(base or '').rstrip('/')}{path}"
+def _compose_suno_url(*parts: str) -> str:
+    cleaned = [p.strip() for p in parts if p]
+    if not cleaned:
+        return ""
+    # Explicit URLs take precedence
+    for part in reversed(cleaned):
+        if "://" in part:
+            return part
+
+    normalized = []
+    for idx, part in enumerate(cleaned):
+        fragment = part.replace("\\", "/")
+        if idx == 0:
+            normalized.append(fragment.rstrip("/"))
+        else:
+            normalized.append(fragment.strip("/"))
+
+    joined = "/".join(normalized)
+    if "://" not in joined:
+        joined = f"https://{joined}"
+
+    parsed = urlparse(joined)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or normalized[0].split("://", 1)[-1].split("/", 1)[0]
+    path = parsed.path.replace("//", "/")
+    path = path.replace("/suno-api/api/", "/api/")
+    path = path.replace("/suno-api/v1/", "/api/v1/")
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def _normalize_prefix(value: str) -> str:
+    prefix = (value or "").strip()
+    if not prefix:
+        return ""
+    if "://" in prefix:
+        return prefix
+    return "/" + prefix.strip("/")
 
 
 def _load_suno_config() -> SunoConfig:
-    base = (_env("SUNO_API_URL", "https://api.kie.ai/suno-api") or "https://api.kie.ai/suno-api").strip().rstrip("/")
-    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/generate-music"), "/generate-music")
+    base = (_env("SUNO_API_BASE", "https://api.kie.ai") or "https://api.kie.ai").strip().rstrip("/")
+    prefix = _normalize_prefix(_env("SUNO_API_PREFIX", ""))
+    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/api/v1/generate/music"), "/api/v1/generate/music")
     status_path = _normalize_suno_path(
         _env("SUNO_STATUS_PATH", "/get-music-details"),
         "/get-music-details",
@@ -223,6 +256,7 @@ def _load_suno_config() -> SunoConfig:
     has_key = bool(_env("KIE_API_KEY"))
     return SunoConfig(
         base=base,
+        prefix=prefix,
         gen_path=gen_path,
         status_path=status_path,
         extend_path=extend_path,
@@ -238,7 +272,7 @@ def _load_suno_config() -> SunoConfig:
 SUNO_CONFIG = _load_suno_config()
 SUNO_MODEL = (SUNO_CONFIG.model or "V5").upper()
 SUNO_MODEL_LABEL = SUNO_MODEL
-SUNO_BASE_URL = SUNO_CONFIG.base or "https://api.kie.ai/suno-api"
+SUNO_BASE_URL = _compose_suno_url(SUNO_CONFIG.base or "https://api.kie.ai", SUNO_CONFIG.prefix)
 SUNO_GEN_PATH = SUNO_CONFIG.gen_path
 SUNO_STATUS_PATH = SUNO_CONFIG.status_path
 SUNO_EXTEND_PATH = SUNO_CONFIG.extend_path
@@ -1861,7 +1895,7 @@ async def _suno_request(
     if not _suno_configured():
         raise SunoConfigError("Suno API is not configured")
 
-    url = _compose_suno_url(SUNO_CONFIG.base, path)
+    url = _compose_suno_url(SUNO_CONFIG.base, SUNO_CONFIG.prefix, path)
     headers = _suno_headers()
     method_upper = method.upper()
     request_params: Optional[Dict[str, Any]] = None
