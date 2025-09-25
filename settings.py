@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_VALID_LEVELS = {name for name in logging._nameToLevel if isinstance(name, str)}
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in _VALID_LEVELS:
+    LOG_LEVEL = "INFO"
 
 
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:

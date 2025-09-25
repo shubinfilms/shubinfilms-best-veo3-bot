@@ -6,7 +6,21 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 # odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys
+import logging
+import os
+from settings import LOG_LEVEL
+
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(levelname)s | bot | %(message)s",
+)
+
+for noisy in ("httpx", "urllib3", "aiogram", "telegram", "uvicorn", "gunicorn"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys
 from pathlib import Path
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
@@ -381,8 +395,6 @@ POLL_INTERVAL_SECS = int(_env("POLL_INTERVAL_SECS", "6"))
 POLL_TIMEOUT_SECS  = int(_env("POLL_TIMEOUT_SECS", str(20 * 60)))
 KIE_STRICT_POLLING = _env("KIE_STRICT_POLLING", "false").lower() == "true"
 
-LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logging.getLogger("kie").setLevel(logging.INFO)
 log = logging.getLogger("veo3-bot")
 singleton_log = logging.getLogger("veo3-bot.singleton")
@@ -432,7 +444,7 @@ def acquire_singleton_lock(ttl_sec: int = 3600) -> None:
         return
 
     if not acquired:
-        singleton_log.error("Another bot instance holds the lock; exiting to avoid Telegram conflict")
+        singleton_log.debug("Bot singleton: another worker detected, exiting early")
         sys.exit(1)
 
     singleton_log.info("Singleton lock acquired (ttl=%s)", ttl_sec)

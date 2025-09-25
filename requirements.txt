@@ -8,6 +8,7 @@ gunicorn>=21.2,<22.0
 tenacity>=8.2,<9.0
 pydantic>=2.7,<3.0
 pytest>=8.2,<9.0
+requests-mock>=1.12
 openai==0.28.1
 redis==5.0.7
 aiohttp>=3.9.5,<4.0

@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import requests
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
+from settings import LOG_LEVEL
 
 # redis optional
 try:
@@ -26,7 +27,14 @@ except Exception:  # pragma: no cover - optional helper
     suno_download_file = None  # type: ignore
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | suno-web | %(message)s")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(levelname)s | suno-web | %(message)s",
+)
+for noisy in ("httpx", "urllib3", "uvicorn", "gunicorn"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("suno-web")
 
 app = FastAPI(title="Suno Callback Web")
