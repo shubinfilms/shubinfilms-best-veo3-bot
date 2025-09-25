@@ -21,6 +21,8 @@ for noisy in ("httpx", "urllib3", "aiogram", "telegram", "uvicorn", "gunicorn"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys
+import threading
+import atexit
 from pathlib import Path
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
@@ -142,6 +144,17 @@ def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
 def _env(k: str, d: str = "") -> str:
     v = os.getenv(k)
     return (v if v is not None else d).strip()
+
+
+def _env_float(k: str, default: float) -> float:
+    raw = _env(k, str(default))
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
 
 def _env_int(k: str, default: int) -> int:
     raw = _env(k, str(default))
@@ -298,7 +311,13 @@ SUNO_LYRICS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_LYRICS_PATH)
 SUNO_PRICE = SUNO_CONFIG.price
 SUNO_POLL_INTERVAL = 3.0
 SUNO_POLL_TIMEOUT = float(SUNO_CONFIG.timeout_sec)
+ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
+BOT_SINGLETON_DISABLED = _env("BOT_SINGLETON_DISABLED", "false").lower() == "true"
+BOT_LEADER_TTL_MS   = 30_000
+BOT_LEADER_STALE_MS = 45_000
+BOT_LEADER_HEARTBEAT_INTERVAL_SEC = max(0.01, _env_float("BOT_LEADER_HEARTBEAT_INTERVAL_SEC", 10.0))
 TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN_HASH = hashlib.sha256(TELEGRAM_TOKEN.encode("utf-8")).hexdigest() if TELEGRAM_TOKEN else "no-token"
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
 PROMO_ENABLED       = _env("PROMO_ENABLED", "true").lower() == "true"
@@ -419,35 +438,211 @@ async def _safe_edit_message_text(
 
 # Redis
 REDIS_URL           = _env("REDIS_URL")
-BOT_LOCK_KEY        = _env("BOT_LOCK_KEY", "veo3:bot:lock")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 
+def _build_leader_key() -> str:
+    env = ENV_NAME or "prod"
+    token_hash = TELEGRAM_TOKEN_HASH or "no-token"
+    return f"tg:bot:leader:{env}:{token_hash}"
+
+
+class _LeaderContext:
+    def __init__(
+        self,
+        client: "redis.Redis",
+        key: str,
+        owner: str,
+        ttl_ms: int,
+        heartbeat_interval: float,
+    ) -> None:
+        self._client = client
+        self._key = key
+        self._owner = owner
+        self._ttl_ms = ttl_ms
+        self._interval = heartbeat_interval
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="bot-leader-heartbeat", daemon=True)
+        self._stopped = False
+        self._failures = 0
+
+    def start(self) -> None:
+        self._thread.start()
+        atexit.register(self.stop)
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        self._stop_event.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2.0)
+        try:
+            self._client.delete(self._key)
+        except Exception:
+            pass
+
+    def _heartbeat_payload(self) -> str:
+        now_ms = int(time.time() * 1000)
+        return json.dumps({"owner": self._owner, "ts": now_ms}, ensure_ascii=False)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval):
+            payload = self._heartbeat_payload()
+            try:
+                ok = self._client.set(self._key, payload, xx=True, px=self._ttl_ms)
+            except Exception:
+                ok = False
+            if ok:
+                self._failures = 0
+                singleton_log.info("leader: heartbeat ok")
+            else:
+                self._failures += 1
+                if self._failures >= 3:
+                    singleton_log.warning("leader: lost heartbeat")
+
+
+_leader_context: Optional[_LeaderContext] = None
+
+
+_LEADER_STEAL_SCRIPT = """
+local key = KEYS[1]
+local value = ARGV[1]
+local ttl_ms = tonumber(ARGV[2])
+local now_ms = tonumber(ARGV[3])
+local stale_ms = tonumber(ARGV[4])
+local current = redis.call('GET', key)
+if not current then
+    if redis.call('SET', key, value, 'NX', 'PX', ttl_ms) then
+        return 1
+    end
+    return 0
+end
+local ok, data = pcall(cjson.decode, current)
+local ts = 0
+if ok and type(data) == 'table' then
+    local current_ts = data.ts
+    local current_ts_type = type(current_ts)
+    if current_ts_type == 'number' then
+        ts = current_ts
+    elseif current_ts_type == 'string' then
+        ts = tonumber(current_ts) or 0
+    end
+end
+if now_ms - ts > stale_ms then
+    redis.call('SET', key, value, 'PX', ttl_ms)
+    return 2
+end
+return 0
+"""
+
+
+def _steal_leader_if_stale(
+    client: "redis.Redis",
+    key: str,
+    payload: str,
+    now_ms: int,
+    ttl_ms: int,
+    stale_ms: int,
+) -> bool:
+    try:
+        result = client.eval(
+            _LEADER_STEAL_SCRIPT,
+            1,
+            key,
+            payload,
+            ttl_ms,
+            now_ms,
+            stale_ms,
+        )
+    except Exception as exc:
+        singleton_log.debug("leader steal script failed: %s", exc)
+        return False
+    if result in (1, 2):
+        if result == 2:
+            singleton_log.warning("leader: stale leader stolen")
+        return True
+    return False
+
+
 def acquire_singleton_lock(ttl_sec: int = 3600) -> None:
-    """Exit if another bot instance is already running (prevents getUpdates conflict)."""
+    """Attempt to acquire a soft leader role backed by Redis heartbeats."""
+
+    del ttl_sec  # legacy argument, kept for compatibility
+
+    global _leader_context
+
+    if BOT_SINGLETON_DISABLED:
+        singleton_log.warning("BOT_SINGLETON_DISABLED=true — leader election disabled")
+        return
 
     if not REDIS_URL or redis is None:
-        singleton_log.warning("No REDIS_URL/redis — singleton lock disabled")
+        singleton_log.warning("No REDIS_URL/redis — leader election disabled")
         return
 
     try:
         client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     except Exception as exc:
-        singleton_log.warning("Singleton lock disabled: redis unavailable (%s)", exc)
+        singleton_log.warning("Leader election disabled: redis unavailable (%s)", exc)
         return
 
+    if _leader_context is not None:
+        _leader_context.stop()
+        _leader_context = None
+
+    key = _build_leader_key()
+    owner = f"{socket.gethostname()}:{os.getpid()}"
+    now_ms = int(time.time() * 1000)
+    payload = json.dumps({"owner": owner, "ts": now_ms}, ensure_ascii=False)
+
     try:
-        acquired = client.set(BOT_LOCK_KEY, str(os.getpid()), nx=True, ex=ttl_sec)
+        acquired = client.set(key, payload, nx=True, px=BOT_LEADER_TTL_MS)
     except Exception as exc:
-        singleton_log.warning("Singleton lock disabled: redis error (%s)", exc)
+        singleton_log.warning("Leader election disabled: redis error (%s)", exc)
         return
 
     if not acquired:
-        singleton_log.debug("Bot singleton: another worker detected, exiting early")
-        sys.exit(1)
+        try:
+            current_raw = client.get(key)
+        except Exception as exc:
+            singleton_log.debug("leader: failed to read current owner: %s", exc)
+            current_raw = None
 
-    singleton_log.info("Singleton lock acquired (ttl=%s)", ttl_sec)
+        current_ts = 0
+        if current_raw:
+            try:
+                current_data = json.loads(current_raw)
+                ts_candidate = current_data.get("ts")
+                if isinstance(ts_candidate, (int, float)):
+                    current_ts = int(ts_candidate)
+                elif isinstance(ts_candidate, str) and ts_candidate.isdigit():
+                    current_ts = int(ts_candidate)
+            except Exception:
+                current_ts = 0
+
+        if now_ms - current_ts > BOT_LEADER_STALE_MS:
+            if not _steal_leader_if_stale(
+                client,
+                key,
+                payload,
+                now_ms,
+                BOT_LEADER_TTL_MS,
+                BOT_LEADER_STALE_MS,
+            ):
+                return
+        else:
+            return
+
+    singleton_log.info("leader: acquired")
+    _leader_context = _LeaderContext(
+        client,
+        key,
+        owner,
+        BOT_LEADER_TTL_MS,
+        BOT_LEADER_HEARTBEAT_INTERVAL_SEC,
+    )
+    _leader_context.start()
 
 def _parse_admin_ids(raw: str) -> set[int]:
     result: set[int] = set()
