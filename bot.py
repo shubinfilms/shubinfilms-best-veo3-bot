@@ -125,6 +125,41 @@ ACTIVE_TASKS: Dict[int, str] = {}
 
 SUNO_SERVICE = SunoService()
 
+_SUNO_LOCK_TTL = 15 * 60
+_SUNO_LOCK_GUARD = threading.Lock()
+_SUNO_LOCK_MEMORY: set[int] = set()
+
+
+def _suno_lock_key(user_id: int) -> str:
+    return f"{REDIS_PREFIX}:lock:{int(user_id)}"
+
+
+def _acquire_suno_lock(user_id: int) -> bool:
+    key = _suno_lock_key(user_id)
+    if rds:
+        try:
+            stored = rds.set(key, "1", nx=True, ex=_SUNO_LOCK_TTL)
+            if stored:
+                return True
+        except Exception as exc:
+            log.warning("Suno lock redis error | user=%s err=%s", user_id, exc)
+    with _SUNO_LOCK_GUARD:
+        if user_id in _SUNO_LOCK_MEMORY:
+            return False
+        _SUNO_LOCK_MEMORY.add(user_id)
+        return True
+
+
+def _release_suno_lock(user_id: int) -> None:
+    key = _suno_lock_key(user_id)
+    if rds:
+        try:
+            rds.delete(key)
+        except Exception as exc:
+            log.warning("Suno lock release redis error | user=%s err=%s", user_id, exc)
+    with _SUNO_LOCK_GUARD:
+        _SUNO_LOCK_MEMORY.discard(user_id)
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -2603,6 +2638,16 @@ async def _launch_suno_generation(
             lyrics=(lyrics if (lyrics and not instrumental) else None),
             model=model,
             instrumental=instrumental,
+            user_id=user_id,
+            prompt="\n".join(
+                part.strip()
+                for part in (
+                    title or "",
+                    style or "",
+                    (lyrics or "") if (lyrics and not instrumental) else "",
+                )
+                if part and part.strip()
+            ),
         )
     except SunoAPIError as exc:
         log.warning("Suno start failed | status=%s payload=%s", exc.status, exc.payload)
@@ -4222,6 +4267,93 @@ async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await suno_entry(chat.id, ctx)
 
 
+async def _ensure_admin(update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    if not _is_admin(user.id):
+        return False
+    return True
+
+
+async def suno_last_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update):
+        return
+    tasks = await asyncio.to_thread(SUNO_SERVICE.list_last_tasks, 5)
+    message = update.effective_message
+    if message is None:
+        return
+    if not tasks:
+        await message.reply_text("⚠️ Нет сохранённых задач Suno.")
+        return
+    lines = ["🗂️ Последние задачи Suno:"]
+    for item in tasks:
+        task_id = item.get("task_id") or "?"
+        status = item.get("status") or "unknown"
+        prompt = (item.get("prompt") or "").strip() or "—"
+        user_id = item.get("user_id") or "?"
+        created = item.get("created_at") or item.get("updated_at") or "?"
+        lines.append(f"• {task_id} | {status} | user={user_id} | {created}\n  prompt: {prompt}")
+    await message.reply_text("\n".join(lines))
+
+
+async def suno_task_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update):
+        return
+    args = getattr(ctx, "args", None) or []
+    if not args:
+        await update.effective_message.reply_text("⚠️ Укажите ID задачи: /suno_task <task_id>.")
+        return
+    task_id = args[0]
+    record = await asyncio.to_thread(SUNO_SERVICE.get_task_record, task_id)
+    message = update.effective_message
+    if message is None:
+        return
+    if not record:
+        await message.reply_text(f"❓ Задача {task_id} не найдена.")
+        return
+    lines = [
+        f"🧾 Suno задача {task_id}",
+        f"Статус: {record.get('status') or 'unknown'}",
+        f"Пользователь: {record.get('user_id')}",
+        f"Чат: {record.get('chat_id')}",
+        f"Создана: {record.get('created_at')}",
+        f"Обновлена: {record.get('updated_at')}",
+        f"Код: {record.get('code')} | Сообщение: {record.get('msg')}",
+        f"Промпт: {(record.get('prompt') or '').strip() or '—'}",
+        f"Треков: {len(record.get('tracks') or [])}",
+    ]
+    tracks = record.get("tracks") or []
+    if isinstance(tracks, list) and tracks:
+        for idx, track in enumerate(tracks, start=1):
+            if not isinstance(track, Mapping):
+                continue
+            lines.append(
+                f"  {idx}. {track.get('title') or track.get('id') or 'track'}\n"
+                f"     audio: {track.get('audio_url') or '—'}\n"
+                f"     image: {track.get('image_url') or '—'}"
+            )
+    await message.reply_text("\n".join(lines))
+
+
+async def suno_retry_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update):
+        return
+    args = getattr(ctx, "args", None) or []
+    if not args:
+        await update.effective_message.reply_text("⚠️ Укажите ID задачи: /suno_retry <task_id>.")
+        return
+    task_id = args[0]
+    success = await asyncio.to_thread(SUNO_SERVICE.resend_links, task_id)
+    message = update.effective_message
+    if message is None:
+        return
+    if success:
+        await message.reply_text(f"🔁 Повторная отправка для задачи {task_id} запущена.")
+    else:
+        await message.reply_text(f"⚠️ Не удалось повторно отправить задачу {task_id}.")
+
+
 async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     message = update.effective_message
@@ -5207,14 +5339,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             await q.answer()
             params = _suno_collect_params(s)
-            await _launch_suno_generation(
-                chat_id,
-                ctx,
-                params=params,
-                user_id=uid,
-                reply_to=q.message,
-                trigger="start",
-            )
+            lock_acquired = False
+            if uid is not None:
+                lock_acquired = _acquire_suno_lock(int(uid))
+                if not lock_acquired:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⏳ Уже есть активная задача Suno. Дождитесь завершения предыдущей.",
+                        reply_to=q.message,
+                    )
+                    return
+            try:
+                await _launch_suno_generation(
+                    chat_id,
+                    ctx,
+                    params=params,
+                    user_id=uid,
+                    reply_to=q.message,
+                    trigger="start",
+                )
+            finally:
+                if lock_acquired and uid is not None:
+                    _release_suno_lock(int(uid))
             return
 
         if action == "repeat":
@@ -5226,14 +5373,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Нет предыдущих параметров", show_alert=True)
                 return
             await q.answer()
-            await _launch_suno_generation(
-                chat_id,
-                ctx,
-                params=params,
-                user_id=uid,
-                reply_to=q.message,
-                trigger="repeat",
-            )
+            lock_acquired = False
+            if uid is not None:
+                lock_acquired = _acquire_suno_lock(int(uid))
+                if not lock_acquired:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⏳ Уже есть активная задача Suno. Дождитесь завершения предыдущей.",
+                        reply_to=q.message,
+                    )
+                    return
+            try:
+                await _launch_suno_generation(
+                    chat_id,
+                    ctx,
+                    params=params,
+                    user_id=uid,
+                    reply_to=q.message,
+                    trigger="repeat",
+                )
+            finally:
+                if lock_acquired and uid is not None:
+                    _release_suno_lock(int(uid))
             return
 
         await q.answer()
@@ -6302,6 +6464,9 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("video", video_command))
     application.add_handler(CommandHandler("image", image_command))
     application.add_handler(CommandHandler("suno", suno_command))
+    application.add_handler(CommandHandler("suno_last", suno_last_command))
+    application.add_handler(CommandHandler("suno_task", suno_task_command))
+    application.add_handler(CommandHandler("suno_retry", suno_retry_command))
     application.add_handler(CommandHandler("lang", lang_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("faq", faq_command))
