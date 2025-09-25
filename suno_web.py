@@ -1,33 +1,22 @@
+"""FastAPI application receiving callbacks from Suno."""
 from __future__ import annotations
 
 import json
 import logging
 import mimetypes
 import os
-import pathlib
 import random
 import time
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
+
 from settings import LOG_LEVEL
-
-# redis optional
-try:
-    import redis  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    redis = None  # type: ignore
-
-try:
-    from suno.downloader import download_file as suno_download_file
-except Exception:  # pragma: no cover - optional helper
-    suno_download_file = None  # type: ignore
-
-
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
+from suno.schemas import SunoTask
+from suno.service import SunoService
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -39,26 +28,15 @@ log = logging.getLogger("suno-web")
 
 app = FastAPI(title="Suno Callback Web")
 
-REDIS_URL = os.getenv("REDIS_URL")
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-ADMIN_IDS = [item.strip() for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip()]
 CALLBACK_SECRET = os.getenv("SUNO_CALLBACK_SECRET", "")
-UA = os.getenv("SUNO_DOWNLOAD_UA") or "SunoCallbackBot/1.0 (+render)"
-HEADERS = {"User-Agent": UA, "Accept": "*/*", "Connection": "close"}
+DOWNLOAD_TIMEOUT = float(os.getenv("SUNO_DOWNLOAD_TIMEOUT", "60"))
 DOWNLOAD_TRIES = int(os.getenv("SUNO_DOWNLOAD_TRIES", "3"))
-DOWNLOAD_TIMEOUT = int(os.getenv("SUNO_DOWNLOAD_TIMEOUT", "60"))
+UA = os.getenv("SUNO_DOWNLOAD_UA") or "best-veo3-bot/1.0"
+HEADERS = {"User-Agent": UA, "Accept": "*/*", "Connection": "close"}
+BASE_DIR = Path("/tmp/suno")
 
-rds = None
-if REDIS_URL and redis is not None:
-    try:
-        rds = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-        rds.ping()
-        log.info("Redis connected")
-    except Exception as exc:  # pragma: no cover - best effort
-        log.warning(f"Redis unavailable: {exc}")
-
-
-_seen: set[str] = set()
+service = SunoService()
+_seen_callbacks: set[str] = set()
 
 
 @app.get("/healthz")
@@ -71,184 +49,108 @@ def root() -> Dict[str, bool]:
     return {"ok": True}
 
 
-@app.get("/suno-callback")
-def ping_callback() -> Dict[str, Any]:
-    return {"ok": True, "endpoint": "suno-callback"}
-
-
 def _idem_key(task_id: str, cb_type: str) -> str:
-    return f"suno:cb:{task_id}:{cb_type}"
+    return f"{task_id}:{cb_type}" if task_id else cb_type
 
 
-def _idem_check_and_mark(key: str) -> bool:
-    """Return True if key already processed."""
-
-    try:
-        if rds is not None:
-            added = rds.setnx(key, "1")
-            if not added:
-                return True
-            rds.expire(key, 86400)
-            return False
-    except Exception as exc:  # pragma: no cover - network/cache issue
-        log.warning(f"Redis idempotency failed: {exc}")
-
-    if key in _seen:
+def _should_skip(key: str) -> bool:
+    if not key:
+        return False
+    if key in _seen_callbacks:
         return True
-    _seen.add(key)
+    _seen_callbacks.add(key)
     return False
 
 
-def _ensure_dir(path: pathlib.Path) -> None:
+def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _guess_ext_from_headers(resp: requests.Response, url_path: str) -> str:
-    ct = resp.headers.get("Content-Type", "").lower()
+def _guess_ext(resp: requests.Response, url_path: str, suggested: Optional[str]) -> str:
+    if suggested:
+        clean = suggested if suggested.startswith(".") else f".{suggested}"
+        return clean
+    ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
     if ct:
-        ext = mimetypes.guess_extension(ct.split(";")[0].strip(), strict=False)
+        ext = mimetypes.guess_extension(ct, strict=False)
         if ext:
             return ext
-        if "audio/mpeg" in ct:
+        if ct == "audio/mpeg":
             return ".mp3"
-        if "audio/wav" in ct:
+        if ct == "audio/wav":
             return ".wav"
-        if "image/jpeg" in ct:
-            return ".jpg"
-        if "image/png" in ct:
-            return ".png"
-
-    path_ext = pathlib.Path(url_path or "").suffix
+    path_ext = Path(url_path or "").suffix
     return path_ext if path_ext else ".bin"
 
 
-def _download(url: str, destination: pathlib.Path) -> Optional[pathlib.Path]:
+def _download(url: str, destination: Path, *, suggested_ext: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
     if not url:
-        return None
-
-    parsed = urlparse(url)
-    referer = ""
-    if parsed.scheme and parsed.netloc:
-        referer = f"{parsed.scheme}://{parsed.netloc}/"
-
+        return None, None
     tries = max(1, DOWNLOAD_TRIES)
     delay = 1.0
-    last_err: Optional[Exception] = None
-    url_path = parsed.path
-    dest_with_suffix = destination if destination.suffix else destination.with_suffix(".bin")
-
+    last_error: Optional[str] = None
+    parsed_path = Path(url).name
     for attempt in range(1, tries + 1):
         try:
-            headers = HEADERS.copy()
-            if referer:
-                headers["Referer"] = referer
-
-            with requests.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=DOWNLOAD_TIMEOUT,
-            ) as resp:
-                if resp.status_code >= 400:
-                    raise requests.HTTPError(f"HTTP {resp.status_code}")
-
-                final_dest = dest_with_suffix
+            with requests.get(url, headers=HEADERS, stream=True, timeout=DOWNLOAD_TIMEOUT) as resp:
+                status = resp.status_code
+                if status in {403, 404}:
+                    return None, f"http{status}"
+                if status >= 500:
+                    last_error = f"http{status}"
+                    raise requests.HTTPError(status)
+                if status >= 400:
+                    return None, f"http{status}"
+                final_dest = destination
                 if not destination.suffix:
-                    guessed = _guess_ext_from_headers(resp, url_path)
-                    final_dest = destination.with_suffix(guessed)
-
+                    ext = _guess_ext(resp, parsed_path, suggested_ext)
+                    final_dest = destination.with_suffix(ext)
                 _ensure_dir(final_dest.parent)
                 with final_dest.open("wb") as fh:
                     for chunk in resp.iter_content(8192):
                         if chunk:
                             fh.write(chunk)
-                return final_dest
-
-        except Exception as exc:
-            last_err = exc
-            log.warning(
-                "Download attempt %s/%s failed for %s: %s",
-                attempt,
-                tries,
-                url,
-                exc,
-            )
+                return final_dest, None
+        except Exception as exc:  # pragma: no cover - network errors
+            last_error = last_error or str(exc)
             if attempt < tries:
                 time.sleep(delay + random.uniform(0, 0.25))
                 delay *= 1.5
-
-    log.warning("Download failed permanently for %s: %s", url, last_err)
-
-    if suno_download_file is not None:
-        try:
-            fallback_dest = destination
-            if not fallback_dest.suffix:
-                fallback_dest = dest_with_suffix
-            _ensure_dir(fallback_dest.parent)
-            downloaded = suno_download_file(url, fallback_dest.name, base_dir=fallback_dest.parent)
-            if downloaded:
-                return pathlib.Path(downloaded)
-        except Exception as exc:  # pragma: no cover - optional helper fallback
-            log.warning(f"Download helper fallback failed {url}: {exc}")
-
-    return None
+    return None, last_error
 
 
-def _tg_send_message(text: str) -> List[str]:
-    statuses: List[str] = []
-    if not TG_TOKEN or not ADMIN_IDS:
-        log.warning("No TELEGRAM_TOKEN/ADMIN_IDS; skip Telegram notify")
-        return ["skipped"]
-
-    for chat_id in ADMIN_IDS:
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=20,
-            )
-            if response.ok:
-                statuses.append(f"{chat_id}:ok")
+def _process_tracks(task_id: str, task: SunoTask) -> Tuple[List[str], List[str]]:
+    downloaded: List[str] = []
+    errors: List[str] = []
+    if not task_id:
+        return downloaded, errors
+    base_dir = BASE_DIR / task_id
+    for idx, track in enumerate(task.items, start=1):
+        track_id = track.id or str(idx)
+        title = track.title or f"track-{idx}"
+        if track.audio_url:
+            dest = base_dir / track_id
+            path, err = _download(track.audio_url, dest, suggested_ext=track.ext)
+            if path:
+                size = path.stat().st_size
+                downloaded.append(f"audio:{path.name}:{size}")
             else:
-                statuses.append(f"{chat_id}:http{response.status_code}")
-        except Exception as exc:  # pragma: no cover - network issues
-            statuses.append(f"{chat_id}:error")
-            log.warning(f"sendMessage failed for {chat_id}: {exc}")
-    return statuses
-
-
-def _tg_send_file(filepath: pathlib.Path, caption: str = "") -> List[str]:
-    statuses: List[str] = []
-    if not TG_TOKEN or not ADMIN_IDS:
-        return ["skipped"]
-
-    suffix = filepath.suffix.lower()
-    mime = "audio/mpeg" if suffix in {".mp3", ".wav"} else None
-    method = "sendDocument"
-    field_name = "document"
-    if suffix in {".jpg", ".jpeg", ".png"}:
-        method = "sendPhoto"
-        field_name = "photo"
-
-    for chat_id in ADMIN_IDS:
-        try:
-            with filepath.open("rb") as fh:
-                files = {field_name: (filepath.name, fh, mime or "application/octet-stream")}
-                data = {"chat_id": chat_id, "caption": caption}
-                response = requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/{method}",
-                    data=data,
-                    files=files,
-                    timeout=60,
-                )
-            if response.ok:
-                statuses.append(f"{chat_id}:ok")
+                downloaded.append(f"audio-link:{track.audio_url}")
+                if err:
+                    errors.append(f"audio:{track_id}:{err}")
+        if track.image_url:
+            dest = base_dir / f"{track_id}_cover"
+            path, err = _download(track.image_url, dest, suggested_ext=None)
+            if path:
+                size = path.stat().st_size
+                downloaded.append(f"image:{path.name}:{size}")
             else:
-                statuses.append(f"{chat_id}:http{response.status_code}")
-        except Exception as exc:  # pragma: no cover - network issues
-            statuses.append(f"{chat_id}:error")
-            log.warning(f"sendFile failed for {chat_id}: {exc}")
-    return statuses
+                downloaded.append(f"image-link:{track.image_url}")
+                if err:
+                    errors.append(f"image:{track_id}:{err}")
+    return downloaded, errors
+
+
 @app.post("/suno-callback")
 async def suno_callback(
     request: Request,
@@ -258,106 +160,55 @@ async def suno_callback(
         if not x_callback_token or x_callback_token != CALLBACK_SECRET:
             log.warning("Forbidden: bad X-Callback-Token")
             return JSONResponse({"error": "forbidden"}, status_code=403)
-    else:
-        log.warning("SUNO_CALLBACK_SECRET is empty — allowing requests in DEV")
-
     try:
         payload = await request.json()
     except json.JSONDecodeError as exc:
         body = await request.body()
-        log.error(f"Invalid JSON payload: {exc}; body={body!r}")
+        log.error("Invalid JSON payload: %s body=%s", exc, body[:200])
         return {"status": "received"}
-
     if not isinstance(payload, dict):
-        log.error(f"Unexpected payload type: {type(payload)!r}")
+        log.error("Unexpected payload type: %s", type(payload))
         return {"status": "received"}
 
-    code: Optional[int] = payload.get("code")
-    msg: Optional[str] = payload.get("msg")
-    data: Dict[str, Any] = payload.get("data") or {}
-    cb_type_raw = data.get("callbackType") or data.get("callback_type") or ""
-    cb_type = str(cb_type_raw).lower() or "unknown"
-    task_id = data.get("task_id") or data.get("taskId") or "unknown"
-    items: List[Dict[str, Any]] = data.get("data") or []
+    data = payload.get("data") or {}
+    callback_type = str(data.get("callbackType") or data.get("callback_type") or "").lower() or "unknown"
+    task_id = str(data.get("task_id") or data.get("taskId") or "").strip()
+    code = payload.get("code")
+    items = data.get("data") or []
 
-    idem_key = _idem_key(task_id, cb_type)
-    if _idem_check_and_mark(idem_key):
-        log.info(f"duplicate callback dropped | task={task_id} type={cb_type}")
+    key = _idem_key(task_id, callback_type)
+    if _should_skip(key):
+        log.info("duplicate callback dropped | task=%s type=%s", task_id or "?", callback_type)
         return {"status": "received"}
-
-    downloaded_assets: List[str] = []
-    tg_statuses: List[str] = []
-    download_errors: List[str] = []
 
     log.info(
-        f"callback received | code={code} task={task_id} type={cb_type} items={len(items)}"
+        "callback received | code=%s task=%s type=%s items=%s",
+        code,
+        task_id or "?",
+        callback_type,
+        len(items) if isinstance(items, list) else 0,
     )
 
-    tg_statuses.extend(_tg_send_message(f"Suno: этап {cb_type}, task={task_id}"))
+    task = SunoTask.from_payload(payload)
+    if task_id and not task.task_id:
+        task.task_id = task_id
+    task.status = callback_type or task.status
 
-    if cb_type in {"first", "complete"} and items:
-        base_dir = pathlib.Path("/tmp/suno") / task_id
-        for idx, track in enumerate(items, start=1):
-            track_id = str(track.get("id") or idx)
-            title = track.get("title") or "track"
-            audio_url = track.get("audio_url") or track.get("audioUrl")
-            image_url = track.get("image_url") or track.get("imageUrl")
-
-            if audio_url:
-                dest = base_dir / track_id
-                downloaded = _download(audio_url, dest)
-                if downloaded and downloaded.exists():
-                    size = downloaded.stat().st_size
-                    downloaded_assets.append(f"audio:{downloaded.name}:{size}")
-                    tg_statuses.extend(
-                        _tg_send_file(downloaded, caption=f"{title} (audio)")
-                    )
-                else:
-                    log.warning(
-                        f"audio download skipped | task={task_id} track={track_id} url={audio_url}"
-                    )
-                    downloaded_assets.append(f"audio-link:{audio_url}")
-                    download_errors.append(f"audio:{track_id}:{audio_url}")
-                    tg_statuses.extend(
-                        _tg_send_message(f"Audio link (fallback): {audio_url}")
-                    )
-
-            if image_url:
-                dest = base_dir / f"{track_id}_cover"
-                downloaded = _download(image_url, dest)
-                if downloaded and downloaded.exists():
-                    size = downloaded.stat().st_size
-                    downloaded_assets.append(f"image:{downloaded.name}:{size}")
-                    tg_statuses.extend(
-                        _tg_send_file(downloaded, caption=f"{title} (cover)")
-                    )
-                else:
-                    log.warning(
-                        f"image download skipped | task={task_id} track={track_id} url={image_url}"
-                    )
-                    downloaded_assets.append(f"image-link:{image_url}")
-                    download_errors.append(f"image:{track_id}:{image_url}")
-                    tg_statuses.extend(
-                        _tg_send_message(f"Image link (fallback): {image_url}")
-                    )
-
-    if download_errors:
-        err_preview = "\n".join(download_errors[:10])
-        tg_statuses.extend(
-            _tg_send_message(
-                "Suno: проблемы со скачиванием файлов" + (f"\n{err_preview}" if err_preview else "")
-            )
-        )
+    downloaded_assets, download_errors = _process_tracks(task.task_id, task)
 
     log_line = {
-        "task_id": task_id,
-        "callbackType": cb_type,
+        "task_id": task.task_id,
+        "callbackType": callback_type,
         "code": code,
         "assets": downloaded_assets,
         "errors": download_errors,
-        "telegram": tg_statuses or ["not-sent"],
-        "message": msg,
+        "message": payload.get("msg"),
     }
-    log.info(f"processed | {json.dumps(log_line, ensure_ascii=False)}")
+    log.info("processed | %s", json.dumps(log_line, ensure_ascii=False))
+
+    try:
+        service.handle_callback(task)
+    except Exception:  # pragma: no cover - defensive
+        log.exception("SunoService.handle_callback failed for task %s", task.task_id)
 
     return {"status": "received"}

@@ -1,14 +1,12 @@
-"""Suno integration module."""
+"""Public surface for the Suno integration."""
 from .client import SunoClient, SunoAPIError
-from .store import TaskStore, InMemoryTaskStore
+from .schemas import SunoTask, SunoTrack
 from .service import SunoService
-from .callbacks import suno_bp
 
 __all__ = [
     "SunoClient",
     "SunoAPIError",
-    "TaskStore",
-    "InMemoryTaskStore",
     "SunoService",
-    "suno_bp",
+    "SunoTask",
+    "SunoTrack",
 ]

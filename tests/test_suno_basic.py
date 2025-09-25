@@ -80,5 +80,5 @@ def test_suno_e2e_mocked(monkeypatch, caplog, tmp_path):
     joined = "\n".join(caplog.messages)
     assert "callback received" in joined
     assert "processed |" in joined
-    # проверяем, что телеграм пропущен из-за отсутствия токена
-    assert "skip Telegram notify" in joined
+    # проверяем, что сервис не упал без сохранённого чата
+    assert "No chat mapping" in joined
