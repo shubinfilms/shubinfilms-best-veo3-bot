@@ -5,10 +5,20 @@ import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from settings import (
+    SUNO_CALLBACK_URL,
+    SUNO_GEN_PATH,
+    SUNO_INSTR_PATH,
+    SUNO_MODEL,
+    SUNO_TASK_STATUS_PATH,
+    SUNO_UPLOAD_EXTEND_PATH,
+)
+
+from .client import SunoHttp
 from .downloader import download_file
-from .schemas import CallbackEnvelope, TaskAsset
+from .schemas import CallbackEnvelope, SunoTask, SunoTrack, TaskAsset
 from .store import TaskStore
 
 if TYPE_CHECKING:  # pragma: no cover - only used for typing
@@ -48,12 +58,14 @@ class SunoService:
         download_dir: Path | str = _DEFAULT_DOWNLOAD_DIR,
         executor: Optional[ThreadPoolExecutor] = None,
         downloader=download_file,
+        http: Optional[SunoHttp] = None,
     ) -> None:
         self.store = store
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.downloader = downloader
         self.executor = executor or ThreadPoolExecutor(max_workers=4)
+        self._http_client: Optional[SunoHttp] = http
 
     def handle_music_callback(self, payload: Any) -> None:
         self._handle_callback("music", payload)
@@ -69,6 +81,11 @@ class SunoService:
 
     def handle_mp4_callback(self, payload: dict) -> None:
         self._handle_callback("mp4", payload)
+
+    def _get_http(self) -> SunoHttp:
+        if self._http_client is None:
+            self._http_client = SunoHttp()
+        return self._http_client
 
     def _handle_callback(self, task_kind: str, payload: Any) -> None:
         raw_payload: dict | None
@@ -274,3 +291,203 @@ class SunoService:
             filename = asset.filename or f"{asset.asset_type}_{asset.identifier or 'asset'}"
             relative_path = Path(task_id) / filename
             self.executor.submit(self.downloader, asset.url, relative_path, self.download_dir)
+
+    # ------------------------------------------------------------------ HTTP
+    def _resolve_path(self, value: Optional[str], env_name: str) -> str:
+        if not value:
+            raise RuntimeError(f"{env_name} is not configured")
+        if value.startswith("http"):
+            return value
+        return value if value.startswith("/") else "/" + value.lstrip("/")
+
+    def _with_callback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        callback_url = SUNO_CALLBACK_URL
+        if callback_url and not any(key in payload for key in ("callback_url", "callbackUrl")):
+            payload["callback_url"] = callback_url
+        return payload
+
+    def _clean_payload(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        cleaned: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if value is None:
+                continue
+            cleaned[key] = value
+        return cleaned
+
+    def _normalize_task(self, payload: Optional[Mapping[str, Any]]) -> SunoTask:
+        if not isinstance(payload, Mapping):
+            return SunoTask(code=0, message=None, task_id=None, items=[])
+        code = payload.get("code") or payload.get("status") or 0
+        try:
+            code_int = int(code)
+        except (TypeError, ValueError):
+            code_int = 0
+        message = None
+        for key in ("message", "msg", "detail"):
+            raw_msg = payload.get(key)
+            if isinstance(raw_msg, str) and raw_msg:
+                message = raw_msg
+                break
+        data = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
+        task_id = None
+        if isinstance(data, Mapping):
+            for key in ("taskId", "task_id", "id"):
+                value = data.get(key)
+                if value:
+                    task_id = str(value)
+                    break
+            if not message:
+                data_msg = data.get("message") or data.get("msg")
+                if isinstance(data_msg, str):
+                    message = data_msg
+        if not task_id:
+            for key in ("taskId", "task_id", "id"):
+                value = payload.get(key)
+                if value:
+                    task_id = str(value)
+                    break
+        items_raw: Any = None
+        if isinstance(data, Mapping):
+            for key in ("items", "tracks", "songs"):
+                maybe = data.get(key)
+                if maybe:
+                    items_raw = maybe
+                    break
+            if items_raw is None:
+                response = data.get("response")
+                if isinstance(response, Mapping):
+                    for key in ("tracks", "items"):
+                        maybe = response.get(key)
+                        if maybe:
+                            items_raw = maybe
+                            break
+        items: List[SunoTrack] = []
+        if isinstance(items_raw, list):
+            for entry in items_raw:
+                track = self._coerce_track_entry(entry)
+                if track:
+                    items.append(track)
+        elif isinstance(items_raw, Mapping):
+            track = self._coerce_track_entry(items_raw)
+            if track:
+                items.append(track)
+        return SunoTask(code=code_int, message=message, task_id=task_id, items=items)
+
+    def _coerce_track_entry(self, entry: Any) -> Optional[SunoTrack]:
+        if entry is None:
+            return None
+        if isinstance(entry, str):
+            return SunoTrack(audio_url=entry)
+        if not isinstance(entry, Mapping):
+            return None
+        payload: Dict[str, Any] = {}
+        for key in ("id", "trackId", "track_id", "audioId"):
+            value = entry.get(key)
+            if value:
+                payload["id"] = str(value)
+                break
+        for key in ("title", "name"):
+            value = entry.get(key)
+            if value:
+                payload["title"] = str(value)
+                break
+        for key in ("audio_url", "audioUrl", "url", "fileUrl"):
+            value = entry.get(key)
+            if value:
+                payload["audio_url"] = str(value)
+                break
+        for key in ("image_url", "imageUrl", "coverUrl"):
+            value = entry.get(key)
+            if value:
+                payload["image_url"] = str(value)
+                break
+        for key in ("duration_ms", "durationMs", "duration"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            try:
+                payload["duration_ms"] = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            break
+        if not payload:
+            return None
+        return SunoTrack.model_validate(payload)
+
+    def create_music(
+        self,
+        *,
+        title: Optional[str] = None,
+        style: Optional[str] = None,
+        lyrics: Optional[str] = None,
+        model: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> SunoTask:
+        payload = {
+            "title": title,
+            "style": style,
+            "lyrics": lyrics,
+            "model": model or SUNO_MODEL,
+            "mode": mode,
+        }
+        payload = self._with_callback(self._clean_payload(payload))
+        response = self._get_http().post(
+            self._resolve_path(SUNO_GEN_PATH, "SUNO_GEN_PATH"),
+            json=payload,
+            op="create_music",
+        )
+        return self._normalize_task(response)
+
+    def add_instrumental(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        upload_url: Optional[str] = None,
+        **extra: Any,
+    ) -> SunoTask:
+        if not task_id and not upload_url:
+            raise ValueError("Either task_id or upload_url must be provided")
+        payload = {
+            "task_id": task_id,
+            "upload_url": upload_url,
+            **{key: value for key, value in extra.items() if value is not None},
+        }
+        payload = self._with_callback(self._clean_payload(payload))
+        response = self._get_http().post(
+            self._resolve_path(SUNO_INSTR_PATH, "SUNO_INSTR_PATH"),
+            json=payload,
+            op="add_instrumental",
+        )
+        return self._normalize_task(response)
+
+    def extend_upload(
+        self,
+        file_url: str,
+        *,
+        start_at: int = 0,
+        **extra: Any,
+    ) -> SunoTask:
+        if not file_url:
+            raise ValueError("file_url must be provided")
+        payload = {
+            "file_url": file_url,
+            "start_at": start_at,
+            **{key: value for key, value in extra.items() if value is not None},
+        }
+        payload = self._with_callback(self._clean_payload(payload))
+        response = self._get_http().post(
+            self._resolve_path(SUNO_UPLOAD_EXTEND_PATH, "SUNO_UPLOAD_EXTEND_PATH"),
+            json=payload,
+            op="extend_upload",
+        )
+        return self._normalize_task(response)
+
+    def get_status(self, task_id: str) -> SunoTask:
+        if not task_id:
+            raise ValueError("task_id must be provided")
+        response = self._get_http().get(
+            self._resolve_path(SUNO_TASK_STATUS_PATH, "SUNO_TASK_STATUS_PATH"),
+            params={"task_id": task_id},
+            op="get_status",
+        )
+        return self._normalize_task(response)
