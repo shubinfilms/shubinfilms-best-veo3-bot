@@ -6,7 +6,7 @@
 # Остальное (карточки, кнопки, тексты, цены, FAQ, промокоды, бонусы и т.д.) — без изменений.
 
 # odex/fix-balance-reset-after-deploy
-import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, html
+import os, json, time, uuid, asyncio, logging, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys
 from pathlib import Path
 # main
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
@@ -385,6 +385,7 @@ LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logging.getLogger("kie").setLevel(logging.INFO)
 log = logging.getLogger("veo3-bot")
+singleton_log = logging.getLogger("veo3-bot.singleton")
 
 try:
     import telegram as _tg
@@ -406,8 +407,35 @@ async def _safe_edit_message_text(
 
 # Redis
 REDIS_URL           = _env("REDIS_URL")
+BOT_LOCK_KEY        = _env("BOT_LOCK_KEY", "veo3:bot:lock")
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
+
+def acquire_singleton_lock(ttl_sec: int = 3600) -> None:
+    """Exit if another bot instance is already running (prevents getUpdates conflict)."""
+
+    if not REDIS_URL or redis is None:
+        singleton_log.warning("No REDIS_URL/redis — singleton lock disabled")
+        return
+
+    try:
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    except Exception as exc:
+        singleton_log.warning("Singleton lock disabled: redis unavailable (%s)", exc)
+        return
+
+    try:
+        acquired = client.set(BOT_LOCK_KEY, str(os.getpid()), nx=True, ex=ttl_sec)
+    except Exception as exc:
+        singleton_log.warning("Singleton lock disabled: redis error (%s)", exc)
+        return
+
+    if not acquired:
+        singleton_log.error("Another bot instance holds the lock; exiting to avoid Telegram conflict")
+        sys.exit(1)
+
+    singleton_log.info("Singleton lock acquired (ttl=%s)", ttl_sec)
 
 def _parse_admin_ids(raw: str) -> set[int]:
     result: set[int] = set()
@@ -6249,6 +6277,7 @@ async def run_bot_async() -> None:
 
 def main() -> None:
     # Единая точка входа: создаём и закрываем цикл здесь
+    acquire_singleton_lock(3600)
     asyncio.run(run_bot_async())
 
 
