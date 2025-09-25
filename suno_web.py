@@ -156,9 +156,10 @@ async def suno_callback(
     request: Request,
     x_callback_token: Optional[str] = Header(default=None, convert_underscores=False),
 ):
+    token = x_callback_token or request.query_params.get("token")
     if CALLBACK_SECRET:
-        if not x_callback_token or x_callback_token != CALLBACK_SECRET:
-            log.warning("Forbidden: bad X-Callback-Token")
+        if not token or token != CALLBACK_SECRET:
+            log.warning(f"Forbidden: bad X-Callback-Token ({token})")
             return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
         payload = await request.json()
