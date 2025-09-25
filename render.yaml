@@ -1,4 +1,13 @@
 services:
+  - type: web
+    name: shubinfilms-best-veo3-bot
+    env: python
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn suno_web:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
   - type: worker
     name: best-veo3-bot
     env: python

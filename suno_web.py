@@ -164,42 +164,27 @@ def _tg_send_file(filepath: pathlib.Path, caption: str = "") -> List[str]:
     return statuses
 
 
-def _validate_callback_token(
-    header_token: Optional[str], query_token: Optional[str]
-) -> bool:
-    if not CALLBACK_SECRET:
-        log.info("Callback token accepted")
-        return True
-    if header_token == CALLBACK_SECRET or query_token == CALLBACK_SECRET:
-        log.info("Callback token accepted")
-        return True
-    log.warning("Forbidden: bad callback token")
-    return False
-
-
-@app.get("/health")
-def health() -> Dict[str, bool]:
+@app.get("/healthz")
+def healthz() -> Dict[str, bool]:
     return {"ok": True}
 
 
-@app.get("/suno-callback")
-async def suno_callback_get(
-    token: Optional[str] = None,
-    x_callback_token: Optional[str] = Header(default=None, convert_underscores=False),
-):
-    if not _validate_callback_token(x_callback_token, token):
-        return JSONResponse({"error": "forbidden"}, status_code=403)
+@app.get("/")
+def index() -> Dict[str, Any]:
     return {"ok": True, "endpoint": "suno-callback"}
 
 
 @app.post("/suno-callback")
 async def suno_callback(
     request: Request,
-    token: Optional[str] = None,
     x_callback_token: Optional[str] = Header(default=None, convert_underscores=False),
 ):
-    if not _validate_callback_token(x_callback_token, token):
-        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if CALLBACK_SECRET:
+        if not x_callback_token or x_callback_token != CALLBACK_SECRET:
+            log.warning("Forbidden: bad X-Callback-Token")
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+    else:
+        log.warning("SUNO_CALLBACK_SECRET is empty — allowing requests in DEV")
 
     try:
         payload = await request.json()
