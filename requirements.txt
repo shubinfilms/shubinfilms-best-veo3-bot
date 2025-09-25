@@ -1,6 +1,8 @@
 python-telegram-bot[rate-limiter]==21.6
 requests==2.32.3
 python-dotenv==1.0.1
+fastapi>=0.111,<0.112
+uvicorn[standard]>=0.30,<0.31
 Flask>=3.0.3,<4.0
 gunicorn>=21.2,<22.0
 tenacity>=8.2,<9.0
