@@ -23,8 +23,9 @@ KIE_BANANA_MODEL=google/nano-banana-edit
 
 # Suno API
 SUNO_ENABLED=true
-SUNO_API_URL=https://api.kie.ai/suno-api
-SUNO_GEN_PATH=/api/v1/generate
+SUNO_API_BASE=https://api.kie.ai
+SUNO_API_PREFIX=
+SUNO_GEN_PATH=/api/v1/generate/music
 SUNO_STATUS_PATH=/api/v1/generate/record-info
 SUNO_EXTEND_PATH=/api/v1/generate/extend
 SUNO_LYRICS_PATH=/api/v1/lyrics

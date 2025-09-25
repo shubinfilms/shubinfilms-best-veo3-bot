@@ -4,14 +4,58 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Dict, Optional
-from urllib.parse import urljoin
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from requests import Response, Session
 
 from ._retry import RetryError, Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-logger = logging.getLogger("suno.client")
+log = logging.getLogger("suno")
+
+
+def _join_url(*parts: str) -> str:
+    """Join URL parts safely, normalizing duplicate segments."""
+
+    cleaned: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        cleaned.append(part.strip().replace("\\", "/"))
+
+    if not cleaned:
+        return ""
+
+    joined = "/".join(segment.strip("/") for segment in cleaned)
+
+    # Ensure we have a scheme for urlparse to work reliably
+    if "://" not in joined:
+        joined = f"https://{joined}"
+
+    parsed = urlparse(joined)
+    scheme = parsed.scheme or "https"
+    if parsed.netloc:
+        netloc = parsed.netloc
+        path = parsed.path
+    else:
+        # Recover netloc from the first cleaned part when scheme was missing
+        first = cleaned[0]
+        if "://" in first:
+            first_parsed = urlparse(first)
+            netloc = first_parsed.netloc
+            path_prefix = first_parsed.path
+        else:
+            netloc = first.split("/", 1)[0]
+            path_prefix = "/" + first[len(netloc):]
+        path = (path_prefix.rstrip("/") + "/" + parsed.path.lstrip("/")).replace("//", "/")
+
+    # Normalize path and drop duplicate "suno-api" prefixes
+    path = path.replace("//", "/")
+    path = path.replace("/suno-api/api/", "/api/")
+    path = path.replace("/suno-api/v1/", "/api/v1/")
+
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
 
 BASE = os.getenv("SUNO_API_BASE", "https://api.kie.ai")
 
@@ -65,17 +109,33 @@ class SunoClient:
     def __init__(
         self,
         base_url: Optional[str] = None,
-        token: str = "",
+        token: Optional[str] = None,
         timeout: int = _DEFAULT_TIMEOUT,
         session: Optional[Session] = None,
     ) -> None:
-        resolved_base = (base_url or BASE or "").strip()
-        if not resolved_base:
-            raise ValueError("base_url must be provided")
-        if not token:
+        env_base = (os.environ.get("SUNO_API_BASE") or BASE or "").strip()
+        env_token = (os.environ.get("SUNO_API_TOKEN") or "").strip()
+        self._prefix = (os.environ.get("SUNO_API_PREFIX") or "").strip()
+
+        resolved_base = (base_url or env_base or "").strip()
+        if base_url is None:
+            if not resolved_base or not resolved_base.startswith("http"):
+                raise RuntimeError(f"Invalid SUNO_API_BASE: {resolved_base!r}")
+        else:
+            if not resolved_base:
+                raise ValueError("base_url must be provided")
+            if not resolved_base.startswith("http"):
+                raise ValueError("base_url must start with 'http'")
+
+        resolved_token = token if token is not None else env_token
+        if token is None:
+            if not resolved_token:
+                raise RuntimeError("SUNO_API_TOKEN is empty")
+        elif not resolved_token:
             raise ValueError("token must be provided")
+
         self.base_url = resolved_base.rstrip("/")
-        self.token = token
+        self.token = resolved_token
         self.timeout = timeout
         self.session = session or requests.Session()
         self._retryer = Retrying(
@@ -93,9 +153,14 @@ class SunoClient:
             raise ValueError("path must start with '/'")
         return path
 
+    def _url(self, path: str) -> str:
+        url = _join_url(self.base_url, self._prefix, path)
+        log.debug("Suno request → %s", url)
+        return url
+
     def _url_for(self, endpoint: str) -> str:
         path = self._resolve_path(endpoint)
-        return urljoin(self.base_url + "/", path.lstrip("/"))
+        return self._url(path)
 
     def _request(
         self,
@@ -106,7 +171,7 @@ class SunoClient:
         params: Optional[dict] = None,
     ) -> dict:
         path = self._resolve_path(endpoint)
-        url = urljoin(self.base_url + "/", path.lstrip("/"))
+        url = self._url(path)
         headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -123,10 +188,10 @@ class SunoClient:
                     timeout=self.timeout,
                 )
             except requests.RequestException as exc:  # pragma: no cover - handled by retryer
-                logger.warning("Request error on %s %s: %s", method, url, exc)
+                log.warning("Request error on %s %s: %s", method, url, exc)
                 raise exc
             if response.status_code != 200:
-                logger.warning(
+                log.warning(
                     "Suno API HTTP error %s on %s %s: %s",
                     response.status_code,
                     method,
@@ -143,7 +208,7 @@ class SunoClient:
             code = payload.get("code")
             if isinstance(code, int) and code != 200:
                 message = payload.get("msg") or "unexpected error"
-                logger.warning(
+                log.warning(
                     "Suno API logical error on %s %s: code=%s msg=%s payload=%s",
                     method,
                     path,
