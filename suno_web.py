@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import pathlib
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -32,6 +34,12 @@ REDIS_URL = os.getenv("REDIS_URL")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_IDS = [item.strip() for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip()]
 CALLBACK_SECRET = os.getenv("SUNO_CALLBACK_SECRET", "")
+DOWNLOAD_UA = os.getenv(
+    "SUNO_DOWNLOAD_UA",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+)
+DOWNLOAD_TRIES = int(os.getenv("SUNO_DOWNLOAD_TRIES", "3"))
+DOWNLOAD_TIMEOUT = int(os.getenv("SUNO_DOWNLOAD_TIMEOUT", "60"))
 
 rds = None
 if REDIS_URL and redis is not None:
@@ -49,6 +57,16 @@ _seen: set[str] = set()
 @app.get("/healthz")
 def healthz() -> Dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"ok": True, "endpoint": "suno-callback"}
+
+
+@app.get("/suno-callback")
+def ping_callback() -> Dict[str, Any]:
+    return {"ok": True, "endpoint": "suno-callback"}
 
 
 def _idem_key(task_id: str, cb_type: str) -> str:
@@ -78,33 +96,112 @@ def _ensure_dir(path: pathlib.Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _guess_ext_from_content_type(ct: Optional[str], fallback: str = "") -> str:
+    if not ct:
+        return fallback
+    if "audio/mpeg" in ct:
+        return ".mp3"
+    if "audio/wav" in ct or "audio/x-wav" in ct:
+        return ".wav"
+    if "image/jpeg" in ct or "image/jpg" in ct:
+        return ".jpg"
+    if "image/png" in ct:
+        return ".png"
+    ext = mimetypes.guess_extension(ct.split(";")[0].strip(), strict=False)
+    return ext or fallback
+
+
 def _download(url: str, destination: pathlib.Path) -> Optional[pathlib.Path]:
     if not url:
         return None
 
+    parsed = urlparse(url)
     target = destination
     if not target.suffix:
-        ext = pathlib.Path(urlparse(url).path).suffix
-        if ext:
-            target = target.with_suffix(ext)
+        url_ext = pathlib.Path(parsed.path).suffix
+        if url_ext:
+            target = target.with_suffix(url_ext)
 
-    try:
-        if suno_download_file is not None:
+    base_headers = {
+        "User-Agent": DOWNLOAD_UA,
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "Accept-Encoding": "identity",
+    }
+    if parsed.scheme and parsed.netloc:
+        base_headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+
+    headers = {k: v for k, v in base_headers.items() if v}
+
+    tries = max(1, DOWNLOAD_TRIES)
+    backoff = 1.5
+
+    for attempt in range(1, tries + 1):
+        try:
+            with requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=DOWNLOAD_TIMEOUT,
+                allow_redirects=True,
+            ) as resp:
+                status = resp.status_code
+                if status == 200:
+                    if not target.suffix:
+                        ct = resp.headers.get("Content-Type", "")
+                        guessed = _guess_ext_from_content_type(ct)
+                        if guessed:
+                            target = target.with_suffix(guessed)
+
+                    _ensure_dir(target.parent)
+                    with target.open("wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                fh.write(chunk)
+                    return target
+
+                if status in (403, 406, 415, 416, 429, 500, 502, 503, 504) or attempt == tries:
+                    r2 = requests.get(
+                        url,
+                        headers=headers,
+                        stream=False,
+                        timeout=DOWNLOAD_TIMEOUT,
+                        allow_redirects=True,
+                    )
+                    if r2.status_code == 200:
+                        if not target.suffix:
+                            guessed = _guess_ext_from_content_type(r2.headers.get("Content-Type", ""))
+                            if guessed:
+                                target = target.with_suffix(guessed)
+                        _ensure_dir(target.parent)
+                        target.write_bytes(r2.content)
+                        return target
+
+                    log.warning(
+                        f"Download try#{attempt} failed {url} -> HTTP {status} / {r2.status_code}"
+                    )
+                else:
+                    log.warning(f"Download try#{attempt} failed {url} -> HTTP {status}")
+
+        except Exception as exc:
+            if attempt == tries:
+                log.warning(f"Download error {url} on last try: {exc}")
+            else:
+                log.warning(f"Download error {url} on try#{attempt}: {exc}")
+
+        if attempt < tries:
+            time.sleep(backoff**attempt)
+
+    if suno_download_file is not None:
+        try:
             _ensure_dir(target.parent)
             downloaded = suno_download_file(url, target.name, base_dir=target.parent)
-            return pathlib.Path(downloaded)
+            if downloaded:
+                return pathlib.Path(downloaded)
+        except Exception as exc:  # pragma: no cover - optional helper fallback
+            log.warning(f"Download helper fallback failed {url}: {exc}")
 
-        with requests.get(url, stream=True, timeout=60) as resp:
-            resp.raise_for_status()
-            _ensure_dir(target.parent)
-            with target.open("wb") as file_handle:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        file_handle.write(chunk)
-        return target
-    except Exception as exc:  # pragma: no cover - external IO failures
-        log.warning(f"Download failed {url} -> {destination}: {exc}")
-        return None
+    return None
 
 
 def _tg_send_message(text: str) -> List[str]:
@@ -162,18 +259,6 @@ def _tg_send_file(filepath: pathlib.Path, caption: str = "") -> List[str]:
             statuses.append(f"{chat_id}:error")
             log.warning(f"sendFile failed for {chat_id}: {exc}")
     return statuses
-
-
-@app.get("/healthz")
-def healthz() -> Dict[str, bool]:
-    return {"ok": True}
-
-
-@app.get("/")
-def index() -> Dict[str, Any]:
-    return {"ok": True, "endpoint": "suno-callback"}
-
-
 @app.post("/suno-callback")
 async def suno_callback(
     request: Request,
@@ -212,6 +297,7 @@ async def suno_callback(
 
     downloaded_assets: List[str] = []
     tg_statuses: List[str] = []
+    download_errors: List[str] = []
 
     log.info(
         f"callback received | code={code} task={task_id} type={cb_type} items={len(items)}"
@@ -237,7 +323,11 @@ async def suno_callback(
                         _tg_send_file(downloaded, caption=f"{title} (audio)")
                     )
                 else:
+                    log.warning(
+                        f"audio download skipped | task={task_id} track={track_id} url={audio_url}"
+                    )
                     downloaded_assets.append(f"audio-link:{audio_url}")
+                    download_errors.append(f"audio:{track_id}:{audio_url}")
 
             if image_url:
                 dest = base_dir / f"{track_id}_cover"
@@ -249,13 +339,26 @@ async def suno_callback(
                         _tg_send_file(downloaded, caption=f"{title} (cover)")
                     )
                 else:
+                    log.warning(
+                        f"image download skipped | task={task_id} track={track_id} url={image_url}"
+                    )
                     downloaded_assets.append(f"image-link:{image_url}")
+                    download_errors.append(f"image:{track_id}:{image_url}")
+
+    if download_errors:
+        err_preview = "\n".join(download_errors[:10])
+        tg_statuses.extend(
+            _tg_send_message(
+                "Suno: проблемы со скачиванием файлов" + (f"\n{err_preview}" if err_preview else "")
+            )
+        )
 
     log_line = {
         "task_id": task_id,
         "callbackType": cb_type,
         "code": code,
         "assets": downloaded_assets,
+        "errors": download_errors,
         "telegram": tg_statuses or ["not-sent"],
         "message": msg,
     }
