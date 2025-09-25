@@ -54,6 +54,49 @@ REDIS_PREFIX=veo3:prod
 # Postgres ledger storage (обязательно)
 DATABASE_URL=postgresql://user:password@host:5432/database
 
+## Logging
+- Управление уровнем логов: `LOG_LEVEL=DEBUG|INFO|WARNING|ERROR|CRITICAL` (по умолчанию `INFO`).
+- Небуферизованный stdout: `PYTHONUNBUFFERED=1` включён кодом.
+
+## Tests
+Локально:
+```bash
+pytest -q
+```
+
+Проверка callback вручную:
+
+```bash
+curl -i -X POST "https://<service>.onrender.com/suno-callback" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Callback-Token: <YOUR_SUNO_CALLBACK_SECRET>' \
+  -d '{
+    "code":200,
+    "msg":"ok",
+    "data":{"callbackType":"complete","task_id":"demo123",
+      "data":[{"id":"trk1","title":"Demo",
+               "audio_url":"https://example.com/file.mp3",
+               "image_url":"https://example.com/cover.png"}]}}'
+```
+
+---
+
+## Render env
+- `LOG_LEVEL=INFO` *(временно можно `DEBUG` для диагностики)*
+- `SUNO_CALLBACK_SECRET=<secret>` *(уже есть)*
+
+---
+
+## Acceptance Criteria
+- При `LOG_LEVEL=INFO` нет спама от `httpx/urllib3/uvicorn/telegram` в логах.
+- `/` ⇒ `{"ok": true}`; `/healthz` ⇒ `{"ok": true}`; `/suno-callback` с валидным токеном ⇒ `{"status":"received"}`.
+- `pytest -q` проходит локально.
+- Ручной `curl` с `complete`-payload:
+  - логирует «callback received» и «processed | {...}»,
+  - при 403 на аудио — фиксирует `audio-link:...` без падения,
+  - при 200 на обложку — сохраняет файл во временной папке и логирует размер,
+  - при пустых `TELEGRAM_TOKEN/ADMIN_IDS` пишет «skip Telegram notify».
+
 ## Redis runner lock mechanics
 
 * При запуске бот ставит ключ `{REDIS_PREFIX}:lock:runner` в Redis (`SET NX EX=60`). Значение — JSON с `host`, `pid`, `started_at`, `heartbeat_at`, `version`.

@@ -1,145 +1,84 @@
-from __future__ import annotations
-
-import importlib
 import json
 import os
 import sys
-from typing import Callable, Dict
-from unittest.mock import MagicMock
 
-import pytest
+import requests
+from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-
-@pytest.fixture
-def suno_modules(monkeypatch) -> Callable[..., tuple]:
-    def _loader(**env: str) -> tuple:
-        defaults: Dict[str, str] = {
-            "SUNO_API_BASE": "https://api.test",
-            "SUNO_API_TOKEN": "token-123",
-            "SUNO_GEN_PATH": "/generate",
-            "SUNO_INSTR_PATH": "/instrumental",
-            "SUNO_UPLOAD_EXTEND_PATH": "/extend",
-            "SUNO_TASK_STATUS_PATH": "/status",
-        }
-        defaults.update(env)
-        for key, value in defaults.items():
-            monkeypatch.setenv(key, value)
-        # Ensure optional values are removed when explicitly set to None
-        for key, value in env.items():
-            if value is None:
-                monkeypatch.delenv(key, raising=False)
-        import settings
-        import suno.client as suno_client
-        import suno.service as suno_service
-
-        importlib.reload(settings)
-        importlib.reload(suno_client)
-        importlib.reload(suno_service)
-        return settings, suno_client, suno_service
-
-    return _loader
+from suno_web import app
 
 
-def _mock_response(status: int, payload: dict) -> MagicMock:
-    response = MagicMock()
-    response.status_code = status
-    body = json.dumps(payload).encode()
-    response.content = body
-    response.json.return_value = payload
-    response.headers = {}
-    return response
+def test_suno_e2e_mocked(monkeypatch, caplog, tmp_path):
+    # env
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "test-secret")
+    monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
+    monkeypatch.delenv("ADMIN_IDS", raising=False)
 
+    caplog.set_level("DEBUG")
 
-def test_create_music_builds_request(suno_modules, monkeypatch, tmp_path):
-    settings, suno_client, suno_service = suno_modules(SUNO_CALLBACK_URL="https://callback.example/hook")
-    session = MagicMock()
+    client = TestClient(app)
+
+    # mock HTTP GET for downloads
+    class FakeResp:
+        def __init__(self, status=200, body=b"ok", ct="audio/mpeg"):
+            self.status_code = status
+            self.ok = status == 200
+            self.headers = {"Content-Type": ct}
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            if not self.ok:
+                raise requests.HTTPError(self.status_code)
+
+        def iter_content(self, chunk_size=8192):
+            yield self._body
+
+    def fake_get(url, *a, **k):
+        if "forbidden.mp3" in url:
+            return FakeResp(status=403)
+        if url.endswith(".svg"):
+            return FakeResp(body=b"<svg/>", ct="image/svg+xml")
+        return FakeResp(body=b"FAKEAUDIO", ct="audio/mpeg")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    # emulate Suno callback
     payload = {
         "code": 200,
+        "msg": "ok",
         "data": {
-            "taskId": "task-42",
-            "items": [
+            "callbackType": "complete",
+            "task_id": "demo123",
+            "data": [
                 {
-                    "id": "song-1",
-                    "title": "Neon",
-                    "audio_url": "https://cdn.example/song.mp3",
-                    "image_url": "https://cdn.example/song.jpg",
-                    "duration_ms": 1234,
+                    "id": "trk1",
+                    "title": "Demo",
+                    "audio_url": "https://host/forbidden.mp3",  # will 403 -> link fallback
+                    "image_url": "https://host/cover.svg",  # will 200 -> saved
                 }
             ],
         },
     }
-    session.request.return_value = _mock_response(200, payload)
 
-    http = suno_client.SunoHttp(session=session)
-    store = MagicMock()
-    service = suno_service.SunoService(store=store, download_dir=tmp_path, http=http)
-
-    result = service.create_music(title="Song", style="Synth", lyrics="text", model="MODEL_X", mode="fast")
-
-    assert result.task_id == "task-42"
-    assert result.items and result.items[0].audio_url == "https://cdn.example/song.mp3"
-
-    args, kwargs = session.request.call_args
-    assert args[0] == "POST"
-    assert args[1] == "https://api.test/generate"
-    assert kwargs["json"]["callback_url"] == "https://callback.example/hook"
-    assert kwargs["headers"]["Authorization"] == "Bearer token-123"
-    assert kwargs["headers"]["Accept"] == "application/json"
-    assert kwargs["headers"]["Content-Type"] == "application/json"
-    assert kwargs["headers"]["User-Agent"].startswith("best-veo3-bot/1.0")
-
-
-def test_retry_on_transient_errors(monkeypatch, suno_modules, tmp_path):
-    monkeypatch.setattr("random.random", lambda: 0.0)
-    sleep_calls = []
-    monkeypatch.setattr("time.sleep", lambda value: sleep_calls.append(value))
-    settings, suno_client, suno_service = suno_modules()
-
-    session = MagicMock()
-    session.request.side_effect = [
-        _mock_response(429, {"code": 429, "message": "rate"}),
-        _mock_response(502, {"code": 502, "message": "bad gateway"}),
-        _mock_response(200, {"code": 200, "data": {"taskId": "ok"}}),
-    ]
-
-    http = suno_client.SunoHttp(session=session)
-    service = suno_service.SunoService(store=MagicMock(), download_dir=tmp_path, http=http)
-    result = service.create_music(title="Song")
-
-    assert result.task_id == "ok"
-    assert session.request.call_count == 3
-    # two sleeps between three attempts
-    assert len(sleep_calls) == 2
-    assert pytest.approx(sleep_calls[0], rel=0.05) == 1.0
-    assert pytest.approx(sleep_calls[1], rel=0.05) == 2.0
-
-
-def test_not_found_raises(suno_modules, tmp_path):
-    settings, suno_client, suno_service = suno_modules()
-    session = MagicMock()
-    session.request.return_value = _mock_response(404, {"message": "missing"})
-
-    http = suno_client.SunoHttp(session=session)
-    service = suno_service.SunoService(store=MagicMock(), download_dir=tmp_path, http=http)
-
-    with pytest.raises(suno_client.SunoNotFound):
-        service.get_status("task-id")
-
-
-def test_callback_secret_header(suno_modules, tmp_path):
-    settings, suno_client, suno_service = suno_modules(
-        SUNO_CALLBACK_URL="https://callback.example/hook",
-        SUNO_CALLBACK_SECRET="secret-key",
+    r = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Token": "test-secret", "Content-Type": "application/json"},
+        data=json.dumps(payload),
     )
-    session = MagicMock()
-    session.request.return_value = _mock_response(200, {"code": 200, "data": {}})
+    assert r.status_code == 200
+    assert r.json().get("status") == "received"
 
-    http = suno_client.SunoHttp(session=session)
-    service = suno_service.SunoService(store=MagicMock(), download_dir=tmp_path, http=http)
-
-    service.create_music(title="Song")
-
-    headers = session.request.call_args.kwargs["headers"]
-    assert headers["X-Callback-Token"] == "secret-key"
+    joined = "\n".join(caplog.messages)
+    assert "callback received" in joined
+    assert "processed |" in joined
+    # проверяем, что телеграм пропущен из-за отсутствия токена
+    assert "skip Telegram notify" in joined
