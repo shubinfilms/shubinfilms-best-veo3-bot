@@ -64,6 +64,20 @@ telegram_send_total = Counter(
     registry=REGISTRY,
 )
 
+faq_root_views_total = Counter(
+    "faq_root_views_total",
+    "Total number of FAQ root menu views",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
+faq_views_total = Counter(
+    "faq_views_total",
+    "FAQ section views grouped by section",
+    labelnames=("section", "env", "service"),
+    registry=REGISTRY,
+)
+
 chat_messages_total = Counter(
     "chat_messages_total",
     "Total chat messages processed",
@@ -202,6 +216,8 @@ __all__: Iterable[str] = [
     "suno_notify_latency_ms",
     "suno_refund_total",
     "telegram_send_total",
+    "faq_root_views_total",
+    "faq_views_total",
     "suno_latency_seconds",
     "suno_notify_ok",
     "suno_notify_fail",

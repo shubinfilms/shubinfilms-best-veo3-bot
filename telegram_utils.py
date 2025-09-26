@@ -7,7 +7,7 @@ import os
 import random
 from asyncio.subprocess import PIPE
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.constants import ParseMode
@@ -321,8 +321,25 @@ def md2_escape(text: str) -> str:
     return "".join(result)
 
 
+def build_inline_kb(
+    rows: Sequence[Sequence[tuple[str, str]]]
+) -> InlineKeyboardMarkup:
+    """Construct an :class:`InlineKeyboardMarkup` from label/callback rows."""
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        buttons = [InlineKeyboardButton(label, callback_data=callback) for label, callback in row]
+        keyboard_rows.append(buttons)
+    return InlineKeyboardMarkup(keyboard_rows)
+
+
 async def safe_edit_markdown_v2(
-    bot: Any, chat_id: int, message_id: int, text: str
+    bot: Any,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> Optional[Any]:
     try:
         return await bot.edit_message_text(
@@ -331,6 +348,7 @@ async def safe_edit_markdown_v2(
             text=text,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
+            reply_markup=reply_markup,
         )
     except BadRequest as exc:
         if _is_message_not_modified(exc):
@@ -398,4 +416,5 @@ __all__ = [
     "safe_edit_markdown_v2",
     "run_ffmpeg",
     "md2_escape",
+    "build_inline_kb",
 ]
