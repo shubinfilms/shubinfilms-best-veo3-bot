@@ -84,6 +84,27 @@ chat_context_tokens = Gauge(
     registry=REGISTRY,
 )
 
+chat_voice_total = Counter(
+    "chat_voice_total",
+    "Voice messages processed in chat",
+    labelnames=("outcome", "env", "service"),
+    registry=REGISTRY,
+)
+
+chat_voice_latency_ms = Histogram(
+    "chat_voice_latency_ms",
+    "Latency of handling chat voice messages in milliseconds",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
+chat_transcribe_latency_ms = Histogram(
+    "chat_transcribe_latency_ms",
+    "Latency of audio transcription calls in milliseconds",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
 suno_latency_seconds = Histogram(
     "suno_latency_seconds",
     "Latency from task start to callback",
@@ -176,6 +197,9 @@ __all__: Iterable[str] = [
     "chat_messages_total",
     "chat_latency_ms",
     "chat_context_tokens",
+    "chat_voice_total",
+    "chat_voice_latency_ms",
+    "chat_transcribe_latency_ms",
     "process_uptime_seconds",
     "render_metrics",
 ]
