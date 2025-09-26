@@ -4,38 +4,119 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+from requests.adapters import HTTPAdapter
+from urllib3.util import Timeout
 
+from logging_utils import configure_logging
+from metrics import render_metrics, suno_callback_download_fail_total, suno_callback_total
 from redis_utils import rds
-from settings import LOG_LEVEL, REDIS_PREFIX, SUNO_CALLBACK_SECRET
+from settings import (
+    HTTP_POOL_CONNECTIONS,
+    HTTP_POOL_PER_HOST,
+    HTTP_TIMEOUT_CONNECT,
+    HTTP_TIMEOUT_READ,
+    HTTP_TIMEOUT_TOTAL,
+    REDIS_PREFIX,
+    SUNO_API_BASE,
+    SUNO_CALLBACK_SECRET,
+    SUNO_CALLBACK_URL,
+    SUNO_ENABLED,
+    TMP_CLEANUP_HOURS,
+)
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.service import SunoService
+from suno.tempfiles import cleanup_old_directories, task_directory
 
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(levelname)s | suno-web | %(message)s",
-)
-for noisy in ("httpx", "urllib3", "uvicorn", "gunicorn"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
+configure_logging("suno-web")
 log = logging.getLogger("suno-web")
 
-
-app = FastAPI(title="Suno Callback Web")
+app = FastAPI(title="Suno Callback Web", docs_url=None, redoc_url=None)
 service = SunoService()
 
-_CALLBACK_TTL = 24 * 60 * 60
-_DOWNLOAD_TRIES = 3
-_BACKOFF_SCHEDULE = (1, 3, 7)
-_BASE_DIR = Path(os.getenv("SUNO_STORAGE", "/tmp/suno"))
-_memory_idempotency: dict[str, float] = {}
+_MAX_JSON_BYTES = 512 * 1024
+_ALLOWED_CORS_PATHS = {"/healthz", "/callbackz"}
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_REQUESTS = 0
+_SHUTDOWN = threading.Event()
+
+_adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
+_session = requests.Session()
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+_timeout = Timeout(connect=HTTP_TIMEOUT_CONNECT, read=HTTP_TIMEOUT_READ, total=HTTP_TIMEOUT_TOTAL)
+
+
+def _active_count() -> int:
+    with _ACTIVE_LOCK:
+        return _ACTIVE_REQUESTS
+
+
+def _handle_sigterm(signum: int, frame: Optional[object]) -> None:  # pragma: no cover - signal handling
+    log.warning("sigterm received", extra={"meta": {"active_requests": _active_count()}})
+    _SHUTDOWN.set()
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if _active_count() == 0:
+            break
+        time.sleep(0.1)
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
+@app.on_event("startup")
+async def _startup_event() -> None:
+    cleanup_old_directories()
+    summary = {
+        "suno_enabled": SUNO_ENABLED,
+        "api_base": SUNO_API_BASE,
+        "callback_configured": bool(SUNO_CALLBACK_URL),
+        "tmp_cleanup_hours": TMP_CLEANUP_HOURS,
+    }
+    log.info("configuration summary", extra={"meta": summary})
+
+
+@app.middleware("http")
+async def _middleware(request: Request, call_next):  # type: ignore[override]
+    if request.method == "OPTIONS":
+        if request.url.path in _ALLOWED_CORS_PATHS:
+            response = Response(status_code=204)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET"
+            response.headers["Access-Control-Allow-Headers"] = "accept"
+            return response
+        return Response(status_code=405)
+
+    if _SHUTDOWN.is_set():
+        return JSONResponse({"status": "shutting_down"}, status_code=503)
+
+    global _ACTIVE_REQUESTS
+    with _ACTIVE_LOCK:
+        _ACTIVE_REQUESTS += 1
+    try:
+        response = await call_next(request)
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_REQUESTS -= 1
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    origin = request.headers.get("origin")
+    if origin and request.method == "GET" and request.url.path in _ALLOWED_CORS_PATHS:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
 
 
 @app.get("/")
@@ -53,6 +134,12 @@ def callbackz() -> dict[str, str | bool]:
     return {"ok": True, "endpoint": "/suno-callback"}
 
 
+@app.get("/metrics", include_in_schema=False)
+def metrics_endpoint() -> Response:
+    payload = render_metrics()
+    return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
 def _idempotency_key(task: str, cb_type: str) -> str:
     task_part = task or "unknown"
     type_part = cb_type or "unknown"
@@ -64,19 +151,22 @@ def _register_once(key: str) -> bool:
         return True
     if rds is not None:
         try:
-            stored = rds.set(key, "1", nx=True, ex=_CALLBACK_TTL)
+            stored = rds.set(key, "1", nx=True, ex=24 * 60 * 60)
             if stored:
                 return True
             return False
         except Exception as exc:  # pragma: no cover - Redis failure fallback
-            log.warning("idempotency redis error | key=%s err=%s", key, exc)
+            log.warning("idempotency redis error", extra={"meta": {"key": key, "err": str(exc)}})
     now = time.time()
-    expires_at = now + _CALLBACK_TTL
+    expires_at = now + 24 * 60 * 60
     current = _memory_idempotency.get(key)
     if current and current > now:
         return False
     _memory_idempotency[key] = expires_at
     return True
+
+
+_memory_idempotency: dict[str, float] = {}
 
 
 def _ensure_directory(path: Path) -> None:
@@ -91,22 +181,26 @@ def _apply_extension(base: Path, url: str) -> Path:
     return base
 
 
+def _record_download_failure(reason: str, url: str) -> None:
+    suno_callback_download_fail_total.labels(reason=reason).inc()
+    log.warning("asset download failed", extra={"meta": {"reason": reason, "url": url}})
+
+
 def _download(url: str, dest: Path) -> str:
     if not url:
         return url
-    for attempt in range(1, _DOWNLOAD_TRIES + 1):
+    for attempt in range(1, 4):
         try:
-            with requests.get(url, stream=True, timeout=(10, 30)) as resp:
+            with _session.get(url, stream=True, timeout=_timeout) as resp:
                 status = resp.status_code
                 if status in {403, 408} or 500 <= status < 600:
-                    if attempt == _DOWNLOAD_TRIES:
-                        log.warning("asset download failed | code=%s url=%s", status, url)
+                    if attempt == 3:
+                        _record_download_failure(f"status_{status}", url)
                         return url
-                    delay = _BACKOFF_SCHEDULE[min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1)]
-                    time.sleep(delay)
+                    time.sleep((1, 3, 7)[min(attempt - 1, 2)])
                     continue
                 if status >= 400:
-                    log.warning("asset download non-retryable | code=%s url=%s", status, url)
+                    _record_download_failure(f"status_{status}", url)
                     return url
                 _ensure_directory(dest)
                 with dest.open("wb") as fh:
@@ -114,19 +208,18 @@ def _download(url: str, dest: Path) -> str:
                         if chunk:
                             fh.write(chunk)
                 return str(dest)
-        except requests.RequestException as exc:
-            if attempt == _DOWNLOAD_TRIES:
-                log.warning("asset download exception | url=%s err=%s", url, exc)
+        except requests.RequestException:
+            if attempt == 3:
+                _record_download_failure("network", url)
                 return url
-            delay = _BACKOFF_SCHEDULE[min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1)]
-            time.sleep(delay)
+            time.sleep((1, 3, 7)[min(attempt - 1, 2)])
     return url
 
 
 def _prepare_assets(task: SunoTask) -> None:
     if not task.task_id:
         return
-    base_dir = _BASE_DIR / task.task_id
+    base_dir = task_directory(task.task_id)
     for index, track in enumerate(task.items, start=1):
         track_id = track.id or str(index)
         if track.audio_url:
@@ -144,21 +237,29 @@ async def suno_callback(
 ):
     provided = x_callback_token or request.query_params.get("token")
     if SUNO_CALLBACK_SECRET and provided != SUNO_CALLBACK_SECRET:
-        log.warning("forbidden callback | provided=%s", provided)
+        log.warning("forbidden callback", extra={"meta": {"provided": bool(provided)}})
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
+    body = await request.body()
+    if len(body) > _MAX_JSON_BYTES:
+        log.warning("payload too large", extra={"meta": {"size": len(body)}})
+        raise HTTPException(status_code=413, detail="payload too large")
+
     try:
-        payload = await request.json()
+        payload = json.loads(body or b"{}")
     except json.JSONDecodeError:
-        body = await request.body()
-        log.error("invalid json payload: %s", body[:200])
+        log.error("invalid json payload", extra={"meta": {"preview": body[:200].decode("utf-8", errors="replace")}})
         return JSONResponse({"status": "ignored"}, status_code=400)
 
     envelope = CallbackEnvelope.model_validate(payload)
     task = SunoTask.from_envelope(envelope)
+    suno_callback_total.labels(
+        type=(task.callback_type or "unknown"),
+        code=str(task.code or 0),
+    ).inc()
     key = _idempotency_key(task.task_id, task.callback_type)
     if not _register_once(key):
-        log.info("duplicate callback ignored | key=%s", key)
+        log.info("duplicate callback ignored", extra={"meta": {"key": key}})
         return {"ok": True, "duplicate": True}
 
     _prepare_assets(task)

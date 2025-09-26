@@ -11,10 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
+from metrics import bot_telegram_send_fail_total, suno_task_store_total
 from suno.client import SunoClient, SunoAPIError
 from suno.schemas import SunoTask, SunoTrack
-from settings import REDIS_PREFIX
+from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
+from settings import HTTP_POOL_CONNECTIONS, HTTP_POOL_PER_HOST, REDIS_PREFIX
 
 try:  # pragma: no cover - optional runtime dependency
     from redis import Redis
@@ -30,6 +33,7 @@ log = logging.getLogger("suno.service")
 
 _TASK_TTL = 24 * 60 * 60
 _USER_LINK_TTL = 7 * 24 * 60 * 60
+_LOG_ONCE_TTL = 48 * 60 * 60
 
 
 @dataclass(slots=True)
@@ -65,7 +69,12 @@ class SunoService:
         self._task_records_memory: MutableMapping[str, tuple[float, str]] = {}
         self._task_order: list[str] = []
         self._bot_session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
+        self._bot_session.mount("https://", adapter)
+        self._bot_session.mount("http://", adapter)
         self._admin_ids = self._parse_admins(os.getenv("ADMIN_IDS"))
+        self._log_once_memory: MutableMapping[str, float] = {}
+        cleanup_old_directories()
 
     # ------------------------------------------------------------------ storage
     def _redis_key(self, task_id: str) -> str:
@@ -79,6 +88,29 @@ class SunoService:
 
     def _last_tasks_key(self) -> str:
         return f"{REDIS_PREFIX}:suno:last"
+
+    def _log_once_key(self, task_id: str, callback_type: Optional[str]) -> str:
+        kind = (callback_type or "unknown").lower()
+        return f"log:once:{task_id}:{kind}"
+
+    def _should_log_once(self, task_id: str, callback_type: Optional[str]) -> bool:
+        key = self._log_once_key(task_id, callback_type)
+        if self.redis is not None:
+            try:
+                stored = self.redis.set(key, "1", nx=True, ex=_LOG_ONCE_TTL)
+            except Exception:  # pragma: no cover - Redis failure
+                log.warning("SunoService redis.set log-once failed", exc_info=True)
+            else:
+                if stored:
+                    return True
+                return False
+        now = time.time()
+        expires_at = now + _LOG_ONCE_TTL
+        current = self._log_once_memory.get(key)
+        if current and current > now:
+            return False
+        self._log_once_memory[key] = expires_at
+        return True
 
     @staticmethod
     def _parse_admins(raw: Optional[str]) -> set[int]:
@@ -101,11 +133,15 @@ class SunoService:
         if self.redis is not None:
             try:
                 self.redis.setex(key, _TASK_TTL, raw)
-                return
             except Exception:  # pragma: no cover - Redis failure
                 log.warning("SunoService redis.setex failed", exc_info=True)
+                suno_task_store_total.labels(result="redis_error").inc()
+            else:
+                suno_task_store_total.labels(result="redis").inc()
+                return
         expires_at = time.time() + _TASK_TTL
         self._memory[key] = (expires_at, raw)
+        suno_task_store_total.labels(result="memory").inc()
 
     def _store_user_link(self, task_id: str, payload: Mapping[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False)
@@ -113,11 +149,15 @@ class SunoService:
         if self.redis is not None:
             try:
                 self.redis.setex(key, _USER_LINK_TTL, raw)
-                return
             except Exception:  # pragma: no cover - Redis failure
                 log.warning("SunoService redis.setex user-link failed", exc_info=True)
+                suno_task_store_total.labels(result="redis_error").inc()
+            else:
+                suno_task_store_total.labels(result="redis").inc()
+                return
         expires_at = time.time() + _USER_LINK_TTL
         self._user_memory[key] = (expires_at, raw)
+        suno_task_store_total.labels(result="memory").inc()
 
     def _save_task_record(self, task_id: str, payload: Mapping[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False)
@@ -127,6 +167,7 @@ class SunoService:
                 self.redis.setex(key, _USER_LINK_TTL, raw)
             except Exception:  # pragma: no cover - Redis failure
                 log.warning("SunoService redis.setex record failed", exc_info=True)
+                suno_task_store_total.labels(result="redis_error").inc()
             else:
                 try:
                     self.redis.lrem(self._last_tasks_key(), 0, task_id)
@@ -134,9 +175,11 @@ class SunoService:
                     self.redis.ltrim(self._last_tasks_key(), 0, 49)
                 except Exception:  # pragma: no cover
                     log.warning("SunoService redis.lpush record failed", exc_info=True)
+                suno_task_store_total.labels(result="redis").inc()
                 return
         expires_at = time.time() + _USER_LINK_TTL
         self._task_records_memory[key] = (expires_at, raw)
+        suno_task_store_total.labels(result="memory").inc()
         if task_id in self._task_order:
             self._task_order.remove(task_id)
         self._task_order.insert(0, task_id)
@@ -331,11 +374,14 @@ class SunoService:
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_to:
             payload["reply_to_message_id"] = reply_to
+        method = "sendMessage"
         try:
-            resp = self._bot_session.post(self._bot_url("sendMessage"), json=payload, timeout=20)
+            resp = self._bot_session.post(self._bot_url(method), json=payload, timeout=20)
             if not resp.ok:
+                bot_telegram_send_fail_total.labels(method=method).inc()
                 log.warning("Telegram sendMessage failed | status=%s text=%s", resp.status_code, resp.text)
         except requests.RequestException:
+            bot_telegram_send_fail_total.labels(method=method).inc()
             log.warning("Telegram sendMessage network error", exc_info=True)
 
     def _send_file(self, method: str, field: str, chat_id: int, path: Path, *, caption: Optional[str], reply_to: Optional[int]) -> bool:
@@ -349,22 +395,31 @@ class SunoService:
                 files = {field: (path.name, fh)}
                 resp = self._bot_session.post(self._bot_url(method), data=data, files=files, timeout=120)
             if not resp.ok:
+                bot_telegram_send_fail_total.labels(method=method).inc()
                 log.warning("Telegram %s failed | status=%s text=%s", method, resp.status_code, resp.text)
                 return False
             return True
         except FileNotFoundError:
+            bot_telegram_send_fail_total.labels(method=method).inc()
             return False
         except requests.RequestException:
             log.warning("Telegram %s network error", method, exc_info=True)
+            bot_telegram_send_fail_total.labels(method=method).inc()
             return False
 
     def _send_audio(self, chat_id: int, path: Path, *, title: str, reply_to: Optional[int]) -> bool:
         caption = f"🎵 {title}" if title else None
-        return self._send_file("sendAudio", "audio", chat_id, path, caption=caption, reply_to=reply_to)
+        success = self._send_file("sendAudio", "audio", chat_id, path, caption=caption, reply_to=reply_to)
+        if success:
+            schedule_unlink(path)
+        return success
 
     def _send_image(self, chat_id: int, path: Path, *, title: str, reply_to: Optional[int]) -> bool:
         caption = f"🖼️ {title} (обложка)" if title else "🖼️ Обложка"
-        return self._send_file("sendPhoto", "photo", chat_id, path, caption=caption, reply_to=reply_to)
+        success = self._send_file("sendPhoto", "photo", chat_id, path, caption=caption, reply_to=reply_to)
+        if success:
+            schedule_unlink(path)
+        return success
 
     # ------------------------------------------------------------------ helpers
     def _notify_admins(self, text: str) -> None:
@@ -382,7 +437,7 @@ class SunoService:
         return f"🎧 Suno: этап {status} получен."
 
     def _base_dir(self, task_id: str) -> Path:
-        return Path("/tmp/suno") / task_id
+        return task_directory(task_id)
 
     def _find_local_file(self, base_dir: Path, prefix: str) -> Optional[Path]:
         if not base_dir.exists():
@@ -546,6 +601,18 @@ class SunoService:
             )
             record.setdefault("created_at", existing.get("created_at") or datetime.now(timezone.utc).isoformat())
             self._save_task_record(task.task_id, record)
+            if self._should_log_once(task.task_id, task.callback_type):
+                log.info(
+                    "processed | suno.callback",
+                    extra={
+                        "meta": {
+                            "task_id": task.task_id,
+                            "type": task.callback_type,
+                            "code": task.code,
+                            "tracks": len(task.items),
+                        }
+                    },
+                )
         finally:
             if (task.callback_type or "").lower() == "complete":
                 self._delete_mapping(task.task_id)

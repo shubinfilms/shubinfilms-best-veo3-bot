@@ -1,11 +1,11 @@
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 import requests
 from fastapi.testclient import TestClient
-from pathlib import Path
 
 os.environ.setdefault("SUNO_API_TOKEN", "test-token")
 os.environ.setdefault("SUNO_CALLBACK_SECRET", "secret-token")
@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import suno_web
 from suno_web import app
+import suno.tempfiles as tempfiles
 
 
 def _build_payload(task_id: str = "task-1", callback_type: str = "complete") -> dict:
@@ -113,6 +114,26 @@ def test_duplicate_callbacks_processed_once(monkeypatch):
     assert count["calls"] == 1
 
 
+def test_callback_rejects_payloads_over_limit(monkeypatch):
+    invoked = {"called": False}
+
+    def fake_handle(task):  # pragma: no cover - should not be called
+        invoked["called"] = True
+
+    monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
+    client = _client()
+    oversized = "x" * (suno_web._MAX_JSON_BYTES + 10)
+    body = json.dumps({"data": oversized})
+    response = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Token": "secret-token", "Content-Type": "application/json"},
+        content=body,
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"] == "payload too large"
+    assert invoked["called"] is False
+
+
 def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
     captured = {}
 
@@ -136,13 +157,14 @@ def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
         def iter_content(self, chunk_size=8192):
             yield self._body
 
-    def fake_get(url, *args, **kwargs):
-        if url.endswith("demo.mp3"):
-            return FakeResp(403)
-        return FakeResp(200, body=b"data", ct="image/jpeg")
+    class FakeSession:
+        def get(self, url, *args, **kwargs):
+            if url.endswith("demo.mp3"):
+                return FakeResp(403)
+            return FakeResp(200, body=b"data", ct="image/jpeg")
 
-    monkeypatch.setattr(requests, "get", fake_get)
-    suno_web._BASE_DIR = Path(tmp_path)
+    monkeypatch.setattr(suno_web, "_session", FakeSession(), raising=False)
+    monkeypatch.setattr(tempfiles, "BASE_DIR", Path(tmp_path), raising=False)
     client = _client()
     response = client.post(
         "/suno-callback",
@@ -155,4 +177,4 @@ def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
     assert task.items[0].audio_url == "https://cdn.example.com/demo.mp3"
     image_path = task.items[0].image_url
     assert image_path
-    assert image_path.startswith(str(tmp_path))
+    assert Path(image_path).exists()

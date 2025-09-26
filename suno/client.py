@@ -3,14 +3,23 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from typing import Any, Mapping, MutableMapping, Optional
 from urllib.parse import urljoin
 
 import requests
 from requests import RequestException, Response, Session
+from requests.adapters import HTTPAdapter
+from urllib3.util import Timeout
 
 from settings import (
+    HTTP_POOL_CONNECTIONS,
+    HTTP_POOL_PER_HOST,
+    HTTP_RETRY_ATTEMPTS,
+    HTTP_TIMEOUT_CONNECT,
+    HTTP_TIMEOUT_READ,
+    HTTP_TIMEOUT_TOTAL,
     SUNO_API_BASE,
     SUNO_API_TOKEN,
     SUNO_CALLBACK_SECRET,
@@ -18,12 +27,11 @@ from settings import (
     SUNO_GEN_PATH,
     SUNO_MAX_RETRIES,
     SUNO_TASK_STATUS_PATH,
-    SUNO_TIMEOUT_SEC,
 )
 
 log = logging.getLogger("suno.client")
 
-_RETRYABLE_CODES = {429, 502, 503, 504}
+_RETRYABLE_CODES = {408, 429}
 _BACKOFF_SCHEDULE = (1, 3, 7)
 
 
@@ -46,7 +54,7 @@ class SunoClient:
         token: Optional[str] = None,
         session: Optional[Session] = None,
         max_retries: Optional[int] = None,
-        timeout: Optional[tuple[int, int]] = None,
+        timeout: Optional[tuple[int, int] | Timeout] = None,
     ) -> None:
         raw_base = (base_url or SUNO_API_BASE or "").strip()
         if not raw_base:
@@ -56,10 +64,26 @@ class SunoClient:
         if not self.token:
             raise RuntimeError("SUNO_API_TOKEN is not configured")
         self.session = session or requests.Session()
-        retries = max_retries if max_retries is not None else SUNO_MAX_RETRIES
+        adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        retries = max_retries if max_retries is not None else SUNO_MAX_RETRIES or HTTP_RETRY_ATTEMPTS
         self.max_attempts = max(1, int(retries))
-        read_timeout = max(1, int(SUNO_TIMEOUT_SEC or 75) - 15)
-        self.timeout = timeout or (10, read_timeout)
+        if timeout is None:
+            self.timeout = Timeout(
+                total=HTTP_TIMEOUT_TOTAL,
+                connect=HTTP_TIMEOUT_CONNECT,
+                read=HTTP_TIMEOUT_READ,
+            )
+        elif isinstance(timeout, tuple):
+            connect, read = timeout
+            self.timeout = Timeout(
+                total=max(HTTP_TIMEOUT_TOTAL, float(connect), float(read)),
+                connect=float(connect),
+                read=float(read),
+            )
+        else:
+            self.timeout = timeout
 
     # ------------------------------------------------------------------ helpers
     def _headers(self) -> MutableMapping[str, str]:
@@ -91,10 +115,14 @@ class SunoClient:
     def _maybe_backoff(self, code: Optional[int], attempt: int) -> bool:
         if attempt >= self.max_attempts:
             return False
-        if code is None or code in _RETRYABLE_CODES:
-            delay = _BACKOFF_SCHEDULE[min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1)]
+        retryable = code is None or code in _RETRYABLE_CODES or (code is not None and code >= 500)
+        if retryable:
+            base = _BACKOFF_SCHEDULE[min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1)]
+            jitter = random.uniform(0.0, 1.0)
+            delay = base + jitter
             log.warning(
-                "suno.http retry code=%s attempt=%s backoff=%.1f", code or "error", attempt, float(delay)
+                "suno.http retry",
+                extra={"meta": {"code": code or "error", "attempt": attempt, "delay": round(delay, 3)}},
             )
             time.sleep(delay)
             return True
@@ -130,7 +158,7 @@ class SunoClient:
                 continue
 
             status = response.status_code
-            if status in _RETRYABLE_CODES and self._maybe_backoff(status, attempt):
+            if self._maybe_backoff(status, attempt):
                 continue
 
             payload = self._parse_json(response)

@@ -8,17 +8,12 @@
 # odex/fix-balance-reset-after-deploy
 import logging
 import os
-from settings import LOG_LEVEL
+
+from logging_utils import configure_logging
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(levelname)s | bot | %(message)s",
-)
-
-for noisy in ("httpx", "urllib3", "aiogram", "telegram", "uvicorn", "gunicorn"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
+configure_logging("bot")
 
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys
 import threading
@@ -122,6 +117,7 @@ APP_VERSION = "2025-09-14r4"
 
 
 ACTIVE_TASKS: Dict[int, str] = {}
+SHUTDOWN_EVENT = threading.Event()
 
 SUNO_SERVICE = SunoService()
 
@@ -6512,7 +6508,16 @@ async def run_bot_async() -> None:
             stop_event = asyncio.Event()
             manual_signal_handlers: List[signal.Signals] = []
 
+            graceful_task: Optional[asyncio.Task[None]] = None
+
+            async def _await_active_tasks() -> None:
+                deadline = time.time() + 10.0
+                while time.time() < deadline and ACTIVE_TASKS:
+                    await asyncio.sleep(0.1)
+                stop_event.set()
+
             def _trigger_stop(sig: Optional[signal.Signals] = None, *, reason: str = "external") -> None:
+                nonlocal graceful_task
                 if stop_event.is_set():
                     return
                 if sig is not None:
@@ -6520,7 +6525,11 @@ async def run_bot_async() -> None:
                     log.info("Stop signal received: %s. Triggering shutdown.", sig_name)
                 else:
                     log.info("Stop requested (%s). Triggering shutdown.", reason)
-                stop_event.set()
+                SHUTDOWN_EVENT.set()
+                if application.updater:
+                    loop.create_task(application.updater.stop())
+                if graceful_task is None or graceful_task.done():
+                    graceful_task = loop.create_task(_await_active_tasks())
 
             lock.add_stop_callback(lambda sig: _trigger_stop(sig))
 
