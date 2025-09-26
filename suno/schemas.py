@@ -1,7 +1,7 @@
 """Pydantic models shared between the Suno bot and callback worker."""
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -73,10 +73,16 @@ def _ensure_iterable(value: Any) -> Iterable[Any]:
 
 
 def _extract_items(data: dict[str, Any]) -> Iterable[Any]:
-    for key in ("data", "items", "tracks"):
+    for key in ("tracks", "items", "data"):
         maybe = data.get(key)
         if maybe:
             return _ensure_iterable(maybe)
+    input_section = data.get("input")
+    if isinstance(input_section, Mapping):
+        for key in ("tracks", "items", "data"):
+            maybe = input_section.get(key)
+            if maybe:
+                return _ensure_iterable(maybe)
     response = data.get("response")
     if isinstance(response, dict):
         for key in ("data", "items", "tracks"):
