@@ -103,6 +103,21 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
+from settings import REDIS_PREFIX, SUNO_LOG_KEY
+from suno.service import SunoService, SunoAPIError
+from chat_service import (
+    append_ctx,
+    build_messages,
+    call_llm,
+    clear_ctx,
+    estimate_tokens,
+    is_mode_on,
+    load_ctx,
+    rate_limit_hit,
+    set_mode,
+    CTX_MAX_TOKENS,
+    INPUT_MAX_CHARS,
+)
 from metrics import (
     suno_enqueue_duration_seconds,
     suno_enqueue_total,
@@ -112,10 +127,18 @@ from metrics import (
     suno_notify_ok,
     suno_notify_total,
     suno_refund_total,
+    chat_messages_total,
+    chat_latency_ms,
+    chat_context_tokens,
 )
-from settings import REDIS_PREFIX, SUNO_LOG_KEY
-from suno.service import SunoService, SunoAPIError
-from telegram_utils import build_hub_keyboard, build_hub_text, safe_send as tg_safe_send
+from telegram_utils import (
+    build_hub_keyboard,
+    build_hub_text,
+    safe_send as tg_safe_send,
+    safe_edit_text,
+    safe_send_text,
+    md2_escape,
+)
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -923,6 +946,11 @@ MODE_CHAT = "chat"
 MODE_PM = "prompt_master"
 MODE_KEY_FMT = f"{REDIS_PREFIX}:mode:{{chat_id}}"
 
+CHAT_SYSTEM_PROMPT = (
+    "Вы — дружелюбный ассистент бота Best VEO3. "
+    "Отвечайте кратко, по делу, при необходимости приводите простой пример."
+)
+
 # Если Redis подключен — используем его; иначе fallback на память процесса.
 _inmem_modes: Dict[Any, Any] = {}
 
@@ -1165,6 +1193,68 @@ async def chatgpt_smalltalk(text: str, chat_id: int) -> str:
         return response["choices"][0]["message"]["content"].strip()
 
     return await asyncio.to_thread(_sync_call)
+
+
+async def chat_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    set_mode(user.id, True)
+    _mode_set(chat.id, MODE_CHAT)
+    try:
+        await safe_send_text(
+            ctx.bot,
+            chat.id,
+            md2_escape("💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст."),
+        )
+    except Exception as exc:
+        log.warning("chat.command_hint_failed | chat=%s err=%s", chat.id, exc)
+
+
+async def chat_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    clear_ctx(user.id)
+    set_mode(user.id, True)
+    _mode_set(chat.id, MODE_CHAT)
+    try:
+        await safe_send_text(ctx.bot, chat.id, md2_escape("🧹 Контекст очищен."))
+    except Exception as exc:
+        log.warning("chat.reset_notify_failed | chat=%s err=%s", chat.id, exc)
+
+
+async def chat_history_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    set_mode(user.id, True)
+    _mode_set(chat.id, MODE_CHAT)
+    history = load_ctx(user.id)
+    last_items = history[-5:]
+    if last_items:
+        chunks = []
+        for item in last_items:
+            role = item.get("role")
+            icon = "🧍" if role == "user" else "🤖"
+            content = str(item.get("content", ""))
+            if len(content) > 400:
+                content = content[:400] + "…"
+            chunks.append(f"{icon} {md2_escape(content)}")
+        body = "\n\n".join(chunks)
+    else:
+        body = "_пусто_"
+    header = "*История \\(последние 5\\):*"
+    try:
+        await safe_send_text(ctx.bot, chat.id, f"{header}\n{body}")
+    except Exception as exc:
+        log.warning("chat.history_send_failed | chat=%s err=%s", chat.id, exc)
 
 
 def _acquire_click_lock(user_id: Optional[int], action: str) -> bool:
@@ -2065,6 +2155,8 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
 
     if action == "video":
+        if user_id:
+            set_mode(user_id, False)
         s["mode"] = None
         await query.answer()
         try:
@@ -2081,6 +2173,8 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if action == "image":
+        if user_id:
+            set_mode(user_id, False)
         s["mode"] = None
         await query.answer()
         try:
@@ -2097,11 +2191,15 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if action == "music":
+        if user_id:
+            set_mode(user_id, False)
         await query.answer()
         await suno_entry(chat_id, ctx)
         return
 
     if action == "prompt":
+        if user_id:
+            set_mode(user_id, False)
         s["mode"] = None
         _mode_set(chat_id, MODE_PM)
         await query.answer()
@@ -2118,16 +2216,16 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if action == "chat":
+        if user_id:
+            set_mode(user_id, True)
         s["mode"] = None
         _mode_set(chat_id, MODE_CHAT)
         await query.answer()
         try:
-            await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
-                chat_id=chat_id,
-                text="✉️ Напишите сообщение — отвечу здесь. Чтобы вернуться, нажмите /menu.",
+            await safe_send_text(
+                ctx.bot,
+                chat_id,
+                md2_escape("💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст."),
             )
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
@@ -2935,6 +3033,9 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_balance: bool = True) -> None:
     s = state(ctx)
     s["suno_waiting_field"] = None
+    uid = get_user_id(ctx)
+    if uid:
+        set_mode(uid, False)
     if not _suno_configured():
         await _suno_notify(
             ctx,
@@ -2943,9 +3044,9 @@ async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_ba
         )
         return
     if refresh_balance:
-        uid = get_user_id(ctx) or chat_id
-        if uid:
-            s["suno_balance"] = _safe_get_balance(int(uid))
+        balance_uid = uid or chat_id
+        if balance_uid:
+            s["suno_balance"] = _safe_get_balance(int(balance_uid))
     s["mode"] = "suno"
     s.setdefault("suno_instrumental", True)
     s["_last_text_suno"] = None
@@ -5002,6 +5103,8 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user_id = user.id if user else None
+    if user_id:
+        set_mode(user_id, False)
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
     menu_message = await safe_send(update, ctx, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
@@ -5040,6 +5143,9 @@ async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat is None:
         return
+    user = update.effective_user
+    if user:
+        set_mode(user.id, False)
 
     if not _suno_configured():
         await _suno_notify(
@@ -5145,6 +5251,9 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
+    user = update.effective_user
+    if user:
+        set_mode(user.id, False)
     state(ctx)["mode"] = None
     await message.reply_text("🎬 Выберите тип генерации видео:", reply_markup=video_menu_kb())
 
@@ -5154,6 +5263,9 @@ async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
+    user = update.effective_user
+    if user:
+        set_mode(user.id, False)
     state(ctx)["mode"] = None
     await message.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
 
@@ -5666,18 +5778,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == CB_MODE_CHAT:
         if chat_id is not None:
             _mode_set(chat_id, MODE_CHAT)
+        if user:
+            set_mode(user.id, True)
         s["mode"] = None
         await q.answer("Режим: Обычный чат")
         if message is not None:
             await _safe_edit_message_text(
                 q.edit_message_text,
-                "Режим переключён: теперь это обычный чат. Напишите сообщение.",
+                "Режим переключён: теперь это обычный чат. Пишите вопрос! /reset — очистить контекст.",
             )
         return
 
     if data == CB_MODE_PM:
         if chat_id is not None:
             _mode_set(chat_id, MODE_PM)
+        if user:
+            set_mode(user.id, False)
         s["mode"] = None
         await q.answer("Режим: Prompt-Master")
         if message is not None:
@@ -5690,6 +5806,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == CB_GO_HOME:
         if chat_id is not None:
             _mode_set(chat_id, MODE_CHAT)
+        if user:
+            set_mode(user.id, False)
         s.update({**DEFAULT_STATE})
         _apply_state_defaults(s)
         await q.answer()
@@ -6374,6 +6492,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw_text = msg.text or ""
     text = raw_text.strip()
     chat_id = msg.chat_id
+    user = update.effective_user
+    user_id = user.id if user else None
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
@@ -6414,16 +6534,22 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == MENU_BTN_VIDEO:
+        if user_id:
+            set_mode(user_id, False)
         s["mode"] = None
         await msg.reply_text("🎬 Выберите тип генерации видео:", reply_markup=video_menu_kb())
         return
 
     if text == MENU_BTN_IMAGE:
+        if user_id:
+            set_mode(user_id, False)
         s["mode"] = None
         await msg.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
         return
 
     if text == MENU_BTN_SUNO:
+        if user_id:
+            set_mode(user_id, False)
         await suno_entry(chat_id, ctx)
         return
 
@@ -6439,15 +6565,26 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == MENU_BTN_PM:
+        if user_id:
+            set_mode(user_id, False)
         _mode_set(chat_id, MODE_PM)
         s["mode"] = None
         await msg.reply_text("Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.")
         return
 
     if text == MENU_BTN_CHAT:
+        if user_id:
+            set_mode(user_id, True)
         _mode_set(chat_id, MODE_CHAT)
         s["mode"] = None
-        await msg.reply_text("Режим переключён: Обычный чат. Напишите сообщение.")
+        try:
+            await safe_send_text(
+                ctx.bot,
+                chat_id,
+                md2_escape("💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст."),
+            )
+        except Exception as exc:
+            log.warning("chat.menu_hint_failed | chat=%s err=%s", chat_id, exc)
         return
 
     if state_mode == "promo":
@@ -6563,21 +6700,97 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not text:
             await msg.reply_text("⚠️ Отправьте сообщение.")
             return
-        if openai is None or not OPENAI_API_KEY:
-            await msg.reply_text("⚠️ ChatGPT недоступен (нет OPENAI_API_KEY).")
+        if not user_id:
             return
-        await msg.reply_text("💬 Думаю над ответом…")
+        if not is_mode_on(user_id):
+            return
+        if rate_limit_hit(user_id):
+            chat_messages_total.labels(outcome="rate_limited").inc()
+            try:
+                await safe_send_text(
+                    ctx.bot,
+                    chat_id,
+                    md2_escape("⏳ Слишком быстро. Подождите секунду и повторите."),
+                )
+            except Exception as exc:
+                log.warning("chat.rate_limit_notify_failed | chat=%s err=%s", chat_id, exc)
+            return
+        if len(raw_text) > INPUT_MAX_CHARS:
+            chat_messages_total.labels(outcome="too_long").inc()
+            try:
+                await safe_send_text(
+                    ctx.bot,
+                    chat_id,
+                    md2_escape("✂️ Сообщение слишком длинное. Сократите, пожалуйста (до 3000 символов)."),
+                )
+            except Exception as exc:
+                log.warning("chat.too_long_notify_failed | chat=%s err=%s", chat_id, exc)
+            return
+
+        with suppress(Exception):
+            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        placeholder = None
         try:
-            answer = await chatgpt_smalltalk(text, chat_id)
+            placeholder = await safe_send_text(ctx.bot, chat_id, md2_escape("Думаю…"))
         except Exception as exc:
-            log.exception("Chat error: %s", exc)
-            await msg.reply_text("⚠️ Ошибка запроса к ChatGPT.")
-            return
-        await msg.reply_text(
-            answer,
-            reply_markup=None,
-            disable_web_page_preview=True,
-        )
+            log.warning("chat.placeholder_failed | chat=%s err=%s", chat_id, exc)
+            placeholder = None
+
+        start = time.time()
+        try:
+            history = load_ctx(user_id)
+            ctx_tokens = sum(
+                estimate_tokens(str(item.get("content", ""))) for item in history
+            )
+            ctx_tokens += estimate_tokens(text)
+            chat_context_tokens.set(float(min(ctx_tokens, CTX_MAX_TOKENS)))
+
+            lang = detect_lang(raw_text or text)
+            messages = build_messages(CHAT_SYSTEM_PROMPT, history, text, lang)
+
+            append_ctx(user_id, "user", text)
+
+            answer = await asyncio.to_thread(call_llm, messages)
+
+            append_ctx(user_id, "assistant", answer)
+
+            escaped_answer = md2_escape(answer)
+            edited = False
+            if placeholder and getattr(placeholder, "message_id", None) is not None:
+                try:
+                    await safe_edit_text(
+                        ctx.bot, chat_id, placeholder.message_id, escaped_answer
+                    )
+                    edited = True
+                except Exception as exc:
+                    log.warning("chat.edit_failed | chat=%s err=%s", chat_id, exc)
+            if not edited:
+                try:
+                    await safe_send_text(ctx.bot, chat_id, escaped_answer)
+                except Exception as exc:
+                    log.warning("chat.send_failed | chat=%s err=%s", chat_id, exc)
+
+            chat_messages_total.labels(outcome="ok").inc()
+            chat_latency_ms.observe((time.time() - start) * 1000.0)
+        except Exception as exc:
+            chat_messages_total.labels(outcome="error").inc()
+            chat_latency_ms.observe((time.time() - start) * 1000.0)
+            error_payload = md2_escape("⚠️ Не получилось ответить сейчас. Попробуйте ещё раз.")
+            handled = False
+            if placeholder and getattr(placeholder, "message_id", None) is not None:
+                try:
+                    await safe_edit_text(
+                        ctx.bot, chat_id, placeholder.message_id, error_payload
+                    )
+                    handled = True
+                except Exception as edit_exc:
+                    log.warning("chat.error_edit_failed | chat=%s err=%s", chat_id, edit_exc)
+            if not handled:
+                with suppress(Exception):
+                    await safe_send_text(ctx.bot, chat_id, error_payload)
+            app_logger = getattr(getattr(ctx, "application", None), "logger", log)
+            app_logger.exception("chat error", extra={"user_id": user_id})
         return
 
     # Если режим не распознан — по умолчанию обновляем карточку VEO
@@ -7296,6 +7509,9 @@ async def run_bot_async() -> None:
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("topup", topup))
     application.add_handler(CommandHandler("promo", promo_command))
+    application.add_handler(CommandHandler("chat", chat_command))
+    application.add_handler(CommandHandler("reset", chat_reset_command))
+    application.add_handler(CommandHandler("history", chat_history_command))
     application.add_handler(CommandHandler("users_count", users_count_command))
     application.add_handler(CommandHandler("whoami", whoami_command))
     application.add_handler(CommandHandler("suno_debug", suno_debug_command))

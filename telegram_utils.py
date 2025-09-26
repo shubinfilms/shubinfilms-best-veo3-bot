@@ -8,6 +8,7 @@ import random
 from typing import Any, Awaitable, Callable, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
@@ -305,4 +306,41 @@ async def safe_send(
     raise RuntimeError(f"Telegram send exceeded retries for {method_name}")
 
 
-__all__ = ["safe_send"]
+_MD2_SPECIALS = set("_*[]()~`>#+-=|{}.!")
+
+
+def md2_escape(text: str) -> str:
+    result = []
+    for ch in text or "":
+        if ch in _MD2_SPECIALS:
+            result.append("\\" + ch)
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+async def safe_edit_text(bot: Any, chat_id: int, message_id: int, text: str) -> Optional[Any]:
+    try:
+        return await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as exc:
+        if _is_message_not_modified(exc):
+            return None
+        raise
+
+
+async def safe_send_text(bot: Any, chat_id: int, text: str) -> Optional[Any]:
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+__all__ = ["safe_send", "safe_send_text", "safe_edit_text", "md2_escape"]
