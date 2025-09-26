@@ -130,6 +130,9 @@ from metrics import (
     chat_messages_total,
     chat_latency_ms,
     chat_context_tokens,
+    chat_voice_total,
+    chat_voice_latency_ms,
+    chat_transcribe_latency_ms,
 )
 from telegram_utils import (
     build_hub_keyboard,
@@ -137,8 +140,12 @@ from telegram_utils import (
     safe_send as tg_safe_send,
     safe_edit_text,
     safe_send_text,
+    safe_send_placeholder,
+    safe_edit_markdown_v2,
+    run_ffmpeg,
     md2_escape,
 )
+from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -157,6 +164,7 @@ SUNO_SERVICE = SunoService()
 
 _METRIC_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
+_VOICE_METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
 
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
@@ -951,6 +959,12 @@ CHAT_SYSTEM_PROMPT = (
     "Отвечайте кратко, по делу, при необходимости приводите простой пример."
 )
 
+VOICE_MAX_SIZE_BYTES = 20 * 1024 * 1024
+VOICE_MAX_DURATION_SEC = 5 * 60
+VOICE_TOO_LARGE_TEXT = "✂️ Голосовое слишком длинное/большое. Отправьте до 5 минут и 20 МБ."
+VOICE_PLACEHOLDER_TEXT = "🎙️ Распознаю голос…"
+VOICE_TRANSCRIBE_ERROR_TEXT = "⚠️ Не удалось распознать аудио. Попробуйте ещё раз."
+
 # Если Redis подключен — используем его; иначе fallback на память процесса.
 _inmem_modes: Dict[Any, Any] = {}
 
@@ -1174,6 +1188,43 @@ def detect_lang(text: str) -> str:
     return "ru" if _CYRILLIC_RE.search(text or "") else "en"
 
 
+async def _download_telegram_file(url: str, timeout: float = 120.0) -> bytes:
+    timeout_cfg = ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            return await resp.read()
+
+
+def _should_convert_to_wav(mime: Optional[str], file_path: Optional[str]) -> bool:
+    mime_lower = (mime or "").lower()
+    if "ogg" in mime_lower or "opus" in mime_lower:
+        return True
+    path_lower = (file_path or "").lower()
+    return path_lower.endswith((".ogg", ".oga", ".opus"))
+
+
+def _voice_preview(text: str, limit: int = 3000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…."
+
+
+def _voice_lang_hint(message: Message, user: Optional[User]) -> str:
+    if message.caption:
+        return detect_lang(message.caption)
+    if user and user.language_code:
+        code = user.language_code.lower()
+        if code.startswith("ru"):
+            return "ru"
+    if user:
+        parts = [user.first_name or "", user.last_name or ""]
+        joined = " ".join(part for part in parts if part)
+        if joined:
+            return detect_lang(joined)
+    return "en"
+
+
 async def chatgpt_smalltalk(text: str, chat_id: int) -> str:
     if openai is None or not OPENAI_API_KEY:
         raise RuntimeError("ChatGPT is not configured")
@@ -1207,7 +1258,10 @@ async def chat_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_send_text(
             ctx.bot,
             chat.id,
-            md2_escape("💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст."),
+            md2_escape(
+                "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
+                "🎙️ Можно присылать голосовые — я их распознаю."
+            ),
         )
     except Exception as exc:
         log.warning("chat.command_hint_failed | chat=%s err=%s", chat.id, exc)
@@ -2225,7 +2279,10 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_send_text(
                 ctx.bot,
                 chat_id,
-                md2_escape("💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст."),
+                md2_escape(
+                    "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
+                    "🎙️ Можно присылать голосовые — я их распознаю."
+                ),
             )
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
@@ -6581,7 +6638,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await safe_send_text(
                 ctx.bot,
                 chat_id,
-                md2_escape("💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст."),
+                md2_escape(
+                    "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
+                    "🎙️ Можно присылать голосовые — я их распознаю."
+                ),
             )
         except Exception as exc:
             log.warning("chat.menu_hint_failed | chat=%s err=%s", chat_id, exc)
@@ -6914,7 +6974,272 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show_veo_card(update.effective_chat.id, ctx)
     except Exception as e:
         log.exception("Get photo failed: %s", e)
-        await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+    await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+
+# --- Voice handling -----------------------------------------------------
+
+
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
+    message = update.message
+    if message is None:
+        return
+
+    voice_or_audio = message.voice or message.audio
+    if voice_or_audio is None:
+        return
+
+    chat_id = message.chat_id
+    user = update.effective_user
+    user_id = user.id if user else None
+    start_time = time.time()
+
+    file_size = getattr(voice_or_audio, "file_size", None) or 0
+    duration = getattr(voice_or_audio, "duration", None) or 0
+
+    if file_size and file_size > VOICE_MAX_SIZE_BYTES:
+        payload = md2_escape(VOICE_TOO_LARGE_TEXT)
+        try:
+            await safe_send_text(ctx.bot, chat_id, payload)
+        except Exception as exc:
+            log.warning("chat.voice.too_large_notify_failed | chat=%s err=%s", chat_id, exc)
+        chat_voice_total.labels(outcome="too_large", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        return
+
+    if duration and duration > VOICE_MAX_DURATION_SEC:
+        payload = md2_escape(VOICE_TOO_LARGE_TEXT)
+        try:
+            await safe_send_text(ctx.bot, chat_id, payload)
+        except Exception as exc:
+            log.warning("chat.voice.too_long_notify_failed | chat=%s err=%s", chat_id, exc)
+        chat_voice_total.labels(outcome="too_long", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        return
+
+    with suppress(Exception):
+        await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    placeholder = None
+    try:
+        placeholder = await safe_send_placeholder(
+            ctx.bot, chat_id, md2_escape(VOICE_PLACEHOLDER_TEXT)
+        )
+    except Exception as exc:
+        log.warning("chat.voice.placeholder_failed | chat=%s err=%s", chat_id, exc)
+        placeholder = None
+
+    transcribe_started: Optional[float] = None
+    transcription: Optional[str] = None
+    mime_type = getattr(voice_or_audio, "mime_type", None)
+    try:
+        file = await ctx.bot.get_file(voice_or_audio.file_id)
+        file_path = getattr(file, "file_path", None)
+        if not file_path:
+            raise RuntimeError("telegram file path missing")
+        url = tg_direct_file_url(TELEGRAM_TOKEN, file_path)
+        audio_bytes = await _download_telegram_file(url)
+        actual_mime = mime_type or getattr(file, "mime_type", None)
+        if _should_convert_to_wav(actual_mime, file_path):
+            audio_bytes = await run_ffmpeg(
+                audio_bytes,
+                ["-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"],
+            )
+            actual_mime = "audio/wav"
+        lang_hint = _voice_lang_hint(message, user)
+        transcribe_started = time.time()
+        transcription = await asyncio.to_thread(
+            voice_transcribe, audio_bytes, actual_mime, lang_hint
+        )
+    except VoiceTranscribeError as exc:
+        if transcribe_started is not None:
+            chat_transcribe_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+                (time.time() - transcribe_started) * 1000.0
+            )
+        err_text = md2_escape(VOICE_TRANSCRIBE_ERROR_TEXT)
+        handled = False
+        if placeholder and getattr(placeholder, "message_id", None) is not None:
+            try:
+                await safe_edit_markdown_v2(
+                    ctx.bot, chat_id, placeholder.message_id, err_text
+                )
+                handled = True
+            except Exception as edit_exc:
+                log.warning(
+                    "chat.voice.transcribe_edit_failed | chat=%s err=%s",
+                    chat_id,
+                    edit_exc,
+                )
+        if not handled:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, err_text)
+        chat_voice_total.labels(outcome="error", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        log.warning("chat.voice.transcribe_failed | chat=%s err=%s", chat_id, exc)
+        return
+    except Exception as exc:
+        if transcribe_started is not None:
+            chat_transcribe_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+                (time.time() - transcribe_started) * 1000.0
+            )
+        err_text = md2_escape(VOICE_TRANSCRIBE_ERROR_TEXT)
+        handled = False
+        if placeholder and getattr(placeholder, "message_id", None) is not None:
+            try:
+                await safe_edit_markdown_v2(
+                    ctx.bot, chat_id, placeholder.message_id, err_text
+                )
+                handled = True
+            except Exception as edit_exc:
+                log.warning(
+                    "chat.voice.general_edit_failed | chat=%s err=%s",
+                    chat_id,
+                    edit_exc,
+                )
+        if not handled:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, err_text)
+        chat_voice_total.labels(outcome="error", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        log.exception("chat.voice.error | chat=%s", chat_id)
+        return
+
+    if transcribe_started is not None:
+        chat_transcribe_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - transcribe_started) * 1000.0
+        )
+
+    assert transcription is not None
+    preview = _voice_preview(transcription)
+    thinking_text = md2_escape(
+        f"📝 Расшифровка:\n{preview}\n\nДумаю над ответом…"
+    )
+    placeholder_msg_id = getattr(placeholder, "message_id", None)
+    if placeholder_msg_id is not None:
+        try:
+            await safe_edit_markdown_v2(ctx.bot, chat_id, placeholder_msg_id, thinking_text)
+        except Exception as exc:
+            log.warning("chat.voice.thinking_edit_failed | chat=%s err=%s", chat_id, exc)
+            placeholder_msg_id = None
+    if placeholder_msg_id is None:
+        try:
+            new_placeholder = await safe_send_placeholder(ctx.bot, chat_id, thinking_text)
+        except Exception as exc:
+            log.warning("chat.voice.thinking_send_failed | chat=%s err=%s", chat_id, exc)
+            new_placeholder = None
+        placeholder_msg_id = getattr(new_placeholder, "message_id", None)
+
+    user_mode = _mode_get(chat_id) or MODE_CHAT
+    if user_mode != MODE_CHAT or not user_id or not is_mode_on(user_id):
+        final_text = md2_escape(
+            f"📝 Расшифровка:\n{preview}\n\n💬 Включить чат: /chat"
+        )
+        delivered = False
+        if placeholder_msg_id is not None:
+            try:
+                await safe_edit_markdown_v2(ctx.bot, chat_id, placeholder_msg_id, final_text)
+                delivered = True
+            except Exception as exc:
+                log.warning("chat.voice.final_edit_failed | chat=%s err=%s", chat_id, exc)
+        if not delivered:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, final_text)
+        chat_voice_total.labels(outcome="ok", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        return
+
+    if rate_limit_hit(user_id):
+        chat_messages_total.labels(outcome="rate_limited").inc()
+        rate_text = md2_escape(
+            f"📝 Расшифровка:\n{preview}\n\n⏳ Слишком быстро. Подождите секунду и повторите."
+        )
+        handled = False
+        if placeholder_msg_id is not None:
+            try:
+                await safe_edit_markdown_v2(ctx.bot, chat_id, placeholder_msg_id, rate_text)
+                handled = True
+            except Exception as exc:
+                log.warning("chat.voice.rate_limit_edit_failed | chat=%s err=%s", chat_id, exc)
+        if not handled:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, rate_text)
+        chat_voice_total.labels(outcome="ok", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        return
+
+    history = load_ctx(user_id)
+    ctx_tokens = sum(estimate_tokens(str(item.get("content", ""))) for item in history)
+    ctx_tokens += estimate_tokens(transcription)
+    chat_context_tokens.set(float(min(ctx_tokens, CTX_MAX_TOKENS)))
+
+    append_ctx(user_id, "user", transcription)
+
+    lang = detect_lang(transcription)
+    messages = build_messages(CHAT_SYSTEM_PROMPT, history, transcription, lang)
+
+    chat_start = time.time()
+    try:
+        answer = await asyncio.to_thread(call_llm, messages)
+        append_ctx(user_id, "assistant", answer)
+        final_payload = md2_escape(answer)
+        delivered = False
+        if placeholder_msg_id is not None:
+            try:
+                await safe_edit_markdown_v2(
+                    ctx.bot, chat_id, placeholder_msg_id, final_payload
+                )
+                delivered = True
+            except Exception as exc:
+                log.warning("chat.voice.answer_edit_failed | chat=%s err=%s", chat_id, exc)
+        if not delivered:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, final_payload)
+
+        chat_messages_total.labels(outcome="ok").inc()
+        chat_latency_ms.observe((time.time() - chat_start) * 1000.0)
+        chat_voice_total.labels(outcome="ok", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+    except Exception as exc:
+        chat_messages_total.labels(outcome="error").inc()
+        chat_latency_ms.observe((time.time() - chat_start) * 1000.0)
+        error_payload = md2_escape("⚠️ Не получилось ответить сейчас. Попробуйте ещё раз.")
+        handled = False
+        if placeholder_msg_id is not None:
+            try:
+                await safe_edit_markdown_v2(
+                    ctx.bot, chat_id, placeholder_msg_id, error_payload
+                )
+                handled = True
+            except Exception as edit_exc:
+                log.warning(
+                    "chat.voice.answer_error_edit_failed | chat=%s err=%s",
+                    chat_id,
+                    edit_exc,
+                )
+        if not handled:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, error_payload)
+
+        chat_voice_total.labels(outcome="error", **_VOICE_METRIC_LABELS).inc()
+        chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
+            (time.time() - start_time) * 1000.0
+        )
+        app_logger = getattr(getattr(ctx, "application", None), "logger", log)
+        app_logger.exception("chat voice error", extra={"user_id": user_id})
 
 # ---------- Payments: Stars (XTR) ----------
 async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -7530,6 +7855,7 @@ async def run_bot_async() -> None:
     application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     application.add_error_handler(error_handler)
 

@@ -5,9 +5,11 @@ import asyncio
 import logging
 import os
 import random
+from asyncio.subprocess import PIPE
+from contextlib import suppress
 from typing import Any, Awaitable, Callable, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
@@ -319,7 +321,9 @@ def md2_escape(text: str) -> str:
     return "".join(result)
 
 
-async def safe_edit_text(bot: Any, chat_id: int, message_id: int, text: str) -> Optional[Any]:
+async def safe_edit_markdown_v2(
+    bot: Any, chat_id: int, message_id: int, text: str
+) -> Optional[Any]:
     try:
         return await bot.edit_message_text(
             chat_id=chat_id,
@@ -334,6 +338,10 @@ async def safe_edit_text(bot: Any, chat_id: int, message_id: int, text: str) -> 
         raise
 
 
+async def safe_edit_text(bot: Any, chat_id: int, message_id: int, text: str) -> Optional[Any]:
+    return await safe_edit_markdown_v2(bot, chat_id, message_id, text)
+
+
 async def safe_send_text(bot: Any, chat_id: int, text: str) -> Optional[Any]:
     return await bot.send_message(
         chat_id=chat_id,
@@ -343,4 +351,51 @@ async def safe_send_text(bot: Any, chat_id: int, text: str) -> Optional[Any]:
     )
 
 
-__all__ = ["safe_send", "safe_send_text", "safe_edit_text", "md2_escape"]
+async def safe_send_placeholder(bot: Any, chat_id: int, text: str) -> Optional[Message]:
+    return await safe_send(
+        bot.send_message,
+        method_name="send_message",
+        kind="placeholder",
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+async def run_ffmpeg(input_bytes: bytes, args: list[str], timeout: float = 40.0) -> bytes:
+    ffmpeg_bin = (os.getenv("FFMPEG_BIN") or "ffmpeg").strip() or "ffmpeg"
+    cmd = [ffmpeg_bin, *args]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=PIPE,
+        stdout=PIPE,
+        stderr=PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input_bytes), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        with suppress(Exception):
+            await proc.communicate()
+        raise RuntimeError("ffmpeg timeout") from exc
+
+    if proc.returncode != 0:
+        err_text = (stderr or b"").decode("utf-8", "ignore")
+        log.warning(
+            "ffmpeg failed",
+            extra={"meta": {"code": proc.returncode, "stderr": err_text[:400]}},
+        )
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
+    return stdout
+
+
+__all__ = [
+    "safe_send",
+    "safe_send_text",
+    "safe_send_placeholder",
+    "safe_edit_text",
+    "safe_edit_markdown_v2",
+    "run_ffmpeg",
+    "md2_escape",
+]
