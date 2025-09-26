@@ -531,13 +531,16 @@ class SunoService:
             "lyrics": lyrics,
             "model": model,
             "instrumental": instrumental,
+            "prompt": prompt,
         }
         try:
-            result = self.client.create_music(payload, req_id=req_id)
-        except SunoAPIError:
+            result, api_version = self.client.create_music(payload, req_id=req_id)
+        except SunoAPIError as exc:
+            version = getattr(exc, "api_version", "v5") or "v5"
             suno_requests_total.labels(
                 result="fail",
                 reason="start_music",
+                api_version=version,
                 **_metric_labels("bot"),
             ).inc()
             raise
@@ -545,6 +548,7 @@ class SunoService:
             suno_requests_total.labels(
                 result="fail",
                 reason="start_music",
+                api_version="unknown",
                 **_metric_labels("bot"),
             ).inc()
             raise
@@ -552,6 +556,7 @@ class SunoService:
             suno_requests_total.labels(
                 result="ok",
                 reason="start_music",
+                api_version=api_version,
                 **_metric_labels("bot"),
             ).inc()
         task_id = str(

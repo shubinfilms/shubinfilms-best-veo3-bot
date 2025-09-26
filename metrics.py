@@ -18,7 +18,7 @@ def _labels(service: str) -> dict[str, str]:
 suno_requests_total = Counter(
     "suno_requests_total",
     "Total Suno requests grouped by outcome",
-    labelnames=("result", "reason", "env", "service"),
+    labelnames=("result", "reason", "api_version", "env", "service"),
     registry=REGISTRY,
 )
 

@@ -101,13 +101,15 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
             responses.append({"status_code": 200, "json": {"task_id": "ok"}})
         else:
             responses.append({"status_code": status, "json": {"message": "err"}})
-    requests_mock.post("https://example.com/api/v1/generate/music", responses)
+    requests_mock.post("https://example.com/suno-api/generate", responses)
     suno_client = SunoClient(base_url="https://example.com", token="tkn", max_retries=3)
     if status_codes[0] == 403:
         with pytest.raises(SunoAPIError):
-            suno_client.create_music({})
+            suno_client.create_music({"instrumental": False})
     else:
-        suno_client.create_music({})
+        payload, version = suno_client.create_music({"instrumental": False})
+        assert payload["task_id"] == "ok"
+        assert version == "v5"
     assert requests_mock.call_count == expected_calls
 
 
