@@ -136,6 +136,8 @@ from metrics import (
     chat_voice_total,
     chat_voice_latency_ms,
     chat_transcribe_latency_ms,
+    faq_root_views_total,
+    faq_views_total,
 )
 from telegram_utils import (
     build_hub_keyboard,
@@ -148,6 +150,7 @@ from telegram_utils import (
     run_ffmpeg,
     md2_escape,
 )
+from faq_content import FAQ_SECTIONS, FAQ_ROOT_TEXT, faq_back_kb, faq_main_kb
 from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
@@ -168,6 +171,9 @@ SUNO_SERVICE = SunoService()
 _METRIC_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
 _VOICE_METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
+
+_FAQ_ROOT_MESSAGE = md2_escape(FAQ_ROOT_TEXT)
+_FAQ_SECTION_MESSAGES = {key: md2_escape(value["text"]) for key, value in FAQ_SECTIONS.items()}
 
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
@@ -2816,21 +2822,69 @@ async def _edit_balance_from_history(
     msg_ids["balance"] = message.message_id
 
 
-def render_faq_text() -> str:
-    return (
-        "📘 *FAQ*\n"
-        "— *Как начать с VEO?*\n"
-        "1) Выберите «Veo Fast» или «Veo Quality». 2) Пришлите идею текстом и/или фото. "
-        "3) Карточка откроется автоматически — проверьте параметры и жмите «🚀 Сгенерировать».\n\n"
-        "— *Fast vs Quality?* Fast — быстрее и дешевле. Quality — дольше, но лучше детализация.\n\n"
-        "— *Форматы VEO?* Готовые клипы загружаем в чат как видеофайлы.\n\n"
-        "— *MJ:* Цена 10💎. Один бесплатный перезапуск при сетевой ошибке. На выходе одно изображение.\n\n"
-        "— *Banana:* до 4 фото, затем текст — что поменять (фон, одежда, макияж, удаление объектов, объединение людей).\n\n"
-        "— *Время ожидания:* VEO 2–10 мин, MJ 1–3 мин, Banana 1–5 мин (может быть дольше при нагрузке).\n\n"
-        "— *Токены/возвраты:* списываются при старте; при ошибке/таймауте бот автоматически возвращает 💎.\n\n"
-        f"— *Пополнение:* через Stars в меню. Где купить: {STARS_BUY_URL}\n"
-        f"— *Примеры и идеи:* {PROMPTS_CHANNEL_URL}."
+async def _send_faq_root_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    faq_root_views_total.labels(**_METRIC_LABELS).inc()
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="send_message",
+        kind="faq",
+        chat_id=chat_id,
+        text=_FAQ_ROOT_MESSAGE,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+        reply_markup=faq_main_kb(),
     )
+
+
+async def faq_callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    if not data.startswith("faq:"):
+        return
+
+    message = query.message
+    if data == "faq:home":
+        await query.answer()
+        if message is not None:
+            await show_main_menu(message.chat_id, ctx)
+        return
+
+    if message is None:
+        await query.answer()
+        return
+
+    if data == "faq:root":
+        faq_root_views_total.labels(**_METRIC_LABELS).inc()
+        await _safe_edit_message_text(
+            query.edit_message_text,
+            _FAQ_ROOT_MESSAGE,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+            reply_markup=faq_main_kb(),
+        )
+        await query.answer()
+        return
+
+    section = data.split(":", 1)[1]
+    text = _FAQ_SECTION_MESSAGES.get(section)
+    if text is None:
+        await query.answer("Раздел недоступен", show_alert=True)
+        return
+
+    faq_views_total.labels(section=section, **_METRIC_LABELS).inc()
+    await _safe_edit_message_text(
+        query.edit_message_text,
+        text,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+        reply_markup=faq_back_kb(),
+    )
+    await query.answer()
 
 def _short_prompt(prompt: Optional[str], limit: int = 120) -> str:
     txt = (prompt or "").strip()
@@ -5605,11 +5659,11 @@ async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
-    await message.reply_text(
-        render_faq_text(),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_kb(),
-    )
+
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        return
+    await _send_faq_root_menu(chat_id, ctx)
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -6212,11 +6266,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "faq":
-        await q.message.reply_text(
-            render_faq_text(),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_menu_kb(),
-        )
+        await q.answer()
+        if q.message is not None:
+            await _send_faq_root_menu(q.message.chat_id, ctx)
         return
 
     if data == "back":
@@ -8059,6 +8111,7 @@ async def run_bot_async() -> None:
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
     application.add_handler(CallbackQueryHandler(main_suggest_router, pattern="^go:"))
+    application.add_handler(CallbackQueryHandler(faq_callback_router, pattern="^faq:"))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
