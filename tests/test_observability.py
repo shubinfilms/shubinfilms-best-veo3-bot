@@ -24,6 +24,10 @@ from metrics import (
     suno_callback_download_fail_total,
     suno_callback_total,
     suno_task_store_total,
+    suno_enqueue_duration_seconds,
+    suno_notify_fail,
+    suno_notify_ok,
+    suno_notify_duration_seconds,
 )
 from settings import MAX_IN_LOG_BODY
 from suno.client import SunoAPIError, SunoClient
@@ -112,10 +116,18 @@ def test_metrics_endpoint_outputs_counters(monkeypatch):
     suno_callback_total.labels(status="ok", env=env, service="test").inc()
     suno_callback_download_fail_total.labels(reason="network").inc()
     suno_task_store_total.labels(result="memory").inc()
+    env = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+    suno_notify_ok.labels(env=env, service="test").inc()
+    suno_notify_fail.labels(type="Forbidden", env=env, service="test").inc()
+    suno_notify_duration_seconds.labels(env=env, service="test").observe(0.1)
+    suno_enqueue_duration_seconds.labels(env=env, service="test").observe(0.2)
     payload = render_metrics().decode("utf-8")
     assert "suno_callback_total" in payload
     assert 'status="ok"' in payload
     assert "process_uptime_seconds" in payload
+    assert "suno_notify_ok" in payload
+    assert "suno_notify_fail" in payload
+    assert "suno_enqueue_duration_seconds" in payload
 
 
 def test_cleanup_old_directories(tmp_path, monkeypatch):
