@@ -111,7 +111,7 @@ from metrics import (
 )
 from settings import REDIS_PREFIX, SUNO_LOG_KEY
 from suno.service import SunoService, SunoAPIError
-from telegram_utils import safe_send
+from telegram_utils import build_hub_keyboard, build_hub_text, safe_send
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -1844,21 +1844,218 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+async def show_emoji_hub_for_chat(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: Optional[int] = None,
+    replace: bool = False,
+) -> Optional[int]:
+    """Render the emoji hub for a chat, editing the stored message when possible."""
+
+    resolved_uid: Optional[int] = None
+    if user_id is not None:
+        try:
+            resolved_uid = int(user_id)
+        except (TypeError, ValueError):
+            resolved_uid = None
+    if resolved_uid is None:
+        ctx_uid = get_user_id(ctx)
+        if ctx_uid is not None:
+            try:
+                resolved_uid = int(ctx_uid)
+            except (TypeError, ValueError):
+                resolved_uid = None
+    if resolved_uid is None:
+        resolved_uid = int(chat_id)
+
+    balance = _safe_get_balance(resolved_uid)
+    _set_cached_balance(ctx, balance)
+
+    text = build_hub_text(balance)
+    keyboard = build_hub_keyboard()
+
+    log.info("hub.show | user_id=%s balance=%s", resolved_uid, balance)
+
+    hub_msg_id = ctx.user_data.get("hub_msg_id")
+    if replace and hub_msg_id:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=hub_msg_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            ctx.user_data["hub_msg_id"] = hub_msg_id
+            return hub_msg_id
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                ctx.user_data["hub_msg_id"] = hub_msg_id
+                return hub_msg_id
+            log.warning("hub.edit_failed | user_id=%s err=%s", resolved_uid, exc)
+            ctx.user_data["hub_msg_id"] = None
+        except TelegramError as exc:
+            log.warning("hub.edit_failed | user_id=%s err=%s", resolved_uid, exc)
+            ctx.user_data["hub_msg_id"] = None
+        except Exception as exc:  # pragma: no cover - unexpected errors
+            log.warning("hub.edit_failed | user_id=%s err=%s", resolved_uid, exc)
+            ctx.user_data["hub_msg_id"] = None
+
+    try:
+        message = await safe_send(
+            ctx.bot.send_message,
+            method_name="sendMessage",
+            kind="message",
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:  # pragma: no cover - network issues
+        log.warning("hub.send_failed | user_id=%s err=%s", resolved_uid, exc)
+        return None
+
+    message_id = getattr(message, "message_id", None)
+    if isinstance(message_id, int):
+        ctx.user_data["hub_msg_id"] = message_id
+        return message_id
+    return None
+
+
+async def show_emoji_hub(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, replace: bool = False
+) -> Optional[int]:
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = None
+    if chat is not None:
+        chat_id = chat.id
+    elif user is not None:
+        chat_id = user.id
+    if chat_id is None:
+        return None
+    user_id = user.id if user is not None else None
+    return await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=replace)
+
+
 async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    return await show_emoji_hub_for_chat(chat_id, ctx, replace=True)
+
+
+async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    if not data.startswith("hub:"):
+        return
+
+    action = data.split(":", 1)[1]
+    message = query.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    chat_id = None
+    if message is not None:
+        chat_id = message.chat_id
+    elif chat is not None:
+        chat_id = chat.id
+
+    user_id = user.id if user is not None else None
+
+    if action == "root":
+        await query.answer()
+        if chat_id is not None:
+            await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
+        return
+
+    if chat_id is None:
+        await query.answer()
+        return
+
     s = state(ctx)
-    uid = get_user_id(ctx) or chat_id
-    balance = _safe_get_balance(uid)
-    text = render_welcome_for(uid, ctx, balance=balance)
-    return await upsert_card(
-        ctx,
-        chat_id,
-        s,
-        "last_ui_msg_id_menu",
-        text,
-        reply_markup=main_menu_kb(),
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
+
+    if action == "video":
+        s["mode"] = None
+        await query.answer()
+        try:
+            await safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text="🎬 Выберите тип генерации видео:",
+                reply_markup=video_menu_kb(),
+            )
+        except Exception as exc:  # pragma: no cover - network issues
+            log.warning("hub.video_send_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    if action == "image":
+        s["mode"] = None
+        await query.answer()
+        try:
+            await safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text="🖼️ Выберите режим работы с изображениями:",
+                reply_markup=image_menu_kb(),
+            )
+        except Exception as exc:  # pragma: no cover - network issues
+            log.warning("hub.image_send_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    if action == "music":
+        await query.answer()
+        await suno_entry(chat_id, ctx)
+        return
+
+    if action == "prompt":
+        s["mode"] = None
+        _mode_set(chat_id, MODE_PM)
+        await query.answer()
+        try:
+            await safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text="Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
+            )
+        except Exception as exc:  # pragma: no cover - network issues
+            log.warning("hub.prompt_send_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    if action == "chat":
+        s["mode"] = None
+        _mode_set(chat_id, MODE_CHAT)
+        await query.answer()
+        try:
+            await safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text="✉️ Напишите сообщение — отвечу здесь. Чтобы вернуться, нажмите /menu.",
+            )
+        except Exception as exc:  # pragma: no cover - network issues
+            log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    if action == "balance":
+        await query.answer()
+        await show_balance_card(chat_id, ctx)
+        return
+
+    await query.answer()
 
 
 def video_menu_kb() -> InlineKeyboardMarkup:
@@ -4702,8 +4899,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         log.exception("Signup bonus failed for %s: %s", uid, exc)
 
-    chat_id = update.effective_chat.id if update.effective_chat else uid
-    await show_main_menu(chat_id, ctx)
+    await show_emoji_hub(update, ctx, replace=True)
 
 async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -4714,8 +4910,7 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.update({**DEFAULT_STATE})
     _apply_state_defaults(s)
     uid = update.effective_user.id if update.effective_user else 0
-    chat_id = update.effective_chat.id if update.effective_chat else uid
-    await show_main_menu(chat_id, ctx)
+    await show_emoji_hub(update, ctx, replace=True)
 
 
 async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5340,6 +5535,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state(ctx)
     message = q.message
     chat = update.effective_chat
+    user = update.effective_user
     chat_id = None
     if message is not None:
         chat_id = message.chat_id
@@ -5379,7 +5575,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if message is not None:
             with suppress(BadRequest):
                 await q.edit_message_reply_markup(reply_markup=None)
-            await message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb())
+        target_chat = chat_id if chat_id is not None else (user.id if user else None)
+        if target_chat is not None:
+            await show_emoji_hub_for_chat(
+                target_chat,
+                ctx,
+                user_id=user.id if user else None,
+                replace=True,
+            )
         return
 
     if data.startswith(CB_PM_INSERT_VEO):
@@ -5471,12 +5674,28 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "back":
         s.update({**DEFAULT_STATE})
         _apply_state_defaults(s)
-        await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
+        target_chat = chat_id if chat_id is not None else (user.id if user else None)
+        if target_chat is not None:
+            await show_emoji_hub_for_chat(
+                target_chat,
+                ctx,
+                user_id=user.id if user else None,
+                replace=True,
+            )
+        return
 
     if data == "start_new_cycle":
         s.update({**DEFAULT_STATE})
         _apply_state_defaults(s)
-        await q.message.reply_text("Выберите режим:", reply_markup=main_menu_kb()); return
+        target_chat = chat_id if chat_id is not None else (user.id if user else None)
+        if target_chat is not None:
+            await show_emoji_hub_for_chat(
+                target_chat,
+                ctx,
+                user_id=user.id if user else None,
+                replace=True,
+            )
+        return
 
     if data == "topup_open":
         await q.message.reply_text("💳 Выберите пакет Stars ниже:", reply_markup=stars_topup_kb()); return
@@ -5596,7 +5815,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     pass
             s["last_ui_msg_id_mj"] = None
             s["_last_text_mj"] = None
-            await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb()); return
+            target_chat = chat_id if chat_id is not None else (update.effective_user.id if update.effective_user else None)
+            if target_chat is not None:
+                await show_emoji_hub_for_chat(
+                    target_chat,
+                    ctx,
+                    user_id=update.effective_user.id if update.effective_user else None,
+                    replace=True,
+                )
+            return
 
         if action == "confirm":
             if s.get("mj_generating"):
@@ -6958,6 +7185,7 @@ async def run_bot_async() -> None:
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
