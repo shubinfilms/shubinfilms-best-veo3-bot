@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, MutableMapping, Optional
 import requests
 from requests.adapters import HTTPAdapter
 
-from metrics import bot_telegram_send_fail_total, suno_task_store_total
+from metrics import bot_telegram_send_fail_total, suno_requests_total, suno_task_store_total
 from suno.client import SunoClient, SunoAPIError
 from suno.schemas import SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
@@ -33,7 +33,13 @@ log = logging.getLogger("suno.service")
 
 _TASK_TTL = 24 * 60 * 60
 _USER_LINK_TTL = 7 * 24 * 60 * 60
+_REQ_TTL = 24 * 60 * 60
 _LOG_ONCE_TTL = 48 * 60 * 60
+_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+
+
+def _metric_labels(service: str) -> dict[str, str]:
+    return {"env": _ENV, "service": service}
 
 
 @dataclass(slots=True)
@@ -42,6 +48,7 @@ class TelegramMeta:
     msg_id: int
     title: Optional[str]
     ts: str
+    req_id: Optional[str]
 
 
 @dataclass(slots=True)
@@ -67,6 +74,7 @@ class SunoService:
         self._memory: MutableMapping[str, tuple[float, str]] = {}
         self._user_memory: MutableMapping[str, tuple[float, str]] = {}
         self._task_records_memory: MutableMapping[str, tuple[float, str]] = {}
+        self._req_memory: MutableMapping[str, tuple[float, str]] = {}
         self._task_order: list[str] = []
         self._bot_session = requests.Session()
         adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
@@ -88,6 +96,9 @@ class SunoService:
 
     def _last_tasks_key(self) -> str:
         return f"{REDIS_PREFIX}:suno:last"
+
+    def _req_key(self, task_id: str) -> str:
+        return f"{REDIS_PREFIX}:suno:req:{task_id}"
 
     def _log_once_key(self, task_id: str, callback_type: Optional[str]) -> str:
         kind = (callback_type or "unknown").lower()
@@ -185,6 +196,19 @@ class SunoService:
         self._task_order.insert(0, task_id)
         del self._task_order[50:]
 
+    def _store_req_id(self, task_id: str, req_id: Optional[str]) -> None:
+        if not task_id or not req_id:
+            return
+        key = self._req_key(task_id)
+        if self.redis is not None:
+            try:
+                self.redis.setex(key, _REQ_TTL, req_id)
+                return
+            except Exception:  # pragma: no cover - Redis failure
+                log.warning("SunoService redis.setex req-id failed", exc_info=True)
+        expires_at = time.time() + _REQ_TTL
+        self._req_memory[key] = (expires_at, req_id)
+
     def _load_mapping(self, task_id: str) -> Optional[TelegramMeta]:
         key = self._redis_key(task_id)
         raw: Optional[str] = None
@@ -217,7 +241,8 @@ class SunoService:
             return None
         title = data.get("title")
         ts = data.get("ts") or datetime.now(timezone.utc).isoformat()
-        return TelegramMeta(chat_id=chat_id, msg_id=msg_id, title=title, ts=ts)
+        req_id = data.get("req_id") or self._load_req_id(task_id)
+        return TelegramMeta(chat_id=chat_id, msg_id=msg_id, title=title, ts=ts, req_id=req_id)
 
     def _delete_mapping(self, task_id: str) -> None:
         key = self._redis_key(task_id)
@@ -227,6 +252,43 @@ class SunoService:
             except Exception:  # pragma: no cover - Redis failure
                 log.warning("SunoService redis.delete failed", exc_info=True)
         self._memory.pop(key, None)
+        req_key = self._req_key(task_id)
+        if self.redis is not None:
+            try:
+                self.redis.delete(req_key)
+            except Exception:  # pragma: no cover - Redis failure
+                log.warning("SunoService redis.delete req-id failed", exc_info=True)
+        self._req_memory.pop(req_key, None)
+
+    def _load_req_id(self, task_id: str) -> Optional[str]:
+        if not task_id:
+            return None
+        key = self._req_key(task_id)
+        if self.redis is not None:
+            try:
+                value = self.redis.get(key)
+            except Exception:  # pragma: no cover - Redis failure
+                log.warning("SunoService redis.get req-id failed", exc_info=True)
+            else:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="ignore")
+                if isinstance(value, str):
+                    return value
+        if key in self._req_memory:
+            expires_at, value = self._req_memory[key]
+            if expires_at > time.time():
+                return value
+            self._req_memory.pop(key, None)
+        return None
+
+    def get_request_id(self, task_id: str) -> Optional[str]:
+        return self._load_req_id(task_id)
+
+    def get_start_timestamp(self, task_id: str) -> Optional[str]:
+        meta = self._load_mapping(task_id)
+        if meta is None:
+            return None
+        return meta.ts
 
     def _load_user_link(self, task_id: str) -> Optional[TaskLink]:
         key = self._user_key(task_id)
@@ -461,6 +523,7 @@ class SunoService:
         instrumental: bool = False,
         user_id: Optional[int] = None,
         prompt: Optional[str] = None,
+        req_id: Optional[str] = None,
     ) -> SunoTask:
         payload = {
             "title": title,
@@ -469,7 +532,28 @@ class SunoService:
             "model": model,
             "instrumental": instrumental,
         }
-        result = self.client.create_music(payload)
+        try:
+            result = self.client.create_music(payload, req_id=req_id)
+        except SunoAPIError:
+            suno_requests_total.labels(
+                result="fail",
+                reason="start_music",
+                **_metric_labels("bot"),
+            ).inc()
+            raise
+        except Exception:
+            suno_requests_total.labels(
+                result="fail",
+                reason="start_music",
+                **_metric_labels("bot"),
+            ).inc()
+            raise
+        else:
+            suno_requests_total.labels(
+                result="ok",
+                reason="start_music",
+                **_metric_labels("bot"),
+            ).inc()
         task_id = str(
             result.get("task_id")
             or result.get("id")
@@ -484,8 +568,10 @@ class SunoService:
             "msg_id": int(msg_id),
             "title": title,
             "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": req_id,
         }
         self._store_mapping(task.task_id, meta)
+        self._store_req_id(task.task_id, req_id)
         if user_id is not None:
             self._store_user_link(
                 task.task_id,
@@ -504,24 +590,45 @@ class SunoService:
             "user_id": int(user_id) if user_id is not None else None,
             "prompt": (prompt or "").strip(),
             "title": title,
+            "req_id": req_id,
         }
         self._save_task_record(task.task_id, record)
         log.info(
-            "Suno task stored | task_id=%s chat_id=%s msg_id=%s user=%s",
-            task.task_id,
-            chat_id,
-            msg_id,
-            user_id,
+            "Suno task stored",
+            extra={
+                "meta": {
+                    "task_id": task.task_id,
+                    "chat_id": chat_id,
+                    "msg_id": msg_id,
+                    "user_id": user_id,
+                    "req_id": req_id,
+                }
+            },
         )
         return task
 
-    def handle_callback(self, task: SunoTask) -> None:
+    def handle_callback(self, task: SunoTask, req_id: Optional[str] = None) -> None:
         if not task.task_id:
             log.warning("Callback without task_id: %s", task)
             return
         meta = self._load_mapping(task.task_id)
         link = self._load_user_link(task.task_id)
         chat_id = meta.chat_id if meta else (link.user_id if link else None)
+        if req_id is None and meta is not None:
+            req_id = meta.req_id
+        if req_id is None:
+            req_id = self._load_req_id(task.task_id)
+        log.info(
+            "Suno callback received",
+            extra={
+                "meta": {
+                    "task_id": task.task_id,
+                    "callback_type": task.callback_type,
+                    "chat_id": chat_id,
+                    "req_id": req_id,
+                }
+            },
+        )
         if chat_id is None:
             log.info("No chat mapping for task %s", task.task_id)
             snippet = task.model_dump(exclude_none=True)
@@ -551,6 +658,7 @@ class SunoService:
                         "user_id": link.user_id if link else None,
                         "prompt": link.prompt if link else "",
                         "title": meta.title if meta else None,
+                        "req_id": req_id,
                         "tracks": [],
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }

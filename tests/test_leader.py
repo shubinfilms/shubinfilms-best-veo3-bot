@@ -69,6 +69,10 @@ def reload_bot(monkeypatch, **env):
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
     monkeypatch.setenv("DATABASE_URL", "")
     monkeypatch.setenv("POSTGRES_DSN", "")
+    monkeypatch.setenv("SUNO_API_BASE", "https://example.com")
+    monkeypatch.setenv("SUNO_API_TOKEN", "token")
+    monkeypatch.setenv("SUNO_CALLBACK_URL", "https://callback")
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "secret")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     module = importlib.import_module("bot")

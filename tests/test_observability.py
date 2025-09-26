@@ -108,13 +108,13 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
 
 
 def test_metrics_endpoint_outputs_counters(monkeypatch):
-    suno_callback_total.labels(type="test", code="200").inc()
+    env = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+    suno_callback_total.labels(status="ok", env=env, service="test").inc()
     suno_callback_download_fail_total.labels(reason="network").inc()
     suno_task_store_total.labels(result="memory").inc()
     payload = render_metrics().decode("utf-8")
     assert "suno_callback_total" in payload
-    assert 'code="200"' in payload
-    assert 'type="test"' in payload
+    assert 'status="ok"' in payload
     assert "process_uptime_seconds" in payload
 
 

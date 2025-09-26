@@ -86,7 +86,7 @@ class SunoClient:
             self.timeout = timeout
 
     # ------------------------------------------------------------------ helpers
-    def _headers(self) -> MutableMapping[str, str]:
+    def _headers(self, *, req_id: Optional[str] = None) -> MutableMapping[str, str]:
         headers: MutableMapping[str, str] = {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
@@ -95,6 +95,8 @@ class SunoClient:
             headers["X-Callback-Url"] = SUNO_CALLBACK_URL
         if SUNO_CALLBACK_SECRET:
             headers["X-Callback-Token"] = SUNO_CALLBACK_SECRET
+        if req_id:
+            headers["X-Request-ID"] = req_id
         return headers
 
     def _url(self, path: str) -> str:
@@ -112,7 +114,7 @@ class SunoClient:
             return payload
         return {"data": payload}
 
-    def _maybe_backoff(self, code: Optional[int], attempt: int) -> bool:
+    def _maybe_backoff(self, code: Optional[int], attempt: int, *, req_id: Optional[str] = None) -> bool:
         if attempt >= self.max_attempts:
             return False
         retryable = code is None or code in _RETRYABLE_CODES or (code is not None and code >= 500)
@@ -122,7 +124,14 @@ class SunoClient:
             delay = base + jitter
             log.warning(
                 "suno.http retry",
-                extra={"meta": {"code": code or "error", "attempt": attempt, "delay": round(delay, 3)}},
+                extra={
+                    "meta": {
+                        "code": code or "error",
+                        "attempt": attempt,
+                        "delay": round(delay, 3),
+                        "req_id": req_id,
+                    }
+                },
             )
             time.sleep(delay)
             return True
@@ -135,6 +144,7 @@ class SunoClient:
         *,
         json_payload: Optional[Mapping[str, Any]] = None,
         params: Optional[Mapping[str, Any]] = None,
+        req_id: Optional[str] = None,
     ) -> Mapping[str, Any]:
         url = self._url(path)
         attempt = 0
@@ -145,43 +155,52 @@ class SunoClient:
                 response = self.session.request(
                     method.upper(),
                     url,
-                    headers=self._headers(),
+                    headers=self._headers(req_id=req_id),
                     json=json_payload,
                     params=params,
                     timeout=self.timeout,
                 )
             except RequestException as exc:
                 last_error = exc
-                if not self._maybe_backoff(None, attempt):
-                    log.error("suno.http failed attempt=%s error=%s", attempt, exc)
+                if not self._maybe_backoff(None, attempt, req_id=req_id):
+                    log.error(
+                        "suno.http failed",
+                        extra={"meta": {"attempt": attempt, "req_id": req_id, "error": str(exc)}},
+                    )
                     raise SunoAPIError("Network error talking to Suno") from exc
                 continue
 
             status = response.status_code
-            if self._maybe_backoff(status, attempt):
+            if self._maybe_backoff(status, attempt, req_id=req_id):
                 continue
 
             payload = self._parse_json(response)
             if status >= 400:
-                log.error("suno.http error code=%s attempt=%s", status, attempt)
+                log.error(
+                    "suno.http error",
+                    extra={"meta": {"code": status, "attempt": attempt, "req_id": req_id}},
+                )
                 raise SunoAPIError(
                     payload.get("message") or payload.get("msg") or f"HTTP {status}",
                     status=status,
                     payload=payload,
                 )
 
-            log.info("suno.http success code=%s attempt=%s", status, attempt)
+            log.info(
+                "suno.http success",
+                extra={"meta": {"code": status, "attempt": attempt, "req_id": req_id}},
+            )
             return payload
 
         raise SunoAPIError("Suno request exhausted retries", payload=getattr(last_error, "response", None))
 
     # ------------------------------------------------------------------ public API
-    def create_music(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    def create_music(self, payload: Mapping[str, Any], *, req_id: Optional[str] = None) -> Mapping[str, Any]:
         body = {key: value for key, value in payload.items() if value is not None}
-        return self._request("POST", SUNO_GEN_PATH, json_payload=body)
+        return self._request("POST", SUNO_GEN_PATH, json_payload=body, req_id=req_id)
 
-    def get_task_status(self, task_id: str) -> Mapping[str, Any]:
-        return self._request("GET", SUNO_TASK_STATUS_PATH, params={"task_id": task_id})
+    def get_task_status(self, task_id: str, *, req_id: Optional[str] = None) -> Mapping[str, Any]:
+        return self._request("GET", SUNO_TASK_STATUS_PATH, params={"task_id": task_id}, req_id=req_id)
 
 
 __all__ = ["SunoClient", "SunoAPIError"]

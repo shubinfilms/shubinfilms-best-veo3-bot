@@ -1,17 +1,45 @@
 """Prometheus metrics helpers shared across bot and web services."""
 from __future__ import annotations
 
+import os
 import time
 from typing import Iterable
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
 REGISTRY = CollectorRegistry()
+
+_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+
+
+def _labels(service: str) -> dict[str, str]:
+    return {"env": _ENV, "service": service}
+
+suno_requests_total = Counter(
+    "suno_requests_total",
+    "Total Suno requests grouped by outcome",
+    labelnames=("result", "reason", "env", "service"),
+    registry=REGISTRY,
+)
 
 suno_callback_total = Counter(
     "suno_callback_total",
     "Total Suno callbacks processed",
-    labelnames=("type", "code"),
+    labelnames=("status", "env", "service"),
+    registry=REGISTRY,
+)
+
+telegram_send_total = Counter(
+    "telegram_send_total",
+    "Telegram send attempts grouped by kind/result",
+    labelnames=("kind", "result", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_latency_seconds = Histogram(
+    "suno_latency_seconds",
+    "Latency from task start to callback",
+    labelnames=("env", "service"),
     registry=REGISTRY,
 )
 
@@ -54,10 +82,13 @@ def render_metrics() -> bytes:
 
 __all__: Iterable[str] = [
     "REGISTRY",
-    "suno_callback_total",
+    "suno_requests_total",
     "suno_callback_download_fail_total",
     "suno_task_store_total",
     "bot_telegram_send_fail_total",
+    "suno_callback_total",
+    "telegram_send_total",
+    "suno_latency_seconds",
     "process_uptime_seconds",
     "render_metrics",
 ]
