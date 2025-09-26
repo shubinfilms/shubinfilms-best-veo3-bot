@@ -7,6 +7,7 @@ import os
 import random
 from typing import Any, Awaitable, Callable, Optional
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
@@ -18,6 +19,43 @@ _BOT_LABELS = {"env": _ENV, "service": "bot"}
 _RETRY_SCHEDULE = (0.6, 1.0, 1.6)
 _TEMP_ERROR_CODES = {409, 420, 429}
 _PERM_ERROR_CODES = {400, 403, 404}
+
+_DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
+_HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL
+
+
+def build_hub_text(user_balance: int) -> str:
+    """Render the main hub text with the current balance."""
+
+    try:
+        balance_value = int(user_balance)
+    except (TypeError, ValueError):
+        balance_value = 0
+
+    return (
+        "👋 Добро пожаловать!\n\n"
+        f"💎 Ваш баланс: {balance_value}\n"
+        f"📈 Больше идей и примеров — [канал с промптами]({_HUB_PROMPTS_URL})\n\n"
+        "Выберите, что хотите сделать:"
+    )
+
+
+def build_hub_keyboard() -> InlineKeyboardMarkup:
+    """Return a compact 2x3 inline keyboard for the emoji hub."""
+
+    rows = [
+        [
+            InlineKeyboardButton("🎬", callback_data="hub:video"),
+            InlineKeyboardButton("🎨", callback_data="hub:image"),
+            InlineKeyboardButton("🎵", callback_data="hub:music"),
+        ],
+        [
+            InlineKeyboardButton("🧠", callback_data="hub:prompt"),
+            InlineKeyboardButton("💬", callback_data="hub:chat"),
+            InlineKeyboardButton("💎", callback_data="hub:balance"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _extract_status(exc: BaseException) -> Optional[int]:
