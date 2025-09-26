@@ -111,13 +111,14 @@ from chat_service import (
     call_llm,
     clear_ctx,
     estimate_tokens,
-    is_mode_on,
     load_ctx,
     rate_limit_hit,
+    reply as chat_reply,
     set_mode,
     CTX_MAX_TOKENS,
     INPUT_MAX_CHARS,
 )
+from chat_mode import is_on as chat_mode_is_on, turn_on as chat_mode_turn_on
 from metrics import (
     suno_enqueue_duration_seconds,
     suno_enqueue_total,
@@ -130,6 +131,8 @@ from metrics import (
     chat_messages_total,
     chat_latency_ms,
     chat_context_tokens,
+    chat_autoswitch_total,
+    chat_first_hint_total,
     chat_voice_total,
     chat_voice_latency_ms,
     chat_transcribe_latency_ms,
@@ -1791,6 +1794,7 @@ DEFAULT_STATE = {
     "suno_last_task_id": None,
     "suno_last_params": None,
     "suno_balance": None,
+    "chat_hint_sent": False,
 }
 
 
@@ -1839,6 +1843,224 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     return _apply_state_defaults(ensure_state(ctx))
 
 
+_CHAT_HINT_TEXT = "💬 Обычный чат включён автоматически. Пишите вопрос! /reset — очистить контекст."
+
+
+def _chat_state_waiting_input(state_dict: Dict[str, Any]) -> bool:
+    mode = state_dict.get("mode")
+    if mode and str(mode) not in {"", "chat", "none", "null"}:
+        return True
+    if state_dict.get("suno_waiting_field"):
+        return True
+    if state_dict.get("banana_active_op_key"):
+        return True
+    if state_dict.get("mj_active_op_key"):
+        return True
+    if state_dict.get("active_generation_op"):
+        return True
+    return False
+
+
+def main_suggest_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🎬 Видео", callback_data="go:video"),
+                InlineKeyboardButton("🎨 Изображения", callback_data="go:image"),
+            ],
+            [
+                InlineKeyboardButton("🎵 Музыка", callback_data="go:music"),
+                InlineKeyboardButton("💎 Баланс", callback_data="go:balance"),
+            ],
+            [
+                InlineKeyboardButton("ℹ️ FAQ", callback_data="go:faq"),
+            ],
+        ]
+    )
+
+
+async def safe_send_typing(bot, chat_id: int) -> None:
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception as exc:
+        log.debug("chat.typing_failed | chat=%s err=%s", chat_id, exc)
+
+
+async def maybe_send_chat_hint(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, state_dict: Dict[str, Any]
+) -> None:
+    if state_dict.get("chat_hint_sent"):
+        return
+    try:
+        await safe_send_text(ctx.bot, chat_id, md2_escape(_CHAT_HINT_TEXT))
+    except Exception as exc:
+        log.warning("chat.hint_failed | chat=%s err=%s", chat_id, exc)
+        return
+    state_dict["chat_hint_sent"] = True
+    chat_first_hint_total.inc()
+
+
+async def _safe_edit_placeholder(
+    bot,
+    placeholder: Optional[Message],
+    text: str,
+    *,
+    inline_keyboard: Optional[InlineKeyboardMarkup] = None,
+) -> bool:
+    if not placeholder or getattr(placeholder, "message_id", None) is None:
+        return False
+    chat_id = placeholder.chat_id
+    message_id = placeholder.message_id
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+            reply_markup=inline_keyboard,
+        )
+        return True
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        log.warning("chat.placeholder_edit_failed | chat=%s err=%s", chat_id, exc)
+    except Exception as exc:
+        log.warning("chat.placeholder_edit_failed | chat=%s err=%s", chat_id, exc)
+    return False
+
+
+async def _send_chat_message(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    inline_keyboard: Optional[InlineKeyboardMarkup] = None,
+) -> bool:
+    try:
+        await tg_safe_send(
+            bot.send_message,
+            method_name="send_message",
+            kind="chat_reply",
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+            reply_markup=inline_keyboard,
+        )
+        return True
+    except Exception as exc:
+        log.warning("chat.send_failed | chat=%s err=%s", chat_id, exc)
+    return False
+
+
+async def _handle_chat_message(
+    *,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    state_dict: Dict[str, Any],
+    raw_text: str,
+    text: str,
+    send_typing_action: bool,
+    send_hint: bool,
+    inline_keyboard: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    if not text:
+        await safe_send_text(ctx.bot, chat_id, md2_escape("⚠️ Отправьте сообщение."))
+        return
+
+    if rate_limit_hit(user_id):
+        chat_messages_total.labels(outcome="rate_limited").inc()
+        try:
+            await safe_send_text(
+                ctx.bot,
+                chat_id,
+                md2_escape("⏳ Слишком быстро. Подождите секунду и повторите."),
+            )
+        except Exception as exc:
+            log.warning("chat.rate_limit_notify_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    if len(raw_text) > INPUT_MAX_CHARS:
+        chat_messages_total.labels(outcome="too_long").inc()
+        try:
+            await safe_send_text(
+                ctx.bot,
+                chat_id,
+                md2_escape(
+                    "✂️ Сообщение слишком длинное. Сократите, пожалуйста (до 3000 символов)."
+                ),
+            )
+        except Exception as exc:
+            log.warning("chat.too_long_notify_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    placeholder: Optional[Message] = None
+    if send_typing_action:
+        await safe_send_typing(ctx.bot, chat_id)
+    try:
+        placeholder = await safe_send_placeholder(
+            ctx.bot, chat_id, md2_escape("Думаю…")
+        )
+    except Exception as exc:
+        log.warning("chat.placeholder_failed | chat=%s err=%s", chat_id, exc)
+        placeholder = None
+
+    if send_hint:
+        await maybe_send_chat_hint(ctx, chat_id, state_dict)
+
+    start = time.time()
+    try:
+        history = load_ctx(user_id)
+        ctx_tokens = sum(estimate_tokens(str(item.get("content", ""))) for item in history)
+        ctx_tokens += estimate_tokens(text)
+        chat_context_tokens.set(float(min(ctx_tokens, CTX_MAX_TOKENS)))
+
+        lang = detect_lang(raw_text or text)
+
+        answer = await chat_reply(
+            user_id,
+            text,
+            system_prompt=CHAT_SYSTEM_PROMPT,
+            answer_lang=lang,
+            history=history,
+        )
+
+        escaped_answer = md2_escape(answer)
+        handled = False
+        if placeholder and getattr(placeholder, "message_id", None) is not None:
+            handled = await _safe_edit_placeholder(
+                ctx.bot,
+                placeholder,
+                escaped_answer,
+                inline_keyboard=inline_keyboard,
+            )
+        if not handled:
+            await _send_chat_message(
+                ctx.bot,
+                chat_id,
+                escaped_answer,
+                inline_keyboard=inline_keyboard,
+            )
+
+        chat_messages_total.labels(outcome="ok").inc()
+        chat_latency_ms.observe((time.time() - start) * 1000.0)
+    except Exception as exc:
+        chat_messages_total.labels(outcome="error").inc()
+        chat_latency_ms.observe((time.time() - start) * 1000.0)
+
+        error_payload = md2_escape("⚠️ Не получилось ответить сейчас. Попробуйте ещё раз.")
+        handled = False
+        if placeholder and getattr(placeholder, "message_id", None) is not None:
+            handled = await _safe_edit_placeholder(
+                ctx.bot, placeholder, error_payload, inline_keyboard=None
+            )
+        if not handled:
+            with suppress(Exception):
+                await safe_send_text(ctx.bot, chat_id, error_payload)
+        app_logger = getattr(getattr(ctx, "application", None), "logger", log)
+        app_logger.exception("chat error", extra={"user_id": user_id})
 async def safe_send(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -2294,6 +2516,36 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await query.answer()
+
+
+async def main_suggest_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    handler: Optional[Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]] = None
+    if data == "go:video":
+        handler = video_command
+    elif data == "go:image":
+        handler = image_command
+    elif data == "go:music":
+        handler = suno_command
+    elif data == "go:balance":
+        handler = my_balance_command
+    elif data == "go:faq":
+        handler = faq_command
+
+    try:
+        await query.answer()
+    except Exception as exc:
+        chat_id = query.message.chat_id if query.message else None
+        log.debug("chat.main_suggest_answer_failed | chat=%s err=%s", chat_id, exc)
+
+    if handler is None:
+        return
+
+    await handler(update, ctx)
 
 
 def video_menu_kb() -> InlineKeyboardMarkup:
@@ -6554,12 +6806,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
+    waiting_field = s.get("suno_waiting_field")
+    waiting_for_input = _chat_state_waiting_input(s)
+    if (
+        waiting_for_input
+        and user_id
+        and user_mode != MODE_PM
+        and not chat_mode_is_on(user_id)
+    ):
+        chat_autoswitch_total.labels(outcome="skip_active").inc()
+
     lowered = text.lower()
     if lowered in {"меню", "menu", "главное меню"}:
         await handle_menu(update, ctx)
         return
 
-    waiting_field = s.get("suno_waiting_field")
     if waiting_field:
         lowered = text.lower()
         if lowered == "/cancel":
@@ -6631,7 +6892,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == MENU_BTN_CHAT:
         if user_id:
-            set_mode(user_id, True)
+            chat_mode_turn_on(user_id)
         _mode_set(chat_id, MODE_CHAT)
         s["mode"] = None
         try:
@@ -6756,101 +7017,45 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_veo_card(chat_id, ctx)
         return
 
+    waiting_for_input = _chat_state_waiting_input(s)
+    if (
+        user_id
+        and user_mode != MODE_PM
+        and not chat_mode_is_on(user_id)
+        and not waiting_for_input
+    ):
+        chat_autoswitch_total.labels(outcome="on").inc()
+        chat_mode_turn_on(user_id)
+        _mode_set(chat_id, MODE_CHAT)
+        s["mode"] = None
+        await _handle_chat_message(
+            ctx=ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=s,
+            raw_text=raw_text,
+            text=text,
+            send_typing_action=True,
+            send_hint=True,
+            inline_keyboard=main_suggest_kb(),
+        )
+        return
+
     if user_mode == MODE_CHAT:
-        if not text:
-            await msg.reply_text("⚠️ Отправьте сообщение.")
-            return
         if not user_id:
             return
-        if not is_mode_on(user_id):
+        if not chat_mode_is_on(user_id):
             return
-        if rate_limit_hit(user_id):
-            chat_messages_total.labels(outcome="rate_limited").inc()
-            try:
-                await safe_send_text(
-                    ctx.bot,
-                    chat_id,
-                    md2_escape("⏳ Слишком быстро. Подождите секунду и повторите."),
-                )
-            except Exception as exc:
-                log.warning("chat.rate_limit_notify_failed | chat=%s err=%s", chat_id, exc)
-            return
-        if len(raw_text) > INPUT_MAX_CHARS:
-            chat_messages_total.labels(outcome="too_long").inc()
-            try:
-                await safe_send_text(
-                    ctx.bot,
-                    chat_id,
-                    md2_escape("✂️ Сообщение слишком длинное. Сократите, пожалуйста (до 3000 символов)."),
-                )
-            except Exception as exc:
-                log.warning("chat.too_long_notify_failed | chat=%s err=%s", chat_id, exc)
-            return
-
-        with suppress(Exception):
-            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-        placeholder = None
-        try:
-            placeholder = await safe_send_text(ctx.bot, chat_id, md2_escape("Думаю…"))
-        except Exception as exc:
-            log.warning("chat.placeholder_failed | chat=%s err=%s", chat_id, exc)
-            placeholder = None
-
-        start = time.time()
-        try:
-            history = load_ctx(user_id)
-            ctx_tokens = sum(
-                estimate_tokens(str(item.get("content", ""))) for item in history
-            )
-            ctx_tokens += estimate_tokens(text)
-            chat_context_tokens.set(float(min(ctx_tokens, CTX_MAX_TOKENS)))
-
-            lang = detect_lang(raw_text or text)
-            messages = build_messages(CHAT_SYSTEM_PROMPT, history, text, lang)
-
-            append_ctx(user_id, "user", text)
-
-            answer = await asyncio.to_thread(call_llm, messages)
-
-            append_ctx(user_id, "assistant", answer)
-
-            escaped_answer = md2_escape(answer)
-            edited = False
-            if placeholder and getattr(placeholder, "message_id", None) is not None:
-                try:
-                    await safe_edit_text(
-                        ctx.bot, chat_id, placeholder.message_id, escaped_answer
-                    )
-                    edited = True
-                except Exception as exc:
-                    log.warning("chat.edit_failed | chat=%s err=%s", chat_id, exc)
-            if not edited:
-                try:
-                    await safe_send_text(ctx.bot, chat_id, escaped_answer)
-                except Exception as exc:
-                    log.warning("chat.send_failed | chat=%s err=%s", chat_id, exc)
-
-            chat_messages_total.labels(outcome="ok").inc()
-            chat_latency_ms.observe((time.time() - start) * 1000.0)
-        except Exception as exc:
-            chat_messages_total.labels(outcome="error").inc()
-            chat_latency_ms.observe((time.time() - start) * 1000.0)
-            error_payload = md2_escape("⚠️ Не получилось ответить сейчас. Попробуйте ещё раз.")
-            handled = False
-            if placeholder and getattr(placeholder, "message_id", None) is not None:
-                try:
-                    await safe_edit_text(
-                        ctx.bot, chat_id, placeholder.message_id, error_payload
-                    )
-                    handled = True
-                except Exception as edit_exc:
-                    log.warning("chat.error_edit_failed | chat=%s err=%s", chat_id, edit_exc)
-            if not handled:
-                with suppress(Exception):
-                    await safe_send_text(ctx.bot, chat_id, error_payload)
-            app_logger = getattr(getattr(ctx, "application", None), "logger", log)
-            app_logger.exception("chat error", extra={"user_id": user_id})
+        await _handle_chat_message(
+            ctx=ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=s,
+            raw_text=raw_text,
+            text=text,
+            send_typing_action=True,
+            send_hint=False,
+        )
         return
 
     # Если режим не распознан — по умолчанию обновляем карточку VEO
@@ -7138,7 +7343,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         placeholder_msg_id = getattr(new_placeholder, "message_id", None)
 
     user_mode = _mode_get(chat_id) or MODE_CHAT
-    if user_mode != MODE_CHAT or not user_id or not is_mode_on(user_id):
+    if user_mode != MODE_CHAT or not user_id or not chat_mode_is_on(user_id):
         final_text = md2_escape(
             f"📝 Расшифровка:\n{preview}\n\n💬 Включить чат: /chat"
         )
@@ -7853,6 +8058,7 @@ async def run_bot_async() -> None:
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
+    application.add_handler(CallbackQueryHandler(main_suggest_router, pattern="^go:"))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
