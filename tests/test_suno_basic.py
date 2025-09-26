@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import suno_web
 from suno_web import app
 import suno.tempfiles as tempfiles
+from suno.service import SunoService
 
 
 def _build_payload(task_id: str = "task-1", callback_type: str = "complete") -> dict:
@@ -52,26 +53,29 @@ def _client():
 def test_callback_accepts_header_token(monkeypatch):
     received = {}
 
-    def fake_handle(task):
+    def fake_handle(task, req_id=None):
         received["task"] = task
+        received["req_id"] = req_id
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
     client = _client()
     response = client.post(
         "/suno-callback",
-        headers={"X-Callback-Token": "secret-token"},
+        headers={"X-Callback-Token": "secret-token", "X-Request-ID": "req-header"},
         json=_build_payload("header-token"),
     )
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert received["task"].task_id == "header-token"
+    assert received["req_id"] == "req-header"
 
 
 def test_callback_accepts_query_token(monkeypatch):
     received = {}
 
-    def fake_handle(task):
+    def fake_handle(task, req_id=None):
         received["task"] = task
+        received["req_id"] = req_id
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
     client = _client()
@@ -98,7 +102,7 @@ def test_callback_rejects_wrong_token():
 def test_duplicate_callbacks_processed_once(monkeypatch):
     count = {"calls": 0}
 
-    def fake_handle(task):
+    def fake_handle(task, req_id=None):
         count["calls"] += 1
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
@@ -137,7 +141,7 @@ def test_callback_rejects_payloads_over_limit(monkeypatch):
 def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_handle(task):
+    def fake_handle(task, req_id=None):
         captured["task"] = task
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
@@ -178,3 +182,63 @@ def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
     image_path = task.items[0].image_url
     assert image_path
     assert Path(image_path).exists()
+
+
+def test_suno_service_records_request_id(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.captured_req_id = None
+
+        def create_music(self, payload, *, req_id=None):
+            self.captured_req_id = req_id
+            return {"task_id": "task-req"}
+
+    service = SunoService(client=FakeClient(), redis=None, telegram_token="dummy")
+    task = service.start_music(
+        100,
+        200,
+        title="Demo",
+        style="Pop",
+        lyrics="Lyrics",
+        instrumental=False,
+        user_id=1,
+        prompt="Demo",
+        req_id="req-123",
+    )
+    assert task.task_id == "task-req"
+    assert service.client.captured_req_id == "req-123"
+    assert service.get_request_id(task.task_id) == "req-123"
+    ts = service.get_start_timestamp(task.task_id)
+    assert ts is not None
+
+
+def test_callback_restores_missing_req_id(monkeypatch):
+    class FakeClient:
+        def __init__(self, task_id: str):
+            self.task_id = task_id
+
+        def create_music(self, payload, *, req_id=None):
+            return {"task_id": self.task_id}
+
+    fake_client = FakeClient("restore-task")
+    service = SunoService(client=fake_client, redis=None, telegram_token="dummy")
+    service.start_music(1, 1, title="T", style="S", lyrics="L", instrumental=False, user_id=2, prompt="P", req_id="req-restore")
+
+    captured = {}
+
+    def fake_handle(task, req_id=None):
+        captured["task"] = task
+        captured["req_id"] = req_id
+
+    monkeypatch.setattr(suno_web, "service", service, raising=False)
+    monkeypatch.setattr(service, "handle_callback", fake_handle)
+    monkeypatch.setattr(suno_web, "_prepare_assets", lambda task: None)
+
+    client = _client()
+    response = client.post(
+        "/suno-callback?token=secret-token",
+        json=_build_payload("restore-task"),
+    )
+    assert response.status_code == 200
+    assert captured["task"].task_id == "restore-task"
+    assert captured["req_id"] == "req-restore"

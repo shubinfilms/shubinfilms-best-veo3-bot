@@ -4,13 +4,22 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from settings import LOG_JSON, LOG_LEVEL, MAX_IN_LOG_BODY
 
-_SECRET_ENV_KEYS = {"DATABASE_URL", "REDIS_URL"}
+_SECRET_ENV_KEYS = {
+    "DATABASE_URL",
+    "REDIS_URL",
+    "TELEGRAM_TOKEN",
+    "OPENAI_API_KEY",
+    "KIE_API_KEY",
+    "SUNO_API_TOKEN",
+    "SUNO_CALLBACK_SECRET",
+}
 for key, value in os.environ.items():
     upper = key.upper()
     if upper.endswith(("_TOKEN", "_KEY", "_SECRET")) or upper in _SECRET_ENV_KEYS:
@@ -44,6 +53,9 @@ def _truncate(value: str) -> str:
     return value[:MAX_IN_LOG_BODY] + "…(truncated)"
 
 
+_TOKEN_QUERY_RE = re.compile(r"(token=)([^&\s]+)", re.IGNORECASE)
+
+
 def _redact_text(value: str) -> str:
     if not value:
         return value
@@ -52,6 +64,7 @@ def _redact_text(value: str) -> str:
     for secret in secrets:
         if secret and secret in value:
             value = value.replace(secret, "***")
+    value = _TOKEN_QUERY_RE.sub(r"\1***", value)
     return value
 
 
