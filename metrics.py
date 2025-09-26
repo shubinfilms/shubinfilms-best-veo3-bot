@@ -84,6 +84,19 @@ chat_context_tokens = Gauge(
     registry=REGISTRY,
 )
 
+chat_autoswitch_total = Counter(
+    "chat_autoswitch_total",
+    "Automatic chat mode routing events grouped by outcome",
+    labelnames=("outcome",),
+    registry=REGISTRY,
+)
+
+chat_first_hint_total = Counter(
+    "chat_first_hint_total",
+    "Total hint messages shown for automatic chat activation",
+    registry=REGISTRY,
+)
+
 chat_voice_total = Counter(
     "chat_voice_total",
     "Voice messages processed in chat",
@@ -197,6 +210,8 @@ __all__: Iterable[str] = [
     "chat_messages_total",
     "chat_latency_ms",
     "chat_context_tokens",
+    "chat_autoswitch_total",
+    "chat_first_hint_total",
     "chat_voice_total",
     "chat_voice_latency_ms",
     "chat_transcribe_latency_ms",

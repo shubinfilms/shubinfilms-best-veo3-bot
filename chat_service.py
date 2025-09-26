@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -182,6 +183,28 @@ def rate_limit_hit(user_id: int) -> bool:
         return True
     rate_store[key] = now + 1
     return False
+
+
+async def reply(
+    user_id: int,
+    text: str,
+    *,
+    system_prompt: str,
+    answer_lang: str,
+    history: Optional[List[Dict[str, object]]] = None,
+) -> str:
+    """Generate a chat reply and persist the updated context."""
+
+    if history is None:
+        history = load_ctx(user_id)
+
+    messages = build_messages(system_prompt, history, text, answer_lang)
+    append_ctx(user_id, "user", text)
+
+    answer = await asyncio.to_thread(call_llm, messages)
+    append_ctx(user_id, "assistant", answer)
+
+    return answer
 
 
 def build_messages(
