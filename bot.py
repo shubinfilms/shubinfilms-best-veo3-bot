@@ -20,7 +20,7 @@ import threading
 import atexit
 from pathlib import Path
 # main
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode
@@ -32,7 +32,7 @@ import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
-    KeyboardButton, BotCommand, User
+    KeyboardButton, BotCommand, User, Message
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -111,7 +111,7 @@ from metrics import (
 )
 from settings import REDIS_PREFIX, SUNO_LOG_KEY
 from suno.service import SunoService, SunoAPIError
-from telegram_utils import build_hub_keyboard, build_hub_text, safe_send
+from telegram_utils import build_hub_keyboard, build_hub_text, safe_send as tg_safe_send
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
@@ -1645,7 +1645,27 @@ DEFAULT_STATE = {
 }
 
 
-def _apply_state_defaults(target: Dict[str, Any]) -> Dict[str, Any]:
+def ensure_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    user_data = getattr(ctx, "user_data", None)
+    if not isinstance(user_data, dict):
+        user_data = {}
+        try:
+            setattr(ctx, "user_data", user_data)
+        except Exception:
+            return {}
+    state_dict = user_data.get("state")
+    if not isinstance(state_dict, dict):
+        state_dict = {}
+        for key in DEFAULT_STATE.keys():
+            if key in user_data:
+                state_dict[key] = user_data.pop(key)
+        user_data["state"] = state_dict
+    return state_dict
+
+
+def _apply_state_defaults(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(target, dict):
+        target = {}
     for key, value in DEFAULT_STATE.items():
         if key not in target:
             if isinstance(value, list):
@@ -1667,8 +1687,62 @@ def _apply_state_defaults(target: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    ud = ctx.user_data
-    return _apply_state_defaults(ud)
+    return _apply_state_defaults(ensure_state(ctx))
+
+
+async def safe_send(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: Optional[Union[ReplyKeyboardMarkup, InlineKeyboardMarkup]] = None,
+) -> Optional[Message]:
+    """Safely deliver text to the chat, falling back to send_message on edit errors."""
+
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id: Optional[int] = None
+    if chat is not None:
+        chat_id = chat.id
+    elif user is not None:
+        chat_id = user.id
+
+    hub_msg_id: Optional[int] = None
+    user_data = getattr(ctx, "user_data", None)
+    if isinstance(user_data, dict):
+        hub_val = user_data.get("hub_msg_id")
+        if isinstance(hub_val, int):
+            hub_msg_id = hub_val
+
+    kwargs = {
+        "text": text,
+        "reply_markup": reply_markup,
+        "parse_mode": ParseMode.MARKDOWN,
+        "disable_web_page_preview": True,
+    }
+
+    if message is not None and getattr(message, "chat_id", None) is not None:
+        message_id = getattr(message, "message_id", None)
+        if not isinstance(message_id, int) or hub_msg_id == message_id:
+            message = None  # Skip editing hub message; send a new one instead
+        else:
+            try:
+                return await message.edit_text(**kwargs)
+            except TelegramError as exc:
+                log.warning("menu.safe_send_edit_failed | chat=%s err=%s", chat_id, exc)
+                message = None
+            except Exception as exc:  # pragma: no cover - unexpected errors
+                log.warning("menu.safe_send_edit_crashed | chat=%s err=%s", chat_id, exc)
+                message = None
+
+    if chat_id is None:
+        return None
+
+    try:
+        return await ctx.bot.send_message(chat_id=chat_id, **kwargs)
+    except Exception as exc:  # pragma: no cover - network issues
+        log.warning("menu.safe_send_send_failed | chat=%s err=%s", chat_id, exc)
+        return None
 
 # odex/fix-balance-reset-after-deploy
 # main
@@ -1804,6 +1878,10 @@ WELCOME = (
     "👇 Выберите режим"
 )
 
+
+MAIN_MENU_TEXT = "📋 *Главное меню*\nВыберите, что хотите сделать:"
+
+
 MENU_BTN_VIDEO = "🎬 ГЕНЕРАЦИЯ ВИДЕО"
 MENU_BTN_IMAGE = "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
@@ -1904,7 +1982,7 @@ async def show_emoji_hub_for_chat(
             ctx.user_data["hub_msg_id"] = None
 
     try:
-        message = await safe_send(
+        message = await tg_safe_send(
             ctx.bot.send_message,
             method_name="sendMessage",
             kind="message",
@@ -1985,7 +2063,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s["mode"] = None
         await query.answer()
         try:
-            await safe_send(
+            await tg_safe_send(
                 ctx.bot.send_message,
                 method_name="sendMessage",
                 kind="message",
@@ -2001,7 +2079,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s["mode"] = None
         await query.answer()
         try:
-            await safe_send(
+            await tg_safe_send(
                 ctx.bot.send_message,
                 method_name="sendMessage",
                 kind="message",
@@ -2023,7 +2101,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _mode_set(chat_id, MODE_PM)
         await query.answer()
         try:
-            await safe_send(
+            await tg_safe_send(
                 ctx.bot.send_message,
                 method_name="sendMessage",
                 kind="message",
@@ -2039,7 +2117,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _mode_set(chat_id, MODE_CHAT)
         await query.answer()
         try:
-            await safe_send(
+            await tg_safe_send(
                 ctx.bot.send_message,
                 method_name="sendMessage",
                 kind="message",
@@ -2880,7 +2958,7 @@ async def _suno_notify(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> Optional["telegram.Message"]:
     if reply_to is not None:
-        return await safe_send(
+        return await tg_safe_send(
             reply_to.reply_text,
             method_name="sendMessage",
             kind="message",
@@ -2889,7 +2967,7 @@ async def _suno_notify(
             parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
-    return await safe_send(
+    return await tg_safe_send(
         ctx.bot.send_message,
         method_name="sendMessage",
         kind="message",
@@ -3515,7 +3593,7 @@ async def _poll_suno_and_send(
                         req_id=req_id,
                     )
 
-                await safe_send(
+                await tg_safe_send(
                     ctx.bot.send_audio,
                     method_name="sendAudio",
                     kind="audio",
@@ -4884,33 +4962,55 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    s = state(ctx); s.update({**DEFAULT_STATE}); _apply_state_defaults(s)
-    uid = update.effective_user.id
 
-    await _handle_referral_deeplink(update, ctx)
+    query = update.callback_query
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer()
 
-    try:
-        bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
-        _set_cached_balance(ctx, bonus_result.balance)
-        if bonus_result.applied:
-            await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
-    except Exception as exc:
-        log.exception("Signup bonus failed for %s: %s", uid, exc)
-
-    await show_emoji_hub(update, ctx, replace=True)
-
-async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    message = update.effective_message
-    if message is None:
-        return
     s = state(ctx)
     s.update({**DEFAULT_STATE})
     _apply_state_defaults(s)
-    uid = update.effective_user.id if update.effective_user else 0
-    await show_emoji_hub(update, ctx, replace=True)
+
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id if chat else (user.id if user else None)
+    if chat_id is None:
+        return
+
+    user_id = user.id if user else None
+    await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
+
+    menu_message = await safe_send(update, ctx, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+    if isinstance(menu_message, Message):
+        try:
+            s["last_ui_msg_id_menu"] = menu_message.message_id
+        except Exception:
+            pass
+
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user_record(update)
+    uid = update.effective_user.id if update.effective_user else None
+
+    await _handle_referral_deeplink(update, ctx)
+
+    if uid is not None:
+        try:
+            bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
+            _set_cached_balance(ctx, bonus_result.balance)
+            if bonus_result.applied and update.message is not None:
+                await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
+        except Exception as exc:
+            log.exception("Signup bonus failed for %s: %s", uid, exc)
+
+    await handle_menu(update, ctx)
+
+
+async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await handle_menu(update, ctx)
 
 
 async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6255,6 +6355,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
+
+    lowered = text.lower()
+    if lowered in {"меню", "menu", "главное меню"}:
+        await handle_menu(update, ctx)
+        return
 
     waiting_field = s.get("suno_waiting_field")
     if waiting_field:
