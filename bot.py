@@ -39,7 +39,7 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
-from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
 from handlers import (
     PROMPT_MASTER_CANCEL,
@@ -103,6 +103,12 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
+from metrics import (
+    suno_enqueue_duration_seconds,
+    suno_notify_duration_seconds,
+    suno_notify_fail,
+    suno_notify_ok,
+)
 from settings import REDIS_PREFIX, SUNO_LOG_KEY
 from suno.service import SunoService, SunoAPIError
 from telegram_utils import safe_send
@@ -122,9 +128,19 @@ SHUTDOWN_EVENT = threading.Event()
 
 SUNO_SERVICE = SunoService()
 
+_METRIC_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+_METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
+
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
 _SUNO_LOCK_MEMORY: set[int] = set()
+
+_SUNO_PENDING_TTL = 24 * 60 * 60
+_SUNO_PENDING_LOCK = threading.Lock()
+_SUNO_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
+
+_SUNO_REFUND_PENDING_LOCK = threading.Lock()
+_SUNO_REFUND_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
 
 
 def _suno_lock_key(user_id: int) -> str:
@@ -198,6 +214,127 @@ def _suno_set_cooldown(user_id: int) -> None:
 
 def _suno_refund_key(task_id: str) -> str:
     return f"{REDIS_PREFIX}:refund:{task_id}"
+
+
+def _suno_pending_key(req_id: str) -> str:
+    return f"{REDIS_PREFIX}:suno:pending:{req_id}"
+
+
+def _suno_refund_pending_key(req_id: str) -> str:
+    return f"{REDIS_PREFIX}:suno:refund:pending:{req_id}"
+
+
+def _suno_pending_store(req_id: str, payload: Dict[str, Any]) -> None:
+    if not req_id:
+        return
+    key = _suno_pending_key(req_id)
+    raw = json.dumps(payload, ensure_ascii=False)
+    if rds:
+        try:
+            rds.setex(key, _SUNO_PENDING_TTL, raw)
+            return
+        except Exception as exc:
+            log.warning("Suno pending redis error | req_id=%s err=%s", req_id, exc)
+    expires_at = time.time() + _SUNO_PENDING_TTL
+    with _SUNO_PENDING_LOCK:
+        _SUNO_PENDING_MEMORY[key] = (expires_at, raw)
+
+
+def _suno_pending_load(req_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not req_id:
+        return None
+    key = _suno_pending_key(req_id)
+    raw: Optional[str] = None
+    if rds:
+        try:
+            data = rds.get(key)
+        except Exception as exc:
+            log.warning("Suno pending redis get error | req_id=%s err=%s", req_id, exc)
+        else:
+            if isinstance(data, bytes):
+                raw = data.decode("utf-8", errors="replace")
+            elif data is not None:
+                raw = str(data)
+    if raw is None:
+        now = time.time()
+        with _SUNO_PENDING_LOCK:
+            entry = _SUNO_PENDING_MEMORY.get(key)
+            if entry:
+                expires_at, value = entry
+                if expires_at > now:
+                    raw = value
+                else:
+                    _SUNO_PENDING_MEMORY.pop(key, None)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        log.warning("Suno pending decode error | req_id=%s", req_id)
+        return None
+
+
+def _suno_refund_pending_mark(req_id: str, payload: Dict[str, Any]) -> None:
+    if not req_id:
+        return
+    key = _suno_refund_pending_key(req_id)
+    raw = json.dumps(payload, ensure_ascii=False)
+    if rds:
+        try:
+            rds.setex(key, _SUNO_PENDING_TTL, raw)
+            return
+        except Exception as exc:
+            log.warning("Suno refund-pending redis error | req_id=%s err=%s", req_id, exc)
+    expires_at = time.time() + _SUNO_PENDING_TTL
+    with _SUNO_REFUND_PENDING_LOCK:
+        _SUNO_REFUND_PENDING_MEMORY[key] = (expires_at, raw)
+
+
+def _suno_refund_pending_load(req_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not req_id:
+        return None
+    key = _suno_refund_pending_key(req_id)
+    raw: Optional[str] = None
+    if rds:
+        try:
+            data = rds.get(key)
+        except Exception as exc:
+            log.warning("Suno refund-pending redis get error | req_id=%s err=%s", req_id, exc)
+        else:
+            if isinstance(data, bytes):
+                raw = data.decode("utf-8", errors="replace")
+            elif data is not None:
+                raw = str(data)
+    if raw is None:
+        now = time.time()
+        with _SUNO_REFUND_PENDING_LOCK:
+            entry = _SUNO_REFUND_PENDING_MEMORY.get(key)
+            if entry:
+                expires_at, value = entry
+                if expires_at > now:
+                    raw = value
+                else:
+                    _SUNO_REFUND_PENDING_MEMORY.pop(key, None)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        log.warning("Suno refund-pending decode error | req_id=%s", req_id)
+        return None
+
+
+def _suno_refund_pending_clear(req_id: Optional[str]) -> None:
+    if not req_id:
+        return
+    key = _suno_refund_pending_key(req_id)
+    if rds:
+        try:
+            rds.delete(key)
+        except Exception as exc:
+            log.warning("Suno refund-pending redis delete error | req_id=%s err=%s", req_id, exc)
+    with _SUNO_REFUND_PENDING_LOCK:
+        _SUNO_REFUND_PENDING_MEMORY.pop(key, None)
 
 
 def _suno_acquire_refund(task_id: Optional[str]) -> bool:
@@ -2610,6 +2747,16 @@ async def _suno_issue_refund(
     if req_id:
         meta["req_id"] = req_id
 
+    if req_id:
+        _suno_refund_pending_clear(req_id)
+        pending_meta = _suno_pending_load(req_id)
+        if isinstance(pending_meta, dict):
+            pending_meta.update({
+                "status": "refunded",
+                "updated_ts": _utcnow_iso(),
+            })
+            _suno_pending_store(req_id, pending_meta)
+
     allow_refund = _suno_acquire_refund(task_id)
     if allow_refund:
         try:
@@ -2721,7 +2868,21 @@ async def _launch_suno_generation(
     style = (params.get("style") or "").strip()
     lyrics = params.get("lyrics") or ""
     model = SUNO_MODEL or "V5"
-    req_id = str(uuid.uuid4())
+    existing_req_id = s.get("suno_current_req_id")
+    req_id = (
+        existing_req_id
+        if isinstance(existing_req_id, str) and existing_req_id.strip()
+        else str(uuid.uuid4())
+    )
+
+    existing_pending = _suno_pending_load(req_id)
+    if existing_pending and existing_pending.get("status") == "queued" and existing_pending.get("task_id"):
+        log.info(
+            "[SUNO] duplicate launch skip | req_id=%s task_id=%s",
+            req_id,
+            existing_pending.get("task_id"),
+        )
+        return
 
     meta: Dict[str, Any] = {
         "task_id": None,
@@ -2749,7 +2910,14 @@ async def _launch_suno_generation(
         },
     )
 
-    ok, new_balance = debit_try(user_id, PRICE_SUNO, "suno:start", meta=meta)
+    already_charged = bool(existing_pending and existing_pending.get("charged"))
+    if already_charged:
+        ok = True
+        new_balance = existing_pending.get("balance_after")
+        if not isinstance(new_balance, int):
+            new_balance = s.get("suno_balance")
+    else:
+        ok, new_balance = debit_try(user_id, PRICE_SUNO, "suno:start", meta=meta)
     if not ok:
         balance_after = new_balance if isinstance(new_balance, int) else _safe_get_balance(user_id)
         await show_balance_notification(
@@ -2769,115 +2937,236 @@ async def _launch_suno_generation(
         "lyrics": lyrics,
         "instrumental": instrumental,
     }
-    s["suno_balance"] = new_balance
+    if isinstance(new_balance, int):
+        s["suno_balance"] = new_balance
     s["_last_text_suno"] = None
     s["suno_waiting_field"] = None
     s["suno_current_req_id"] = req_id
 
-    await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
-    await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
-
-    notify_text = (
-        f"✅ Списано {PRICE_SUNO}💎. Задача отправлена в Suno. "
-        "Как только получим коллбек — пришлю аудио/ссылки."
-    )
-    ack_message = await _suno_notify(
-        ctx,
-        chat_id,
-        notify_text,
-        req_id=req_id,
-        reply_to=reply_to,
-    )
-
-    reply_message_id = 0
-    if ack_message is not None and getattr(ack_message, "message_id", None):
-        reply_message_id = int(getattr(ack_message, "message_id"))
-    elif reply_to is not None:
-        reply_message_id = int(reply_to.message_id)
-
     try:
-        task = await asyncio.to_thread(
-            SUNO_SERVICE.start_music,
-            chat_id,
-            reply_message_id,
-            title=title or None,
-            style=style or None,
-            lyrics=(lyrics if (lyrics and not instrumental) else None),
-            model=model,
-            instrumental=instrumental,
-            user_id=user_id,
-            prompt="\n".join(
-                part.strip()
-                for part in (
-                    title or "",
-                    style or "",
-                    (lyrics or "") if (lyrics and not instrumental) else "",
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
+
+        pending_meta = dict(existing_pending or {})
+        pending_meta.update(
+            {
+                "user_id": int(user_id),
+                "chat_id": int(chat_id),
+                "price": PRICE_SUNO,
+                "req_id": req_id,
+                "charged": True,
+            }
+        )
+
+        notify_text = (
+            f"✅ Списано {PRICE_SUNO}💎. Задача отправлена в Suno. "
+            "Как только получим коллбек — пришлю аудио/ссылки."
+        )
+        notify_exc: Optional[Exception] = None
+        notify_started = time.monotonic()
+        notify_ok = False
+        ack_message: Optional["telegram.Message"] = None
+        try:
+            ack_message = await _suno_notify(
+                ctx,
+                chat_id,
+                notify_text,
+                req_id=req_id,
+                reply_to=reply_to,
+            )
+        except (Forbidden, BadRequest, RetryAfter, TimedOut, NetworkError, TelegramError) as exc:
+            notify_exc = exc
+        except Exception as exc:
+            notify_exc = exc
+        finally:
+            duration = time.monotonic() - notify_started
+            suno_notify_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+            if notify_exc is None:
+                notify_ok = True
+                suno_notify_ok.labels(**_METRIC_LABELS).inc()
+                log.info("[SUNO] notify ok | req_id=%s duration=%.3f", req_id, duration)
+            else:
+                suno_notify_fail.labels(type=type(notify_exc).__name__, **_METRIC_LABELS).inc()
+                log.warning(
+                    "[SUNO] notify fail | req_id=%s user_id=%s chat_id=%s err=%s duration=%.3f",
+                    req_id,
+                    user_id,
+                    chat_id,
+                    notify_exc,
+                    duration,
                 )
-                if part and part.strip()
-            ),
-            req_id=req_id,
-        )
-    except SunoAPIError as exc:
-        log.warning("Suno start failed | status=%s payload=%s", exc.status, exc.payload)
-        await _suno_issue_refund(
-            ctx,
-            chat_id,
-            user_id,
-            base_meta=meta,
-            task_id=None,
-            error_text=str(exc.payload or exc),
-            reason="suno:refund:create_err",
-            req_id=req_id,
-            reply_to=reply_to,
-        )
-        s["suno_generating"] = False
-        return
-    except Exception as exc:
-        log.exception("Suno start crashed: %s", exc)
-        await _suno_issue_refund(
-            ctx,
-            chat_id,
-            user_id,
-            base_meta=meta,
-            task_id=None,
-            error_text=str(exc),
-            reason="suno:refund:create_err",
-            req_id=req_id,
-            reply_to=reply_to,
-        )
-        s["suno_generating"] = False
-        return
 
-    task_id = (task.task_id or "").strip()
-    if not task_id:
-        log.warning("Suno start response missing task_id | task=%s", task)
-        await _suno_issue_refund(
-            ctx,
-            chat_id,
-            user_id,
-            base_meta=meta,
-            task_id=None,
-            error_text="missing_task_id",
-            reason="suno:refund:create_err",
-            req_id=req_id,
-            reply_to=reply_to,
+        pending_meta.update(
+            {
+                "ts": _utcnow_iso(),
+                "updated_ts": _utcnow_iso(),
+                "notify_ok": notify_ok,
+                "status": "pending",
+            }
         )
+        if isinstance(new_balance, int):
+            pending_meta["balance_after"] = new_balance
+        _suno_pending_store(req_id, pending_meta)
+        _suno_refund_pending_clear(req_id)
+
+        reply_message_id = 0
+        if ack_message is not None and getattr(ack_message, "message_id", None):
+            reply_message_id = int(getattr(ack_message, "message_id"))
+        elif reply_to is not None:
+            reply_message_id = int(reply_to.message_id)
+
+        enqueue_started = time.monotonic()
+        prompt_text = "\n".join(
+            part.strip()
+            for part in (
+                title or "",
+                style or "",
+                (lyrics or "") if (lyrics and not instrumental) else "",
+            )
+            if part and part.strip()
+        )
+
+        try:
+            task = await asyncio.to_thread(
+                SUNO_SERVICE.start_music,
+                chat_id,
+                reply_message_id,
+                title=title or None,
+                style=style or None,
+                lyrics=(lyrics if (lyrics and not instrumental) else None),
+                model=model,
+                instrumental=instrumental,
+                user_id=user_id,
+                prompt=prompt_text,
+                req_id=req_id,
+            )
+        except SunoAPIError as exc:
+            duration = time.monotonic() - enqueue_started
+            suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+            pending_meta.update(
+                {
+                    "status": "api_error",
+                    "error": str(exc.payload or exc),
+                    "updated_ts": _utcnow_iso(),
+                }
+            )
+            _suno_pending_store(req_id, pending_meta)
+            _suno_refund_pending_mark(req_id, pending_meta)
+            log.warning(
+                "[SUNO] enqueue api error | req_id=%s duration=%.3f status=%s",
+                req_id,
+                duration,
+                exc.status,
+            )
+            await _suno_issue_refund(
+                ctx,
+                chat_id,
+                user_id,
+                base_meta=meta,
+                task_id=None,
+                error_text=str(exc.payload or exc),
+                reason="suno:refund:create_err",
+                req_id=req_id,
+                reply_to=reply_to,
+            )
+            return
+        except Exception as exc:
+            duration = time.monotonic() - enqueue_started
+            suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+            pending_meta.update(
+                {
+                    "status": "failed",
+                    "error": str(exc),
+                    "updated_ts": _utcnow_iso(),
+                }
+            )
+            _suno_pending_store(req_id, pending_meta)
+            _suno_refund_pending_mark(req_id, pending_meta)
+            log.exception(
+                "[SUNO] enqueue crash | req_id=%s duration=%.3f",
+                req_id,
+                duration,
+            )
+            await _suno_issue_refund(
+                ctx,
+                chat_id,
+                user_id,
+                base_meta=meta,
+                task_id=None,
+                error_text=str(exc),
+                reason="suno:refund:create_err",
+                req_id=req_id,
+                reply_to=reply_to,
+            )
+            return
+
+        duration = time.monotonic() - enqueue_started
+        suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+
+        task_id = (task.task_id or "").strip()
+        if not task_id:
+            log.warning("Suno start response missing task_id | task=%s", task)
+            pending_meta.update(
+                {
+                    "status": "missing_task_id",
+                    "error": "missing_task_id",
+                    "updated_ts": _utcnow_iso(),
+                }
+            )
+            _suno_pending_store(req_id, pending_meta)
+            _suno_refund_pending_mark(req_id, pending_meta)
+            await _suno_issue_refund(
+                ctx,
+                chat_id,
+                user_id,
+                base_meta=meta,
+                task_id=None,
+                error_text="missing_task_id",
+                reason="suno:refund:create_err",
+                req_id=req_id,
+                reply_to=reply_to,
+            )
+            return
+
+        log.info("[SUNO] enqueue ok | req_id=%s task_id=%s duration=%.3f", req_id, task_id, duration)
+
+        _suno_set_cooldown(int(user_id))
+        meta["task_id"] = task_id
+        _suno_update_last_debit_meta(user_id, {"task_id": task_id})
+
+        pending_meta.update(
+            {
+                "task_id": task_id,
+                "status": "queued",
+                "updated_ts": _utcnow_iso(),
+            }
+        )
+        _suno_pending_store(req_id, pending_meta)
+        _suno_refund_pending_clear(req_id)
+
+        s["suno_last_task_id"] = task_id
+        s["suno_last_params"] = {
+            "title": title,
+            "style": style,
+            "lyrics": lyrics,
+            "instrumental": instrumental,
+        }
         s["suno_generating"] = False
-        return
-
-    _suno_set_cooldown(int(user_id))
-    meta["task_id"] = task_id
-    _suno_update_last_debit_meta(user_id, {"task_id": task_id})
-
-    s["suno_last_task_id"] = task_id
-    s["suno_last_params"] = {
-        "title": title,
-        "style": style,
-        "lyrics": lyrics,
-        "instrumental": instrumental,
-    }
-    s["suno_generating"] = False
-    await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        s["suno_current_req_id"] = None
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+    finally:
+        if s.get("suno_generating"):
+            s["suno_generating"] = False
+            s["suno_current_req_id"] = None
+            s["_last_text_suno"] = None
+            try:
+                await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+            except Exception as exc:
+                log.warning("[SUNO] final card refresh fail | req_id=%s err=%s", req_id, exc)
+            try:
+                await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
+            except Exception as exc:
+                log.warning("[SUNO] final balance refresh fail | req_id=%s err=%s", req_id, exc)
 
 
 async def _poll_suno_and_send(

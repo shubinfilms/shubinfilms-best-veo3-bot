@@ -51,6 +51,8 @@ def _import_bot(monkeypatch):
     module = importlib.import_module("bot")
     module._SUNO_REFUND_MEMORY.clear()
     module._SUNO_COOLDOWN_MEMORY.clear()
+    module._SUNO_PENDING_MEMORY.clear()
+    module._SUNO_REFUND_PENDING_MEMORY.clear()
     return module
 
 
@@ -97,3 +99,28 @@ def test_cooldown_blocks(monkeypatch):
     bot._SUNO_COOLDOWN_MEMORY[84] = time.time() + 3
     remaining_local = bot._suno_cooldown_remaining(84)
     assert remaining_local >= 2
+
+
+def test_suno_pending_storage(monkeypatch):
+    bot = _import_bot(monkeypatch)
+    monkeypatch.setattr(bot, "rds", None)
+    req_id = "req-pending"
+    payload = {"user_id": 1, "chat_id": 2, "price": 3, "ts": "now", "notify_ok": True}
+    bot._suno_pending_store(req_id, payload)
+    stored = bot._suno_pending_load(req_id)
+    assert stored is not None
+    assert stored["user_id"] == 1
+    assert stored["notify_ok"] is True
+
+
+def test_suno_refund_pending_guard(monkeypatch):
+    bot = _import_bot(monkeypatch)
+    monkeypatch.setattr(bot, "rds", None)
+    req_id = "req-refund"
+    payload = {"user_id": 7, "chat_id": 8}
+    bot._suno_refund_pending_mark(req_id, payload)
+    stored = bot._suno_refund_pending_load(req_id)
+    assert stored is not None
+    assert stored["user_id"] == 7
+    bot._suno_refund_pending_clear(req_id)
+    assert bot._suno_refund_pending_load(req_id) is None

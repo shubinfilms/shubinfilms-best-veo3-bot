@@ -1,11 +1,22 @@
+import asyncio
+import importlib
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
 from fastapi.testclient import TestClient
+from metrics import (
+    suno_enqueue_duration_seconds,
+    suno_notify_duration_seconds,
+    suno_notify_fail,
+    suno_notify_ok,
+)
+from telegram.error import Forbidden, TimedOut
 
 os.environ.setdefault("SUNO_API_TOKEN", "test-token")
 os.environ.setdefault("SUNO_CALLBACK_SECRET", "secret-token")
@@ -48,6 +59,53 @@ def _reset_env(monkeypatch):
 
 def _client():
     return TestClient(app)
+
+
+def _metric_labels() -> dict[str, str]:
+    env = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+    return {"env": env, "service": "bot"}
+
+
+def _counter_value(counter, **labels) -> float:
+    child = counter.labels(**labels)
+    return child._value.get()
+
+
+def _hist_sum(histogram, **labels) -> float:
+    child = histogram.labels(**labels)
+    return child._sum.get()
+
+
+class FakeRedis:
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    def setex(self, key, ttl, value):
+        self.store[key] = value
+        return True
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def delete(self, key):
+        self.store.pop(key, None)
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        return True
+
+
+@pytest.fixture
+def bot_module(monkeypatch):
+    monkeypatch.setenv("LEDGER_BACKEND", "memory")
+    bot = importlib.import_module("bot")
+    bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_COOLDOWN_MEMORY.clear()
+    bot._SUNO_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_PENDING_MEMORY.clear()
+    return bot
 
 
 def test_callback_accepts_header_token(monkeypatch):
@@ -242,3 +300,360 @@ def test_callback_restores_missing_req_id(monkeypatch):
     assert response.status_code == 200
     assert captured["task"].task_id == "restore-task"
     assert captured["req_id"] == "req-restore"
+
+
+def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
+    bot = bot_module
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    labels = _metric_labels()
+    ok_before = _counter_value(suno_notify_ok, **labels)
+    notify_hist_before = _hist_sum(suno_notify_duration_seconds, **labels)
+    enqueue_hist_before = _hist_sum(suno_enqueue_duration_seconds, **labels)
+
+    debit_calls = {"count": 0}
+
+    def fake_debit_try(user_id, price, reason, meta):
+        debit_calls["count"] += 1
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit_try)
+
+    notify_calls = {"count": 0}
+
+    async def fake_notify(*args, **kwargs):
+        notify_calls["count"] += 1
+        return SimpleNamespace(message_id=111)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    start_calls = {"count": 0}
+
+    class DummyTask:
+        def __init__(self, task_id: str):
+            self.task_id = task_id
+            self.items = []
+            self.callback_type = "start"
+            self.msg = None
+            self.code = None
+
+    def fake_start_music(*args, **kwargs):
+        start_calls["count"] += 1
+        return DummyTask("task-xyz")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
+
+    fixed_uuid = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run():
+        await bot._launch_suno_generation(
+            chat_id=123,
+            ctx=ctx,
+            params=params,
+            user_id=555,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    ok_after = _counter_value(suno_notify_ok, **labels)
+    notify_hist_after = _hist_sum(suno_notify_duration_seconds, **labels)
+    enqueue_hist_after = _hist_sum(suno_enqueue_duration_seconds, **labels)
+
+    assert ok_after == ok_before + 1
+    assert notify_hist_after > notify_hist_before
+    assert enqueue_hist_after > enqueue_hist_before
+    assert notify_calls["count"] == 1
+    assert start_calls["count"] == 1
+    assert debit_calls["count"] == 1
+
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    assert pending_key in fake_redis.store
+    record = json.loads(fake_redis.store[pending_key])
+    assert record["notify_ok"] is True
+    assert record["task_id"] == "task-xyz"
+    assert record["status"] == "queued"
+    state = bot.state(ctx)
+    assert state["suno_generating"] is False
+    assert state["suno_current_req_id"] is None
+
+
+def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
+    bot = bot_module
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    labels = _metric_labels()
+    ok_before = _counter_value(suno_notify_ok, **labels)
+    fail_labels = dict(labels, type="Forbidden")
+    fail_before = _counter_value(suno_notify_fail, **fail_labels)
+
+    debit_calls = {"count": 0}
+
+    def fake_debit_try(user_id, price, reason, meta):
+        debit_calls["count"] += 1
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit_try)
+
+    async def failing_notify(*args, **kwargs):
+        raise Forbidden("blocked")
+
+    monkeypatch.setattr(bot, "_suno_notify", failing_notify)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    class DummyTask:
+        def __init__(self, task_id: str):
+            self.task_id = task_id
+            self.items = []
+            self.callback_type = "start"
+            self.msg = None
+            self.code = None
+
+    start_calls = {"count": 0}
+
+    def fake_start_music(*args, **kwargs):
+        start_calls["count"] += 1
+        return DummyTask("task-fail-ok")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
+
+    fixed_uuid = uuid.UUID("00000000-0000-0000-0000-000000000002")
+    monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run():
+        await bot._launch_suno_generation(
+            chat_id=321,
+            ctx=ctx,
+            params=params,
+            user_id=777,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    ok_after = _counter_value(suno_notify_ok, **labels)
+    fail_after = _counter_value(suno_notify_fail, **fail_labels)
+    assert ok_after == ok_before
+    assert fail_after == fail_before + 1
+    assert start_calls["count"] == 1
+    assert debit_calls["count"] == 1
+
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    record = json.loads(fake_redis.store[pending_key])
+    assert record["notify_ok"] is False
+    assert record["task_id"] == "task-fail-ok"
+    assert record["status"] == "queued"
+    state = bot.state(ctx)
+    assert state["suno_generating"] is False
+
+
+def test_launch_suno_failure_marks_refund(monkeypatch, bot_module):
+    bot = bot_module
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    labels = _metric_labels()
+    fail_labels = dict(labels, type="TimedOut")
+    fail_before = _counter_value(suno_notify_fail, **fail_labels)
+
+    debit_calls = {"count": 0}
+
+    def fake_debit_try(user_id, price, reason, meta):
+        debit_calls["count"] += 1
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit_try)
+
+    async def failing_notify(*args, **kwargs):
+        raise TimedOut("late")
+
+    monkeypatch.setattr(bot, "_suno_notify", failing_notify)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    refund_calls = {"count": 0}
+
+    async def fake_issue_refund(*args, **kwargs):
+        refund_calls["count"] += 1
+        ctx_obj = args[0] if args else kwargs.get("ctx")
+        if ctx_obj is not None:
+            state = bot.state(ctx_obj)
+            state["suno_generating"] = False
+            state["suno_current_req_id"] = None
+
+    monkeypatch.setattr(bot, "_suno_issue_refund", fake_issue_refund)
+
+    fixed_uuid = uuid.UUID("00000000-0000-0000-0000-000000000003")
+    monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run():
+        await bot._launch_suno_generation(
+            chat_id=654,
+            ctx=ctx,
+            params=params,
+            user_id=888,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    fail_after = _counter_value(suno_notify_fail, **fail_labels)
+    assert fail_after == fail_before + 1
+    assert debit_calls["count"] == 1
+    assert refund_calls["count"] == 1
+
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    record = json.loads(fake_redis.store[pending_key])
+    assert record["status"] == "failed"
+    assert record["notify_ok"] is False
+
+    refund_key = f"{bot.REDIS_PREFIX}:suno:refund:pending:{str(fixed_uuid)}"
+    assert refund_key in fake_redis.store
+    refund_record = json.loads(fake_redis.store[refund_key])
+    assert refund_record["status"] == "failed"
+
+
+def test_launch_suno_duplicate_req_id_no_double_charge(monkeypatch, bot_module):
+    bot = bot_module
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    debit_calls = {"count": 0}
+
+    def fake_debit_try(user_id, price, reason, meta):
+        debit_calls["count"] += 1
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit_try)
+
+    async def fake_notify(*args, **kwargs):
+        return SimpleNamespace(message_id=200)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    class DummyTask:
+        def __init__(self, task_id: str):
+            self.task_id = task_id
+            self.items = []
+            self.callback_type = "start"
+            self.msg = None
+            self.code = None
+
+    start_calls = {"count": 0}
+
+    def fake_start_music(*args, **kwargs):
+        start_calls["count"] += 1
+        return DummyTask("task-dupe")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
+
+    fixed_uuid = uuid.UUID("00000000-0000-0000-0000-000000000004")
+    monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run():
+        await bot._launch_suno_generation(
+            chat_id=777,
+            ctx=ctx,
+            params=params,
+            user_id=999,
+            reply_to=None,
+            trigger="test",
+        )
+        await bot._launch_suno_generation(
+            chat_id=777,
+            ctx=ctx,
+            params=params,
+            user_id=999,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    assert debit_calls["count"] == 1
+    assert start_calls["count"] == 1
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    assert pending_key in fake_redis.store

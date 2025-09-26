@@ -64,6 +64,34 @@ bot_telegram_send_fail_total = Counter(
     registry=REGISTRY,
 )
 
+suno_notify_ok = Counter(
+    "suno_notify_ok",
+    "Successful Suno launch notifications",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
+suno_notify_fail = Counter(
+    "suno_notify_fail",
+    "Failed Suno launch notifications grouped by error type",
+    labelnames=("type", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_notify_duration_seconds = Histogram(
+    "suno_notify_duration_seconds",
+    "Duration of Suno launch acknowledgement notifications",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
+suno_enqueue_duration_seconds = Histogram(
+    "suno_enqueue_duration_seconds",
+    "Duration of Suno enqueue operations",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
 process_uptime_seconds = Gauge(
     "process_uptime_seconds",
     "Process uptime in seconds",
@@ -89,6 +117,10 @@ __all__: Iterable[str] = [
     "suno_callback_total",
     "telegram_send_total",
     "suno_latency_seconds",
+    "suno_notify_ok",
+    "suno_notify_fail",
+    "suno_notify_duration_seconds",
+    "suno_enqueue_duration_seconds",
     "process_uptime_seconds",
     "render_metrics",
 ]
