@@ -257,6 +257,11 @@ async def suno_callback(
     request: Request,
     x_callback_token: Optional[str] = Header(default=None),
 ):
+    if not SUNO_ENABLED:
+        log.warning("callback ignored (disabled)", extra={"meta": {"path": str(request.url.path)}})
+        suno_callback_total.labels(status="disabled", **_WEB_LABELS).inc()
+        return JSONResponse({"error": "disabled"}, status_code=503)
+
     provided = x_callback_token or request.query_params.get("token")
     if SUNO_CALLBACK_SECRET and provided != SUNO_CALLBACK_SECRET:
         log.warning("forbidden callback", extra={"meta": {"provided": bool(provided)}})
@@ -299,6 +304,24 @@ async def suno_callback(
 
     _prepare_assets(task)
     service.handle_callback(task, req_id=req_id)
+    status_name = (task.callback_type or "").lower()
+    if status_name in {"complete", "success"}:
+        log.info(
+            "suno callback success",
+            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "code": task.code}},
+        )
+    else:
+        log.warning(
+            "suno callback processed",
+            extra={
+                "meta": {
+                    "task_id": task.task_id,
+                    "req_id": req_id,
+                    "code": task.code,
+                    "type": status_name,
+                }
+            },
+        )
     suno_callback_total.labels(status="ok", **_WEB_LABELS).inc()
     return {"ok": True}
 

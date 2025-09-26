@@ -34,10 +34,7 @@ log = logging.getLogger("suno.client")
 
 _RETRYABLE_CODES = {408, 429}
 _BACKOFF_SCHEDULE = (1, 3, 7)
-_LEGACY_GEN_PATH = "/api/v1/generate/music"
-_LEGACY_TASK_STATUS_PATH = "/api/v1/generate/record-info"
 _API_V5 = "v5"
-_API_LEGACY = "legacy"
 
 
 class SunoAPIError(RuntimeError):
@@ -131,15 +128,6 @@ class SunoClient:
             return "suno-v5"
         return normalized
 
-    @staticmethod
-    def _legacy_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"title", "style", "lyrics", "model", "instrumental"}
-        result: dict[str, Any] = {}
-        for key in allowed:
-            if key in payload and payload[key] is not None:
-                result[key] = payload[key]
-        return result
-
     def _build_v5_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self._normalize_model(str(payload.get("model") or "")),
@@ -168,29 +156,18 @@ class SunoClient:
         except (TypeError, ValueError):
             return False
 
-    def _should_fallback_error(self, error: SunoAPIError) -> bool:
-        if error.status == 404:
-            return True
-        payload = error.payload
-        if isinstance(payload, Mapping) and self._is_not_found_code(payload.get("code")):
-            return True
-        return False
-
-    def _should_fallback_payload(self, payload: Mapping[str, Any]) -> bool:
+    def _raise_if_not_found(self, payload: Mapping[str, Any]) -> None:
         if not isinstance(payload, Mapping):
-            return False
+            return
         if self._is_not_found_code(payload.get("code")):
-            return True
+            error = SunoAPIError("Suno reported not found", status=404, payload=payload)
+            error.api_version = _API_V5
+            raise error
         nested = payload.get("data")
         if isinstance(nested, Mapping) and self._is_not_found_code(nested.get("code")):
-            return True
-        return False
-
-    def _log_fallback(self, *, target: str, req_id: Optional[str], reason: str) -> None:
-        log.info(
-            "suno.http fallback",
-            extra={"meta": {"target": target, "reason": reason, "req_id": req_id}},
-        )
+            error = SunoAPIError("Suno reported not found", status=404, payload=payload)
+            error.api_version = _API_V5
+            raise error
 
     @staticmethod
     def _parse_json(response: Response) -> Mapping[str, Any]:
@@ -288,43 +265,14 @@ class SunoClient:
     def create_music(
         self, payload: Mapping[str, Any], *, req_id: Optional[str] = None
     ) -> tuple[Mapping[str, Any], str]:
-        legacy_payload = self._legacy_payload(payload)
         body_v5 = self._build_v5_payload(payload)
-        api_version = _API_V5
         try:
             response = self._request("POST", self._primary_gen_path, json_payload=body_v5, req_id=req_id)
         except SunoAPIError as exc:
-            if self._should_fallback_error(exc):
-                self._log_fallback(target=_LEGACY_GEN_PATH, req_id=req_id, reason="not_found")
-                api_version = _API_LEGACY
-                try:
-                    response = self._request(
-                        "POST",
-                        _LEGACY_GEN_PATH,
-                        json_payload=legacy_payload,
-                        req_id=req_id,
-                    )
-                except SunoAPIError as legacy_exc:
-                    legacy_exc.api_version = api_version
-                    raise
-            else:
-                exc.api_version = api_version
-                raise
-        else:
-            if self._should_fallback_payload(response):
-                self._log_fallback(target=_LEGACY_GEN_PATH, req_id=req_id, reason="code_404")
-                api_version = _API_LEGACY
-                try:
-                    response = self._request(
-                        "POST",
-                        _LEGACY_GEN_PATH,
-                        json_payload=legacy_payload,
-                        req_id=req_id,
-                    )
-                except SunoAPIError as legacy_exc:
-                    legacy_exc.api_version = api_version
-                    raise
-        return response, api_version
+            exc.api_version = _API_V5
+            raise
+        self._raise_if_not_found(response)
+        return response, _API_V5
 
     def get_task_status(self, task_id: str, *, req_id: Optional[str] = None) -> Mapping[str, Any]:
         params_v5 = {"taskId": task_id}
@@ -336,30 +284,9 @@ class SunoClient:
                 req_id=req_id,
             )
         except SunoAPIError as exc:
-            if self._should_fallback_error(exc):
-                self._log_fallback(target=_LEGACY_TASK_STATUS_PATH, req_id=req_id, reason="not_found")
-                try:
-                    response = self._request(
-                        "GET",
-                        _LEGACY_TASK_STATUS_PATH,
-                        params={"task_id": task_id},
-                        req_id=req_id,
-                    )
-                except SunoAPIError as legacy_exc:
-                    legacy_exc.api_version = _API_LEGACY
-                    raise
-            else:
-                exc.api_version = _API_V5
-                raise
-        else:
-            if self._should_fallback_payload(response):
-                self._log_fallback(target=_LEGACY_TASK_STATUS_PATH, req_id=req_id, reason="code_404")
-                response = self._request(
-                    "GET",
-                    _LEGACY_TASK_STATUS_PATH,
-                    params={"task_id": task_id},
-                    req_id=req_id,
-                )
+            exc.api_version = _API_V5
+            raise
+        self._raise_if_not_found(response)
         return response
 
 

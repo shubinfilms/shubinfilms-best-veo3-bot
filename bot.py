@@ -105,9 +105,13 @@ from ledger import (
 )
 from metrics import (
     suno_enqueue_duration_seconds,
+    suno_enqueue_total,
     suno_notify_duration_seconds,
     suno_notify_fail,
+    suno_notify_latency_ms,
     suno_notify_ok,
+    suno_notify_total,
+    suno_refund_total,
 )
 from settings import REDIS_PREFIX, SUNO_LOG_KEY
 from suno.service import SunoService, SunoAPIError
@@ -491,8 +495,6 @@ def _compose_suno_url(*parts: str) -> str:
     scheme = parsed.scheme or "https"
     netloc = parsed.netloc or normalized[0].split("://", 1)[-1].split("/", 1)[0]
     path = parsed.path.replace("//", "/")
-    path = path.replace("/suno-api/api/", "/api/")
-    path = path.replace("/suno-api/v1/", "/api/v1/")
     return urlunparse((scheme, netloc, path, "", "", ""))
 
 
@@ -508,16 +510,19 @@ def _normalize_prefix(value: str) -> str:
 def _load_suno_config() -> SunoConfig:
     base = (_env("SUNO_API_BASE", "https://api.kie.ai") or "https://api.kie.ai").strip().rstrip("/")
     prefix = _normalize_prefix(_env("SUNO_API_PREFIX", ""))
-    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/api/v1/generate/music"), "/api/v1/generate/music")
+    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/suno-api/generate"), "/suno-api/generate")
     status_path = _normalize_suno_path(
-        _env("SUNO_STATUS_PATH", "/get-music-details"),
-        "/get-music-details",
+        _env("SUNO_STATUS_PATH", "/suno-api/record-info"),
+        "/suno-api/record-info",
     )
     extend_path = _normalize_suno_path(
-        _env("SUNO_EXTEND_PATH", "/api/v1/generate/extend"),
-        "/api/v1/generate/extend",
+        _env("SUNO_EXTEND_PATH", "/suno-api/generate/extend"),
+        "/suno-api/generate/extend",
     )
-    lyrics_path = _normalize_suno_path(_env("SUNO_LYRICS_PATH", "/api/v1/lyrics"), "/api/v1/lyrics")
+    lyrics_path = _normalize_suno_path(
+        _env("SUNO_LYRICS_PATH", "/suno-api/generate/get-timestamped-lyrics"),
+        "/suno-api/generate/get-timestamped-lyrics",
+    )
     model = os.getenv("SUNO_MODEL", "V5").upper()  # всегда "V5"
     price = _env_int("SUNO_PRICE", 30)
     timeout_sec = _env_int("SUNO_TIMEOUT_SEC", 180)
@@ -3022,6 +3027,11 @@ async def _suno_issue_refund(
     if req_id:
         meta["req_id"] = req_id
 
+    metric_reason = "notify_error"
+    if reason.startswith("suno:refund:create"):
+        metric_reason = "enqeue_error"
+    suno_refund_total.labels(reason=metric_reason, **_METRIC_LABELS).inc()
+
     if req_id:
         _suno_refund_pending_clear(req_id)
         pending_meta = _suno_pending_load(req_id)
@@ -3222,6 +3232,9 @@ async def _launch_suno_generation(
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
 
+        short_req_id = (req_id or "").replace("-", "")[:6].upper()
+        req_label = short_req_id or "—"
+
         pending_meta = dict(existing_pending or {})
         pending_meta.update(
             {
@@ -3229,12 +3242,13 @@ async def _launch_suno_generation(
                 "chat_id": int(chat_id),
                 "price": PRICE_SUNO,
                 "req_id": req_id,
+                "req_short": req_label,
                 "charged": True,
             }
         )
 
         notify_text = (
-            f"✅ Списано {PRICE_SUNO}💎. Задача отправлена в Suno. "
+            f"✅ Списано {PRICE_SUNO}💎 (req {req_label}). Задача создана и отправлена в Suno. "
             "Как только получим коллбек — пришлю аудио/ссылки."
         )
         notify_exc: Optional[Exception] = None
@@ -3256,12 +3270,15 @@ async def _launch_suno_generation(
         finally:
             duration = time.monotonic() - notify_started
             suno_notify_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+            suno_notify_latency_ms.labels(**_METRIC_LABELS).observe(max(duration * 1000.0, 0.0))
             if notify_exc is None:
                 notify_ok = True
                 suno_notify_ok.labels(**_METRIC_LABELS).inc()
+                suno_notify_total.labels(outcome="success", **_METRIC_LABELS).inc()
                 log.info("[SUNO] notify ok | req_id=%s duration=%.3f", req_id, duration)
             else:
                 suno_notify_fail.labels(type=type(notify_exc).__name__, **_METRIC_LABELS).inc()
+                suno_notify_total.labels(outcome="error", **_METRIC_LABELS).inc()
                 log.warning(
                     "[SUNO] notify fail | req_id=%s user_id=%s chat_id=%s err=%s duration=%.3f",
                     req_id,
@@ -3318,6 +3335,7 @@ async def _launch_suno_generation(
         except SunoAPIError as exc:
             duration = time.monotonic() - enqueue_started
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+            suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
             pending_meta.update(
                 {
                     "status": "api_error",
@@ -3348,6 +3366,7 @@ async def _launch_suno_generation(
         except Exception as exc:
             duration = time.monotonic() - enqueue_started
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
+            suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
             pending_meta.update(
                 {
                     "status": "failed",
@@ -3377,7 +3396,6 @@ async def _launch_suno_generation(
 
         duration = time.monotonic() - enqueue_started
         suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
-
         task_id = (task.task_id or "").strip()
         if not task_id:
             log.warning("Suno start response missing task_id | task=%s", task)
@@ -3390,6 +3408,7 @@ async def _launch_suno_generation(
             )
             _suno_pending_store(req_id, pending_meta)
             _suno_refund_pending_mark(req_id, pending_meta)
+            suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
             await _suno_issue_refund(
                 ctx,
                 chat_id,
@@ -3402,6 +3421,8 @@ async def _launch_suno_generation(
                 reply_to=reply_to,
             )
             return
+
+        suno_enqueue_total.labels(outcome="success", api="v5", **_METRIC_LABELS).inc()
 
         log.info("[SUNO] enqueue ok | req_id=%s task_id=%s duration=%.3f", req_id, task_id, duration)
 

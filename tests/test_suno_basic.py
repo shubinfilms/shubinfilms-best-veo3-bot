@@ -10,23 +10,30 @@ from types import SimpleNamespace
 import pytest
 import requests
 from fastapi.testclient import TestClient
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from metrics import (
     suno_enqueue_duration_seconds,
+    suno_enqueue_total,
     suno_notify_duration_seconds,
     suno_notify_fail,
+    suno_notify_latency_ms,
     suno_notify_ok,
+    suno_notify_total,
+    suno_refund_total,
 )
 from telegram.error import Forbidden, TimedOut
 
 os.environ.setdefault("SUNO_API_TOKEN", "test-token")
 os.environ.setdefault("SUNO_CALLBACK_SECRET", "secret-token")
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("SUNO_ENABLED", "true")
+os.environ.setdefault("SUNO_CALLBACK_URL", "https://callback.local/suno-callback")
 
 import suno_web
 from suno_web import app
 import suno.tempfiles as tempfiles
-from suno.client import SunoClient
+from suno.client import SunoClient, SunoAPIError
 from suno.service import SunoService
 
 
@@ -57,8 +64,11 @@ def _build_payload(task_id: str = "task-1", callback_type: str = "complete") -> 
 def _reset_env(monkeypatch):
     monkeypatch.setenv("SUNO_CALLBACK_SECRET", "secret-token")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
+    monkeypatch.setenv("SUNO_ENABLED", "true")
+    monkeypatch.setenv("SUNO_CALLBACK_URL", "https://callback.local/suno-callback")
     monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
     monkeypatch.delenv("ADMIN_IDS", raising=False)
+    monkeypatch.setattr(suno_web, "SUNO_ENABLED", True, raising=False)
     suno_web._memory_idempotency.clear()
 
 
@@ -86,6 +96,8 @@ def _setup_client_env(monkeypatch) -> None:
     monkeypatch.setenv("SUNO_API_TOKEN", "token")
     monkeypatch.setenv("SUNO_CALLBACK_URL", "https://callback.local/suno-callback")
     monkeypatch.setenv("SUNO_CALLBACK_SECRET", "secret-token")
+    monkeypatch.setenv("SUNO_ENABLED", "true")
+    monkeypatch.setattr(suno_web, "SUNO_ENABLED", True, raising=False)
     monkeypatch.setenv("SUNO_MODEL", "suno-v5")
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_URL", "https://callback.local/suno-callback", raising=False)
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_SECRET", "secret-token", raising=False)
@@ -124,7 +136,7 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
     assert body["input"]["instrumental"] is True
 
 
-def test_suno_v5_enqueue_404_fallback_legacy(monkeypatch, requests_mock):
+def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
@@ -132,34 +144,27 @@ def test_suno_v5_enqueue_404_fallback_legacy(monkeypatch, requests_mock):
         status_code=404,
         json={"message": "not found"},
     )
-    requests_mock.post(
-        "https://api.example.com/api/v1/generate/music",
-        json={"task_id": "legacy-task"},
-    )
-    payload, version = client.create_music({"prompt": "hello", "instrumental": False})
-    assert version == "legacy"
-    assert payload["task_id"] == "legacy-task"
-    assert requests_mock.call_count == 2
+    with pytest.raises(SunoAPIError) as exc:
+        client.create_music({"prompt": "hello", "instrumental": False})
+    assert exc.value.status == 404
+    assert exc.value.api_version == "v5"
+    assert requests_mock.call_count == 1
 
 
-def test_suno_v5_enqueue_code_404_fallback_legacy(monkeypatch, requests_mock):
+def test_suno_v5_enqueue_code_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
         "https://api.example.com/suno-api/generate",
         json={"code": 404, "message": "not found"},
     )
-    requests_mock.post(
-        "https://api.example.com/api/v1/generate/music",
-        json={"task_id": "legacy-code"},
-    )
-    payload, version = client.create_music({"prompt": "fallback"})
-    assert version == "legacy"
-    assert payload["task_id"] == "legacy-code"
-    assert requests_mock.call_count == 2
+    with pytest.raises(SunoAPIError) as exc:
+        client.create_music({"prompt": "fallback"})
+    assert exc.value.api_version == "v5"
+    assert requests_mock.call_count == 1
 
 
-def test_suno_status_v5_then_404_fallback_legacy(monkeypatch, requests_mock):
+def test_suno_status_v5_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.get(
@@ -167,16 +172,11 @@ def test_suno_status_v5_then_404_fallback_legacy(monkeypatch, requests_mock):
         status_code=404,
         json={"message": "not found"},
     )
-    requests_mock.get(
-        "https://api.example.com/api/v1/generate/record-info",
-        json={"task_id": "legacy"},
-    )
-    payload = client.get_task_status("abc")
-    assert payload["task_id"] == "legacy"
-    assert requests_mock.call_count == 2
-    first_qs = requests_mock.request_history[0].qs
-    assert first_qs.get("taskId") == ["abc"] or first_qs.get("taskid") == ["abc"]
-    assert requests_mock.last_request.qs.get("task_id") == ["abc"]
+    with pytest.raises(SunoAPIError) as exc:
+        client.get_task_status("abc")
+    assert exc.value.status == 404
+    assert exc.value.api_version == "v5"
+    assert requests_mock.call_count == 1
 
 
 class FakeRedis:
@@ -435,7 +435,10 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     labels = _metric_labels()
     ok_before = _counter_value(suno_notify_ok, **labels)
     notify_hist_before = _hist_sum(suno_notify_duration_seconds, **labels)
+    notify_latency_before = _hist_sum(suno_notify_latency_ms, **labels)
     enqueue_hist_before = _hist_sum(suno_enqueue_duration_seconds, **labels)
+    notify_total_before = _counter_value(suno_notify_total, outcome="success", **labels)
+    enqueue_total_before = _counter_value(suno_enqueue_total, outcome="success", api="v5", **labels)
 
     debit_calls = {"count": 0}
 
@@ -494,11 +497,17 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
 
     ok_after = _counter_value(suno_notify_ok, **labels)
     notify_hist_after = _hist_sum(suno_notify_duration_seconds, **labels)
+    notify_latency_after = _hist_sum(suno_notify_latency_ms, **labels)
     enqueue_hist_after = _hist_sum(suno_enqueue_duration_seconds, **labels)
+    notify_total_after = _counter_value(suno_notify_total, outcome="success", **labels)
+    enqueue_total_after = _counter_value(suno_enqueue_total, outcome="success", api="v5", **labels)
 
     assert ok_after == ok_before + 1
     assert notify_hist_after > notify_hist_before
+    assert notify_latency_after > notify_latency_before
     assert enqueue_hist_after > enqueue_hist_before
+    assert notify_total_after == notify_total_before + 1
+    assert enqueue_total_after == enqueue_total_before + 1
     assert notify_calls["count"] == 1
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
@@ -509,6 +518,7 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     assert record["notify_ok"] is True
     assert record["task_id"] == "task-xyz"
     assert record["status"] == "queued"
+    assert record["req_short"] == "000000"
     state = bot.state(ctx)
     assert state["suno_generating"] is False
     assert state["suno_current_req_id"] is None
@@ -535,6 +545,8 @@ def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
     ok_before = _counter_value(suno_notify_ok, **labels)
     fail_labels = dict(labels, type="Forbidden")
     fail_before = _counter_value(suno_notify_fail, **fail_labels)
+    notify_total_error_before = _counter_value(suno_notify_total, outcome="error", **labels)
+    enqueue_total_before = _counter_value(suno_enqueue_total, outcome="success", api="v5", **labels)
 
     debit_calls = {"count": 0}
 
@@ -590,8 +602,12 @@ def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
 
     ok_after = _counter_value(suno_notify_ok, **labels)
     fail_after = _counter_value(suno_notify_fail, **fail_labels)
+    notify_total_error_after = _counter_value(suno_notify_total, outcome="error", **labels)
+    enqueue_total_after = _counter_value(suno_enqueue_total, outcome="success", api="v5", **labels)
     assert ok_after == ok_before
     assert fail_after == fail_before + 1
+    assert notify_total_error_after == notify_total_error_before + 1
+    assert enqueue_total_after == enqueue_total_before + 1
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
 

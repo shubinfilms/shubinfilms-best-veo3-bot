@@ -29,6 +29,34 @@ suno_callback_total = Counter(
     registry=REGISTRY,
 )
 
+suno_enqueue_total = Counter(
+    "suno_enqueue_total",
+    "Suno enqueue attempts grouped by outcome",
+    labelnames=("outcome", "api", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_notify_total = Counter(
+    "suno_notify_total",
+    "Launch acknowledgement notifications outcome",
+    labelnames=("outcome", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_notify_latency_ms = Histogram(
+    "suno_notify_latency_ms",
+    "Latency of Suno launch acknowledgements in milliseconds",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
+suno_refund_total = Counter(
+    "suno_refund_total",
+    "Total Suno refunds grouped by reason",
+    labelnames=("reason", "env", "service"),
+    registry=REGISTRY,
+)
+
 telegram_send_total = Counter(
     "telegram_send_total",
     "Telegram send attempts grouped by kind/result",
@@ -115,6 +143,10 @@ __all__: Iterable[str] = [
     "suno_task_store_total",
     "bot_telegram_send_fail_total",
     "suno_callback_total",
+    "suno_enqueue_total",
+    "suno_notify_total",
+    "suno_notify_latency_ms",
+    "suno_refund_total",
     "telegram_send_total",
     "suno_latency_seconds",
     "suno_notify_ok",
