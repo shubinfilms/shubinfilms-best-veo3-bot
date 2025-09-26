@@ -64,6 +64,26 @@ telegram_send_total = Counter(
     registry=REGISTRY,
 )
 
+chat_messages_total = Counter(
+    "chat_messages_total",
+    "Total chat messages processed",
+    labelnames=("outcome",),
+    registry=REGISTRY,
+)
+
+chat_latency_ms = Histogram(
+    "chat_latency_ms",
+    "Chat roundtrip latency in milliseconds",
+    buckets=(50, 100, 200, 400, 800, 1500, 3000, 6000, 10000),
+    registry=REGISTRY,
+)
+
+chat_context_tokens = Gauge(
+    "chat_context_tokens",
+    "Estimated tokens in chat context (last observed)",
+    registry=REGISTRY,
+)
+
 suno_latency_seconds = Histogram(
     "suno_latency_seconds",
     "Latency from task start to callback",
@@ -153,6 +173,9 @@ __all__: Iterable[str] = [
     "suno_notify_fail",
     "suno_notify_duration_seconds",
     "suno_enqueue_duration_seconds",
+    "chat_messages_total",
+    "chat_latency_ms",
+    "chat_context_tokens",
     "process_uptime_seconds",
     "render_metrics",
 ]
