@@ -1,83 +1,82 @@
-"""Tests for Prompt-Master handlers."""
-
 import asyncio
 import json
 from types import SimpleNamespace
 
 from handlers.prompt_master_handler import (
-    PM_HINT,
-    build_prompt_result,
-    classify_prompt_engine,
+    build_prompt,
+    detect_language,
     prompt_master_callback,
     prompt_master_open,
 )
-from keyboards import CB_PM_PREFIX, prompt_master_keyboard
+from keyboards import (
+    CB_PM_PREFIX,
+    prompt_master_keyboard,
+    prompt_master_mode_keyboard,
+)
 
 
-def test_prompt_master_keyboard_layout() -> None:
-    keyboard = prompt_master_keyboard()
+def test_prompt_master_keyboard_layout_ru() -> None:
+    keyboard = prompt_master_keyboard("ru")
     layout = [
         (button.text, button.callback_data)
         for row in keyboard.inline_keyboard
         for button in row
     ]
     expected = [
-        ("🎬 Видеопромпт (VEO)", f"{CB_PM_PREFIX}video"),
-        ("🖼️ Промпт генерации фото (MJ)", f"{CB_PM_PREFIX}mj_gen"),
-        ("🫥 Оживление фото (VEO)", f"{CB_PM_PREFIX}photo_live"),
-        ("✂️ Редактирование фото (Banana)", f"{CB_PM_PREFIX}banana_edit"),
-        ("🎵 Текст песни (Suno)", f"{CB_PM_PREFIX}suno_lyrics"),
-        ("↩️ Назад", f"{CB_PM_PREFIX}back"),
+        ("🎬 Видеопромпт (VEO)", f"{CB_PM_PREFIX}veo"),
+        ("🖼️ Изображение (Midjourney)", f"{CB_PM_PREFIX}mj"),
+        ("🫥 Оживление фото", f"{CB_PM_PREFIX}animate"),
+        ("✂️ Редактирование фото (Banana)", f"{CB_PM_PREFIX}banana"),
+        ("🎵 Трек (Suno)", f"{CB_PM_PREFIX}suno"),
+        ("⬅️ Назад", f"{CB_PM_PREFIX}back"),
     ]
     assert layout == expected
 
 
-def test_prompt_master_open_replies_with_keyboard() -> None:
+def test_prompt_master_open_replies_with_keyboard_html() -> None:
     calls = []
 
     async def fake_reply(text, **kwargs):
         calls.append((text, kwargs))
 
     message = SimpleNamespace(reply_text=fake_reply)
-    update = SimpleNamespace(effective_message=message, message=message, callback_query=None)
-    ctx = SimpleNamespace()
+    user = SimpleNamespace(language_code="ru")
+    update = SimpleNamespace(effective_message=message, message=message, callback_query=None, effective_user=user)
+    ctx = SimpleNamespace(user_data={})
 
     asyncio.run(prompt_master_open(update, ctx))
 
     assert calls
-    text, kwargs = calls[0]
-    assert text == PM_HINT
-    assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard().inline_keyboard
-    assert kwargs["parse_mode"] == "Markdown"
+    _text, kwargs = calls[0]
+    assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard("ru").inline_keyboard
+    assert kwargs["parse_mode"] == "HTML"
 
 
-def test_prompt_master_callback_returns_placeholder() -> None:
+def test_prompt_master_callback_sets_pm_state() -> None:
     edits = []
 
     async def fake_edit(text, **kwargs):
         edits.append((text, kwargs))
 
-    answers = []
-
-    async def fake_answer():
-        answers.append(True)
+    async def fake_answer(*args, **kwargs):
+        pass
 
     query = SimpleNamespace(
-        data=f"{CB_PM_PREFIX}video",
+        data=f"{CB_PM_PREFIX}veo",
         answer=fake_answer,
         edit_message_text=fake_edit,
-        message=SimpleNamespace(),
+        message=SimpleNamespace(chat=SimpleNamespace(id=1)),
     )
-    update = SimpleNamespace(callback_query=query, effective_user=None)
-    ctx = SimpleNamespace()
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=42, language_code="ru"), effective_chat=SimpleNamespace(id=1))
+    ctx = SimpleNamespace(user_data={})
 
     asyncio.run(prompt_master_callback(update, ctx))
 
-    assert answers == [True]
+    assert ctx.user_data.get("mode") == "pm"
+    assert ctx.user_data.get("pm_engine") == "veo"
     assert edits
-    text, kwargs = edits[0]
-    assert "Функция скоро будет доступна" in text
-    assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard().inline_keyboard
+    _text, kwargs = edits[0]
+    assert kwargs["reply_markup"].inline_keyboard == prompt_master_mode_keyboard("ru").inline_keyboard
 
 
 def test_prompt_master_callback_back_returns_menu() -> None:
@@ -86,56 +85,45 @@ def test_prompt_master_callback_back_returns_menu() -> None:
     async def fake_edit(text, **kwargs):
         edits.append((text, kwargs))
 
-    answers = []
-
-    async def fake_answer():
-        answers.append(True)
+    async def fake_answer(*args, **kwargs):
+        pass
 
     query = SimpleNamespace(
         data=f"{CB_PM_PREFIX}back",
         answer=fake_answer,
         edit_message_text=fake_edit,
-        message=SimpleNamespace(),
+        message=SimpleNamespace(chat=SimpleNamespace(id=1)),
     )
-    update = SimpleNamespace(callback_query=query, effective_message=None, effective_user=None)
-    ctx = SimpleNamespace()
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(language_code="ru"))
+    ctx = SimpleNamespace(user_data={"mode": "pm", "pm_engine": "veo"})
 
     asyncio.run(prompt_master_callback(update, ctx))
 
-    assert answers == [True]
+    assert not ctx.user_data.get("pm_engine")
     assert edits
-    text, kwargs = edits[0]
-    assert text == PM_HINT
-    assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard().inline_keyboard
+    _text, kwargs = edits[0]
+    assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard("ru").inline_keyboard
+    assert kwargs["parse_mode"] == "HTML"
 
 
-def test_classify_prompt_engine_variants() -> None:
-    assert classify_prompt_engine("midjourney cinematic scene") == "mj"
-    assert classify_prompt_engine("оживи фото дедушки") == "photo_live"
-    assert classify_prompt_engine("banana edit portrait") == "banana"
-    assert classify_prompt_engine("Suno make a song about hope") == "suno"
-    assert classify_prompt_engine("снимем клип про рассвет") == "veo"
+def test_build_prompt_banana_contains_safety_phrase() -> None:
+    prompt = build_prompt("banana", "remove blemishes", "en", {})
+    assert not prompt.is_json
+    assert "real face" in prompt.body.lower()
 
 
-def test_build_prompt_result_veo_contains_duration() -> None:
-    result, lang = build_prompt_result("Снимем видео VEO про рассвет")
-    assert result.engine == "veo"
-    assert lang == "ru"
-    payload = json.loads(result.raw)
-    assert "Длительность" in payload["action"]
+def test_build_prompt_animate_ru_mentions_safety() -> None:
+    prompt = build_prompt("animate", "мягко оживить портрет", "ru", {})
+    assert "Не менять внешность" in prompt.body
 
 
-def test_build_prompt_result_mj_json_structure() -> None:
-    result, lang = build_prompt_result("Midjourney concept art of neon city")
-    assert result.engine == "mj"
-    assert lang == "en"
-    payload = json.loads(result.raw)
-    assert set(payload.keys()) == {"prompt", "style", "camera", "lighting"}
-    assert "four" in payload["prompt"].lower()
+def test_build_prompt_veo_json_structure() -> None:
+    prompt = build_prompt("veo", "cinematic sunrise", "en", {})
+    assert prompt.is_json
+    payload = json.loads(prompt.body)
+    assert {"scene", "camera", "motion", "lighting", "palette", "details"} <= set(payload.keys())
 
 
-def test_build_prompt_result_banana_has_safety_phrase() -> None:
-    result, _ = build_prompt_result("Banana edit portrait with soft light")
-    assert result.engine == "banana"
-    assert not result.is_json
-    assert "keep the real face unchanged" in result.raw
+def test_detect_language_simple() -> None:
+    assert detect_language("Привет") == "ru"
+    assert detect_language("Hello") == "en"
