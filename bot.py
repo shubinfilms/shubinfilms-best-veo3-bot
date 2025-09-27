@@ -60,11 +60,11 @@ from handlers import (
 )
 
 from prompt_master import (
-    build_animate_prompt,
-    build_banana_json,
-    build_mj_json,
-    build_suno_prompt,
-    build_video_prompt,
+    legacy_build_animate_prompt as build_animate_prompt,
+    legacy_build_banana_json as build_banana_json,
+    legacy_build_mj_json as build_mj_json,
+    legacy_build_suno_prompt as build_suno_prompt,
+    legacy_build_video_prompt as build_video_prompt,
 )
 
 # === KIE Banana wrapper ===
@@ -8760,7 +8760,7 @@ def register_handlers(application: Any) -> None:
 
     pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
     pm_handler.block = False
-    application.add_handler(pm_handler)
+    application.add_handler(pm_handler, group=0)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 

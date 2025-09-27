@@ -1,16 +1,15 @@
-"""Prompt-Master handlers, state helpers and prompt builder."""
+"""Prompt-Master handlers, state helpers and prompt builder integration."""
 
 from __future__ import annotations
 
-import asyncio
 import html
 import logging
 import re
-import time
 from typing import Dict, Optional, Tuple
 
 from telegram import InlineKeyboardMarkup, Update
-from telegram.constants import ChatType, ParseMode
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from keyboards import (
@@ -19,18 +18,20 @@ from keyboards import (
     prompt_master_mode_keyboard,
     prompt_master_result_keyboard,
 )
-from prompt_master import Engine, PromptPayload, build_prompt
+from prompt_master import (
+    Engine,
+    PromptPayload,
+    build_animate_prompt,
+    build_banana_prompt,
+    build_mj_prompt,
+    build_suno_prompt,
+    build_veo_prompt,
+)
+from utils.safe_send import safe_send
 
 logger = logging.getLogger(__name__)
 
-PM_STATE_KEY = "mode"
-PM_ENGINE_KEY = "pm_engine"
-PM_LANG_KEY = "pm_lang"
-PM_PROMPTS_KEY = "pm_prompts"
-
-PM_ENGINES = {engine.value for engine in Engine}
-
-CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+PM_STATE_KEY = "pm_state"
 
 PM_ROOT_TEXT = {
     "ru": "🧠 <b>Prompt-Master</b>\nВыберите движок, под который нужно подготовить промпт.",
@@ -60,7 +61,15 @@ PM_ENGINE_HINTS = {
     },
 }
 
-ENGINE_DISPLAY = {
+ENGINE_BUILDERS = {
+    "veo": build_veo_prompt,
+    "mj": build_mj_prompt,
+    "banana": build_banana_prompt,
+    "animate": build_animate_prompt,
+    "suno": build_suno_prompt,
+}
+
+_ENGINE_DISPLAY = {
     "veo": {"ru": "VEO", "en": "VEO"},
     "mj": {"ru": "Midjourney", "en": "Midjourney"},
     "banana": {"ru": "Banana", "en": "Banana"},
@@ -68,22 +77,43 @@ ENGINE_DISPLAY = {
     "suno": {"ru": "Suno", "en": "Suno"},
 }
 
-_LAST_PROMPTS: Dict[Tuple[int, str], PromptPayload] = {}
-
-START_STATUS = {"ru": "⏳ Готовлю промпт…", "en": "⏳ Crafting your prompt…"}
-SLOW_STATUS = {"ru": "⚠️ Что-то долго. Ещё секунду…", "en": "⚠️ Taking longer than usual. One more second…"}
-ERROR_STATUS = {
-    "ru": "❌ Не удалось собрать промпт. Попробуйте ещё раз или переформулируйте задачу.",
-    "en": "❌ Failed to build the prompt. Try again or rephrase the request.",
+PM_STATUS_TEXT = {
+    "ru": "✍️ <b>Пишу промпт…</b>",
+    "en": "✍️ <b>Crafting the prompt…</b>",
 }
+
+PM_ERROR_TEXT = {
+    "ru": "❌ Не удалось собрать промпт. Попробуйте ещё раз.",
+    "en": "❌ Failed to build the prompt. Try again.",
+}
+
+CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+
+_LAST_PROMPTS: Dict[Tuple[int, str], PromptPayload] = {}
 
 
 def detect_language(text: str) -> str:
     return "ru" if CYRILLIC_RE.search(text or "") else "en"
 
 
-def _store_prompt(chat_id: int, engine: Engine, payload: PromptPayload) -> None:
-    _LAST_PROMPTS[(chat_id, engine.value)] = payload
+def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
+    state = context.user_data.get(PM_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {
+            "engine": None,
+            "card_msg_id": None,
+            "prompt": None,
+            "autodelete": True,
+            "result": None,
+            "lang": None,
+        }
+        context.user_data[PM_STATE_KEY] = state
+    state.setdefault("autodelete", True)
+    return state
+
+
+def _store_prompt(chat_id: int, engine: str, payload: PromptPayload) -> None:
+    _LAST_PROMPTS[(chat_id, engine)] = payload
 
 
 def get_pm_prompt(chat_id: int, engine: str) -> Optional[PromptPayload]:
@@ -97,92 +127,89 @@ def clear_pm_prompts(chat_id: int) -> None:
 
 
 def _resolve_ui_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    lang = context.user_data.get(PM_LANG_KEY)
-    if lang in {"ru", "en"}:
+    state = _ensure_state(context)
+    lang = state.get("lang")
+    if isinstance(lang, str) and lang in {"ru", "en"}:
         return lang
     user = update.effective_user
-    if user and isinstance(user.language_code, str):
-        if user.language_code.lower().startswith("ru"):
-            return "ru"
+    if user and isinstance(user.language_code, str) and user.language_code.lower().startswith("ru"):
+        return "ru"
     return "en"
 
 
-def _header_for_engine(engine: str, lang: str) -> str:
-    display = ENGINE_DISPLAY.get(engine, {}).get(lang, engine.upper())
+def _engine_header(engine: str, lang: str) -> str:
+    display = _ENGINE_DISPLAY.get(engine, {}).get(lang, engine.upper())
     if lang == "ru":
-        return f"<b>Готовый промпт для {html.escape(display)}</b>"
-    return f"<b>Ready prompt for {html.escape(display)}</b>"
+        return f"<b>Карточка {html.escape(display)}</b>"
+    return f"<b>{html.escape(display)} card</b>"
 
 
-def _render_markdown(text: str) -> str:
-    from html import escape
-
-    bold_re = re.compile(r"\*\*(.+?)\*\*")
-
-    def _inline(value: str) -> str:
-        result = []
-        last = 0
-        for match in bold_re.finditer(value):
-            result.append(escape(value[last:match.start()]))
-            result.append(f"<b>{escape(match.group(1))}</b>")
-            last = match.end()
-        result.append(escape(value[last:]))
-        return "".join(result)
-
-    lines = text.splitlines()
-    html_parts = []
-    in_list = False
-    in_code = False
-    for line in lines:
-        if line.startswith("```"):
-            if in_code:
-                html_parts.append("</code></pre>")
-                in_code = False
-            else:
-                html_parts.append("<pre><code>")
-                in_code = True
-            continue
-        if in_code:
-            html_parts.append(f"{escape(line)}\n")
-            continue
-        stripped = line.strip()
-        if stripped.startswith("- "):
-            if not in_list:
-                html_parts.append("<ul>")
-                in_list = True
-            html_parts.append(f"<li>{_inline(stripped[2:])}</li>")
-            continue
-        if in_list:
-            html_parts.append("</ul>")
-            in_list = False
-        if stripped:
-            html_parts.append(f"<p>{_inline(stripped)}</p>")
-        else:
-            html_parts.append("<br/>")
-    if in_list:
-        html_parts.append("</ul>")
-    if in_code:
-        html_parts.append("</code></pre>")
-    return "".join(html_parts)
+def _render_card(engine: str, state: Dict[str, object], lang: str) -> Tuple[str, InlineKeyboardMarkup]:
+    prompt_value = state.get("prompt") or ""
+    hint = PM_ENGINE_HINTS.get(engine, PM_ENGINE_HINTS["veo"]).get(lang, PM_ENGINE_HINTS["veo"]["en"])
+    if prompt_value:
+        body = f"<pre><code>{html.escape(str(prompt_value))}</code></pre>"
+    else:
+        body = "<i>" + html.escape(hint) + "</i>"
+    header = _engine_header(engine, lang)
+    text = f"{header}<br/>{body}"
+    keyboard = prompt_master_mode_keyboard(lang)
+    return text, keyboard
 
 
-def _payload_to_html(engine: str, lang: str, payload: PromptPayload) -> str:
-    body_html = _render_markdown(payload.body_markdown)
-    header = _header_for_engine(engine, lang)
-    return f"{header}<br/>{body_html}"
+async def _upsert_card(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    engine: str,
+    state: Dict[str, object],
+    lang: str,
+) -> None:
+    text, keyboard = _render_card(engine, state, lang)
+    chat = update.effective_chat
+    if chat is None:
+        return
+    chat_id = chat.id
+    message_id = state.get("card_msg_id")
+    if isinstance(message_id, int):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=keyboard,
+            )
+            return
+        except BadRequest:
+            state["card_msg_id"] = None
+        except Exception:
+            logger.exception("prompt_master.card_edit_failed")
+            state["card_msg_id"] = None
+    message = await safe_send(context.bot, chat_id, text, reply_markup=keyboard)
+    if message:
+        state["card_msg_id"] = message.message_id
+
+
+def _payload_to_html(payload: PromptPayload) -> str:
+    title = html.escape(payload.title)
+    return f"<b>{title}</b><br/>{payload.body_html}"
 
 
 async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
+    state = _ensure_state(context)
+    state.update({"engine": None, "prompt": None, "card_msg_id": None})
     lang = _resolve_ui_lang(update, context)
     text = PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"])
 
-    if message is not None:
-        await message.reply_text(
+    message = update.effective_message
+    if message is not None and message.chat:
+        await safe_send(
+            context.bot,
+            message.chat_id,
             text,
             reply_markup=prompt_master_keyboard(lang),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
         )
         return
 
@@ -198,38 +225,81 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-def _set_pm_state(context: ContextTypes.DEFAULT_TYPE, engine: Optional[str]) -> None:
-    if engine is None:
-        context.user_data.pop(PM_STATE_KEY, None)
-        context.user_data.pop(PM_ENGINE_KEY, None)
-        return
-    context.user_data[PM_STATE_KEY] = "pm"
-    context.user_data[PM_ENGINE_KEY] = engine
-
-
-async def _send_engine_hint(
-    query, update: Update, context: ContextTypes.DEFAULT_TYPE, engine: str
+async def _set_engine(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    engine: Optional[str],
 ) -> None:
-    lang = _resolve_ui_lang(update, context)
-    hint = PM_ENGINE_HINTS.get(engine, PM_ENGINE_HINTS["veo"]).get(lang, PM_ENGINE_HINTS["veo"]["en"])
-    markup = prompt_master_mode_keyboard(lang)
-    if query.message is not None:
-        await query.edit_message_text(
-            hint,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=markup,
-        )
-    else:
-        chat = update.effective_chat
-        if chat is not None:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=hint,
+    state = _ensure_state(context)
+    state["engine"] = engine
+    state["prompt"] = None
+    state["result"] = None
+    if engine:
+        lang = _resolve_ui_lang(update, context)
+        hint = PM_ENGINE_HINTS.get(engine, PM_ENGINE_HINTS["veo"]).get(lang, PM_ENGINE_HINTS["veo"]["en"])
+        keyboard = prompt_master_mode_keyboard(lang)
+        query = update.callback_query
+        if query and query.message:
+            await query.edit_message_text(
+                hint,
+                reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
-                reply_markup=markup,
             )
+        else:
+            chat = update.effective_chat
+            if chat is not None:
+                await safe_send(context.bot, chat.id, hint, reply_markup=keyboard)
+    else:
+        state["card_msg_id"] = None
+
+
+async def _handle_copy(update: Update, context: ContextTypes.DEFAULT_TYPE, engine: str, lang: str) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else None
+    payload = get_pm_prompt(chat_id, engine) if chat_id is not None else None
+    if payload is None:
+        await query.answer("Промпт не найден" if lang == "ru" else "Prompt not found", show_alert=True)
+        return
+    await query.answer("Готово" if lang == "ru" else "Done")
+    text = payload.copy_text
+    if text.strip().startswith("{") or text.strip().startswith("["):
+        html_text = f"<pre><code>{html.escape(text)}</code></pre>"
+    else:
+        html_text = html.escape(text).replace("\n", "<br/>")
+    if chat_id is not None:
+        await safe_send(context.bot, chat_id, html_text)
+
+
+async def _handle_insert(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    engine: str,
+    lang: str,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else None
+    if chat_id is None:
+        await query.answer("Чат недоступен", show_alert=True)
+        return
+    payload = get_pm_prompt(chat_id, engine)
+    if payload is None:
+        await query.answer("Промпт не найден" if lang == "ru" else "Prompt not found", show_alert=True)
+        return
+    state = _ensure_state(context)
+    state["engine"] = engine
+    state["lang"] = lang
+    state["result"] = payload
+    state["prompt"] = payload.card_text
+    _store_prompt(chat_id, engine, payload)
+    await _upsert_card(update, context, engine=engine, state=state, lang=lang)
+    await query.answer("Вставлено" if lang == "ru" else "Inserted")
 
 
 async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,47 +308,26 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     data = query.data
-    await query.answer()
     lang = _resolve_ui_lang(update, context)
 
-    if data.startswith(f"{CB_PM_PREFIX}insert:"):
-        parts = data.split(":", 2)
-        engine = parts[2] if len(parts) > 2 else ""
-        user = update.effective_user
-        user_id = user.id if user else None
-        logger.info("pm.insert_clicked | user_id=%s engine=%s", user_id, engine)
+    if data.startswith(f"{CB_PM_PREFIX}copy:"):
+        engine = data.split(":", 2)[2]
+        await _handle_copy(update, context, engine, lang)
         return
 
-    if data.startswith(f"{CB_PM_PREFIX}copy:"):
-        parts = data.split(":", 2)
-        engine = parts[2] if len(parts) > 2 else ""
-        chat = query.message.chat if query.message else update.effective_chat
-        chat_id = chat.id if chat else None
-        prompt = get_pm_prompt(chat_id, engine) if chat_id is not None else None
-        if prompt is None:
-            await query.answer("Промпт не найден" if lang == "ru" else "Prompt not found", show_alert=True)
-            return
-        await query.answer("Готово" if lang == "ru" else "Done")
-        user = update.effective_user
-        user_id = user.id if user else None
-        logger.info("pm.copy_clicked | user_id=%s engine=%s", user_id, engine)
-        copy_text = prompt.copy_text
-        if copy_text.strip().startswith("{") or copy_text.strip().startswith("["):
-            text = f"<pre>{html.escape(copy_text)}</pre>"
-            parse_mode = ParseMode.HTML
-        else:
-            text = copy_text
-            parse_mode = None
-        target_chat = chat_id if chat_id is not None else (update.effective_chat.id if update.effective_chat else None)
-        if target_chat is not None:
-            await context.bot.send_message(chat_id=target_chat, text=text, parse_mode=parse_mode)
+    if data.startswith(f"{CB_PM_PREFIX}insert:"):
+        engine = data.split(":", 2)[2]
+        await _handle_insert(update, context, engine, lang)
         return
 
     if data in {f"{CB_PM_PREFIX}back", f"{CB_PM_PREFIX}menu"}:
+        state = _ensure_state(context)
         chat = query.message.chat if query.message else update.effective_chat
-        if chat is not None:
-            clear_pm_prompts(chat.id)
-        _set_pm_state(context, None)
+        chat_id = chat.id if chat else None
+        if chat_id is not None:
+            clear_pm_prompts(chat_id)
+        await query.answer()
+        state.update({"engine": None, "prompt": None, "result": None})
         await query.edit_message_text(
             PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"]),
             reply_markup=prompt_master_keyboard(lang),
@@ -288,7 +337,8 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data == f"{CB_PM_PREFIX}switch":
-        _set_pm_state(context, None)
+        await query.answer()
+        await _set_engine(update, context, None)
         await query.edit_message_text(
             PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"]),
             reply_markup=prompt_master_keyboard(lang),
@@ -298,14 +348,16 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     engine = data.removeprefix(CB_PM_PREFIX)
-    if engine in PM_ENGINES:
-        _set_pm_state(context, engine)
-        user = update.effective_user
-        user_id = user.id if user else None
-        logger.info("pm.mode_set | user_id=%s engine=%s", user_id, engine)
-        await _send_engine_hint(query, update, context, engine)
+    if engine in ENGINE_BUILDERS:
+        await query.answer()
+        state = _ensure_state(context)
+        state["engine"] = engine
+        state["lang"] = lang
+        await _set_engine(update, context, engine)
+        await _upsert_card(update, context, engine=engine, state=state, lang=lang)
         return
 
+    await query.answer()
     await query.edit_message_text(
         PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"]),
         reply_markup=prompt_master_keyboard(lang),
@@ -314,155 +366,109 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-async def prompt_master_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None or not isinstance(message.text, str):
         return
 
-    if context.user_data.get(PM_STATE_KEY) != "pm":
+    state = _ensure_state(context)
+    engine = state.get("engine")
+    if engine not in ENGINE_BUILDERS:
         return
 
-    engine = context.user_data.get(PM_ENGINE_KEY)
-    if engine not in PM_ENGINES:
+    text = message.text.strip()
+    if not text:
         return
 
-    idea = message.text.strip()
-    if not idea:
-        return
+    lang = detect_language(text) or _resolve_ui_lang(update, context)
+    state["lang"] = lang
+    state["prompt"] = text
 
-    lang = detect_language(idea)
-    if lang not in {"ru", "en"}:
-        lang = _resolve_ui_lang(update, context)
-    context.user_data[PM_LANG_KEY] = lang
-    user = update.effective_user
-    user_id = user.id if user else None
-    logger.info("pm.start | user_id=%s engine=%s lang=%s", user_id, engine, lang)
-    chat = update.effective_chat
-    status_markup = prompt_master_mode_keyboard(lang)
-    try:
-        status_message = await message.reply_text(
-            START_STATUS.get(lang, START_STATUS["en"]),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=status_markup,
-        )
-    except Exception:  # pragma: no cover - Telegram failure
-        logger.exception("prompt_master.status_send_failed")
-        return
+    await _upsert_card(update, context, engine=engine, state=state, lang=lang)
 
-    task = asyncio.create_task(build_prompt(Engine(engine), idea, lang))
-    start_ts = time.monotonic()
-    try:
-        payload = await asyncio.wait_for(task, timeout=12.0)
-    except asyncio.TimeoutError:
-        try:
-            await status_message.edit_text(
-                SLOW_STATUS.get(lang, SLOW_STATUS["en"]),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=status_markup,
-            )
-        except Exception:
-            logger.debug("prompt_master.slow_status_failed", exc_info=True)
-        try:
-            payload = await asyncio.wait_for(task, timeout=18.0)
-        except Exception as exc:  # pragma: no cover - hard failure path
-            logger.error("pm.error | user_id=%s engine=%s err=%s", user_id, engine, exc)
-            try:
-                await status_message.edit_text(
-                    ERROR_STATUS.get(lang, ERROR_STATUS["en"]),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_markup=status_markup,
-                )
-            except Exception:
-                logger.debug("prompt_master.error_status_failed", exc_info=True)
-            return
-    except Exception as exc:  # pragma: no cover - unexpected failure
-        logger.error("pm.error | user_id=%s engine=%s err=%s", user_id, engine, exc)
-        try:
-            await status_message.edit_text(
-                ERROR_STATUS.get(lang, ERROR_STATUS["en"]),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=status_markup,
-            )
-        except Exception:
-            logger.debug("prompt_master.error_status_failed", exc_info=True)
-        return
-
-    duration_ms = int((time.monotonic() - start_ts) * 1000)
-    logger.info(
-        "pm.ready | user_id=%s engine=%s size=%s ms=%s",
-        user_id,
-        engine,
-        len(idea),
-        duration_ms,
-    )
-
-    if chat is not None:
-        _store_prompt(chat.id, Engine(engine), payload)
-
-    prompts = context.user_data.setdefault(PM_PROMPTS_KEY, {})
-    prompts[engine] = payload
-    context.user_data["pm_last_engine"] = engine
-
-    if chat and chat.type == ChatType.PRIVATE:
+    if state.get("autodelete", True):
         try:
             await message.delete()
         except Exception:
             logger.debug("prompt_master.delete_failed", exc_info=True)
 
-    formatted = _payload_to_html(engine, lang, payload)
-    markup = prompt_master_result_keyboard(engine, lang)
-    try:
-        await status_message.edit_text(
-            formatted,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=markup,
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    status = (
+        await safe_send(
+            context.bot,
+            chat_id,
+            PM_STATUS_TEXT.get(lang, PM_STATUS_TEXT["en"]),
+            reply_markup=prompt_master_mode_keyboard(lang),
         )
-    except Exception:
-        logger.exception("prompt_master.reply_failed")
+        if chat_id is not None
+        else None
+    )
+
+    builder = ENGINE_BUILDERS.get(engine)
+    payload: Optional[PromptPayload] = None
+    try:
+        payload = builder(text, lang) if builder else None
+    except Exception as exc:
+        logger.error("prompt_master.build_failed | engine=%s err=%s", engine, exc)
+
+    if payload is None:
+        if status is not None:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=status.chat_id,
+                    message_id=status.message_id,
+                    text=PM_ERROR_TEXT.get(lang, PM_ERROR_TEXT["en"]),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=prompt_master_mode_keyboard(lang),
+                )
+            except Exception:
+                logger.debug("prompt_master.status_error_edit_failed", exc_info=True)
+        return
+
+    if chat_id is not None:
+        _store_prompt(chat_id, engine, payload)
+    state["result"] = payload
+
+    result_html = _payload_to_html(payload)
+    markup = prompt_master_result_keyboard(engine, lang)
+    if status is not None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=status.chat_id,
+                message_id=status.message_id,
+                text=result_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
+        except Exception:
+            logger.exception("prompt_master.reply_failed")
+    else:
+        if chat_id is not None:
+            await safe_send(context.bot, chat_id, result_html, reply_markup=markup)
 
 
 async def prompt_master_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    if chat is not None:
-        clear_pm_prompts(chat.id)
-    _set_pm_state(context, None)
-    context.user_data.pop(PM_PROMPTS_KEY, None)
-    context.user_data.pop(PM_LANG_KEY, None)
-
+    chat_id = chat.id if chat else None
+    if chat_id is not None:
+        clear_pm_prompts(chat_id)
+    state = _ensure_state(context)
+    state.update({"engine": None, "prompt": None, "result": None, "card_msg_id": None, "lang": None})
     lang = _resolve_ui_lang(update, context)
     text = "🧹 Prompt-Master сброшен." if lang == "ru" else "🧹 Prompt-Master reset."
     keyboard = prompt_master_keyboard(lang)
-
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(
-            f"{text}\n\n{PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT['en'])}",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=keyboard,
-        )
-    else:
-        target = chat.id if chat is not None else None
-        if target is not None:
-            await context.bot.send_message(
-                target,
-                f"{text}\n\n{PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT['en'])}",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=keyboard,
-            )
+    if chat_id is not None:
+        await safe_send(context.bot, chat_id, f"{text}\n\n{PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT['en'])}", reply_markup=keyboard)
 
 
-# Backwards compatibility alias
-prompt_master_process = prompt_master_handle_text
-
+prompt_master_handle_text = prompt_master_text_handler
+prompt_master_process = prompt_master_text_handler
 
 __all__ = [
+    "PM_STATE_KEY",
     "clear_pm_prompts",
     "detect_language",
     "get_pm_prompt",

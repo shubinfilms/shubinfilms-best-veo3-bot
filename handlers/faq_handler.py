@@ -1,8 +1,8 @@
-"""FAQ handlers for displaying quick answers."""
+"""FAQ handlers rendering HTML-safe content."""
 
-from __future__ import annotations
-
+import html
 import logging
+import re
 from typing import Awaitable, Callable, Optional
 
 from telegram import Update
@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 
 from keyboards import CB_FAQ_PREFIX, faq_keyboard
 from texts import FAQ_INTRO, FAQ_SECTIONS
+from utils.safe_send import safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -43,18 +44,18 @@ async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Send the FAQ root menu."""
 
     message = update.effective_message
-    if message is None:
+    if message is None or message.chat is None:
         return
     if callable(_on_root_view):
         try:
             _on_root_view()
         except Exception:  # pragma: no cover - metrics should not break flow
             logger.exception("faq.root_metric_failed")
-    await message.reply_text(
-        FAQ_INTRO,
+    await safe_send(
+        context.bot,
+        message.chat_id,
+        _markdown_to_html(FAQ_INTRO),
         reply_markup=faq_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
     )
 
 
@@ -68,16 +69,17 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id if update.effective_user else None
     logger.info("faq.callback | user_id=%s data=%s", user_id, query.data)
 
-    await query.answer()
+    data = query.data
+    key = data.removeprefix(CB_FAQ_PREFIX)
 
-    key = query.data.removeprefix(CB_FAQ_PREFIX)
     if key == "back":
+        await query.answer()
         if callable(_show_main_menu):
             await _show_main_menu(update, context)
             return
-        chat_id = query.message.chat_id if query.message is not None else None
-        if chat_id is not None:
-            await context.application.bot.send_message(chat_id=chat_id, text="📋 Главное меню")
+        chat = query.message.chat if query.message else update.effective_chat
+        if chat is not None:
+            await safe_send(context.bot, chat.id, _markdown_to_html("📋 Главное меню"))
         return
 
     text = FAQ_SECTIONS.get(key, "Раздел не найден.")
@@ -87,9 +89,29 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:  # pragma: no cover - metrics should not break flow
             logger.exception("faq.section_metric_failed | section=%s", key)
 
+    await query.answer()
     await query.edit_message_text(
-        text,
+        _markdown_to_html(text),
         reply_markup=faq_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+_BOLD_RE = re.compile(r"\*(.+?)\*")
+
+
+def _markdown_to_html(text: str) -> str:
+    """Convert the FAQ subset of Markdown to HTML."""
+
+    result_parts = []
+    last = 0
+    for match in _BOLD_RE.finditer(text):
+        result_parts.append(html.escape(text[last:match.start()]))
+        result_parts.append(f"<b>{html.escape(match.group(1))}</b>")
+        last = match.end()
+    result_parts.append(html.escape(text[last:]))
+    return "".join(result_parts).replace("\n", "<br/>")
+
+
+__all__ = ["configure_faq", "faq_callback", "faq_command"]
