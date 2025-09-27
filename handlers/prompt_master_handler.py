@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 from telegram import InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
@@ -19,7 +19,7 @@ from keyboards import (
 )
 from prompt_master import (
     Engine,
-    PromptPayload,
+    PMResult,
     build_animate_prompt,
     build_banana_prompt,
     build_mj_prompt,
@@ -27,7 +27,7 @@ from prompt_master import (
     build_veo_prompt,
 )
 from utils.html_render import html_to_plain, render_pm_html, safe_lines
-from utils.safe_send import safe_send, send_html_with_fallback
+from utils.safe_send import sanitize_html, safe_send, send_html_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +78,8 @@ _ENGINE_DISPLAY = {
 }
 
 PM_STATUS_TEXT = {
-    "ru": "✍️ <b>Пишу промпт…</b>",
-    "en": "✍️ <b>Crafting the prompt…</b>",
+    "ru": "🧠 Пишу промпт…",
+    "en": "🧠 Crafting your prompt…",
 }
 
 PM_ERROR_TEXT = {
@@ -94,7 +94,27 @@ PM_WARNING_TEXT = {
 
 CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
 
-_LAST_PROMPTS: Dict[Tuple[int, str], PromptPayload] = {}
+_LAST_PROMPTS: Dict[Tuple[int, str], PMResult] = {}
+
+
+def _chunk_plain(text: str, *, limit: int = 3500) -> Iterable[str]:
+    if not text:
+        yield ""
+        return
+    start = 0
+    length = len(text)
+    while start < length:
+        end = min(start + limit, length)
+        if end < length:
+            split = text.rfind("\n", start, end)
+            if split <= start:
+                split = text.rfind(" ", start, end)
+            if split <= start:
+                split = end
+        else:
+            split = end
+        yield text[start:split]
+        start = split
 
 
 def detect_language(text: str) -> str:
@@ -117,11 +137,11 @@ def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
     return state
 
 
-def _store_prompt(chat_id: int, engine: str, payload: PromptPayload) -> None:
+def _store_prompt(chat_id: int, engine: str, payload: PMResult) -> None:
     _LAST_PROMPTS[(chat_id, engine)] = payload
 
 
-def get_pm_prompt(chat_id: int, engine: str) -> Optional[PromptPayload]:
+def get_pm_prompt(chat_id: int, engine: str) -> Optional[PMResult]:
     return _LAST_PROMPTS.get((chat_id, engine))
 
 
@@ -172,6 +192,7 @@ async def _upsert_card(
     lang: str,
 ) -> None:
     text, keyboard = _render_card(engine, state, lang)
+    safe_text = sanitize_html(text)
     chat = update.effective_chat
     if chat is None:
         return
@@ -182,7 +203,7 @@ async def _upsert_card(
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
+                text=safe_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
@@ -193,26 +214,9 @@ async def _upsert_card(
         except Exception:
             logger.exception("prompt_master.card_edit_failed")
             state["card_msg_id"] = None
-    message = await safe_send(context.bot, chat_id, text, reply_markup=keyboard)
+    message = await safe_send(context.bot, chat_id, safe_text, reply_markup=keyboard)
     if message:
         state["card_msg_id"] = message.message_id
-
-
-def _render_payload_html(payload: PromptPayload) -> str:
-    parts: list[str] = [f"**{payload.title}**"]
-    if payload.subtitle:
-        parts.append(f"_{payload.subtitle}_")
-    if payload.body_md:
-        parts.append(payload.body_md)
-    if payload.code_block:
-        code_value = payload.code_block.strip()
-        language = "json" if code_value.startswith("{") or code_value.startswith("[") else ""
-        fence = f"```{language}\n{code_value}\n```"
-        parts.append(fence)
-    if payload.buttons:
-        parts.append(safe_lines(payload.buttons))
-    markdown = "\n\n".join(part for part in parts if part)
-    return render_pm_html(markdown)
 
 
 async def _edit_with_fallback(
@@ -222,11 +226,12 @@ async def _edit_with_fallback(
     html_text: str,
     reply_markup: InlineKeyboardMarkup,
 ) -> None:
+    safe_html = sanitize_html(html_text)
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text=html_text,
+            text=safe_html,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=reply_markup,
@@ -237,7 +242,7 @@ async def _edit_with_fallback(
             raise
         logger.warning("pm.html_fallback", extra={"exc": repr(exc)})
         logger.info("pm.render.fallback")
-        plain = html_to_plain(html_text)
+        plain = html_to_plain(safe_html)
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
@@ -265,12 +270,13 @@ async def _handle_render_failure(
     chat_id: Optional[int],
 ) -> None:
     error_text = PM_ERROR_TEXT.get(lang, PM_ERROR_TEXT["en"])
+    safe_error = sanitize_html(error_text)
     if status_message is not None:
         try:
             await context.bot.edit_message_text(
                 chat_id=status_message.chat_id,
                 message_id=status_message.message_id,
-                text=error_text,
+                text=safe_error,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
@@ -278,7 +284,7 @@ async def _handle_render_failure(
         except Exception:
             logger.exception("pm.card.fail", extra={"engine": engine})
     elif chat_id is not None:
-        await send_html_with_fallback(context.bot, chat_id, error_text, reply_markup=keyboard)
+        await send_html_with_fallback(context.bot, chat_id, safe_error, reply_markup=keyboard)
 
 
 async def _notify_failure(
@@ -289,7 +295,7 @@ async def _notify_failure(
     if chat_id is None:
         return
     warning = PM_WARNING_TEXT.get(lang, PM_WARNING_TEXT["en"])
-    await send_html_with_fallback(context.bot, chat_id, warning)
+    await send_html_with_fallback(context.bot, chat_id, sanitize_html(warning))
 
 
 async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -313,7 +319,7 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer()
     await query.edit_message_text(
-        text,
+        sanitize_html(text),
         reply_markup=prompt_master_keyboard(lang),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -336,7 +342,7 @@ async def _set_engine(
         query = update.callback_query
         if query and query.message:
             await query.edit_message_text(
-                hint,
+                sanitize_html(hint),
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -360,13 +366,15 @@ async def _handle_copy(update: Update, context: ContextTypes.DEFAULT_TYPE, engin
         await query.answer("Промпт не найден" if lang == "ru" else "Prompt not found", show_alert=True)
         return
     await query.answer("Готово" if lang == "ru" else "Done")
-    text = payload.copy_text
-    if text.strip().startswith("{") or text.strip().startswith("["):
-        html_text = f"<pre><code>{html.escape(text)}</code></pre>"
-    else:
-        html_text = html.escape(text).replace("\n", "<br/>")
-    if chat_id is not None:
-        await safe_send(context.bot, chat_id, html_text)
+    copy_text = payload.get("copy_text", "")
+    if chat_id is None or copy_text is None:
+        return
+    for chunk in _chunk_plain(str(copy_text)):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            disable_web_page_preview=True,
+        )
 
 
 async def _handle_insert(
@@ -391,7 +399,7 @@ async def _handle_insert(
     state["engine"] = engine
     state["lang"] = lang
     state["result"] = payload
-    state["prompt"] = payload.card_text
+    state["prompt"] = payload.get("card_text") or payload.get("copy_text") or ""
     _store_prompt(chat_id, engine, payload)
     await _upsert_card(update, context, engine=engine, state=state, lang=lang)
     await query.answer("Вставлено" if lang == "ru" else "Inserted")
@@ -424,7 +432,7 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer()
         state.update({"engine": None, "prompt": None, "result": None})
         await query.edit_message_text(
-            PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"]),
+            sanitize_html(PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"])),
             reply_markup=prompt_master_keyboard(lang),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -435,7 +443,7 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer()
         await _set_engine(update, context, None)
         await query.edit_message_text(
-            PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"]),
+            sanitize_html(PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"])),
             reply_markup=prompt_master_keyboard(lang),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -454,7 +462,7 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     await query.answer()
     await query.edit_message_text(
-        PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"]),
+        sanitize_html(PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"])),
         reply_markup=prompt_master_keyboard(lang),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -496,36 +504,30 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
     )
 
     builder = ENGINE_BUILDERS.get(engine)
-    payload: Optional[PromptPayload] = None
+    result_payload: Optional[PMResult] = None
     try:
-        payload = builder(text, lang) if builder else None
-    except Exception as exc:
-        logger.error("prompt_master.build_failed | engine=%s err=%s", engine, exc)
+        result_payload = builder(text, lang) if builder else None
+    except Exception:
+        logger.exception("prompt_master.build_failed", extra={"engine": engine})
 
-    if payload is None:
-        if status is not None:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=status.chat_id,
-                    message_id=status.message_id,
-                    text=PM_ERROR_TEXT.get(lang, PM_ERROR_TEXT["en"]),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_markup=prompt_master_mode_keyboard(lang),
-                )
-            except Exception:
-                logger.debug("prompt_master.status_error_edit_failed", exc_info=True)
+    if result_payload is None:
+        await _handle_render_failure(
+            context,
+            status,
+            lang,
+            engine,
+            prompt_master_mode_keyboard(lang),
+            chat_id,
+        )
         return
 
     if chat_id is not None:
-        _store_prompt(chat_id, engine, payload)
-    state["result"] = payload
+        _store_prompt(chat_id, engine, result_payload)
+    state["result"] = result_payload
 
-    try:
-        result_html = _render_payload_html(payload)
-        logger.info("pm.render.ok", extra={"engine": engine})
-    except Exception:
-        logger.exception("pm.render.error", extra={"engine": engine})
+    result_html = result_payload.get("body_html", "")
+    if not result_html:
+        logger.error("pm.render.empty", extra={"engine": engine})
         await _handle_render_failure(
             context,
             status,
@@ -551,26 +553,26 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
         except Exception:
             logger.exception("pm.card.fail", extra={"engine": engine})
             await _notify_failure(context, chat_id, lang)
+        return
+    if chat_id is not None:
+        try:
+            sent = await send_html_with_fallback(
+                context.bot,
+                chat_id,
+                result_html,
+                reply_markup=markup,
+            )
+        except Exception:
+            logger.exception("pm.card.fail", extra={"engine": engine})
+            await _notify_failure(context, chat_id, lang)
+            return
+        if sent is not None:
+            logger.info("pm.card.sent", extra={"engine": engine})
+            if state.get("autodelete", True):
+                await _safe_delete(message)
         else:
-            if chat_id is not None:
-                try:
-                    message_sent = await send_html_with_fallback(
-                        context.bot,
-                        chat_id,
-                        result_html,
-                        reply_markup=markup,
-                    )
-                except Exception:
-                    logger.exception("pm.card.fail", extra={"engine": engine})
-                    await _notify_failure(context, chat_id, lang)
-                    return
-                if message_sent is not None:
-                    logger.info("pm.card.sent", extra={"engine": engine})
-                    if state.get("autodelete", True):
-                        await _safe_delete(message)
-                else:
-                    logger.error("pm.card.fail", extra={"engine": engine})
-                    await _notify_failure(context, chat_id, lang)
+            logger.error("pm.card.fail", extra={"engine": engine})
+            await _notify_failure(context, chat_id, lang)
 
 
 async def prompt_master_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

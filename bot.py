@@ -6805,24 +6805,25 @@ async def prompt_master_insert_callback(update: Update, ctx: ContextTypes.DEFAUL
         return
 
     s = state(ctx)
+    body_text = str(prompt_obj.get("card_text") or prompt_obj.get("copy_text") or "")
     if engine in {"veo", "animate"}:
-        await set_veo_card_prompt(chat_id, prompt_obj.body, ctx)
+        await set_veo_card_prompt(chat_id, body_text, ctx)
         await query.answer("Промпт вставлен в карточку VEO")
         return
     if engine == "mj":
-        s["last_prompt"] = prompt_obj.body
+        s["last_prompt"] = body_text
         s["_last_text_mj"] = None
         await show_mj_prompt_card(chat_id, ctx)
         await query.answer("Промпт вставлен в карточку Midjourney")
         return
     if engine == "banana":
-        s["last_prompt"] = prompt_obj.body
+        s["last_prompt"] = body_text
         s["_last_text_banana"] = None
         await show_banana_card(chat_id, ctx)
         await query.answer("Промпт вставлен в карточку Banana")
         return
     if engine == "suno":
-        s["suno_lyrics"] = prompt_obj.body
+        s["suno_lyrics"] = body_text
         s["suno_waiting_field"] = None
         s["_last_text_suno"] = None
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)

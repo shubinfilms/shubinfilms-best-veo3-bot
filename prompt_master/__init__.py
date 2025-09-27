@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .generator import (
     Engine,
-    PromptPayload,
+    PMResult,
     build_animate_prompt,
     build_banana_prompt,
     build_mj_prompt,
@@ -31,7 +31,7 @@ else:  # pragma: no cover - unexpected environment
 
 __all__ = [
     "Engine",
-    "PromptPayload",
+    "PMResult",
     "build_prompt",
     "build_veo_prompt",
     "build_mj_prompt",

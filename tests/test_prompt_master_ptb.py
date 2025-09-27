@@ -16,7 +16,6 @@ from handlers.prompt_master_handler import (
     clear_pm_prompts,
     detect_language,
     get_pm_prompt,
-    _render_payload_html,
     _edit_with_fallback,
     prompt_master_callback,
     prompt_master_open,
@@ -174,7 +173,7 @@ def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> Non
     assert card_chat == 333
     assert "<pre><code>" in card_text
     status_chat, status_text, status_kwargs = bot.sent[1]
-    assert status_text.startswith("✍️")
+    assert status_text.startswith("🧠")
     assert status_kwargs["reply_markup"].inline_keyboard == prompt_master_mode_keyboard("en").inline_keyboard
     assert status_kwargs.get("parse_mode") == "HTML"
     # Final edit should include result keyboard
@@ -185,7 +184,10 @@ def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> Non
     assert "<br/>" not in final_text
     buttons = final_kwargs["reply_markup"].inline_keyboard[-1]
     assert buttons[0].callback_data == "pm:copy:mj"
-    assert get_pm_prompt(333, "mj") is not None
+    cached = get_pm_prompt(333, "mj")
+    assert cached is not None
+    assert cached["engine"] == "mj"
+    assert cached["copy_text"].strip().startswith("{")
 
 
 def test_prompt_master_insert_uses_cached_payload() -> None:
@@ -206,8 +208,33 @@ def test_prompt_master_insert_uses_cached_payload() -> None:
         effective_user=SimpleNamespace(language_code="ru"),
     )
     asyncio.run(prompt_master_callback(update, ctx))
-    assert ctx.user_data[PM_STATE_KEY]["prompt"] == payload.card_text
+    assert ctx.user_data[PM_STATE_KEY]["prompt"] == payload.get("card_text")
     assert bot.sent, "card should be rendered on insert"
+
+
+def test_prompt_master_copy_sends_plain_text() -> None:
+    bot = FakeBot()
+    ctx = SimpleNamespace(bot=bot, user_data={PM_STATE_KEY: {"engine": "mj", "card_msg_id": None}})
+    chat_id = 777
+    clear_pm_prompts(chat_id)
+    from handlers.prompt_master_handler import _store_prompt  # type: ignore
+
+    payload = build_mj_prompt("dramatic scene", "en")
+    _store_prompt(chat_id, "mj", payload)
+
+    query = FakeQuery(f"{CB_PM_PREFIX}copy:mj", bot)
+    query.message = SimpleNamespace(chat=SimpleNamespace(id=chat_id))
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(language_code="en"),
+    )
+    asyncio.run(prompt_master_callback(update, ctx))
+    assert bot.sent, "copy must send a message"
+    _, text, kwargs = bot.sent[-1]
+    assert kwargs.get("parse_mode") is None
+    assert "<" not in text
+    assert payload["copy_text"].splitlines()[0] in text
 
 
 @pytest.mark.parametrize(
@@ -220,35 +247,37 @@ def test_prompt_master_insert_uses_cached_payload() -> None:
 )
 def test_prompt_builders_return_body(builder, text, lang, needle) -> None:
     payload = builder(text, lang)
-    assert needle.lower() in payload.body_md.lower()
-    if payload.code_block:
-        assert payload.code_block.strip().startswith("{")
+    body_html = payload["body_html"]
+    assert needle.lower() in body_html.lower()
+    copy = payload["copy_text"]
+    if copy.strip().startswith("{"):
+        assert copy.strip().startswith("{")
 
 
 def test_render_payload_snapshot_mj() -> None:
     payload = build_mj_prompt("cinematic hero", "en")
-    html_text = _render_payload_html(payload)
-    assert "<strong>Ready prompt for Midjourney</strong>" in html_text
+    html_text = payload["body_html"]
+    assert "<b>Ready prompt for Midjourney</b>" in html_text
     assert "&quot;render&quot;" in html_text
 
 
 def test_render_payload_snapshot_veo() -> None:
     payload = build_veo_prompt("cinematic hero", "en")
-    html_text = _render_payload_html(payload)
-    assert "<strong>Ready prompt for VEO</strong>" in html_text
+    html_text = payload["body_html"]
+    assert "<b>Ready prompt for VEO</b>" in html_text
     assert "&quot;scene&quot;" in html_text
 
 
 def test_render_payload_snapshot_banana() -> None:
     payload = build_banana_prompt("touch up", "en")
-    html_text = _render_payload_html(payload)
-    assert "<strong>Banana edit checklist</strong>" in html_text
+    html_text = payload["body_html"]
+    assert "<b>Banana edit checklist</b>" in html_text
     assert "Checklist:" in html_text
 
 
 def test_build_prompt_veo_json_structure() -> None:
     prompt = asyncio.run(build_prompt(Engine.VEO_VIDEO, "cinematic sunrise", "en"))
-    payload = json.loads(prompt.copy_text)
+    payload = json.loads(prompt["copy_text"])
     assert {"scene", "camera", "motion", "lighting", "palette", "details"} <= set(payload.keys())
 
 
