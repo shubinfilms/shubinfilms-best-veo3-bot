@@ -238,7 +238,6 @@ prompt_master_conv = ConversationHandler(
         CallbackQueryHandler(
             prompt_master_open,
             pattern=fr"^{PROMPT_MASTER_OPEN}$",
-            per_message=False,
         ),
     ],
     states={
@@ -250,12 +249,10 @@ prompt_master_conv = ConversationHandler(
             CallbackQueryHandler(
                 prompt_master_reapply,
                 pattern=fr"^{PROMPT_MASTER_OPEN}$",
-                per_message=False,
             ),
             CallbackQueryHandler(
                 prompt_master_cancel,
                 pattern=fr"^{PROMPT_MASTER_CANCEL}$",
-                per_message=False,
             ),
         ]
     },
@@ -264,10 +261,11 @@ prompt_master_conv = ConversationHandler(
         CallbackQueryHandler(
             prompt_master_cancel,
             pattern=fr"^{PROMPT_MASTER_CANCEL}$",
-            per_message=False,
         ),
     ],
     name="prompt_master",
+    per_chat=True,
+    per_user=True,
 )
 
 
