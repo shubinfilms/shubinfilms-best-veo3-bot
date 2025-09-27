@@ -36,17 +36,23 @@ from telegram import (
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    AIORateLimiter,
+    PreCheckoutQueryHandler,
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
 from handlers import (
-    PROMPT_MASTER_BACK,
-    PROMPT_MASTER_OPEN,
-    configure_prompt_master,
-    prompt_master_conv,
-    prompt_master_start,
+    configure_faq,
+    faq_callback,
+    faq_command,
+    prompt_master_callback,
+    prompt_master_open,
 )
 
 from prompt_master import (
@@ -77,6 +83,8 @@ from ui_helpers import (
     pm_main_kb,
     pm_result_kb,
 )
+
+from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
 
 from redis_utils import (
     credit,
@@ -161,7 +169,6 @@ from telegram_utils import (
     run_ffmpeg,
     md2_escape,
 )
-from faq_content import FAQ_SECTIONS, FAQ_ROOT_TEXT, faq_back_kb, faq_main_kb
 from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
@@ -183,10 +190,14 @@ _METRIC_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
 _VOICE_METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
 
-_FAQ_ROOT_MESSAGE = md2_escape(FAQ_ROOT_TEXT)
-_FAQ_SECTION_MESSAGES = {key: md2_escape(value["text"]) for key, value in FAQ_SECTIONS.items()}
 
-FAQ_STATE = 0
+def _faq_track_root() -> None:
+    faq_root_views_total.labels(**_METRIC_LABELS).inc()
+
+
+def _faq_track_section(section: str) -> None:
+    faq_views_total.labels(section=section, **_METRIC_LABELS).inc()
+
 
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
@@ -1018,6 +1029,12 @@ def _mode_set(chat_id: int, mode: str) -> None:
         except Exception as exc:
             log.warning("mode-set redis error: %s", exc)
     _inmem_modes[chat_id] = mode
+
+
+def is_mode_on(user_id: int) -> bool:
+    """Compatibility wrapper for tests expecting legacy API."""
+
+    return chat_mode_is_on(user_id)
 
 
 CACHE_PM_KEY_FMT = f"{REDIS_PREFIX}:pm:last:{{chat_id}}"
@@ -3214,7 +3231,7 @@ async def main_suggest_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     elif data == "go:balance":
         handler = my_balance_command
     elif data == "go:faq":
-        handler = faq_command
+        handler = faq_command_entry
 
     try:
         await query.answer()
@@ -3494,72 +3511,6 @@ async def _edit_balance_from_history(
         msg_ids = {}
         s["msg_ids"] = msg_ids
     msg_ids["balance"] = message.message_id
-
-
-async def _send_faq_root_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    faq_root_views_total.labels(**_METRIC_LABELS).inc()
-    await tg_safe_send(
-        ctx.bot.send_message,
-        method_name="send_message",
-        kind="faq",
-        chat_id=chat_id,
-        text=_FAQ_ROOT_MESSAGE,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True,
-        reply_markup=faq_main_kb(),
-    )
-
-
-async def faq_callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await ensure_user_record(update)
-
-    query = update.callback_query
-    if not query:
-        return FAQ_STATE
-
-    data = (query.data or "").strip()
-    if not data.startswith("faq:"):
-        return FAQ_STATE
-
-    message = query.message
-    if data == "faq:home":
-        await query.answer()
-        if message is not None:
-            await show_main_menu(message.chat_id, ctx)
-        return ConversationHandler.END
-
-    if message is None:
-        await query.answer()
-        return FAQ_STATE
-
-    if data == "faq:root":
-        faq_root_views_total.labels(**_METRIC_LABELS).inc()
-        await _safe_edit_message_text(
-            query.edit_message_text,
-            _FAQ_ROOT_MESSAGE,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-            reply_markup=faq_main_kb(),
-        )
-        await query.answer()
-        return FAQ_STATE
-
-    section = data.split(":", 1)[1]
-    text = _FAQ_SECTION_MESSAGES.get(section)
-    if text is None:
-        await query.answer("Раздел недоступен", show_alert=True)
-        return FAQ_STATE
-
-    faq_views_total.labels(section=section, **_METRIC_LABELS).inc()
-    await _safe_edit_message_text(
-        query.edit_message_text,
-        text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True,
-        reply_markup=faq_back_kb(),
-    )
-    await query.answer()
-    return FAQ_STATE
 
 
 def _short_prompt(prompt: Optional[str], limit: int = 120) -> str:
@@ -6176,6 +6127,13 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_menu(update, ctx)
 
 
+configure_faq(
+    show_main_menu=handle_menu,
+    on_root_view=_faq_track_root,
+    on_section_view=_faq_track_section,
+)
+
+
 async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     message = update.effective_message
@@ -6330,30 +6288,24 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("🆘 Поддержка появится скоро. Напишите сюда свой вопрос, и мы ответим позже.")
 
 
-async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    message = update.effective_message
-    if message is None:
-        return
-
-    chat_id = getattr(message, "chat_id", None)
-    if chat_id is None:
-        return
-    await _send_faq_root_menu(chat_id, ctx)
-
-
-async def faq_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await faq_command(update, ctx)
-    return FAQ_STATE
 
 
-faq_conv = ConversationHandler(
-    entry_points=[CommandHandler("faq", faq_start)],
-    states={FAQ_STATE: [CallbackQueryHandler(faq_callback_router, pattern=r"^faq:")]},
-    fallbacks=[],
-    name="faq",
-    allow_reentry=True,
-)
+async def faq_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await faq_callback(update, ctx)
+
+
+async def prompt_master_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await prompt_master_open(update, ctx)
+
+
+async def prompt_master_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await prompt_master_callback(update, ctx)
 
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6833,8 +6785,6 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await q.answer("Промпт вставлен в карточку VEO")
 
 
-configure_prompt_master(update_veo_card=lambda chat_id, context: show_veo_card(chat_id, context))
-
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     q = update.callback_query
@@ -6872,11 +6822,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_mode(user.id, False)
         s["mode"] = None
         await q.answer("Режим: Prompt-Master")
-        if message is not None:
-            await _safe_edit_message_text(
-                q.edit_message_text,
-                "Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
-            )
+        await prompt_master_command(update, ctx)
         return
 
     if data == CB_GO_HOME:
@@ -6902,9 +6848,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith(CB_PM_INSERT_VEO):
         await handle_pm_insert_to_veo(update, ctx, data)
-        return
-
-    if data in (PROMPT_MASTER_OPEN, PROMPT_MASTER_BACK):
         return
 
     await q.answer()
@@ -6979,9 +6922,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "faq":
-        await q.answer()
-        if q.message is not None:
-            await _send_faq_root_menu(q.message.chat_id, ctx)
+        await faq_command_entry(update, ctx)
         return
 
     if data == "back":
@@ -8728,7 +8669,8 @@ class RedisRunnerLock:
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("start",), start),
     (("menu",), menu_command),
-    (("faq",), faq_command),
+    (("faq",), faq_command_entry),
+    (("prompt_master",), prompt_master_command),
     (("chat",), chat_command),
     (("reset",), chat_reset_command),
     (("history",), chat_history_command),
@@ -8760,8 +8702,9 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("balance_recalc",), balance_recalc),
 ]
 
-CALLBACK_HANDLER_SPECS: List[tuple[str, Any]] = [
-    (r"^pm:", prompt_master_cb),
+CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
+    (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
+    (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (r"^hub:", hub_router),
     (r"^go:", main_suggest_router),
     (None, on_callback),
@@ -8771,6 +8714,7 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
     (MENU_BTN_VIDEO, handle_video_entry),
     (MENU_BTN_IMAGE, handle_image_entry),
     (MENU_BTN_SUNO, handle_music_entry),
+    (MENU_BTN_PM, prompt_master_command),
     (MENU_BTN_CHAT, handle_chat_entry),
     (MENU_BTN_BALANCE, handle_balance_entry),
 ]
@@ -8780,12 +8724,8 @@ def register_handlers(application: Any) -> None:
     for names, callback in PRIORITY_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))
 
-    application.add_handler(prompt_master_conv)
-
     for names, callback in ADDITIONAL_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))
-
-    application.add_handler(faq_conv)
 
     for pattern, callback in CALLBACK_HANDLER_SPECS:
         if pattern is None:
