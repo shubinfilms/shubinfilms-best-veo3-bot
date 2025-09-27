@@ -4,7 +4,8 @@ from .prompt_master_handler import (  # noqa: F401
     PM_MJ,
     PM_SUNO,
     PM_VIDEO,
-    PM_WAITING,
+    PM_SELECT,
+    PM_WAIT_IDEA,
     PROMPT_MASTER_BACK,
     PROMPT_MASTER_OPEN,
     configure_prompt_master,
@@ -22,6 +23,7 @@ __all__ = [
     "PM_BANANA",
     "PM_MJ",
     "PM_SUNO",
-    "PM_WAITING",
+    "PM_SELECT",
+    "PM_WAIT_IDEA",
     "prompt_master_start",
 ]
