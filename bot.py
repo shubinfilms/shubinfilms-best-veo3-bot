@@ -8778,7 +8778,6 @@ async def run_bot_async() -> None:
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             prompt_master_input,
-            block=False,
         )
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
