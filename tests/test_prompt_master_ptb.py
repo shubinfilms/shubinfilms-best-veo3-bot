@@ -1,9 +1,16 @@
-"""Tests for Prompt-Master MVP handlers."""
+"""Tests for Prompt-Master handlers."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
-from handlers.prompt_master_handler import PM_HINT, prompt_master_callback, prompt_master_open
+from handlers.prompt_master_handler import (
+    PM_HINT,
+    build_prompt_result,
+    classify_prompt_engine,
+    prompt_master_callback,
+    prompt_master_open,
+)
 from keyboards import CB_PM_PREFIX, prompt_master_keyboard
 
 
@@ -100,3 +107,35 @@ def test_prompt_master_callback_back_returns_menu() -> None:
     text, kwargs = edits[0]
     assert text == PM_HINT
     assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard().inline_keyboard
+
+
+def test_classify_prompt_engine_variants() -> None:
+    assert classify_prompt_engine("midjourney cinematic scene") == "mj"
+    assert classify_prompt_engine("оживи фото дедушки") == "photo_live"
+    assert classify_prompt_engine("banana edit portrait") == "banana"
+    assert classify_prompt_engine("Suno make a song about hope") == "suno"
+    assert classify_prompt_engine("снимем клип про рассвет") == "veo"
+
+
+def test_build_prompt_result_veo_contains_duration() -> None:
+    result, lang = build_prompt_result("Снимем видео VEO про рассвет")
+    assert result.engine == "veo"
+    assert lang == "ru"
+    payload = json.loads(result.raw)
+    assert "Длительность" in payload["action"]
+
+
+def test_build_prompt_result_mj_json_structure() -> None:
+    result, lang = build_prompt_result("Midjourney concept art of neon city")
+    assert result.engine == "mj"
+    assert lang == "en"
+    payload = json.loads(result.raw)
+    assert set(payload.keys()) == {"prompt", "style", "camera", "lighting"}
+    assert "four" in payload["prompt"].lower()
+
+
+def test_build_prompt_result_banana_has_safety_phrase() -> None:
+    result, _ = build_prompt_result("Banana edit portrait with soft light")
+    assert result.engine == "banana"
+    assert not result.is_json
+    assert "keep the real face unchanged" in result.raw

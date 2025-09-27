@@ -53,6 +53,7 @@ from handlers import (
     faq_command,
     prompt_master_callback,
     prompt_master_open,
+    prompt_master_process,
 )
 
 from prompt_master import (
@@ -7566,68 +7567,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if user_mode == MODE_PM:
-        if not text:
-            await msg.reply_text("⚠️ Пришлите идею или сцену для Prompt-Master.")
-            return
-        from prompt_master import build_cinema_prompt
-
-        status_msg = await msg.reply_text("🧠 Пишу промпт…")
-        with suppress(Exception):
-            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-        try:
-            kino_prompt, _ = await build_cinema_prompt(text, user_lang=detect_lang(text))
-        except Exception as exc:
-            log.exception("Prompt-Master generation failed: %s", exc)
-            err_text = "⚠️ Не удалось сгенерировать промпт, попробуйте ещё раз."
-            if status_msg:
-                try:
-                    result = await _safe_edit_message_text(
-                        ctx.bot.edit_message_text,
-                        chat_id=chat_id,
-                        message_id=status_msg.message_id,
-                        text=err_text,
-                    )
-                    if isinstance(result, BadRequest):
-                        await msg.reply_text(err_text)
-                except Exception:
-                    await msg.reply_text(err_text)
-            else:
-                await msg.reply_text(err_text)
-            return
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎬 Вставить в VEO", callback_data=CB_PM_INSERT_VEO)],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=CB_GO_HOME)],
-        ])
-        block = f"```\n{kino_prompt.strip()}\n```"
-        final_text = f"🧠 Готово! Вот ваш кинопромпт:\n\n{block}"
-
-        try:
-            result = await _safe_edit_message_text(
-                ctx.bot.edit_message_text,
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text=final_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
-            if isinstance(result, BadRequest):
-                await msg.reply_text(
-                    final_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=kb,
-                    disable_web_page_preview=True,
-                )
-        except Exception:
-            await msg.reply_text(
-                final_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
-        cache_pm_prompt(chat_id, kino_prompt.strip())
+        await prompt_master_process(update, ctx)
         return
 
     low = text.lower()
