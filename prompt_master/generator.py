@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List
 
+import html
+
 
 class Engine(str, Enum):
     """Supported Prompt-Master engines."""
@@ -24,9 +26,14 @@ class PromptPayload:
     """Structured payload returned by the prompt builder."""
 
     title: str
-    body_markdown: str
+    body_html: str
     insert_payload: Dict[str, Any]
     copy_text: str
+    card_text: str
+
+    @property
+    def body(self) -> str:  # pragma: no cover - legacy compatibility
+        return self.card_text
 
 
 _FACE_SAFETY = {
@@ -81,6 +88,22 @@ def _short_scene(text: str, *, width: int = 180) -> str:
     return textwrap.shorten(cleaned, width=width, placeholder="…")
 
 
+def _html_paragraph(text: str) -> str:
+    safe = html.escape(text)
+    return f"<p>{safe}</p>"
+
+
+def _html_list(items: List[str]) -> str:
+    if not items:
+        return ""
+    return "<ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in items) + "</ul>"
+
+
+def _html_code_block(content: str) -> str:
+    safe = html.escape(content)
+    return f"<pre><code>{safe}</code></pre>"
+
+
 def _veo_payload(user_text: str, lang: str) -> PromptPayload:
     scene = _short_scene(user_text)
     camera = "Steadicam dolly out" if lang == "en" else "Стефикам с плавным выездом"
@@ -115,7 +138,11 @@ def _veo_payload(user_text: str, lang: str) -> PromptPayload:
     copy_text = json.dumps(payload, ensure_ascii=False, indent=2)
     duration_line = "Видеоролик длится ~8 секунд." if lang == "ru" else "Video runs for ~8 seconds."
     face_line = _FACE_SAFETY[lang]
-    body = f"{duration_line}\n\n```json\n{copy_text}\n```\n\n{face_line}"
+    body = (
+        _html_paragraph(duration_line)
+        + _html_code_block(copy_text)
+        + _html_paragraph(face_line)
+    )
     insert_payload = {
         "engine": Engine.VEO_VIDEO.value,
         "format": "16:9",
@@ -124,9 +151,10 @@ def _veo_payload(user_text: str, lang: str) -> PromptPayload:
     }
     return PromptPayload(
         title=_TITLES[Engine.VEO_VIDEO][lang],
-        body_markdown=body,
+        body_html=body,
         insert_payload=insert_payload,
         copy_text=copy_text,
+        card_text=copy_text,
     )
 
 
@@ -146,16 +174,21 @@ def _mj_payload(user_text: str, lang: str) -> PromptPayload:
     copy_text = json.dumps(payload, ensure_ascii=False, indent=2)
     note = "MJ создаёт 4 изображения из одного промпта." if lang == "ru" else "MJ generates 4 images from a single prompt."
     face_line = _FACE_SAFETY[lang]
-    body = f"{note}\n\n```json\n{copy_text}\n```\n\n{face_line}"
+    body = (
+        _html_paragraph(note)
+        + _html_code_block(copy_text)
+        + _html_paragraph(face_line)
+    )
     insert_payload = {
         "engine": Engine.MJ.value,
         "prompt": payload,
     }
     return PromptPayload(
         title=_TITLES[Engine.MJ][lang],
-        body_markdown=body,
+        body_html=body,
         insert_payload=insert_payload,
         copy_text=copy_text,
+        card_text=copy_text,
     )
 
 
@@ -188,15 +221,11 @@ def _banana_tasks(user_text: str, lang: str) -> List[str]:
 
 def _banana_payload(user_text: str, lang: str) -> PromptPayload:
     tasks = _banana_tasks(user_text, lang)
-    checklist_title = "**Чек-лист:**" if lang == "ru" else "**Checklist:**"
-    lines = [checklist_title]
-    for task in tasks:
-        lines.append(f"- {task}")
+    checklist_title = "Чек-лист:" if lang == "ru" else "Checklist:"
     face_line = _FACE_SAFETY[lang]
     ban_line = _FACE_SWAP_BAN[lang]
-    lines.append(f"- {face_line}")
-    lines.append(f"- {ban_line}")
-    body = "\n".join(lines)
+    list_items = [checklist_title, *tasks, face_line, ban_line]
+    body = _html_list(list_items)
     copy_text = "\n".join(task for task in tasks)
     insert_payload = {
         "engine": Engine.BANANA_EDIT.value,
@@ -204,9 +233,10 @@ def _banana_payload(user_text: str, lang: str) -> PromptPayload:
     }
     return PromptPayload(
         title=_TITLES[Engine.BANANA_EDIT][lang],
-        body_markdown=body,
+        body_html=body,
         insert_payload=insert_payload,
         copy_text=copy_text,
+        card_text="\n".join([*tasks, face_line, ban_line]),
     )
 
 
@@ -233,17 +263,19 @@ def _animate_payload(user_text: str, lang: str) -> PromptPayload:
             else "Result: natural, no plastic look, no feature shifting"
         ),
     ]
-    body_lines = ["**Шаги:**" if lang == "ru" else "**Steps:**"]
-    for hint in hints:
-        body_lines.append(f"- {hint}")
     face_line = _FACE_SAFETY[lang]
     ban_line = _FACE_SWAP_BAN[lang]
-    body_lines.append(f"- {face_line}")
-    body_lines.append(f"- {ban_line}")
     idea_line = (
-        "**Описание кадра:** " if lang == "ru" else "**Frame description:** "
+        "Описание кадра: " if lang == "ru" else "Frame description: "
     ) + _normalize_text(user_text)
-    body_lines.insert(1, idea_line)
+    list_items = [
+        "Шаги:" if lang == "ru" else "Steps:",
+        idea_line,
+        *hints,
+        face_line,
+        ban_line,
+    ]
+    body_html = _html_list(list_items)
     insert_payload = {
         "engine": Engine.VEO_ANIMATE.value,
         "animate_hints": hints,
@@ -252,9 +284,10 @@ def _animate_payload(user_text: str, lang: str) -> PromptPayload:
     copy_text = "\n".join(hints)
     return PromptPayload(
         title=_TITLES[Engine.VEO_ANIMATE][lang],
-        body_markdown="\n".join(body_lines),
+        body_html=body_html,
         insert_payload=insert_payload,
         copy_text=copy_text,
+        card_text="\n".join([idea_line, *hints]),
     )
 
 
@@ -299,20 +332,22 @@ def _suno_payload(user_text: str, lang: str) -> PromptPayload:
         story_lines = _generate_story_lines(user_text, lang)
         lyrics = "\n".join(story_lines)
     lines = [
-        f"- **Жанр:** {genre}" if lang == "ru" else f"- **Genre:** {genre}",
-        f"- **Настроение:** {mood}" if lang == "ru" else f"- **Mood:** {mood}",
-        f"- **Сюжет/картина:** {lyrics}" if lang == "ru" else f"- **Story:** {lyrics}",
+        ("Жанр: " if lang == "ru" else "Genre: ") + genre,
+        ("Настроение: " if lang == "ru" else "Mood: ") + mood,
+        ("Сюжет/картина: " if lang == "ru" else "Story: ") + lyrics,
+        ("Инструменты: " if lang == "ru" else "Instruments: ") + instruments,
         (
-            f"- **Инструменты:** {instruments}" if lang == "ru" else f"- **Instruments:** {instruments}"
-        ),
-        (
-            f"- **Референсы:** {_SUNO_REFERENCES[lang]}"
+            "Референсы: " + _SUNO_REFERENCES[lang]
             if lang == "ru"
-            else f"- **References:** {_SUNO_REFERENCES[lang]}"
+            else "References: " + _SUNO_REFERENCES[lang]
         ),
     ]
     if has_lines:
-        lines.append("- **Текст куплета/припева включён из запроса.**" if lang == "ru" else "- **Verse/chorus text taken from user input.**")
+        lines.append(
+            "Текст куплета/припева включён из запроса."
+            if lang == "ru"
+            else "Verse/chorus text taken from user input."
+        )
     copy_lines = [
         f"Genre: {genre}",
         f"Mood: {mood}",
@@ -331,12 +366,34 @@ def _suno_payload(user_text: str, lang: str) -> PromptPayload:
             "lyrics": lyrics if has_lines else None,
         },
     }
+    body_html = _html_list(lines)
     return PromptPayload(
         title=_TITLES[Engine.SUNO][lang],
-        body_markdown="\n".join(lines),
+        body_html=body_html,
         insert_payload=insert_payload,
         copy_text="\n".join(copy_lines),
+        card_text="\n".join(lines),
     )
+
+
+def build_veo_prompt(user_text: str, lang: str) -> PromptPayload:
+    return _veo_payload(user_text, "ru" if lang == "ru" else "en")
+
+
+def build_mj_prompt(user_text: str, lang: str) -> PromptPayload:
+    return _mj_payload(user_text, "ru" if lang == "ru" else "en")
+
+
+def build_banana_prompt(user_text: str, lang: str) -> PromptPayload:
+    return _banana_payload(user_text, "ru" if lang == "ru" else "en")
+
+
+def build_animate_prompt(user_text: str, lang: str) -> PromptPayload:
+    return _animate_payload(user_text, "ru" if lang == "ru" else "en")
+
+
+def build_suno_prompt(user_text: str, lang: str) -> PromptPayload:
+    return _suno_payload(user_text, "ru" if lang == "ru" else "en")
 
 
 async def build_prompt(engine: Engine, user_text: str, lang: str) -> PromptPayload:
@@ -344,13 +401,13 @@ async def build_prompt(engine: Engine, user_text: str, lang: str) -> PromptPaylo
 
     lang = "ru" if lang == "ru" else "en"
     if engine == Engine.VEO_VIDEO:
-        return _veo_payload(user_text, lang)
+        return build_veo_prompt(user_text, lang)
     if engine == Engine.MJ:
-        return _mj_payload(user_text, lang)
+        return build_mj_prompt(user_text, lang)
     if engine == Engine.BANANA_EDIT:
-        return _banana_payload(user_text, lang)
+        return build_banana_prompt(user_text, lang)
     if engine == Engine.VEO_ANIMATE:
-        return _animate_payload(user_text, lang)
+        return build_animate_prompt(user_text, lang)
     if engine == Engine.SUNO:
-        return _suno_payload(user_text, lang)
+        return build_suno_prompt(user_text, lang)
     raise ValueError(f"Unsupported engine: {engine}")
