@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-import html
-
+from utils.html_render import safe_lines
 
 class Engine(str, Enum):
     """Supported Prompt-Master engines."""
@@ -26,10 +25,13 @@ class PromptPayload:
     """Structured payload returned by the prompt builder."""
 
     title: str
-    body_html: str
+    subtitle: Optional[str]
+    body_md: str
+    code_block: Optional[str]
     insert_payload: Dict[str, Any]
     copy_text: str
     card_text: str
+    buttons: List[str] = field(default_factory=list)
 
     @property
     def body(self) -> str:  # pragma: no cover - legacy compatibility
@@ -88,20 +90,6 @@ def _short_scene(text: str, *, width: int = 180) -> str:
     return textwrap.shorten(cleaned, width=width, placeholder="…")
 
 
-def _html_paragraph(text: str) -> str:
-    safe = html.escape(text)
-    return f"<p>{safe}</p>"
-
-
-def _html_list(items: List[str]) -> str:
-    if not items:
-        return ""
-    return "<ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in items) + "</ul>"
-
-
-def _html_code_block(content: str) -> str:
-    safe = html.escape(content)
-    return f"<pre><code>{safe}</code></pre>"
 
 
 def _veo_payload(user_text: str, lang: str) -> PromptPayload:
@@ -138,11 +126,6 @@ def _veo_payload(user_text: str, lang: str) -> PromptPayload:
     copy_text = json.dumps(payload, ensure_ascii=False, indent=2)
     duration_line = "Видеоролик длится ~8 секунд." if lang == "ru" else "Video runs for ~8 seconds."
     face_line = _FACE_SAFETY[lang]
-    body = (
-        _html_paragraph(duration_line)
-        + _html_code_block(copy_text)
-        + _html_paragraph(face_line)
-    )
     insert_payload = {
         "engine": Engine.VEO_VIDEO.value,
         "format": "16:9",
@@ -151,7 +134,9 @@ def _veo_payload(user_text: str, lang: str) -> PromptPayload:
     }
     return PromptPayload(
         title=_TITLES[Engine.VEO_VIDEO][lang],
-        body_html=body,
+        subtitle=None,
+        body_md=safe_lines([duration_line, face_line]),
+        code_block=copy_text,
         insert_payload=insert_payload,
         copy_text=copy_text,
         card_text=copy_text,
@@ -172,20 +157,21 @@ def _mj_payload(user_text: str, lang: str) -> PromptPayload:
         "render": _MJ_RENDER,
     }
     copy_text = json.dumps(payload, ensure_ascii=False, indent=2)
-    note = "MJ создаёт 4 изображения из одного промпта." if lang == "ru" else "MJ generates 4 images from a single prompt."
-    face_line = _FACE_SAFETY[lang]
-    body = (
-        _html_paragraph(note)
-        + _html_code_block(copy_text)
-        + _html_paragraph(face_line)
+    note = (
+        "MJ создаёт 4 изображения из одного промпта."
+        if lang == "ru"
+        else "MJ generates 4 images from a single prompt."
     )
+    face_line = _FACE_SAFETY[lang]
     insert_payload = {
         "engine": Engine.MJ.value,
         "prompt": payload,
     }
     return PromptPayload(
         title=_TITLES[Engine.MJ][lang],
-        body_html=body,
+        subtitle=note,
+        body_md=safe_lines([face_line]),
+        code_block=copy_text,
         insert_payload=insert_payload,
         copy_text=copy_text,
         card_text=copy_text,
@@ -224,16 +210,17 @@ def _banana_payload(user_text: str, lang: str) -> PromptPayload:
     checklist_title = "Чек-лист:" if lang == "ru" else "Checklist:"
     face_line = _FACE_SAFETY[lang]
     ban_line = _FACE_SWAP_BAN[lang]
-    list_items = [checklist_title, *tasks, face_line, ban_line]
-    body = _html_list(list_items)
     copy_text = "\n".join(task for task in tasks)
     insert_payload = {
         "engine": Engine.BANANA_EDIT.value,
         "banana_tasks": tasks,
     }
+    list_items = [checklist_title, *[f"• {item}" for item in tasks], face_line, ban_line]
     return PromptPayload(
         title=_TITLES[Engine.BANANA_EDIT][lang],
-        body_html=body,
+        subtitle=None,
+        body_md=safe_lines(list_items),
+        code_block=None,
         insert_payload=insert_payload,
         copy_text=copy_text,
         card_text="\n".join([*tasks, face_line, ban_line]),
@@ -275,7 +262,7 @@ def _animate_payload(user_text: str, lang: str) -> PromptPayload:
         face_line,
         ban_line,
     ]
-    body_html = _html_list(list_items)
+    bullet_lines = [list_items[0], *[f"• {item}" for item in list_items[1:]]]
     insert_payload = {
         "engine": Engine.VEO_ANIMATE.value,
         "animate_hints": hints,
@@ -284,7 +271,9 @@ def _animate_payload(user_text: str, lang: str) -> PromptPayload:
     copy_text = "\n".join(hints)
     return PromptPayload(
         title=_TITLES[Engine.VEO_ANIMATE][lang],
-        body_html=body_html,
+        subtitle=None,
+        body_md=safe_lines(bullet_lines),
+        code_block=None,
         insert_payload=insert_payload,
         copy_text=copy_text,
         card_text="\n".join([idea_line, *hints]),
@@ -366,10 +355,11 @@ def _suno_payload(user_text: str, lang: str) -> PromptPayload:
             "lyrics": lyrics if has_lines else None,
         },
     }
-    body_html = _html_list(lines)
     return PromptPayload(
         title=_TITLES[Engine.SUNO][lang],
-        body_html=body_html,
+        subtitle=None,
+        body_md=safe_lines(lines),
+        code_block=None,
         insert_payload=insert_payload,
         copy_text="\n".join(copy_lines),
         card_text="\n".join(lines),
