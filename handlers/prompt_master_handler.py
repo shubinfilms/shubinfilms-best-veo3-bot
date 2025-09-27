@@ -236,20 +236,45 @@ async def prompt_master_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
 
 prompt_master_conv = ConversationHandler(
     entry_points=[
-        CallbackQueryHandler(prompt_master_open, pattern=fr"^{PROMPT_MASTER_OPEN}$"),
+        CallbackQueryHandler(
+            prompt_master_open,
+            pattern=fr"^{PROMPT_MASTER_OPEN}$",
+            block=True,
+            per_message=True,
+        ),
     ],
     states={
         _PM_STATE: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_generate),
-            CallbackQueryHandler(prompt_master_reapply, pattern=fr"^{PROMPT_MASTER_OPEN}$"),
-            CallbackQueryHandler(prompt_master_cancel, pattern=fr"^{PROMPT_MASTER_CANCEL}$"),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                prompt_master_generate,
+                block=True,
+            ),
+            CallbackQueryHandler(
+                prompt_master_reapply,
+                pattern=fr"^{PROMPT_MASTER_OPEN}$",
+                block=True,
+                per_message=True,
+            ),
+            CallbackQueryHandler(
+                prompt_master_cancel,
+                pattern=fr"^{PROMPT_MASTER_CANCEL}$",
+                block=True,
+                per_message=True,
+            ),
         ]
     },
     fallbacks=[
-        CommandHandler("cancel", prompt_master_cancel),
-        CallbackQueryHandler(prompt_master_cancel, pattern=fr"^{PROMPT_MASTER_CANCEL}$"),
+        CommandHandler("cancel", prompt_master_cancel, block=True),
+        CallbackQueryHandler(
+            prompt_master_cancel,
+            pattern=fr"^{PROMPT_MASTER_CANCEL}$",
+            block=True,
+            per_message=True,
+        ),
     ],
     name="prompt_master",
+    block=True,
 )
 
 

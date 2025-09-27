@@ -192,7 +192,7 @@ SECTION_LABELS = {
 
 
 def _clean_value(value: str) -> str:
-    return value.replace("```", "``\`").strip()
+    return value.replace("```", "``\\`").strip()
 
 
 def _fallback_sections(raw_text: str, lang: str) -> Dict[str, str]:
