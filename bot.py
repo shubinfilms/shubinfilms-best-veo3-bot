@@ -37,12 +37,12 @@ from telegram import (
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
+    CallbackQueryHandler, ConversationHandler, filters, AIORateLimiter, PreCheckoutQueryHandler
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
 from handlers import (
-    PROMPT_MASTER_CANCEL,
+    PROMPT_MASTER_BACK,
     PROMPT_MASTER_OPEN,
     configure_prompt_master,
     prompt_master_conv,
@@ -184,6 +184,8 @@ _VOICE_METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
 
 _FAQ_ROOT_MESSAGE = md2_escape(FAQ_ROOT_TEXT)
 _FAQ_SECTION_MESSAGES = {key: md2_escape(value["text"]) for key, value in FAQ_SECTIONS.items()}
+
+FAQ_STATE = 0
 
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
@@ -3507,27 +3509,27 @@ async def _send_faq_root_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def faq_callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def faq_callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await ensure_user_record(update)
 
     query = update.callback_query
     if not query:
-        return
+        return FAQ_STATE
 
     data = (query.data or "").strip()
     if not data.startswith("faq:"):
-        return
+        return FAQ_STATE
 
     message = query.message
     if data == "faq:home":
         await query.answer()
         if message is not None:
             await show_main_menu(message.chat_id, ctx)
-        return
+        return ConversationHandler.END
 
     if message is None:
         await query.answer()
-        return
+        return FAQ_STATE
 
     if data == "faq:root":
         faq_root_views_total.labels(**_METRIC_LABELS).inc()
@@ -3539,13 +3541,13 @@ async def faq_callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=faq_main_kb(),
         )
         await query.answer()
-        return
+        return FAQ_STATE
 
     section = data.split(":", 1)[1]
     text = _FAQ_SECTION_MESSAGES.get(section)
     if text is None:
         await query.answer("Раздел недоступен", show_alert=True)
-        return
+        return FAQ_STATE
 
     faq_views_total.labels(section=section, **_METRIC_LABELS).inc()
     await _safe_edit_message_text(
@@ -3556,6 +3558,8 @@ async def faq_callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=faq_back_kb(),
     )
     await query.answer()
+    return FAQ_STATE
+
 
 def _short_prompt(prompt: Optional[str], limit: int = 120) -> str:
     txt = (prompt or "").strip()
@@ -6336,6 +6340,23 @@ async def faq_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await _send_faq_root_menu(chat_id, ctx)
 
+
+async def faq_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await faq_command(update, ctx)
+    return FAQ_STATE
+
+
+faq_conv = ConversationHandler(
+    entry_points=[CommandHandler("faq", faq_start)],
+    states={FAQ_STATE: [CallbackQueryHandler(faq_callback_router, pattern=r"^faq:")]},
+    fallbacks=[],
+    name="faq",
+    per_chat=True,
+    per_user=True,
+    per_message=False,
+)
+
+
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     await update.message.reply_text(
@@ -6862,7 +6883,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_pm_insert_to_veo(update, ctx, data)
         return
 
-    if data in (PROMPT_MASTER_OPEN, PROMPT_MASTER_CANCEL):
+    if data in (PROMPT_MASTER_OPEN, PROMPT_MASTER_BACK):
         return
 
     await q.answer()
@@ -8728,7 +8749,11 @@ class RedisRunnerLock:
         if not self._redis:
             return
         try:
-            await self._redis.close()
+            close = getattr(self._redis, "aclose", None)
+            if callable(close):
+                await close()
+            else:
+                await self._redis.close()
         except Exception:
             pass
         self._redis = None
@@ -8747,59 +8772,63 @@ async def run_bot_async() -> None:
                    .build())
 
     # Handlers (оставляем как есть)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("menu", menu_command))
-    application.add_handler(CommandHandler("buy", buy_command))
-    application.add_handler(CommandHandler("video", video_command))
-    application.add_handler(CommandHandler("image", image_command))
-    application.add_handler(CommandHandler("suno", suno_command))
-    application.add_handler(CommandHandler("suno_last", suno_last_command))
-    application.add_handler(CommandHandler("suno_task", suno_task_command))
-    application.add_handler(CommandHandler("suno_retry", suno_retry_command))
-    application.add_handler(CommandHandler("lang", lang_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("faq", faq_command))
-    application.add_handler(CommandHandler("health", health))
-    application.add_handler(CommandHandler("topup", topup))
-    application.add_handler(CommandHandler("promo", promo_command))
-    application.add_handler(CommandHandler("chat", chat_command))
-    application.add_handler(CommandHandler("reset", chat_reset_command))
-    application.add_handler(CommandHandler("history", chat_history_command))
-    application.add_handler(CommandHandler("users_count", users_count_command))
-    application.add_handler(CommandHandler("whoami", whoami_command))
-    application.add_handler(CommandHandler("suno_debug", suno_debug_command))
-    application.add_handler(CommandHandler("broadcast", broadcast_command))
-    application.add_handler(CommandHandler("my_balance", my_balance_command))
-    application.add_handler(CommandHandler("add_balance", add_balance_command))
-    application.add_handler(CommandHandler("sub_balance", sub_balance_command))
-    application.add_handler(CommandHandler("transactions", transactions_command))
+    try:
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("menu", menu_command))
+        application.add_handler(CommandHandler("buy", buy_command))
+        application.add_handler(CommandHandler("video", video_command))
+        application.add_handler(CommandHandler("image", image_command))
+        application.add_handler(CommandHandler("suno", suno_command))
+        application.add_handler(CommandHandler("suno_last", suno_last_command))
+        application.add_handler(CommandHandler("suno_task", suno_task_command))
+        application.add_handler(CommandHandler("suno_retry", suno_retry_command))
+        application.add_handler(CommandHandler("lang", lang_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("faq", faq_command))
+        application.add_handler(CommandHandler("health", health))
+        application.add_handler(CommandHandler("topup", topup))
+        application.add_handler(CommandHandler("promo", promo_command))
+        application.add_handler(CommandHandler("chat", chat_command))
+        application.add_handler(CommandHandler("reset", chat_reset_command))
+        application.add_handler(CommandHandler("history", chat_history_command))
+        application.add_handler(CommandHandler("users_count", users_count_command))
+        application.add_handler(CommandHandler("whoami", whoami_command))
+        application.add_handler(CommandHandler("suno_debug", suno_debug_command))
+        application.add_handler(CommandHandler("broadcast", broadcast_command))
+        application.add_handler(CommandHandler("my_balance", my_balance_command))
+        application.add_handler(CommandHandler("add_balance", add_balance_command))
+        application.add_handler(CommandHandler("sub_balance", sub_balance_command))
+        application.add_handler(CommandHandler("transactions", transactions_command))
 # codex/fix-balance-reset-after-deploy
-    application.add_handler(CommandHandler("balance", balance_command))
-    application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-    application.add_handler(
-        CommandHandler(["prompt_master", "prompt", "promptmaster"], prompt_master_cmd)
-    )
-    application.add_handler(
-        MessageHandler(filters.Regex(r"^/prompt-master(?:@[^\s]+)?$"), prompt_master_cmd)
-    )
-    application.add_handler(prompt_master_conv)
-# main
-    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    application.add_handler(CallbackQueryHandler(prompt_master_cb, pattern="^pm:"))
-    application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
-    application.add_handler(CallbackQueryHandler(main_suggest_router, pattern="^go:"))
-    application.add_handler(CallbackQueryHandler(faq_callback_router, pattern="^faq:"))
-    application.add_handler(CallbackQueryHandler(on_callback))
-    application.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            prompt_master_input,
+        application.add_handler(CommandHandler("balance", balance_command))
+        application.add_handler(CommandHandler("balance_recalc", balance_recalc))
+        application.add_handler(
+            CommandHandler(["prompt_master", "prompt", "promptmaster"], prompt_master_cmd)
         )
-    )
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+        application.add_handler(
+            MessageHandler(filters.Regex(r"^/prompt-master(?:@[^\s]+)?$"), prompt_master_cmd)
+        )
+        application.add_handler(prompt_master_conv)
+        application.add_handler(faq_conv)
+# main
+        application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+        application.add_handler(CallbackQueryHandler(prompt_master_cb, pattern="^pm:"))
+        application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
+        application.add_handler(CallbackQueryHandler(main_suggest_router, pattern="^go:"))
+        application.add_handler(CallbackQueryHandler(on_callback))
+        application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+        application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+        application.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                prompt_master_input,
+            )
+        )
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    except Exception:
+        log.exception("handler registration failed")
+        raise
     application.add_error_handler(error_handler)
 
     lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)

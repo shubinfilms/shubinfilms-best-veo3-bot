@@ -21,8 +21,13 @@ from telegram.ext import (
 )
 LOGGER = logging.getLogger(__name__)
 
-PROMPT_MASTER_OPEN = "PROMPT_MASTER_OPEN"
-PROMPT_MASTER_CANCEL = "PROMPT_MASTER_CANCEL"
+PROMPT_MASTER_OPEN = "pm_open"
+PROMPT_MASTER_BACK = "pm_back"
+PM_VIDEO = "pm_video"
+PM_ALIVE = "pm_photo_alive"
+PM_BANANA = "pm_banana"
+PM_MJ = "pm_mj"
+PM_SUNO = "pm_suno"
 
 # Conversation states
 PM_WAITING = range(1)
@@ -64,7 +69,7 @@ def _result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📎 Вставить в VEO ещё раз", callback_data=PROMPT_MASTER_OPEN)],
-            [InlineKeyboardButton("↩️ Назад", callback_data=PROMPT_MASTER_CANCEL)],
+            [InlineKeyboardButton("↩️ Назад", callback_data=PROMPT_MASTER_BACK)],
         ]
     )
 
@@ -185,6 +190,12 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return _PM_STATE
 
 
+async def prompt_master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for the /prompt_master command."""
+
+    return await prompt_master_open(update, context)
+
+
 async def prompt_master_reapply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if query:
@@ -235,10 +246,8 @@ async def prompt_master_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
 
 prompt_master_conv = ConversationHandler(
     entry_points=[
-        CallbackQueryHandler(
-            prompt_master_open,
-            pattern=fr"^{PROMPT_MASTER_OPEN}$",
-        ),
+        CommandHandler("prompt_master", prompt_master_start),
+        CallbackQueryHandler(prompt_master_open, pattern=fr"^{PROMPT_MASTER_OPEN}$"),
     ],
     states={
         _PM_STATE: [
@@ -252,7 +261,7 @@ prompt_master_conv = ConversationHandler(
             ),
             CallbackQueryHandler(
                 prompt_master_cancel,
-                pattern=fr"^{PROMPT_MASTER_CANCEL}$",
+                pattern=fr"^{PROMPT_MASTER_BACK}$",
             ),
         ]
     },
@@ -260,19 +269,26 @@ prompt_master_conv = ConversationHandler(
         CommandHandler("cancel", prompt_master_cancel),
         CallbackQueryHandler(
             prompt_master_cancel,
-            pattern=fr"^{PROMPT_MASTER_CANCEL}$",
+            pattern=fr"^{PROMPT_MASTER_BACK}$",
         ),
     ],
     name="prompt_master",
     per_chat=True,
     per_user=True,
+    per_message=False,
 )
 
 
 __all__ = [
     "PROMPT_MASTER_OPEN",
-    "PROMPT_MASTER_CANCEL",
+    "PROMPT_MASTER_BACK",
+    "PM_VIDEO",
+    "PM_ALIVE",
+    "PM_BANANA",
+    "PM_MJ",
+    "PM_SUNO",
     "PM_WAITING",
     "prompt_master_conv",
     "configure_prompt_master",
+    "prompt_master_start",
 ]
