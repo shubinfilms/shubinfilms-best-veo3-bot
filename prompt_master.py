@@ -340,4 +340,132 @@ async def build_cinema_prompt(user_text: str, user_lang: str = "ru") -> Tuple[st
     return prompt_text, meta
 
 
-__all__ = ["build_cinema_prompt", "call_llm_to_make_kino_prompt"]
+_RHYTHM_KEYWORDS = {
+    "slow": {"slow", "медлен", "dreamy", "calm"},
+    "fast": {"fast", "динами", "быст", "energetic", "upbeat"},
+}
+
+
+def _infer_rhythm(*parts: Optional[str]) -> Optional[str]:
+    combined = " ".join(p for p in parts if p).lower()
+    if not combined:
+        return None
+    for rhythm, keywords in _RHYTHM_KEYWORDS.items():
+        if any(word in combined for word in keywords):
+            return rhythm
+    return None
+
+
+def build_video_prompt(idea: str, style: Optional[str] = None) -> str:
+    idea = idea.strip()
+    style_value = (style or "").strip() or "cinematic, realistic grading, depth of field"
+    rhythm = _infer_rhythm(idea, style)
+    rhythm_line = f"— Rhythm: {rhythm}" if rhythm else ""
+    lines = [
+        "[cinematic prompt]",
+        f"— Scene: {idea}",
+        f"— Style: {style_value}",
+        "— Camera: dynamic shots, smooth dolly, close-ups, wide establishing",
+        "— Lighting: natural, soft shadows, volumetric light",
+        "— Quality: high detail, 4k framing",
+    ]
+    if rhythm_line:
+        lines.append(rhythm_line)
+    lines.append("(avoid: low-res, artifacts)")
+    return "\n".join(lines)
+
+
+def build_animate_prompt(brief: str, mood: Optional[str] = None) -> str:
+    brief_value = brief.strip()
+    mood_value = (mood or "").strip() or "natural"
+    return (
+        f"Bring subtle motion to: {brief_value}\n"
+        "Motion: gentle parallax, breathing, hair/water flicker (if relevant)\n"
+        "Keep face sharp and natural, avoid distortions\n"
+        f"Mood: {mood_value}"
+    )
+
+
+_BANANA_ACTION_MAP: tuple[tuple[str, str], ...] = (
+    ("replace_background", "фон"),
+    ("replace_background", "background"),
+    ("change_clothes", "одежд"),
+    ("change_clothes", "look"),
+    ("change_clothes", "clothes"),
+    ("makeup", "макияж"),
+    ("makeup", "makeup"),
+    ("remove_objects", "удали"),
+    ("remove_objects", "убери"),
+    ("remove_objects", "remove"),
+    ("merge_subjects", "объедини"),
+)
+
+
+def _banana_actions_from_text(brief: str) -> list[Dict[str, Any]]:
+    parts = [segment.strip() for segment in re.split(r"[\n\.;]+", brief) if segment.strip()]
+    actions: list[Dict[str, Any]] = []
+    lowered = brief.lower()
+    for segment in parts or [brief.strip()]:
+        seg_lower = segment.lower()
+        matched_action: Optional[str] = None
+        for action, keyword in _BANANA_ACTION_MAP:
+            if keyword in seg_lower or keyword in lowered:
+                matched_action = action
+                break
+        if not matched_action:
+            matched_action = "enhance"
+        actions.append({"action": matched_action, "value": segment})
+    return actions or [{"action": "enhance", "value": brief.strip()}]
+
+
+def build_banana_json(brief: str, avoid: Optional[str] = None) -> Dict[str, Any]:
+    instructions = _banana_actions_from_text(brief)
+    constraints = {
+        "preserve_identity": True,
+        "avoid": (avoid or "").strip() or "over-smoothing, plastic skin",
+    }
+    return {"instructions": instructions, "constraints": constraints}
+
+
+def build_mj_json(subject: str, style: Optional[str] = None) -> Dict[str, Any]:
+    subject_value = subject.strip()
+    style_value = (style or "").strip() or "photorealistic, cinematic lighting, ultra-detailed"
+    prompt = f"portrait of {subject_value}, {style_value}".strip().rstrip(",")
+    return {
+        "prompt": prompt,
+        "negative": "blurry, lowres, deformed hands, artifacts",
+        "aspect": "16:9",
+        "quality": "high",
+        "seed": None,
+    }
+
+
+def build_suno_prompt(
+    idea: str,
+    style: Optional[str] = None,
+    vocal: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+) -> str:
+    idea_value = idea.strip()
+    style_value = (style or "").strip() or "pop"
+    vocal_value = (vocal or "").strip() or "any"
+    lang = (language or ("ru" if _CYRILLIC_RE.search(idea_value) else "en")).lower()
+    lang_label = "Russian" if lang.startswith("ru") else "English"
+    return (
+        f"Song theme: {idea_value}\n"
+        f"Style: {style_value}\n"
+        f"Vocal: {vocal_value}\n"
+        f"Write short verses + catchy chorus in {lang_label}. Structure:\n[Verse 1]\n[Chorus]\n[Verse 2]\n[Chorus]"
+    )
+
+
+__all__ = [
+    "build_cinema_prompt",
+    "call_llm_to_make_kino_prompt",
+    "build_video_prompt",
+    "build_animate_prompt",
+    "build_banana_json",
+    "build_mj_json",
+    "build_suno_prompt",
+]
