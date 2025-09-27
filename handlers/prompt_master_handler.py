@@ -6,7 +6,6 @@ import asyncio
 import html
 import logging
 import os
-import warnings
 from contextlib import suppress
 from typing import Awaitable, Callable, Optional
 
@@ -20,14 +19,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.warnings import PTBUserWarning
-
-warnings.filterwarnings(
-    "ignore",
-    message="If 'per_message=False', 'CallbackQueryHandler' will not be tracked for every message.*",
-    category=PTBUserWarning,
-)
-
 LOGGER = logging.getLogger(__name__)
 
 PROMPT_MASTER_OPEN = "PROMPT_MASTER_OPEN"
@@ -247,7 +238,7 @@ prompt_master_conv = ConversationHandler(
         CallbackQueryHandler(
             prompt_master_open,
             pattern=fr"^{PROMPT_MASTER_OPEN}$",
-            block=True,
+            per_message=False,
         ),
     ],
     states={
@@ -255,30 +246,28 @@ prompt_master_conv = ConversationHandler(
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 prompt_master_generate,
-                block=True,
             ),
             CallbackQueryHandler(
                 prompt_master_reapply,
                 pattern=fr"^{PROMPT_MASTER_OPEN}$",
-                block=True,
+                per_message=False,
             ),
             CallbackQueryHandler(
                 prompt_master_cancel,
                 pattern=fr"^{PROMPT_MASTER_CANCEL}$",
-                block=True,
+                per_message=False,
             ),
         ]
     },
     fallbacks=[
-        CommandHandler("cancel", prompt_master_cancel, block=True),
+        CommandHandler("cancel", prompt_master_cancel),
         CallbackQueryHandler(
             prompt_master_cancel,
             pattern=fr"^{PROMPT_MASTER_CANCEL}$",
-            block=True,
+            per_message=False,
         ),
     ],
     name="prompt_master",
-    block=True,
 )
 
 

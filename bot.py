@@ -2755,13 +2755,34 @@ async def safe_send(
         "disable_web_page_preview": True,
     }
 
+    async def _send_new_message() -> Optional[Message]:
+        if chat_id is None:
+            return None
+        try:
+            return await ctx.bot.send_message(chat_id=chat_id, **kwargs)
+        except Exception as exc:  # pragma: no cover - network issues
+            log.warning("menu.safe_send_send_failed | chat=%s err=%s", chat_id, exc)
+            return None
+
     if message is not None and getattr(message, "chat_id", None) is not None:
         message_id = getattr(message, "message_id", None)
         if not isinstance(message_id, int) or hub_msg_id == message_id:
             message = None  # Skip editing hub message; send a new one instead
         else:
             try:
-                return await message.edit_text(**kwargs)
+                return await ctx.bot.edit_message_text(
+                    chat_id=message.chat_id,
+                    message_id=message_id,
+                    **kwargs,
+                )
+            except BadRequest as exc:
+                err_text = str(exc).lower()
+                if "message is not modified" in err_text:
+                    return message
+                if "can't" in err_text and "edit" in err_text:
+                    return await _send_new_message()
+                log.warning("menu.safe_send_edit_failed | chat=%s err=%s", chat_id, exc)
+                message = None
             except TelegramError as exc:
                 log.warning("menu.safe_send_edit_failed | chat=%s err=%s", chat_id, exc)
                 message = None
@@ -2769,14 +2790,7 @@ async def safe_send(
                 log.warning("menu.safe_send_edit_crashed | chat=%s err=%s", chat_id, exc)
                 message = None
 
-    if chat_id is None:
-        return None
-
-    try:
-        return await ctx.bot.send_message(chat_id=chat_id, **kwargs)
-    except Exception as exc:  # pragma: no cover - network issues
-        log.warning("menu.safe_send_send_failed | chat=%s err=%s", chat_id, exc)
-        return None
+    return await _send_new_message()
 
 # odex/fix-balance-reset-after-deploy
 # main
@@ -8762,7 +8776,12 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-    application.add_handler(CommandHandler("prompt_master", prompt_master_cmd))
+    application.add_handler(
+        CommandHandler(["prompt_master", "prompt", "promptmaster"], prompt_master_cmd)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/prompt-master(?:@[^\s]+)?$"), prompt_master_cmd)
+    )
     application.add_handler(prompt_master_conv)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
