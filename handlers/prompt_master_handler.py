@@ -1,336 +1,81 @@
-"""Prompt-Master conversation handler that generates cinematic prompts."""
+"""Prompt-Master MVP handlers."""
 
 from __future__ import annotations
 
-import asyncio
-import html
 import logging
-import os
-from contextlib import suppress
-from typing import Awaitable, Callable, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from telegram.constants import ChatAction
-from telegram.ext import (
-    CallbackQueryHandler,
-    CommandHandler,
-    ConversationHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-LOGGER = logging.getLogger(__name__)
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import ContextTypes
 
-PROMPT_MASTER_OPEN = "PM_OPEN"
-PROMPT_MASTER_BACK = "PM_BACK"
-PM_VIDEO = "pm_video"
-PM_ALIVE = "pm_photo_alive"
-PM_BANANA = "pm_banana"
-PM_MJ = "pm_mj"
-PM_SUNO = "pm_suno"
+from keyboards import CB_PM_PREFIX, prompt_master_keyboard
 
-# Conversation states
-PM_SELECT, PM_WAIT_IDEA = range(2)
+logger = logging.getLogger(__name__)
 
-REQUEST_MESSAGE = "Пришлите тему/идею. /cancel — выход."
-READY_MESSAGE_PREFIX = "🧠 Готово! Вот ваш кинопромпт:"
-ERROR_MESSAGE = "⚠️ Не удалось сгенерировать промпт, попробуйте ещё раз."
-CANCEL_MESSAGE = "Отмена"
-
-SYS_PROMPT = (
-    "Ты профессиональный сценарист. Сгенерируй лаконичный, структурированный кинопромпт на английском, "
-    "но диалоги и lip-sync на языке пользователя. Структура: Scene, Camera, Action, Dialogue, Lip-sync, Audio, "
-    "Lighting, Wardrobe/props, Framing. Без лишних пояснений, только разделы с короткими абзацами."
-)
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-try:
-    import openai  # type: ignore
-
-    if OPENAI_API_KEY:
-        openai.api_key = OPENAI_API_KEY
-except Exception:  # pragma: no cover - optional dependency
-    openai = None  # type: ignore
-
-_veo_card_updater: Optional[
-    Callable[[int, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
-] = None
+PM_HINT = "🧠 *Prompt-Master*\nВыберите, что хотите сделать:"
 
 
-def configure_prompt_master(*, update_veo_card: Optional[Callable[[int, ContextTypes.DEFAULT_TYPE], Awaitable[None]]]) -> None:
-    """Register dependencies required by Prompt-Master handlers."""
+async def prompt_master_open(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    from_callback: bool = False,
+) -> None:
+    """Send or edit the Prompt-Master root menu."""
 
-    global _veo_card_updater
-    _veo_card_updater = update_veo_card
-
-
-def _main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💡 Придумать промпт", callback_data=PROMPT_MASTER_OPEN)],
-            [InlineKeyboardButton("↩️ Назад", callback_data=PROMPT_MASTER_BACK)],
-        ]
-    )
-
-
-def _result_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📎 Вставить в VEO ещё раз", callback_data=PROMPT_MASTER_OPEN)],
-            [InlineKeyboardButton("↩️ Назад", callback_data=PROMPT_MASTER_BACK)],
-        ]
-    )
-
-
-def _effective_message(update: Update) -> Optional[Message]:
-    if update.message:
-        return update.message
-    if update.callback_query and update.callback_query.message:
-        return update.callback_query.message
-    return None
-
-
-async def _send_request_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = _effective_message(update)
-    if message is not None:
-        await message.reply_text(REQUEST_MESSAGE)
-        return
-    chat = update.effective_chat
-    if chat is not None:
-        await context.bot.send_message(chat.id, REQUEST_MESSAGE)
-
-
-def _remember_prompt(context: ContextTypes.DEFAULT_TYPE, prompt_text: str) -> None:
-    context.chat_data.setdefault("prompt_master", {})["last_prompt"] = prompt_text
-
-
-def _apply_prompt_to_card(context: ContextTypes.DEFAULT_TYPE, prompt_text: str) -> None:
-    context.chat_data.setdefault("veo_card", {})["prompt"] = prompt_text
-    context.user_data["last_prompt"] = prompt_text
-
-
-def _stored_prompt(context: ContextTypes.DEFAULT_TYPE) -> str:
-    veo_card = context.chat_data.get("veo_card") or {}
-    prompt = veo_card.get("prompt")
-    if isinstance(prompt, str):
-        return prompt
-    last_prompt = context.chat_data.get("prompt_master", {}).get("last_prompt")
-    return last_prompt if isinstance(last_prompt, str) else ""
-
-
-async def _update_veo_card_if_visible(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    if chat is None or not callable(_veo_card_updater):
-        return
-    last_ui_msg_id = context.user_data.get("last_ui_msg_id_veo")
-    if not last_ui_msg_id:
-        return
-    try:
-        await _veo_card_updater(chat.id, context)  # type: ignore[arg-type]
-    except Exception:  # pragma: no cover - UI update should not crash flow
-        LOGGER.exception("Failed to update VEO card from Prompt-Master")
-
-
-def _is_result_message(message: Optional[Message]) -> bool:
-    if not message or not message.text:
-        return False
-    return message.text.startswith(READY_MESSAGE_PREFIX)
-
-
-async def _call_openai(user_lang: str, topic: str) -> str:
-    if openai is None or not OPENAI_API_KEY:
-        raise RuntimeError("OpenAI client is not configured")
-
-    def _sync_call() -> str:
-        response = openai.ChatCompletion.create(  # type: ignore[union-attr]
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYS_PROMPT},
-                {"role": "user", "content": f"Language: {user_lang}\nTopic: {topic}"},
-            ],
-            temperature=0.7,
-            max_tokens=700,
-        )
-        choice = response.choices[0].message["content"].strip()
-        return choice
-
-    return await asyncio.to_thread(_sync_call)
-
-
-async def _generate_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str) -> Optional[str]:
-    chat = update.effective_chat
-    if chat is not None:
-        with suppress(Exception):
-            await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-
-    user_lang = "en"
-    if update.effective_user and update.effective_user.language_code:
-        user_lang = update.effective_user.language_code
-
-    try:
-        prompt_text = await _call_openai(user_lang, topic)
-    except Exception:
-        LOGGER.exception("Prompt-Master generation failed")
-        return None
-    return prompt_text.strip()
-
-
-async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    reapply = False
-    answer_text: Optional[str] = None
-    if query and _is_result_message(query.message):
-        reapply = True
-
-    if reapply:
-        prompt = _stored_prompt(context)
-        if prompt:
-            _remember_prompt(context, prompt)
-            _apply_prompt_to_card(context, prompt)
-            await _update_veo_card_if_visible(update, context)
-            answer_text = "Промпт вставлен в карточку VEO."
-
-    if query:
-        await query.answer(answer_text)
-
-    await _send_request_message(update, context)
-    return PM_WAIT_IDEA
-
-
-async def prompt_master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for the /prompt_master command."""
-
-    if update.callback_query:
-        await update.callback_query.answer()
-
-    message = _effective_message(update)
+    message = update.effective_message
     if message is not None:
         await message.reply_text(
-            "🧠 Prompt-Master\nВыберите, что хотите сделать:",
-            reply_markup=_main_keyboard(),
+            PM_HINT,
+            reply_markup=prompt_master_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
         )
-    else:
-        chat = update.effective_chat
-        if chat is not None:
-            await context.bot.send_message(
-                chat.id,
-                "🧠 Prompt-Master\nВыберите, что хотите сделать:",
-                reply_markup=_main_keyboard(),
-            )
-    return PM_SELECT
+        return
 
-
-async def prompt_master_reapply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    if query:
-        prompt = _stored_prompt(context)
-        if prompt:
-            _remember_prompt(context, prompt)
-            _apply_prompt_to_card(context, prompt)
-            await _update_veo_card_if_visible(update, context)
-            await query.answer("Промпт вставлен в карточку VEO.")
-        else:
-            await query.answer()
-            await _send_request_message(update, context)
-    return PM_WAIT_IDEA
+    if query is None:
+        return
 
+    if not from_callback:
+        await query.answer()
 
-async def prompt_master_generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    message = update.message
-    if message is None:
-        return PM_WAIT_IDEA
-
-    topic = (message.text or "").strip()
-    if not topic:
-        await message.reply_text(REQUEST_MESSAGE)
-        return PM_WAIT_IDEA
-
-    prompt_text = await _generate_prompt(update, context, topic)
-    if not prompt_text:
-        await message.reply_text(ERROR_MESSAGE)
-        return PM_WAIT_IDEA
-
-    _remember_prompt(context, prompt_text)
-
-    await message.reply_html(
-        f"{READY_MESSAGE_PREFIX}\n<pre>{html.escape(prompt_text)}</pre>",
-        reply_markup=_result_keyboard(),
+    await query.edit_message_text(
+        PM_HINT,
+        reply_markup=prompt_master_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
     )
-    return PM_WAIT_IDEA
 
 
-async def prompt_master_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.callback_query:
-        await update.callback_query.answer()
-    message = _effective_message(update)
-    if message is not None:
-        await message.reply_text(CANCEL_MESSAGE)
-    return ConversationHandler.END
+async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Prompt-Master keyboard interactions."""
 
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
 
-prompt_master_conv = ConversationHandler(
-    entry_points=[
-        CommandHandler("prompt_master", prompt_master_start),
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🧠 Prompt-Master$"),
-            prompt_master_start,
-        ),
-        CallbackQueryHandler(
-            prompt_master_start,
-            pattern=fr"^{PROMPT_MASTER_OPEN}$",
-        ),
-    ],
-    states={
-        PM_SELECT: [
-            CallbackQueryHandler(
-                prompt_master_open,
-                pattern=fr"^{PROMPT_MASTER_OPEN}$",
-            ),
-            CallbackQueryHandler(
-                prompt_master_cancel,
-                pattern=fr"^{PROMPT_MASTER_BACK}$",
-            ),
-        ],
-        PM_WAIT_IDEA: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                prompt_master_generate,
-            ),
-            CallbackQueryHandler(
-                prompt_master_reapply,
-                pattern=fr"^{PROMPT_MASTER_OPEN}$",
-            ),
-            CallbackQueryHandler(
-                prompt_master_cancel,
-                pattern=fr"^{PROMPT_MASTER_BACK}$",
-            ),
-        ],
-    },
-    fallbacks=[
-        CommandHandler("cancel", prompt_master_cancel),
-        CommandHandler("menu", prompt_master_cancel),
-        CallbackQueryHandler(
-            prompt_master_cancel,
-            pattern=fr"^{PROMPT_MASTER_BACK}$",
-        ),
-    ],
-    name="prompt_master",
-    conversation_timeout=600,
-    allow_reentry=True,
-)
+    user_id = update.effective_user.id if update.effective_user else None
+    logger.info("prompt_master.callback | user_id=%s data=%s", user_id, query.data)
 
+    await query.answer()
 
-__all__ = [
-    "PROMPT_MASTER_OPEN",
-    "PROMPT_MASTER_BACK",
-    "PM_VIDEO",
-    "PM_ALIVE",
-    "PM_BANANA",
-    "PM_MJ",
-    "PM_SUNO",
-    "PM_SELECT",
-    "PM_WAIT_IDEA",
-    "prompt_master_conv",
-    "configure_prompt_master",
-    "prompt_master_start",
-]
+    code = query.data.removeprefix(CB_PM_PREFIX)
+    if code == "back":
+        await prompt_master_open(update, context, from_callback=True)
+        return
+
+    feature_name = {
+        "video": "🎬 Видеопромпт (VEO)",
+        "mj_gen": "🖼️ Промпт генерации фото (MJ)",
+        "photo_live": "🫥 Оживление фото (VEO)",
+        "banana_edit": "✂️ Редактирование фото (Banana)",
+        "suno_lyrics": "🎵 Текст песни (Suno)",
+    }.get(code, "Неизвестно")
+
+    await query.edit_message_text(
+        f"{feature_name}\n\n⚙️ Функция скоро будет доступна. А пока — опишите задачу текстом, я помогу сформулировать промпт.",
+        reply_markup=prompt_master_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
