@@ -21,8 +21,8 @@ from telegram.ext import (
 )
 LOGGER = logging.getLogger(__name__)
 
-PROMPT_MASTER_OPEN = "pm_open"
-PROMPT_MASTER_BACK = "pm_back"
+PROMPT_MASTER_OPEN = "PM_OPEN"
+PROMPT_MASTER_BACK = "PM_BACK"
 PM_VIDEO = "pm_video"
 PM_ALIVE = "pm_photo_alive"
 PM_BANANA = "pm_banana"
@@ -30,8 +30,7 @@ PM_MJ = "pm_mj"
 PM_SUNO = "pm_suno"
 
 # Conversation states
-PM_WAITING = range(1)
-_PM_STATE = PM_WAITING[0]
+PM_SELECT, PM_WAIT_IDEA = range(2)
 
 REQUEST_MESSAGE = "Пришлите тему/идею. /cancel — выход."
 READY_MESSAGE_PREFIX = "🧠 Готово! Вот ваш кинопромпт:"
@@ -63,6 +62,15 @@ def configure_prompt_master(*, update_veo_card: Optional[Callable[[int, ContextT
 
     global _veo_card_updater
     _veo_card_updater = update_veo_card
+
+
+def _main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💡 Придумать промпт", callback_data=PROMPT_MASTER_OPEN)],
+            [InlineKeyboardButton("↩️ Назад", callback_data=PROMPT_MASTER_BACK)],
+        ]
+    )
 
 
 def _result_keyboard() -> InlineKeyboardMarkup:
@@ -171,9 +179,8 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     reapply = False
     answer_text: Optional[str] = None
-    if query:
-        if _is_result_message(query.message):
-            reapply = True
+    if query and _is_result_message(query.message):
+        reapply = True
 
     if reapply:
         prompt = _stored_prompt(context)
@@ -187,13 +194,30 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer(answer_text)
 
     await _send_request_message(update, context)
-    return _PM_STATE
+    return PM_WAIT_IDEA
 
 
 async def prompt_master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point for the /prompt_master command."""
 
-    return await prompt_master_open(update, context)
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    message = _effective_message(update)
+    if message is not None:
+        await message.reply_text(
+            "🧠 Prompt-Master\nВыберите, что хотите сделать:",
+            reply_markup=_main_keyboard(),
+        )
+    else:
+        chat = update.effective_chat
+        if chat is not None:
+            await context.bot.send_message(
+                chat.id,
+                "🧠 Prompt-Master\nВыберите, что хотите сделать:",
+                reply_markup=_main_keyboard(),
+            )
+    return PM_SELECT
 
 
 async def prompt_master_reapply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -208,23 +232,23 @@ async def prompt_master_reapply(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await query.answer()
             await _send_request_message(update, context)
-    return _PM_STATE
+    return PM_WAIT_IDEA
 
 
 async def prompt_master_generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.message
     if message is None:
-        return _PM_STATE
+        return PM_WAIT_IDEA
 
     topic = (message.text or "").strip()
     if not topic:
         await message.reply_text(REQUEST_MESSAGE)
-        return _PM_STATE
+        return PM_WAIT_IDEA
 
     prompt_text = await _generate_prompt(update, context, topic)
     if not prompt_text:
         await message.reply_text(ERROR_MESSAGE)
-        return _PM_STATE
+        return PM_WAIT_IDEA
 
     _remember_prompt(context, prompt_text)
 
@@ -232,7 +256,7 @@ async def prompt_master_generate(update: Update, context: ContextTypes.DEFAULT_T
         f"{READY_MESSAGE_PREFIX}\n<pre>{html.escape(prompt_text)}</pre>",
         reply_markup=_result_keyboard(),
     )
-    return _PM_STATE
+    return PM_WAIT_IDEA
 
 
 async def prompt_master_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -247,10 +271,27 @@ async def prompt_master_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
 prompt_master_conv = ConversationHandler(
     entry_points=[
         CommandHandler("prompt_master", prompt_master_start),
-        CallbackQueryHandler(prompt_master_open, pattern=fr"^{PROMPT_MASTER_OPEN}$"),
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🧠 Prompt-Master$"),
+            prompt_master_start,
+        ),
+        CallbackQueryHandler(
+            prompt_master_start,
+            pattern=fr"^{PROMPT_MASTER_OPEN}$",
+        ),
     ],
     states={
-        _PM_STATE: [
+        PM_SELECT: [
+            CallbackQueryHandler(
+                prompt_master_open,
+                pattern=fr"^{PROMPT_MASTER_OPEN}$",
+            ),
+            CallbackQueryHandler(
+                prompt_master_cancel,
+                pattern=fr"^{PROMPT_MASTER_BACK}$",
+            ),
+        ],
+        PM_WAIT_IDEA: [
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 prompt_master_generate,
@@ -263,19 +304,19 @@ prompt_master_conv = ConversationHandler(
                 prompt_master_cancel,
                 pattern=fr"^{PROMPT_MASTER_BACK}$",
             ),
-        ]
+        ],
     },
     fallbacks=[
         CommandHandler("cancel", prompt_master_cancel),
+        CommandHandler("menu", prompt_master_cancel),
         CallbackQueryHandler(
             prompt_master_cancel,
             pattern=fr"^{PROMPT_MASTER_BACK}$",
         ),
     ],
     name="prompt_master",
-    per_chat=True,
-    per_user=True,
-    per_message=False,
+    conversation_timeout=600,
+    allow_reentry=True,
 )
 
 
@@ -287,7 +328,8 @@ __all__ = [
     "PM_BANANA",
     "PM_MJ",
     "PM_SUNO",
-    "PM_WAITING",
+    "PM_SELECT",
+    "PM_WAIT_IDEA",
     "prompt_master_conv",
     "configure_prompt_master",
     "prompt_master_start",

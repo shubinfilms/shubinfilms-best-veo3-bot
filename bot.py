@@ -46,6 +46,7 @@ from handlers import (
     PROMPT_MASTER_OPEN,
     configure_prompt_master,
     prompt_master_conv,
+    prompt_master_start,
 )
 
 from prompt_master import (
@@ -6351,9 +6352,7 @@ faq_conv = ConversationHandler(
     states={FAQ_STATE: [CallbackQueryHandler(faq_callback_router, pattern=r"^faq:")]},
     fallbacks=[],
     name="faq",
-    per_chat=True,
-    per_user=True,
-    per_message=False,
+    allow_reentry=True,
 )
 
 
@@ -6398,6 +6397,28 @@ async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         balance = _safe_get_balance(user.id)
         _set_cached_balance(ctx, balance)
         await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+
+
+async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await video_command(update, ctx)
+
+
+async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await image_command(update, ctx)
+
+
+async def handle_music_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await suno_command(update, ctx)
+
+
+async def handle_chat_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await chat_command(update, ctx)
+
+
+async def handle_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await balance_command(update, ctx)
+
+
 
 
 async def transactions_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7595,63 +7616,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_with_retry(lambda: msg.reply_text(updated_message))
         return
 
-    if text == MENU_BTN_VIDEO:
-        if user_id:
-            set_mode(user_id, False)
-        s["mode"] = None
-        await msg.reply_text("🎬 Выберите тип генерации видео:", reply_markup=video_menu_kb())
-        return
-
-    if text == MENU_BTN_IMAGE:
-        if user_id:
-            set_mode(user_id, False)
-        s["mode"] = None
-        await msg.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
-        return
-
-    if text == MENU_BTN_SUNO:
-        if user_id:
-            set_mode(user_id, False)
-        await suno_entry(chat_id, ctx)
-        return
-
-    if text == MENU_BTN_BALANCE:
-        chat_id = msg.chat_id
-        mid = await show_balance_card(chat_id, ctx)
-        if mid is None:
-            balance = get_user_balance_value(ctx, force_refresh=True)
-            await msg.reply_text(
-                f"💎 Ваш баланс: {balance} 💎",
-                reply_markup=balance_menu_kb(),
-            )
-        return
-
-    if text == MENU_BTN_PM:
-        if user_id:
-            set_mode(user_id, False)
-        _mode_set(chat_id, MODE_PM)
-        s["mode"] = None
-        await msg.reply_text("Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.")
-        return
-
-    if text == MENU_BTN_CHAT:
-        if user_id:
-            chat_mode_turn_on(user_id)
-        _mode_set(chat_id, MODE_CHAT)
-        s["mode"] = None
-        try:
-            await safe_send_text(
-                ctx.bot,
-                chat_id,
-                md2_escape(
-                    "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
-                    "🎙️ Можно присылать голосовые — я их распознаю."
-                ),
-            )
-        except Exception as exc:
-            log.warning("chat.menu_hint_failed | chat=%s err=%s", chat_id, exc)
-        return
-
     if state_mode == "promo":
         if not PROMO_ENABLED:
             await msg.reply_text("🎟️ Промокоды временно отключены.")
@@ -7802,7 +7766,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Если режим не распознан — по умолчанию обновляем карточку VEO
+    if user_mode != MODE_CHAT:
+        await msg.reply_text("ℹ️ Выберите раздел в /menu")
+        return
+
     s["last_prompt"] = text
     await show_veo_card(chat_id, ctx)
 
@@ -8758,6 +8725,91 @@ class RedisRunnerLock:
             pass
         self._redis = None
 
+PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
+    (("start",), start),
+    (("menu",), menu_command),
+    (("faq",), faq_command),
+    (("chat",), chat_command),
+    (("reset",), chat_reset_command),
+    (("history",), chat_history_command),
+    (("image",), image_command),
+    (("video",), video_command),
+    (("music",), suno_command),
+    (("balance",), balance_command),
+    (("help",), help_command),
+]
+
+ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
+    (("buy",), buy_command),
+    (("suno",), suno_command),
+    (("suno_last",), suno_last_command),
+    (("suno_task",), suno_task_command),
+    (("suno_retry",), suno_retry_command),
+    (("lang",), lang_command),
+    (("health",), health),
+    (("topup",), topup),
+    (("promo",), promo_command),
+    (("users_count",), users_count_command),
+    (("whoami",), whoami_command),
+    (("suno_debug",), suno_debug_command),
+    (("broadcast",), broadcast_command),
+    (("my_balance",), my_balance_command),
+    (("add_balance",), add_balance_command),
+    (("sub_balance",), sub_balance_command),
+    (("transactions",), transactions_command),
+    (("balance_recalc",), balance_recalc),
+]
+
+CALLBACK_HANDLER_SPECS: List[tuple[str, Any]] = [
+    (r"^pm:", prompt_master_cb),
+    (r"^hub:", hub_router),
+    (r"^go:", main_suggest_router),
+    (None, on_callback),
+]
+
+REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
+    (MENU_BTN_VIDEO, handle_video_entry),
+    (MENU_BTN_IMAGE, handle_image_entry),
+    (MENU_BTN_SUNO, handle_music_entry),
+    (MENU_BTN_CHAT, handle_chat_entry),
+    (MENU_BTN_BALANCE, handle_balance_entry),
+]
+
+
+def register_handlers(application: Any) -> None:
+    for names, callback in PRIORITY_COMMAND_SPECS:
+        application.add_handler(CommandHandler(list(names), callback))
+
+    application.add_handler(prompt_master_conv)
+
+    for names, callback in ADDITIONAL_COMMAND_SPECS:
+        application.add_handler(CommandHandler(list(names), callback))
+
+    application.add_handler(faq_conv)
+
+    for pattern, callback in CALLBACK_HANDLER_SPECS:
+        if pattern is None:
+            application.add_handler(CallbackQueryHandler(callback))
+        else:
+            application.add_handler(CallbackQueryHandler(callback, pattern=pattern))
+
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
+    for text, handler in REPLY_BUTTON_ROUTES:
+        pattern = rf"^{re.escape(text)}$"
+        application.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
+                handler,
+            )
+        )
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+
 # ==========================
 #   Entry (fixed for PTB 21.x)
 # ==========================
@@ -8771,61 +8823,8 @@ async def run_bot_async() -> None:
                    .rate_limiter(AIORateLimiter())
                    .build())
 
-    # Handlers (оставляем как есть)
     try:
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("menu", menu_command))
-        application.add_handler(CommandHandler("buy", buy_command))
-        application.add_handler(CommandHandler("video", video_command))
-        application.add_handler(CommandHandler("image", image_command))
-        application.add_handler(CommandHandler("suno", suno_command))
-        application.add_handler(CommandHandler("suno_last", suno_last_command))
-        application.add_handler(CommandHandler("suno_task", suno_task_command))
-        application.add_handler(CommandHandler("suno_retry", suno_retry_command))
-        application.add_handler(CommandHandler("lang", lang_command))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("faq", faq_command))
-        application.add_handler(CommandHandler("health", health))
-        application.add_handler(CommandHandler("topup", topup))
-        application.add_handler(CommandHandler("promo", promo_command))
-        application.add_handler(CommandHandler("chat", chat_command))
-        application.add_handler(CommandHandler("reset", chat_reset_command))
-        application.add_handler(CommandHandler("history", chat_history_command))
-        application.add_handler(CommandHandler("users_count", users_count_command))
-        application.add_handler(CommandHandler("whoami", whoami_command))
-        application.add_handler(CommandHandler("suno_debug", suno_debug_command))
-        application.add_handler(CommandHandler("broadcast", broadcast_command))
-        application.add_handler(CommandHandler("my_balance", my_balance_command))
-        application.add_handler(CommandHandler("add_balance", add_balance_command))
-        application.add_handler(CommandHandler("sub_balance", sub_balance_command))
-        application.add_handler(CommandHandler("transactions", transactions_command))
-# codex/fix-balance-reset-after-deploy
-        application.add_handler(CommandHandler("balance", balance_command))
-        application.add_handler(CommandHandler("balance_recalc", balance_recalc))
-        application.add_handler(
-            CommandHandler(["prompt_master", "prompt", "promptmaster"], prompt_master_cmd)
-        )
-        application.add_handler(
-            MessageHandler(filters.Regex(r"^/prompt-master(?:@[^\s]+)?$"), prompt_master_cmd)
-        )
-        application.add_handler(prompt_master_conv)
-        application.add_handler(faq_conv)
-# main
-        application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-        application.add_handler(CallbackQueryHandler(prompt_master_cb, pattern="^pm:"))
-        application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
-        application.add_handler(CallbackQueryHandler(main_suggest_router, pattern="^go:"))
-        application.add_handler(CallbackQueryHandler(on_callback))
-        application.add_handler(MessageHandler(filters.PHOTO, on_photo))
-        application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-        application.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                prompt_master_input,
-            )
-        )
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+        register_handlers(application)
     except Exception:
         log.exception("handler registration failed")
         raise
