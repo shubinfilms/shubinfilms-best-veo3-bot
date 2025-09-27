@@ -12,22 +12,18 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_TAGS = {
     "b",
-    "strong",
     "i",
-    "em",
     "u",
-    "span",
     "a",
     "code",
     "pre",
     "s",
-    "tg-spoiler",
     "blockquote",
     "br",
 }
 _ALLOWED_ATTRS = {"a": {"href"}}
 _SELF_CLOSING_TAGS = {"br"}
-_BLOCK_TAGS = {"pre", "blockquote", "tg-spoiler"}
+_BLOCK_TAGS = {"pre", "blockquote"}
 
 _CODE_FENCE_RE = re.compile(r"```(?:[a-z0-9_-]+)?\n(.*?)```", re.IGNORECASE | re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"(?<!\\)`([^`]+?)`")
@@ -163,10 +159,10 @@ def _escape_inline(text: str) -> str:
         safe_code = html.escape(code)
         text = text.replace(f"@@CODE{idx}@@", f"<code>{safe_code}</code>")
 
-    text = _BOLD_RE.sub(lambda m: f"<strong>{m.group(1)}</strong>", text)
+    text = _BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = _STRONG_RE.sub(lambda m: f"<u>{m.group(1)}</u>", text)
-    text = _ITALIC_RE.sub(lambda m: f"<em>{m.group(1)}</em>", text)
-    text = _EM_RE.sub(lambda m: f"<em>{m.group(1)}</em>", text)
+    text = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
+    text = _EM_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
     text = _STRIKE_RE.sub(lambda m: f"<s>{m.group(1)}</s>", text)
 
     def link_repl(match: re.Match[str]) -> str:
