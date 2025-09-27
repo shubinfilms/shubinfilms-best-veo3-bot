@@ -48,6 +48,14 @@ from handlers import (
     prompt_master_conv,
 )
 
+from prompt_master import (
+    build_animate_prompt,
+    build_banana_json,
+    build_mj_json,
+    build_suno_prompt,
+    build_video_prompt,
+)
+
 # === KIE Banana wrapper ===
 from kie_banana import (
     create_banana_task,
@@ -65,6 +73,8 @@ from ui_helpers import (
     refresh_balance_card_if_open,
     refresh_suno_card,
     show_referral_card,
+    pm_main_kb,
+    pm_result_kb,
 )
 
 from redis_utils import (
@@ -1035,6 +1045,653 @@ def get_cached_pm_prompt(chat_id: int) -> Optional[str]:
                 return v.decode("utf-8") if isinstance(v, bytes) else str(v)
         return None
     return _inmem_modes.get(f"pm:{chat_id}")
+
+
+PM_STEP_KEY_FMT = f"{REDIS_PREFIX}:pm:step:{{user_id}}"
+PM_BUF_KEY_FMT = f"{REDIS_PREFIX}:pm:buf:{{user_id}}"
+PM_STATE_TTL = 30 * 60
+PM_PLACEHOLDER_TEXT = "Пишу промпт…"
+PM_ERROR_TEXT = "⚠️ Не получилось, попробуйте ещё раз."
+PM_MENU_TEXT = "🧠 Prompt-Master\nВыберите раздел:"
+
+_PM_STEP_MEMORY: Dict[int, Tuple[float, str]] = {}
+_PM_BUFFER_MEMORY: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _pm_step_key(user_id: int) -> str:
+    return PM_STEP_KEY_FMT.format(user_id=int(user_id))
+
+
+def _pm_buf_key(user_id: int) -> str:
+    return PM_BUF_KEY_FMT.format(user_id=int(user_id))
+
+
+def _pm_memory_get(
+    store: Dict[int, Tuple[float, Any]], user_id: int
+) -> Optional[Any]:
+    entry = store.get(int(user_id))
+    if not entry:
+        return None
+    expires, value = entry
+    if expires <= time.time():
+        store.pop(int(user_id), None)
+        return None
+    return value
+
+
+def _pm_memory_set(store: Dict[int, Tuple[float, Any]], user_id: int, value: Any) -> None:
+    store[int(user_id)] = (time.time() + PM_STATE_TTL, value)
+
+
+def _pm_memory_clear(store: Dict[int, Tuple[float, Any]], user_id: int) -> None:
+    store.pop(int(user_id), None)
+
+
+def _pm_set_step(user_id: int, step: str) -> None:
+    if rds:
+        try:
+            rds.setex(_pm_step_key(user_id), PM_STATE_TTL, step)
+            return
+        except Exception as exc:
+            log.warning("pm.step.redis_set_failed | user_id=%s err=%s", user_id, exc)
+    _pm_memory_set(_PM_STEP_MEMORY, user_id, step)
+
+
+def _pm_get_step(user_id: int) -> Optional[str]:
+    if rds:
+        try:
+            raw = rds.get(_pm_step_key(user_id))
+        except Exception as exc:
+            log.warning("pm.step.redis_get_failed | user_id=%s err=%s", user_id, exc)
+        else:
+            if raw is not None:
+                return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    value = _pm_memory_get(_PM_STEP_MEMORY, user_id)
+    return value if isinstance(value, str) else None
+
+
+def _pm_clear_step(user_id: int) -> None:
+    if rds:
+        try:
+            rds.delete(_pm_step_key(user_id))
+        except Exception as exc:
+            log.warning("pm.step.redis_del_failed | user_id=%s err=%s", user_id, exc)
+    _pm_memory_clear(_PM_STEP_MEMORY, user_id)
+
+
+def _pm_set_buffer(user_id: int, data: Dict[str, Any]) -> None:
+    payload = json.dumps(data, ensure_ascii=False)
+    if rds:
+        try:
+            rds.setex(_pm_buf_key(user_id), PM_STATE_TTL, payload)
+            return
+        except Exception as exc:
+            log.warning("pm.buf.redis_set_failed | user_id=%s err=%s", user_id, exc)
+    _pm_memory_set(_PM_BUFFER_MEMORY, user_id, data)
+
+
+def _pm_get_buffer(user_id: int) -> Optional[Dict[str, Any]]:
+    if rds:
+        try:
+            raw = rds.get(_pm_buf_key(user_id))
+        except Exception as exc:
+            log.warning("pm.buf.redis_get_failed | user_id=%s err=%s", user_id, exc)
+        else:
+            if raw:
+                try:
+                    decoded = (
+                        raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                    )
+                    data = json.loads(decoded)
+                    if isinstance(data, dict):
+                        return data
+                except json.JSONDecodeError:
+                    log.warning("pm.buf.decode_failed | user_id=%s", user_id)
+    value = _pm_memory_get(_PM_BUFFER_MEMORY, user_id)
+    return value if isinstance(value, dict) else None
+
+
+def _pm_clear_buffer(user_id: int) -> None:
+    if rds:
+        try:
+            rds.delete(_pm_buf_key(user_id))
+        except Exception as exc:
+            log.warning("pm.buf.redis_del_failed | user_id=%s err=%s", user_id, exc)
+    _pm_memory_clear(_PM_BUFFER_MEMORY, user_id)
+
+
+def _pm_clear_state(user_id: int) -> None:
+    _pm_clear_step(user_id)
+    _pm_clear_buffer(user_id)
+
+
+_PM_QUESTION_FLOWS: Dict[str, Tuple[Dict[str, Any], ...]] = {
+    "video": (
+        {"key": "idea", "question": "Опишите идею видео одной-двумя фразами", "optional": False},
+        {"key": "style", "question": "Стиль (необязательно)?", "optional": True},
+    ),
+    "animate": (
+        {"key": "brief", "question": "Что на фото и какой микро-движение хотите?", "optional": False},
+    ),
+    "banana": (
+        {"key": "brief", "question": "Что изменить (фон/одежда/макияж/удалить…)?", "optional": False},
+        {"key": "avoid", "question": "Что не делать (необязательно)?", "optional": True},
+    ),
+    "mj": (
+        {"key": "subject", "question": "Что сгенерировать?", "optional": False},
+        {"key": "style", "question": "Стиль/референсы (необязательно)?", "optional": True},
+    ),
+    "suno": (
+        {"key": "idea", "question": "О чём песня и в каком стиле?", "optional": False},
+        {"key": "vocal", "question": "Вокал (m/f/любой)?", "optional": True},
+    ),
+}
+
+_PM_KIND_TITLES = {
+    "video": "🎬 Промпт для видео",
+    "animate": "🖼️ Оживление фото",
+    "banana": "🍌 Banana JSON",
+    "mj": "🎨 Midjourney JSON",
+    "suno": "🎵 Suno (текст)",
+}
+
+_PM_SKIP_WORDS = {"", "-", "—", "нет", "не надо", "никак", "none", "no", "skip", "n/a"}
+
+
+def _pm_flow(kind: str) -> Tuple[Dict[str, Any], ...]:
+    return _PM_QUESTION_FLOWS.get(kind, ())
+
+
+def _pm_should_skip(value: str) -> bool:
+    return value.strip().lower() in _PM_SKIP_WORDS
+
+
+def _pm_user_lang(update: Update) -> Optional[str]:
+    user = update.effective_user
+    if user and user.language_code:
+        return user.language_code
+    return None
+
+
+def _pm_split_suno_idea(text: str) -> Tuple[str, Optional[str]]:
+    raw = text.strip()
+    lower = raw.lower()
+    token = " в стиле "
+    if token in lower:
+        idx = lower.index(token)
+        idea = raw[:idx].strip(" ,.;:\n-—")
+        style = raw[idx + len(token) :].strip()
+        return idea or raw, style or None
+    for sep in (";", "|", "—", "-", ":"):
+        if sep in raw:
+            first, rest = raw.split(sep, 1)
+            idea = first.strip()
+            style = rest.strip()
+            return idea or raw, style or None
+    return raw, None
+
+
+def _pm_normalize_vocal(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    lowered = value.strip().lower()
+    if not lowered:
+        return None
+    if lowered in {"m", "male", "м", "муж", "мужской", "man"}:
+        return "m"
+    if lowered in {"f", "female", "ж", "жен", "женский", "woman"}:
+        return "f"
+    if lowered in {"any", "любая", "любой", "both"}:
+        return "any"
+    return "any"
+
+
+def _pm_store_result(user_id: int, data: Dict[str, Any]) -> None:
+    payload = {"stage": 0, "result": data}
+    _pm_set_buffer(user_id, payload)
+    _pm_set_step(user_id, "idle")
+
+
+def _pm_last_result(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, Any]]:
+    buf = _pm_get_buffer(user_id) or {}
+    result = buf.get("result") if isinstance(buf, dict) else None
+    if isinstance(result, dict) and result.get("raw"):
+        return result
+    chat_state = ctx.chat_data.get("prompt_master") if isinstance(ctx.chat_data, dict) else None
+    fallback = chat_state.get("last_result") if isinstance(chat_state, dict) else None
+    return fallback if isinstance(fallback, dict) else None
+
+
+def _pm_format_text_block(title: str, raw: str, *, is_json: bool = False) -> str:
+    escaped = html.escape(raw)
+    if is_json:
+        return f"{title}\n<pre><code>{escaped}</code></pre>"
+    return f"{title}\n<pre>{escaped}</pre>"
+
+
+def _pm_prepare_result(
+    kind: str,
+    answers: Dict[str, Any],
+    *,
+    update: Update,
+) -> Tuple[str, Dict[str, Any]]:
+    title = _PM_KIND_TITLES.get(kind, "Prompt")
+    if kind == "video":
+        idea = (answers.get("idea") or "").strip()
+        if not idea:
+            raise ValueError("empty idea")
+        style = answers.get("style")
+        prompt_text = build_video_prompt(idea, style)
+        display = _pm_format_text_block(title, prompt_text)
+        return display, {"kind": kind, "raw": prompt_text, "is_json": False}
+    if kind == "animate":
+        brief = (answers.get("brief") or "").strip()
+        if not brief:
+            raise ValueError("empty animate brief")
+        prompt_text = build_animate_prompt(brief, None)
+        display = _pm_format_text_block(title, prompt_text)
+        return display, {"kind": kind, "raw": prompt_text, "is_json": False}
+    if kind == "banana":
+        brief = (answers.get("brief") or "").strip()
+        if not brief:
+            raise ValueError("empty banana brief")
+        avoid = answers.get("avoid")
+        json_payload = build_banana_json(brief, avoid)
+        raw = json.dumps(json_payload, ensure_ascii=False, indent=2)
+        display = _pm_format_text_block(title, raw, is_json=True)
+        return display, {
+            "kind": kind,
+            "raw": raw,
+            "is_json": True,
+            "json": json_payload,
+        }
+    if kind == "mj":
+        subject = (answers.get("subject") or "").strip()
+        if not subject:
+            raise ValueError("empty mj subject")
+        style = answers.get("style")
+        json_payload = build_mj_json(subject, style)
+        raw = json.dumps(json_payload, ensure_ascii=False, indent=2)
+        display = _pm_format_text_block(title, raw, is_json=True)
+        return display, {
+            "kind": kind,
+            "raw": raw,
+            "is_json": True,
+            "json": json_payload,
+        }
+    if kind == "suno":
+        idea_raw = (answers.get("idea") or "").strip()
+        if not idea_raw:
+            raise ValueError("empty suno idea")
+        idea, parsed_style = _pm_split_suno_idea(idea_raw)
+        user_style = answers.get("style")
+        style_value = user_style if user_style else parsed_style
+        vocal_value = _pm_normalize_vocal(answers.get("vocal"))
+        lang = _pm_user_lang(update)
+        prompt_text = build_suno_prompt(
+            idea,
+            style=style_value,
+            vocal=vocal_value,
+            language=lang,
+        )
+        display = _pm_format_text_block(title, prompt_text)
+        return display, {"kind": kind, "raw": prompt_text, "is_json": False}
+    raise ValueError(f"unsupported pm kind: {kind}")
+
+
+def _pm_begin_session(user_id: int, kind: str) -> Dict[str, Any]:
+    payload = {"kind": kind, "stage": 1, "answers": {}}
+    _pm_set_step(user_id, kind)
+    _pm_set_buffer(user_id, payload)
+    return payload
+
+
+def _pm_session(user_id: int) -> Optional[Dict[str, Any]]:
+    data = _pm_get_buffer(user_id)
+    return data if isinstance(data, dict) else None
+
+
+def _pm_save_session(user_id: int, payload: Dict[str, Any]) -> None:
+    _pm_set_step(user_id, str(payload.get("kind", "idle")))
+    _pm_set_buffer(user_id, payload)
+
+
+def is_pm_waiting(user_id: Optional[int]) -> bool:
+    if not user_id:
+        return False
+    payload = _pm_session(user_id)
+    if not payload:
+        return False
+    kind = payload.get("kind")
+    stage = payload.get("stage")
+    flow = _pm_flow(str(kind))
+    if not flow:
+        return False
+    if not isinstance(stage, int):
+        return False
+    return 1 <= stage <= len(flow)
+
+
+async def _pm_send_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=PM_MENU_TEXT,
+        reply_markup=pm_main_kb(),
+        parse_mode=None,
+    )
+
+
+async def _pm_send_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, text: str) -> None:
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=text,
+        parse_mode=None,
+    )
+
+
+def _pm_stage_question(kind: str, stage: int) -> Optional[str]:
+    flow = _pm_flow(kind)
+    if 1 <= stage <= len(flow):
+        question = flow[stage - 1].get("question")
+        if isinstance(question, str):
+            return question
+    return None
+
+
+async def prompt_master_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id:
+        _pm_clear_state(user_id)
+    chat = update.effective_chat
+    message = update.message
+    chat_id = None
+    if chat is not None:
+        chat_id = chat.id
+    elif message is not None:
+        chat_id = message.chat_id
+    if chat_id is None:
+        return
+    await _pm_send_menu(chat_id, ctx)
+
+
+async def _pm_start_flow(
+    user_id: int,
+    kind: str,
+    *,
+    chat_id: Optional[int],
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    payload = _pm_begin_session(user_id, kind)
+    question = _pm_stage_question(kind, payload.get("stage", 0))
+    if chat_id is not None and question:
+        await _pm_send_question(chat_id, ctx, text=question)
+
+
+async def _pm_restart_from_result(
+    user_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int],
+) -> bool:
+    result = _pm_last_result(user_id, ctx)
+    kind = result.get("kind") if isinstance(result, dict) else None
+    if not kind:
+        payload = _pm_session(user_id)
+        kind = payload.get("kind") if isinstance(payload, dict) else None
+    if not isinstance(kind, str):
+        return False
+    await _pm_start_flow(user_id, kind, chat_id=chat_id, ctx=ctx)
+    return True
+
+
+async def _pm_apply_result(
+    kind: str,
+    result: Dict[str, Any],
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> Tuple[bool, str]:
+    chat = update.effective_chat
+    chat_id = chat.id if chat is not None else None
+    if chat_id is None:
+        return False, "Чат недоступен"
+    raw = result.get("raw")
+    if not isinstance(raw, str) or not raw.strip():
+        return False, "Промпт не найден"
+    s = state(ctx)
+    if kind in {"video", "animate"}:
+        await set_veo_card_prompt(chat_id, raw, ctx)
+        cache_pm_prompt(chat_id, raw)
+        label = "Veo" if kind == "video" else "Veo Animate"
+        return True, f"Промпт вставлен в карточку {label}."
+    if kind == "banana":
+        s["last_prompt"] = raw
+        s["_last_text_banana"] = None
+        await show_banana_card(chat_id, ctx)
+        return True, "JSON добавлен в карточку Banana."
+    if kind == "mj":
+        s["last_prompt"] = raw
+        s["_last_text_mj"] = None
+        await show_mj_prompt_card(chat_id, ctx)
+        return True, "JSON установлен для Midjourney."
+    if kind == "suno":
+        s["suno_lyrics"] = raw
+        s["suno_waiting_field"] = None
+        s["_last_text_suno"] = None
+        s.setdefault("mode", "suno")
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        return True, "Текст добавлен в карточку Suno."
+    return False, "Неизвестный тип"
+
+
+async def prompt_master_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    data = query.data
+    user = update.effective_user
+    user_id = user.id if user else None
+    message = query.message
+    chat = update.effective_chat
+    chat_id = None
+    if message is not None:
+        chat_id = message.chat_id
+    elif chat is not None:
+        chat_id = chat.id
+    if not data.startswith("pm:"):
+        await query.answer()
+        return
+    action_payload = data.split(":", 2)
+    action = action_payload[1] if len(action_payload) > 1 else ""
+
+    if action == "menu":
+        if user_id:
+            _pm_clear_state(user_id)
+        await query.answer()
+        if chat_id is not None:
+            await _pm_send_menu(chat_id, ctx)
+        return
+
+    if action == "home":
+        if user_id:
+            _pm_clear_state(user_id)
+        await query.answer()
+        if chat_id is not None:
+            await show_main_menu(chat_id, ctx)
+        return
+
+    if action == "copy":
+        if not user_id:
+            await query.answer()
+            return
+        result = _pm_last_result(user_id, ctx)
+        raw = result.get("raw") if isinstance(result, dict) else None
+        if not isinstance(raw, str):
+            await query.answer("Промпт не найден", show_alert=True)
+            return
+        if chat_id is not None:
+            await tg_safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text=raw,
+                parse_mode=None,
+            )
+        await query.answer("Готово")
+        return
+
+    if action == "back":
+        if not user_id:
+            await query.answer()
+            return
+        restarted = await _pm_restart_from_result(user_id, ctx, chat_id=chat_id)
+        if restarted:
+            await query.answer("Измените ввод")
+        else:
+            _pm_clear_state(user_id)
+            await query.answer()
+            if chat_id is not None:
+                await _pm_send_menu(chat_id, ctx)
+        return
+
+    if action == "reuse" and len(action_payload) > 2:
+        if not user_id:
+            await query.answer()
+            return
+        kind = action_payload[2]
+        result = _pm_last_result(user_id, ctx)
+        if not isinstance(result, dict) or result.get("kind") != kind:
+            await query.answer("Промпт не найден", show_alert=True)
+            return
+        ok, msg = await _pm_apply_result(kind, result, update, ctx)
+        await query.answer(msg, show_alert=not ok)
+        return
+
+    if action in _PM_QUESTION_FLOWS:
+        if not user_id:
+            await query.answer()
+            return
+        _pm_clear_state(user_id)
+        await query.answer()
+        await _pm_start_flow(user_id, action, chat_id=chat_id, ctx=ctx)
+        return
+
+    await query.answer()
+
+
+async def prompt_master_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not isinstance(message.text, str):
+        return
+    user = update.effective_user
+    user_id = user.id if user else None
+    if not is_pm_waiting(user_id):
+        return
+    payload = _pm_session(user_id) or {}
+    kind = payload.get("kind")
+    if not isinstance(kind, str):
+        _pm_clear_state(user_id or 0)
+        return
+    flow = _pm_flow(kind)
+    stage = payload.get("stage")
+    if not isinstance(stage, int) or not (1 <= stage <= len(flow)):
+        _pm_clear_state(user_id or 0)
+        return
+    answers = payload.setdefault("answers", {})
+    question_info = flow[stage - 1]
+    text = message.text.strip()
+    if not text and not question_info.get("optional"):
+        await message.reply_text(str(question_info.get("question") or ""))
+        return
+    if question_info.get("optional") and _pm_should_skip(text):
+        value: Optional[str] = None
+    else:
+        if not text and not question_info.get("optional"):
+            await message.reply_text(str(question_info.get("question") or ""))
+            return
+        value = text
+    answers[question_info.get("key")] = value
+    next_stage = stage + 1
+    if next_stage <= len(flow):
+        payload["stage"] = next_stage
+        _pm_save_session(user_id or 0, payload)
+        next_question = flow[next_stage - 1].get("question")
+        if next_question:
+            await message.reply_text(str(next_question))
+        return
+
+    payload["stage"] = 0
+    _pm_save_session(user_id or 0, payload)
+
+    try:
+        display_text, result = _pm_prepare_result(kind, answers, update=update)
+    except Exception as exc:
+        log.warning("pm.prepare_failed | user_id=%s kind=%s err=%s", user_id, kind, exc)
+        await message.reply_text(PM_ERROR_TEXT)
+        _pm_clear_state(user_id or 0)
+        return
+
+    chat_id = message.chat_id
+    try:
+        await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        pass
+
+    placeholder = await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=PM_PLACEHOLDER_TEXT,
+        parse_mode=None,
+    )
+
+    markup = pm_result_kb(kind)
+    sent = False
+    placeholder_id = getattr(placeholder, "message_id", None)
+    if isinstance(placeholder_id, int):
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=placeholder_id,
+                text=display_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
+            sent = True
+        except Exception as exc:
+            log.warning("pm.edit_failed | user_id=%s err=%s", user_id, exc)
+            with suppress(Exception):
+                await ctx.bot.delete_message(chat_id, placeholder_id)
+
+    if not sent:
+        await tg_safe_send(
+            ctx.bot.send_message,
+            method_name="sendMessage",
+            kind="message",
+            chat_id=chat_id,
+            text=display_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=markup,
+        )
+
+    _pm_store_result(user_id or 0, result)
+    if isinstance(ctx.chat_data, dict):
+        ctx.chat_data.setdefault("prompt_master", {})["last_result"] = result
+
+    if kind in {"video", "animate"}:
+        cache_pm_prompt(chat_id, result.get("raw", ""))
 
 
 CB_MODE_CHAT = "mode:chat"
@@ -8105,16 +8762,22 @@ async def run_bot_async() -> None:
 # codex/fix-balance-reset-after-deploy
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("balance_recalc", balance_recalc))
+    application.add_handler(CommandHandler("prompt_master", prompt_master_cmd))
     application.add_handler(prompt_master_conv)
 # main
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    application.add_handler(CallbackQueryHandler(prompt_master_cb, pattern="^pm:"))
     application.add_handler(CallbackQueryHandler(hub_router, pattern="^hub:"))
     application.add_handler(CallbackQueryHandler(main_suggest_router, pattern="^go:"))
     application.add_handler(CallbackQueryHandler(faq_callback_router, pattern="^faq:"))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_input),
+        block=False,
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     application.add_error_handler(error_handler)
 

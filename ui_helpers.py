@@ -299,3 +299,39 @@ async def show_referral_card(
         msg_ids["balance"] = mid
         state_dict["last_panel"] = "referral"
     return mid
+
+
+def pm_main_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎬 Промпт для видео", callback_data="pm:video")],
+        [InlineKeyboardButton("🖼️ Оживление фото", callback_data="pm:animate")],
+        [InlineKeyboardButton("🍌 Banana JSON", callback_data="pm:banana")],
+        [InlineKeyboardButton("🎨 Midjourney JSON", callback_data="pm:mj")],
+        [InlineKeyboardButton("🎵 Suno (текст песни)", callback_data="pm:suno")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="pm:home")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+_PM_USE_LABELS = {
+    "video": "Veo",
+    "animate": "Veo Animate",
+    "banana": "Banana",
+    "mj": "Midjourney",
+    "suno": "Suno",
+}
+
+
+def pm_result_kb(kind: str) -> InlineKeyboardMarkup:
+    use_target = _PM_USE_LABELS.get(kind, "")
+    use_caption = "⚡ Использовать сейчас" if not use_target else f"⚡ Использовать в {use_target}"
+    rows = [
+        [InlineKeyboardButton("🔁 Изменить ввод", callback_data="pm:back")],
+        [InlineKeyboardButton(use_caption, callback_data=f"pm:reuse:{kind}")],
+        [InlineKeyboardButton("📋 Скопировать", callback_data="pm:copy")],
+        [
+            InlineKeyboardButton("⬅️ Назад к разделам", callback_data="pm:menu"),
+            InlineKeyboardButton("🏠 В меню", callback_data="pm:home"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
