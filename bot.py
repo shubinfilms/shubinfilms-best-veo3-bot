@@ -51,9 +51,12 @@ from handlers import (
     configure_faq,
     faq_callback,
     faq_command,
+    get_pm_prompt,
     prompt_master_callback,
+    prompt_master_handle_text,
     prompt_master_open,
     prompt_master_process,
+    prompt_master_reset,
 )
 
 from prompt_master import (
@@ -6304,9 +6307,19 @@ async def prompt_master_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     await prompt_master_open(update, ctx)
 
 
+async def prompt_master_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await prompt_master_reset(update, ctx)
+
+
 async def prompt_master_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     await prompt_master_callback(update, ctx)
+
+
+async def prompt_master_insert_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await prompt_master_insert_callback(update, ctx)
 
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6770,6 +6783,53 @@ async def set_veo_card_prompt(chat_id: int, prompt_text: str, ctx: ContextTypes.
     s["last_prompt"] = prompt_text
     s["_last_text_veo"] = None
     await show_veo_card(chat_id, ctx)
+
+
+async def prompt_master_insert_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    parts = query.data.split(":", 2)
+    engine = parts[2] if len(parts) > 2 else ""
+    message = query.message
+    chat = message.chat if message is not None else update.effective_chat
+    chat_id = chat.id if chat is not None else None
+    if chat_id is None:
+        await query.answer("Чат недоступен", show_alert=True)
+        return
+
+    prompt_obj = get_pm_prompt(chat_id, engine)
+    if prompt_obj is None:
+        await query.answer("Промпт не найден", show_alert=True)
+        return
+
+    s = state(ctx)
+    if engine in {"veo", "animate"}:
+        await set_veo_card_prompt(chat_id, prompt_obj.body, ctx)
+        await query.answer("Промпт вставлен в карточку VEO")
+        return
+    if engine == "mj":
+        s["last_prompt"] = prompt_obj.body
+        s["_last_text_mj"] = None
+        await show_mj_prompt_card(chat_id, ctx)
+        await query.answer("Промпт вставлен в карточку Midjourney")
+        return
+    if engine == "banana":
+        s["last_prompt"] = prompt_obj.body
+        s["_last_text_banana"] = None
+        await show_banana_card(chat_id, ctx)
+        await query.answer("Промпт вставлен в карточку Banana")
+        return
+    if engine == "suno":
+        s["suno_lyrics"] = prompt_obj.body
+        s["suno_waiting_field"] = None
+        s["_last_text_suno"] = None
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await query.answer("Промпт вставлен в карточку Suno")
+        return
+
+    await query.answer("Режим не поддерживается", show_alert=True)
 
 
 async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str) -> None:
@@ -7935,7 +7995,13 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         placeholder_msg_id = getattr(new_placeholder, "message_id", None)
 
     user_mode = _mode_get(chat_id) or MODE_CHAT
-    if user_mode != MODE_CHAT or not user_id or not chat_mode_is_on(user_id):
+    chat_enabled = False
+    if user_id:
+        try:
+            chat_enabled = chat_mode_is_on(user_id) or is_mode_on(user_id)
+        except Exception:
+            chat_enabled = is_mode_on(user_id)
+    if user_mode != MODE_CHAT or not user_id or not chat_enabled:
         final_text = md2_escape(
             f"📝 Расшифровка:\n{preview}\n\n💬 Включить чат: /chat"
         )
@@ -8611,6 +8677,7 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("menu",), menu_command),
     (("faq",), faq_command_entry),
     (("prompt_master",), prompt_master_command),
+    (("pm_reset",), prompt_master_reset_command),
     (("chat",), chat_command),
     (("reset",), chat_reset_command),
     (("history",), chat_history_command),
@@ -8643,6 +8710,10 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
+    (r"^pm:insert:(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
+    (r"^pm:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
+    (r"^pm:(back|menu|switch)$", prompt_master_callback_entry),
+    (r"^pm:copy:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (r"^hub:", hub_router),
@@ -8686,6 +8757,10 @@ def register_handlers(application: Any) -> None:
                 handler,
             )
         )
+
+    pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
+    pm_handler.block = False
+    application.add_handler(pm_handler)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
