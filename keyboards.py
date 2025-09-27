@@ -57,12 +57,14 @@ def prompt_master_result_keyboard(engine: str, lang: str = "ru") -> InlineKeyboa
         if lang == "ru"
         else f"⬇️ Insert into {display} card"
     )
-    rows = [
+    base_rows = prompt_master_mode_keyboard(lang).inline_keyboard
+    rows = [list(row) for row in base_rows]
+    rows.append(
         [
             InlineKeyboardButton(copy_text, callback_data=f"{CB_PM_PREFIX}copy:{engine}"),
             InlineKeyboardButton(insert_text, callback_data=f"{CB_PM_PREFIX}insert:{engine}"),
         ]
-    ]
+    )
     return InlineKeyboardMarkup(rows)
 
 

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
-import json
 import logging
 import re
-from dataclasses import dataclass
-from typing import Dict, Literal, Optional, Tuple
+import time
+from typing import Dict, Optional, Tuple
 
 from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, ParseMode
@@ -19,6 +19,7 @@ from keyboards import (
     prompt_master_mode_keyboard,
     prompt_master_result_keyboard,
 )
+from prompt_master import Engine, PromptPayload, build_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -27,19 +28,9 @@ PM_ENGINE_KEY = "pm_engine"
 PM_LANG_KEY = "pm_lang"
 PM_PROMPTS_KEY = "pm_prompts"
 
-PM_ENGINES = {"veo", "mj", "banana", "animate", "suno"}
+PM_ENGINES = {engine.value for engine in Engine}
 
 CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
-LOW_LIGHT_HINTS = ("ноч", "night", "неон", "neon", "луна", "moon")
-WARM_LIGHT_HINTS = ("закат", "sunset", "golden hour", "тепл")
-CAMERA_HINTS = (
-    ("drone", ("drone sweep", "дрон с плавным пролётом")),
-    ("крупный план", ("close-up", "крупный план")),
-    ("портрет", ("portrait lens", "портретный объектив 85mm")),
-    ("широкоуголь", ("wide-angle lens", "широкоугольный объектив 24mm")),
-    ("дрон", ("drone sweep", "дрон с плавным пролётом")),
-    ("macro", ("macro lens", "макрообъектив")),
-)
 
 PM_ROOT_TEXT = {
     "ru": "🧠 <b>Prompt-Master</b>\nВыберите движок, под который нужно подготовить промпт.",
@@ -69,17 +60,6 @@ PM_ENGINE_HINTS = {
     },
 }
 
-SAFETY_PHRASES = {
-    "banana": {
-        "ru": "Сохранить реальное лицо и черты, без подмены. Без деформаций, без лишних аксессуаров.",
-        "en": "Keep the real face and traits, no swaps. No distortions, no extra accessories.",
-    },
-    "animate": {
-        "ru": "Не менять внешность. Сохранить реальное лицо, мимику без искажений.",
-        "en": "Do not alter appearance. Keep the real face and undistorted expressions.",
-    },
-}
-
 ENGINE_DISPLAY = {
     "veo": {"ru": "VEO", "en": "VEO"},
     "mj": {"ru": "Midjourney", "en": "Midjourney"},
@@ -88,153 +68,25 @@ ENGINE_DISPLAY = {
     "suno": {"ru": "Suno", "en": "Suno"},
 }
 
+_LAST_PROMPTS: Dict[Tuple[int, str], PromptPayload] = {}
 
-@dataclass
-class PromptOut:
-    engine: Literal["veo", "mj", "banana", "animate", "suno"]
-    body: str
-    is_json: bool
-
-
-_LAST_PROMPTS: Dict[Tuple[int, str], PromptOut] = {}
+START_STATUS = {"ru": "⏳ Готовлю промпт…", "en": "⏳ Crafting your prompt…"}
+SLOW_STATUS = {"ru": "⚠️ Что-то долго. Ещё секунду…", "en": "⚠️ Taking longer than usual. One more second…"}
+ERROR_STATUS = {
+    "ru": "❌ Не удалось собрать промпт. Попробуйте ещё раз или переформулируйте задачу.",
+    "en": "❌ Failed to build the prompt. Try again or rephrase the request.",
+}
 
 
 def detect_language(text: str) -> str:
     return "ru" if CYRILLIC_RE.search(text or "") else "en"
 
 
-def _normalize_text(text: str) -> str:
-    return " ".join((text or "").split())
+def _store_prompt(chat_id: int, engine: Engine, payload: PromptPayload) -> None:
+    _LAST_PROMPTS[(chat_id, engine.value)] = payload
 
 
-def _choose_camera_detail(text: str, lang: str) -> str:
-    lowered = text.lower()
-    for needle, variants in CAMERA_HINTS:
-        if needle in lowered:
-            return variants[1] if lang == "ru" else variants[0]
-    return "Стедикам с плавным въездом" if lang == "ru" else "Steadycam push-in"
-
-
-def _choose_lighting_detail(text: str, lang: str) -> str:
-    lowered = text.lower()
-    if any(hint in lowered for hint in LOW_LIGHT_HINTS):
-        return "Неоновый контровый свет и мягкая дымка" if lang == "ru" else "Neon rim light with gentle haze"
-    if any(hint in lowered for hint in WARM_LIGHT_HINTS):
-        return "Тёплый закатный свет, длинные тени" if lang == "ru" else "Warm sunset glow with long shadows"
-    return "Мягкий рассеянный свет с акцентом" if lang == "ru" else "Soft diffused key light"
-
-
-def _choose_palette(text: str, lang: str) -> str:
-    lowered = text.lower()
-    if "неон" in lowered or "neon" in lowered:
-        return "Неоновая палитра: бирюзовый, фуксия, контрастный свет" if lang == "ru" else "Neon palette: teal, magenta, high contrast"
-    if "пастел" in lowered or "pastel" in lowered:
-        return "Пастельные тона: нежный розовый, песочный, молочный" if lang == "ru" else "Pastel hues: blush pink, sand, ivory"
-    return "Кинематографичная цветокоррекция с глубокими тенями" if lang == "ru" else "Cinematic grading with deep shadows"
-
-
-def _choose_style(lang: str) -> str:
-    return "Гиперреалистичный стиль, премиальная детализация" if lang == "ru" else "Hyper-realistic style with premium detail"
-
-
-def _animate_motion(lang: str) -> str:
-    return (
-        "Плавный параллакс камеры, лёгкое дыхание кадра, мимика естественная"
-        if lang == "ru"
-        else "Soft camera parallax, gentle breathing motion, natural facial micro-expressions"
-    )
-
-
-def build_prompt(
-    engine: Literal["veo", "mj", "banana", "animate", "suno"],
-    text: str,
-    lang: str,
-    user_prefs: Optional[Dict[str, str]] = None,
-) -> PromptOut:
-    cleaned = _normalize_text(text)
-    camera = _choose_camera_detail(text, lang)
-    lighting = _choose_lighting_detail(text, lang)
-    palette = _choose_palette(text, lang)
-    style = _choose_style(lang)
-
-    if engine == "veo":
-        payload = {
-            "scene": cleaned,
-            "camera": camera,
-            "motion": (
-                "Динамичный сторителлинг, 8 секунд, без резких рывков"
-                if lang == "ru"
-                else "Dynamic storytelling, 8 seconds, no abrupt cuts"
-            ),
-            "lighting": lighting,
-            "palette": palette,
-            "details": (
-                "Уточнить героев, окружение, ключевой акцент. Финал оставить выразительным."
-                if lang == "ru"
-                else "Clarify subjects, environment, key accent. End on a striking beat."
-            ),
-        }
-        body = json.dumps(payload, ensure_ascii=False, indent=2)
-        return PromptOut(engine="veo", body=body, is_json=True)
-
-    if engine == "mj":
-        payload = {
-            "prompt": (
-                f"{cleaned}, {style.lower()}"
-                if lang == "ru"
-                else f"{cleaned}, {style.lower()}"
-            ),
-            "camera": camera,
-            "lighting": lighting,
-            "palette": palette,
-            "render": "--ar 16:9 --v 6" if lang == "en" else "--ar 16:9 --v 6",
-        }
-        body = json.dumps(payload, ensure_ascii=False, indent=2)
-        return PromptOut(engine="mj", body=body, is_json=True)
-
-    if engine == "banana":
-        safety = SAFETY_PHRASES["banana"][lang]
-        lines = [
-            ("📝 Задача" if lang == "ru" else "📝 Task") + f": {cleaned}",
-            ("Правки" if lang == "ru" else "Adjustments") + ":",
-            "• " + ("Работа со светом/кожей по описанию." if lang == "ru" else "Tweak light/skin as described."),
-            "• " + ("Уточнить фон и детали одежды при необходимости." if lang == "ru" else "Refine background and outfit details."),
-            "",
-            ("Безопасность" if lang == "ru" else "Safety") + f": {safety}",
-        ]
-        body = "\n".join(lines)
-        return PromptOut(engine="banana", body=body, is_json=False)
-
-    if engine == "animate":
-        safety = SAFETY_PHRASES["animate"][lang]
-        lines = [
-            ("🎬 Оживление" if lang == "ru" else "🎬 Animation") + f": {cleaned}",
-            ("Движение" if lang == "ru" else "Motion") + f": {_animate_motion(lang)}",
-            ("Камера" if lang == "ru" else "Camera") + f": {camera}",
-            ("Свет" if lang == "ru" else "Lighting") + f": {lighting}",
-            "",
-            ("Безопасность" if lang == "ru" else "Safety") + f": {safety}",
-        ]
-        body = "\n".join(lines)
-        return PromptOut(engine="animate", body=body, is_json=False)
-
-    # Suno skeleton
-    mood_line = "Настроение: вдохновляющее" if lang == "ru" else "Mood: inspiring"
-    tempo_line = "Темп: 96-102 BPM" if lang == "ru" else "Tempo: 96-102 BPM"
-    story_title = "Сюжет" if lang == "ru" else "Story"
-    closing = "Сервис скоро будет доступен, но подготовьте текст заранее." if lang == "ru" else "Service launches soon, prepare the text ahead of time."
-    lines = [
-        "🎵 Suno Prompt", mood_line, tempo_line, f"{story_title}: {cleaned}", closing
-    ]
-    body = "\n".join(lines)
-    return PromptOut(engine="suno", body=body, is_json=False)
-
-
-def _store_prompt(chat_id: int, prompt: PromptOut) -> None:
-    _LAST_PROMPTS[(chat_id, prompt.engine)] = prompt
-
-
-def get_pm_prompt(chat_id: int, engine: str) -> Optional[PromptOut]:
+def get_pm_prompt(chat_id: int, engine: str) -> Optional[PromptPayload]:
     return _LAST_PROMPTS.get((chat_id, engine))
 
 
@@ -262,11 +114,62 @@ def _header_for_engine(engine: str, lang: str) -> str:
     return f"<b>Ready prompt for {html.escape(display)}</b>"
 
 
-def _format_block(prompt: PromptOut) -> str:
-    if prompt.is_json:
-        return f"<blockquote><pre>{html.escape(prompt.body)}</pre></blockquote>"
-    escaped = html.escape(prompt.body).replace("\n", "<br/>")
-    return f"<blockquote>{escaped}</blockquote>"
+def _render_markdown(text: str) -> str:
+    from html import escape
+
+    bold_re = re.compile(r"\*\*(.+?)\*\*")
+
+    def _inline(value: str) -> str:
+        result = []
+        last = 0
+        for match in bold_re.finditer(value):
+            result.append(escape(value[last:match.start()]))
+            result.append(f"<b>{escape(match.group(1))}</b>")
+            last = match.end()
+        result.append(escape(value[last:]))
+        return "".join(result)
+
+    lines = text.splitlines()
+    html_parts = []
+    in_list = False
+    in_code = False
+    for line in lines:
+        if line.startswith("```"):
+            if in_code:
+                html_parts.append("</code></pre>")
+                in_code = False
+            else:
+                html_parts.append("<pre><code>")
+                in_code = True
+            continue
+        if in_code:
+            html_parts.append(f"{escape(line)}\n")
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if not in_list:
+                html_parts.append("<ul>")
+                in_list = True
+            html_parts.append(f"<li>{_inline(stripped[2:])}</li>")
+            continue
+        if in_list:
+            html_parts.append("</ul>")
+            in_list = False
+        if stripped:
+            html_parts.append(f"<p>{_inline(stripped)}</p>")
+        else:
+            html_parts.append("<br/>")
+    if in_list:
+        html_parts.append("</ul>")
+    if in_code:
+        html_parts.append("</code></pre>")
+    return "".join(html_parts)
+
+
+def _payload_to_html(engine: str, lang: str, payload: PromptPayload) -> str:
+    body_html = _render_markdown(payload.body_markdown)
+    header = _header_for_engine(engine, lang)
+    return f"{header}<br/>{body_html}"
 
 
 async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -339,6 +242,11 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
     lang = _resolve_ui_lang(update, context)
 
     if data.startswith(f"{CB_PM_PREFIX}insert:"):
+        parts = data.split(":", 2)
+        engine = parts[2] if len(parts) > 2 else ""
+        user = update.effective_user
+        user_id = user.id if user else None
+        logger.info("pm.insert_clicked | user_id=%s engine=%s", user_id, engine)
         return
 
     if data.startswith(f"{CB_PM_PREFIX}copy:"):
@@ -351,8 +259,16 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Промпт не найден" if lang == "ru" else "Prompt not found", show_alert=True)
             return
         await query.answer("Готово" if lang == "ru" else "Done")
-        text = prompt.body if not prompt.is_json else f"<pre>{html.escape(prompt.body)}</pre>"
-        parse_mode = ParseMode.HTML if prompt.is_json else None
+        user = update.effective_user
+        user_id = user.id if user else None
+        logger.info("pm.copy_clicked | user_id=%s engine=%s", user_id, engine)
+        copy_text = prompt.copy_text
+        if copy_text.strip().startswith("{") or copy_text.strip().startswith("["):
+            text = f"<pre>{html.escape(copy_text)}</pre>"
+            parse_mode = ParseMode.HTML
+        else:
+            text = copy_text
+            parse_mode = None
         target_chat = chat_id if chat_id is not None else (update.effective_chat.id if update.effective_chat else None)
         if target_chat is not None:
             await context.bot.send_message(chat_id=target_chat, text=text, parse_mode=parse_mode)
@@ -415,23 +331,80 @@ async def prompt_master_handle_text(update: Update, context: ContextTypes.DEFAUL
         return
 
     lang = detect_language(idea)
+    if lang not in {"ru", "en"}:
+        lang = _resolve_ui_lang(update, context)
     context.user_data[PM_LANG_KEY] = lang
-    user_id = update.effective_user.id if update.effective_user else None
-    result = build_prompt(engine, idea, lang, context.user_data.get("pm_prefs") or {})
+    user = update.effective_user
+    user_id = user.id if user else None
+    logger.info("pm.start | user_id=%s engine=%s lang=%s", user_id, engine, lang)
+    chat = update.effective_chat
+    status_markup = prompt_master_mode_keyboard(lang)
+    try:
+        status_message = await message.reply_text(
+            START_STATUS.get(lang, START_STATUS["en"]),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=status_markup,
+        )
+    except Exception:  # pragma: no cover - Telegram failure
+        logger.exception("prompt_master.status_send_failed")
+        return
+
+    task = asyncio.create_task(build_prompt(Engine(engine), idea, lang))
+    start_ts = time.monotonic()
+    try:
+        payload = await asyncio.wait_for(task, timeout=12.0)
+    except asyncio.TimeoutError:
+        try:
+            await status_message.edit_text(
+                SLOW_STATUS.get(lang, SLOW_STATUS["en"]),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=status_markup,
+            )
+        except Exception:
+            logger.debug("prompt_master.slow_status_failed", exc_info=True)
+        try:
+            payload = await asyncio.wait_for(task, timeout=18.0)
+        except Exception as exc:  # pragma: no cover - hard failure path
+            logger.error("pm.error | user_id=%s engine=%s err=%s", user_id, engine, exc)
+            try:
+                await status_message.edit_text(
+                    ERROR_STATUS.get(lang, ERROR_STATUS["en"]),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=status_markup,
+                )
+            except Exception:
+                logger.debug("prompt_master.error_status_failed", exc_info=True)
+            return
+    except Exception as exc:  # pragma: no cover - unexpected failure
+        logger.error("pm.error | user_id=%s engine=%s err=%s", user_id, engine, exc)
+        try:
+            await status_message.edit_text(
+                ERROR_STATUS.get(lang, ERROR_STATUS["en"]),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=status_markup,
+            )
+        except Exception:
+            logger.debug("prompt_master.error_status_failed", exc_info=True)
+        return
+
+    duration_ms = int((time.monotonic() - start_ts) * 1000)
     logger.info(
-        "pm.generate | user_id=%s engine=%s lang=%s len=%s",
+        "pm.ready | user_id=%s engine=%s size=%s ms=%s",
         user_id,
         engine,
-        lang,
         len(idea),
+        duration_ms,
     )
 
-    chat = update.effective_chat
     if chat is not None:
-        _store_prompt(chat.id, result)
+        _store_prompt(chat.id, Engine(engine), payload)
 
     prompts = context.user_data.setdefault(PM_PROMPTS_KEY, {})
-    prompts[engine] = result.body
+    prompts[engine] = payload
     context.user_data["pm_last_engine"] = engine
 
     if chat and chat.type == ChatType.PRIVATE:
@@ -440,11 +413,10 @@ async def prompt_master_handle_text(update: Update, context: ContextTypes.DEFAUL
         except Exception:
             logger.debug("prompt_master.delete_failed", exc_info=True)
 
-    header = _header_for_engine(engine, lang)
-    formatted = f"{header}\n{_format_block(result)}"
+    formatted = _payload_to_html(engine, lang, payload)
     markup = prompt_master_result_keyboard(engine, lang)
     try:
-        await message.reply_text(
+        await status_message.edit_text(
             formatted,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -491,8 +463,6 @@ prompt_master_process = prompt_master_handle_text
 
 
 __all__ = [
-    "PromptOut",
-    "build_prompt",
     "clear_pm_prompts",
     "detect_language",
     "get_pm_prompt",
