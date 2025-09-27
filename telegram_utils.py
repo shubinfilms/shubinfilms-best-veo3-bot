@@ -351,8 +351,17 @@ async def safe_edit_markdown_v2(
             reply_markup=reply_markup,
         )
     except BadRequest as exc:
+        err_text = str(exc)
         if _is_message_not_modified(exc):
             return None
+        if "can't" in err_text.lower() and "edit" in err_text.lower():
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
         raise
 
 
