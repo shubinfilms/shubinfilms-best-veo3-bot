@@ -83,7 +83,7 @@ def test_wait_state_updates_veo_prompt() -> None:
 
     original_show = bot_module.show_veo_card
 
-    async def fake_show(chat_id: int, ctx_param):
+    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False):
         calls.append((chat_id, ctx_param))
         state_dict["last_ui_msg_id_veo"] = 654
 
@@ -117,7 +117,7 @@ def test_wait_state_updates_banana_prompt() -> None:
 
     original_show = bot_module.show_banana_card
 
-    async def fake_show(chat_id: int, ctx_param):
+    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False):
         calls.append((chat_id, ctx_param))
         state_dict["last_ui_msg_id_banana"] = 222
 
@@ -149,7 +149,15 @@ def test_wait_state_suno_title_updates_card() -> None:
     original_refresh = bot_module.refresh_suno_card
     refreshed: list[tuple[int, dict[str, object]]] = []
 
-    async def fake_refresh(ctx_param, chat_id: int, state_dict_param: dict[str, object], *, price: int, state_key: str = "last_ui_msg_id_suno"):
+    async def fake_refresh(
+        ctx_param,
+        chat_id: int,
+        state_dict_param: dict[str, object],
+        *,
+        price: int,
+        state_key: str = "last_ui_msg_id_suno",
+        force_new: bool = False,
+    ):
         refreshed.append((chat_id, state_dict_param))
         state_dict_param[state_key] = 777
         return 777
