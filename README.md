@@ -69,7 +69,7 @@ pytest -q
 ```bash
 curl -i -X POST "https://<service>.onrender.com/suno-callback" \
   -H 'Content-Type: application/json' \
-  -H 'X-Callback-Token: <YOUR_SUNO_CALLBACK_SECRET>' \
+  -H 'X-Callback-Secret: <YOUR_SUNO_CALLBACK_SECRET>' \
   -d '{
     "code":200,
     "msg":"ok",

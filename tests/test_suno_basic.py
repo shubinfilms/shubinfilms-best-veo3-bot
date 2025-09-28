@@ -33,7 +33,7 @@ os.environ.setdefault("SUNO_CALLBACK_URL", "https://callback.local/suno-callback
 import suno_web
 from suno_web import app
 import suno.tempfiles as tempfiles
-from suno.client import SunoClient, SunoAPIError
+from suno.client import SunoAPIError, SunoClient, SunoClientError
 from suno.service import SunoService
 
 
@@ -102,15 +102,25 @@ def _setup_client_env(monkeypatch) -> None:
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_URL", "https://callback.local/suno-callback", raising=False)
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_SECRET", "secret-token", raising=False)
     monkeypatch.setattr("suno.client.SUNO_MODEL", "suno-v5", raising=False)
-    monkeypatch.setattr("suno.client.SUNO_GEN_PATH", "/suno-api/generate", raising=False)
-    monkeypatch.setattr("suno.client.SUNO_TASK_STATUS_PATH", "/suno-api/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_GEN_PATH", "/api/v1/generate/music", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_TASK_STATUS_PATH", "/api/v1/generate/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_WAV_PATH", "/api/v1/wav/generate", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_WAV_INFO_PATH", "/api/v1/wav/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_MP4_PATH", "/api/v1/mp4/generate", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_MP4_INFO_PATH", "/api/v1/mp4/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_COVER_INFO_PATH", "/api/v1/suno/cover/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_LYRICS_PATH", "/api/v1/generate/get-timestamped-lyrics", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_STEM_PATH", "/api/v1/vocal-removal/generate", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_STEM_INFO_PATH", "/api/v1/vocal-removal/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_INSTR_PATH", "/api/v1/generate/add-instrumental", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_UPLOAD_EXTEND_PATH", "/api/v1/generate/upload-extend", raising=False)
 
 
 def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/suno-api/generate",
+        "https://api.example.com/api/v1/generate/music",
         json={"task_id": "task-new"},
     )
     payload, version = client.create_music({"prompt": "hello", "style": "pop", "instrumental": False, "model": "V5"})
@@ -127,7 +137,7 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
 def test_payload_shape_v5(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
-    requests_mock.post("https://api.example.com/suno-api/generate", json={"task_id": "task-shape"})
+    requests_mock.post("https://api.example.com/api/v1/generate/music", json={"task_id": "task-shape"})
     client.create_music({"title": "Title", "prompt": "lyrics", "instrumental": True})
     body = requests_mock.last_request.json()
     assert body["model"] == "suno-v5"
@@ -140,7 +150,7 @@ def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/suno-api/generate",
+        "https://api.example.com/api/v1/generate/music",
         status_code=404,
         json={"message": "not found"},
     )
@@ -148,6 +158,7 @@ def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
         client.create_music({"prompt": "hello", "instrumental": False})
     assert exc.value.status == 404
     assert exc.value.api_version == "v5"
+    assert isinstance(exc.value, SunoClientError)
     assert requests_mock.call_count == 1
 
 
@@ -155,12 +166,13 @@ def test_suno_v5_enqueue_code_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/suno-api/generate",
+        "https://api.example.com/api/v1/generate/music",
         json={"code": 404, "message": "not found"},
     )
     with pytest.raises(SunoAPIError) as exc:
         client.create_music({"prompt": "fallback"})
     assert exc.value.api_version == "v5"
+    assert isinstance(exc.value, SunoClientError)
     assert requests_mock.call_count == 1
 
 
@@ -168,7 +180,7 @@ def test_suno_status_v5_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.get(
-        "https://api.example.com/suno-api/record-info",
+        "https://api.example.com/api/v1/generate/record-info",
         status_code=404,
         json={"message": "not found"},
     )
@@ -176,7 +188,45 @@ def test_suno_status_v5_404_raises(monkeypatch, requests_mock):
         client.get_task_status("abc")
     assert exc.value.status == 404
     assert exc.value.api_version == "v5"
+    assert isinstance(exc.value, SunoClientError)
     assert requests_mock.call_count == 1
+
+
+def test_suno_wav_helpers(monkeypatch, requests_mock):
+    _setup_client_env(monkeypatch)
+    client = SunoClient(base_url="https://api.example.com", token="token")
+    requests_mock.post("https://api.example.com/api/v1/wav/generate", json={"ok": True})
+    resp = client.build_wav("wav-123")
+    assert resp["ok"] is True
+    assert requests_mock.last_request.json()["taskId"] == "wav-123"
+    requests_mock.get("https://api.example.com/api/v1/wav/record-info", json={"status": "ready"})
+    info = client.get_wav_info("wav-123")
+    assert info["status"] == "ready"
+    assert "taskId=wav-123" in requests_mock.last_request.url
+
+
+def test_suno_mp4_helpers(monkeypatch, requests_mock):
+    _setup_client_env(monkeypatch)
+    client = SunoClient(base_url="https://api.example.com", token="token")
+    requests_mock.post("https://api.example.com/api/v1/mp4/generate", json={"queued": True})
+    resp = client.build_mp4("mp4-1")
+    assert resp["queued"] is True
+    assert requests_mock.last_request.json()["taskId"] == "mp4-1"
+    requests_mock.get("https://api.example.com/api/v1/mp4/record-info", json={"progress": 0.9})
+    info = client.get_mp4_info("mp4-1")
+    assert info["progress"] == 0.9
+    assert "taskId=mp4-1" in requests_mock.last_request.url
+
+
+def test_suno_extend(monkeypatch, requests_mock):
+    _setup_client_env(monkeypatch)
+    client = SunoClient(base_url="https://api.example.com", token="token")
+    requests_mock.post("https://api.example.com/api/v1/generate/upload-extend", json={"task_id": "mp4-1"})
+    payload = {"taskId": "mp4-1", "prompt": "more"}
+    resp = client.upload_extend(payload, req_id="req-1")
+    assert resp["task_id"] == "mp4-1"
+    assert requests_mock.last_request.json()["prompt"] == "more"
+    assert requests_mock.last_request.headers["X-Request-ID"] == "req-1"
 
 
 class FakeRedis:
@@ -222,7 +272,7 @@ def test_callback_accepts_header_token(monkeypatch):
     client = _client()
     response = client.post(
         "/suno-callback",
-        headers={"X-Callback-Token": "secret-token", "X-Request-ID": "req-header"},
+        headers={"X-Callback-Secret": "secret-token", "X-Request-ID": "req-header"},
         json=_build_payload("header-token"),
     )
     assert response.status_code == 200
@@ -241,7 +291,7 @@ def test_callback_accepts_query_token(monkeypatch):
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
     client = _client()
     response = client.post(
-        "/suno-callback?token=secret-token",
+        "/suno-callback?secret=secret-token",
         json=_build_payload("query-token"),
     )
     assert response.status_code == 200
@@ -263,7 +313,7 @@ def test_callback_rejects_wrong_token():
     client = _client()
     response = client.post(
         "/suno-callback",
-        headers={"X-Callback-Token": "bad"},
+        headers={"X-Callback-Secret": "bad"},
         json=_build_payload(),
     )
     assert response.status_code == 403
@@ -282,7 +332,7 @@ def test_duplicate_callbacks_processed_once(monkeypatch):
     for _ in range(2):
         response = client.post(
             "/suno-callback",
-            headers={"X-Callback-Token": "secret-token"},
+            headers={"X-Callback-Secret": "secret-token"},
             json=payload,
         )
         assert response.status_code == 200
@@ -301,7 +351,7 @@ def test_callback_rejects_payloads_over_limit(monkeypatch):
     body = json.dumps({"data": oversized})
     response = client.post(
         "/suno-callback",
-        headers={"X-Callback-Token": "secret-token", "Content-Type": "application/json"},
+        headers={"X-Callback-Secret": "secret-token", "Content-Type": "application/json"},
         content=body,
     )
     assert response.status_code == 413
@@ -343,7 +393,7 @@ def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
     client = _client()
     response = client.post(
         "/suno-callback",
-        headers={"X-Callback-Token": "secret-token"},
+        headers={"X-Callback-Secret": "secret-token"},
         json=_build_payload("asset-task"),
     )
     assert response.status_code == 200

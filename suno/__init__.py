@@ -1,5 +1,5 @@
 """Public surface for the Suno integration."""
-from .client import SunoClient, SunoAPIError
+from .client import SunoAPIError, SunoClient, SunoClientError, SunoServerError
 from .schemas import SunoTask, SunoTrack
 from .service import SunoService
 
@@ -9,4 +9,6 @@ __all__ = [
     "SunoService",
     "SunoTask",
     "SunoTrack",
+    "SunoClientError",
+    "SunoServerError",
 ]
