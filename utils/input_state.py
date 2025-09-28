@@ -274,20 +274,39 @@ class InputRegistry:
 
     def __init__(self) -> None:
         self._by_chat: Dict[int, WaitState] = {}
+        self._log = logging.getLogger("input-registry")
 
-    def get(self, chat_id: int) -> Optional[WaitState]:
-        state = self._by_chat.get(int(chat_id))
-        if state and state.expires_at > time.time():
+    def _purge_if_expired(self, chat_id: int, state: Optional[WaitState]) -> Optional[WaitState]:
+        if not state:
+            return None
+        if state.expires_at > time.time():
             return state
-        self._by_chat.pop(int(chat_id), None)
+        self._by_chat.pop(chat_id, None)
+        self._log.info("registry.expired", extra={"chat_id": chat_id})
         return None
 
-    def set(self, chat_id: int, state: WaitState) -> None:
+    def get(self, chat_id: int) -> Optional[WaitState]:
+        stored = self._by_chat.get(int(chat_id))
+        return self._purge_if_expired(int(chat_id), stored)
+
+    def set(self, chat_id: int, state: WaitState, *, reason: str = "set") -> None:
         state.touch()
         self._by_chat[int(chat_id)] = state
+        self._log.info("registry.set", extra={"chat_id": int(chat_id), "kind": state.kind, "reason": reason})
 
-    def clear(self, chat_id: int) -> None:
-        self._by_chat.pop(int(chat_id), None)
+    def touch(self, chat_id: int, *, reason: str = "refresh") -> Optional[WaitState]:
+        state = self.get(chat_id)
+        if not state:
+            return None
+        state.touch()
+        self._by_chat[int(chat_id)] = state
+        self._log.info("registry.touch", extra={"chat_id": int(chat_id), "kind": state.kind, "reason": reason})
+        return state
+
+    def clear(self, chat_id: int, *, reason: str = "manual") -> None:
+        removed = self._by_chat.pop(int(chat_id), None)
+        if removed:
+            self._log.info("registry.clear", extra={"chat_id": int(chat_id), "kind": removed.kind, "reason": reason})
 
 
 input_state = InputRegistry()

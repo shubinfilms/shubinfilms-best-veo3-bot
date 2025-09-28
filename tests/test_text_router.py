@@ -3,6 +3,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop
@@ -93,7 +94,7 @@ def test_router_updates_veo_prompt() -> None:
     calls: list[int] = []
     original_show = bot_module.show_veo_card
 
-    async def fake_show(chat_id: int, ctx_param):
+    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False):
         calls.append(chat_id)
         state_dict["last_ui_msg_id_veo"] = 456
 
@@ -126,7 +127,7 @@ def test_router_updates_banana_prompt() -> None:
     calls: list[int] = []
     original_show = bot_module.show_banana_card
 
-    async def fake_show(chat_id: int, ctx_param):
+    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False):
         calls.append(chat_id)
         state_dict["last_ui_msg_id_banana"] = 84
 
@@ -159,7 +160,7 @@ def test_router_updates_mj_prompt() -> None:
     calls: list[int] = []
     original_show = bot_module.show_mj_prompt_card
 
-    async def fake_show(chat_id: int, ctx_param):
+    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False):
         calls.append(chat_id)
         state_dict["last_ui_msg_id_mj"] = 1001
 
@@ -188,7 +189,14 @@ def test_router_updates_suno_fields() -> None:
     refreshed: list[int] = []
     original_refresh = bot_module.refresh_suno_card
 
-    async def fake_refresh(ctx_param, chat_id: int, state_payload: dict[str, object], *, price: int):
+    async def fake_refresh(
+        ctx_param,
+        chat_id: int,
+        state_payload: dict[str, object],
+        *,
+        price: int,
+        force_new: bool = False,
+    ):
         refreshed.append(chat_id)
         state_payload["last_ui_msg_id_suno"] = 321
         return 321
@@ -354,3 +362,203 @@ def test_safe_edit_message_handles_not_modified() -> None:
     assert result is False
     assert bot.edit_calls
     assert not bot.reply_markup_calls
+
+
+def test_balance_command_force_new() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    chat = SimpleNamespace(id=555)
+    user = SimpleNamespace(id=777)
+    message = SimpleNamespace()
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_user=user,
+        message=message,
+        effective_message=message,
+    )
+
+    calls: list[tuple[int, bool]] = []
+
+    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False) -> int:
+        calls.append((chat_id, force_new))
+        return 101
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_show = bot_module.show_balance_card
+    original_ensure = bot_module.ensure_user_record
+    bot_module.show_balance_card = fake_show  # type: ignore[assignment]
+    bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+
+    try:
+        asyncio.run(bot_module.balance_command(update, ctx))
+    finally:
+        bot_module.show_balance_card = original_show  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert calls == [(555, True)]
+
+
+def test_suno_command_force_new_card() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    chat = SimpleNamespace(id=321)
+    user = SimpleNamespace(id=123)
+    message = SimpleNamespace()
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_user=user,
+        message=message,
+        effective_message=message,
+    )
+
+    calls: list[tuple[int, bool]] = []
+
+    async def fake_entry(chat_id: int, ctx_param, *, refresh_balance: bool = True, force_new: bool = False) -> None:
+        calls.append((chat_id, force_new))
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_entry = bot_module.suno_entry
+    original_configured = bot_module._suno_configured
+    original_ensure = bot_module.ensure_user_record
+    bot_module.suno_entry = fake_entry  # type: ignore[assignment]
+    bot_module._suno_configured = lambda: True  # type: ignore[assignment]
+    bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+
+    try:
+        asyncio.run(bot_module.suno_command(update, ctx))
+    finally:
+        bot_module.suno_entry = original_entry  # type: ignore[assignment]
+        bot_module._suno_configured = original_configured  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert calls == [(321, True)]
+
+
+def test_prompt_master_command_triggers_open() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    chat = SimpleNamespace(id=999)
+    user = SimpleNamespace(id=1000)
+    message = SimpleNamespace()
+    update = SimpleNamespace(effective_chat=chat, effective_user=user, message=message)
+
+    calls: list[tuple[object, object]] = []
+
+    async def fake_open(update_param, ctx_param):
+        calls.append((update_param, ctx_param))
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_open = bot_module.prompt_master_open
+    original_ensure = bot_module.ensure_user_record
+    bot_module.prompt_master_open = fake_open  # type: ignore[assignment]
+    bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+
+    try:
+        asyncio.run(bot_module.prompt_master_command(update, ctx))
+    finally:
+        bot_module.prompt_master_open = original_open  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert calls == [(update, ctx)]
+
+
+class _FakeMessage:
+    def __init__(self, chat_id: int) -> None:
+        self.chat_id = chat_id
+        self.chat = SimpleNamespace(id=chat_id)
+        self.replies: list[tuple[str, dict[str, object]]] = []
+
+    async def reply_text(self, text: str, **kwargs: object) -> None:  # type: ignore[override]
+        self.replies.append((text, kwargs))
+
+
+class _FakeQuery:
+    def __init__(self, data: str, message: _FakeMessage) -> None:
+        self.data = data
+        self.message = message
+        self.answered: list[tuple[Optional[str], bool]] = []
+
+    async def answer(self, text: Optional[str] = None, show_alert: bool = False) -> None:  # type: ignore[override]
+        self.answered.append((text, show_alert))
+
+
+def test_mj_switch_engine_creates_banana_wait_state() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    state_dict = bot_module.state(ctx)
+    state_dict["aspect"] = "16:9"
+    state_dict["mj_generating"] = False
+    state_dict["mode"] = "mj_txt"
+
+    chat_id = 4242
+    user_id = 313
+    card_calls: list[tuple[int, bool]] = []
+
+    async def fake_banana_entry(chat_id_param: int, ctx_param, *, force_new: bool = True) -> None:
+        card_calls.append((chat_id_param, force_new))
+        state_dict["last_ui_msg_id_banana"] = 808
+
+    original_banana_entry = bot_module.banana_entry
+    bot_module.banana_entry = fake_banana_entry  # type: ignore[assignment]
+
+    message = _FakeMessage(chat_id)
+    query = _FakeQuery("mj:switch_engine", message)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+
+    try:
+        asyncio.run(bot_module.on_callback(update, ctx))
+    finally:
+        bot_module.banana_entry = original_banana_entry  # type: ignore[assignment]
+
+    wait_state = get_wait_state(user_id)
+    try:
+        assert card_calls == [(chat_id, True)]
+        assert wait_state is not None and wait_state.kind == WaitKind.BANANA_PROMPT
+        assert message.replies and bot_module.BANANA_MODE_HINT_MD in message.replies[-1][0]
+    finally:
+        clear_wait_state(user_id)
+
+
+def test_banana_switch_engine_creates_mj_wait_state() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    state_dict = bot_module.state(ctx)
+    state_dict["aspect"] = "16:9"
+    state_dict["mode"] = "banana"
+
+    chat_id = 5151
+    user_id = 707
+    card_calls: list[int] = []
+
+    async def fake_mj_entry(chat_id_param: int, ctx_param) -> None:
+        card_calls.append(chat_id_param)
+        state_dict["last_ui_msg_id_mj"] = 606
+
+    original_mj_entry = bot_module.mj_entry
+    bot_module.mj_entry = fake_mj_entry  # type: ignore[assignment]
+
+    message = _FakeMessage(chat_id)
+    query = _FakeQuery("banana:switch_engine", message)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+
+    try:
+        asyncio.run(bot_module.on_callback(update, ctx))
+    finally:
+        bot_module.mj_entry = original_mj_entry  # type: ignore[assignment]
+
+    wait_state = get_wait_state(user_id)
+    try:
+        assert card_calls == [chat_id]
+        assert wait_state is not None and wait_state.kind == WaitKind.MJ_PROMPT
+        assert message.replies and bot_module.MJ_MODE_HINT_TEXT in message.replies[-1][0]
+    finally:
+        clear_wait_state(user_id)

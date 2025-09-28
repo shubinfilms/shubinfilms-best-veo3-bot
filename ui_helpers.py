@@ -43,12 +43,30 @@ async def upsert_card(
     reply_markup: Optional[Any] = None,
     parse_mode: ParseMode = ParseMode.HTML,
     disable_web_page_preview: bool = True,
+    *,
+    force_new: bool = False,
 ) -> Optional[int]:
     """Update an existing UI card or send a new one.
 
     Returns the message id of the card on success, otherwise ``None``.
     """
 
+    mid = state_dict.get(state_key)
+    if force_new and isinstance(mid, int):
+        try:
+            await ctx.bot.delete_message(chat_id, mid)
+        except BadRequest as exc:
+            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            app_logger.debug("delete %s bad request: %s", state_key, exc)
+        except Exception as exc:  # pragma: no cover - network issues
+            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            app_logger.warning("delete %s failed: %s", state_key, exc)
+        state_dict[state_key] = None
+        msg_ids = state_dict.get("msg_ids")
+        if isinstance(msg_ids, dict):
+            for key, value in list(msg_ids.items()):
+                if value == mid:
+                    msg_ids[key] = None
     mid = state_dict.get(state_key)
     if mid:
         try:
@@ -63,12 +81,12 @@ async def upsert_card(
             )
             return mid
         except BadRequest as exc:
-            logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-            logger.debug("edit %s bad request: %s", state_key, exc)
+            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            app_logger.debug("edit %s bad request: %s", state_key, exc)
             state_dict[state_key] = None
         except Exception as exc:  # pragma: no cover - network issues
-            logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-            logger.warning("edit %s failed: %s", state_key, exc)
+            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            app_logger.warning("edit %s failed: %s", state_key, exc)
             state_dict[state_key] = None
 
     try:
@@ -82,8 +100,8 @@ async def upsert_card(
         state_dict[state_key] = msg.message_id
         return msg.message_id
     except Exception as exc:  # pragma: no cover - network issues
-        logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-        logger.error("send %s failed: %s", state_key, exc)
+        app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+        app_logger.error("send %s failed: %s", state_key, exc)
         return None
 
 
@@ -115,8 +133,8 @@ async def refresh_balance_card_if_open(
     try:
         balance = get_balance(user_id)
     except Exception as exc:  # pragma: no cover - network/redis issues
-        logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-        logger.warning("refresh_balance_card_if_open failed for %s: %s", user_id, exc)
+        app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+        app_logger.warning("refresh_balance_card_if_open failed for %s: %s", user_id, exc)
         return None
 
     text = f"💎 Ваш баланс: {balance}"
@@ -213,6 +231,7 @@ async def refresh_suno_card(
     *,
     price: int,
     state_key: str = "last_ui_msg_id_suno",
+    force_new: bool = False,
 ) -> Optional[int]:
     suno_state_obj = load_suno_state(ctx)
     state_dict["suno_state"] = suno_state_obj.to_dict()
@@ -241,6 +260,21 @@ async def refresh_suno_card(
         msg_id = state_dict.get(state_key)
         if not isinstance(msg_id, int):
             msg_id = None
+
+    if force_new and isinstance(msg_id, int):
+        try:
+            await ctx.bot.delete_message(chat_id, msg_id)
+        except BadRequest as exc:
+            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            app_logger.debug("delete suno card failed: %s", exc)
+        except Exception as exc:  # pragma: no cover - network issues
+            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            app_logger.warning("delete suno card failed: %s", exc)
+        msg_id = None
+        state_dict[state_key] = None
+        card_state["msg_id"] = None
+        card_state["last_text_hash"] = None
+        card_state["last_markup_hash"] = None
 
     if markup is None:
         markup_payload: Any = None
