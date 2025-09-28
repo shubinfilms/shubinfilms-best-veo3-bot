@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 
 from metrics import bot_telegram_send_fail_total, suno_requests_total, suno_task_store_total
 from suno.client import SunoClient, SunoAPIError
-from suno.schemas import SunoTask, SunoTrack
+from suno.schemas import CallbackEnvelope, SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
 from settings import (
     HTTP_POOL_CONNECTIONS,
@@ -539,13 +539,21 @@ class SunoService:
         prompt: Optional[str] = None,
         req_id: Optional[str] = None,
     ) -> SunoTask:
+        prompt_text = str(
+            (prompt if prompt is not None else "")
+            or (lyrics if lyrics is not None else "")
+            or (title if title is not None else "")
+        ).strip()
+        if not prompt_text:
+            prompt_text = "Untitled track"
         payload = {
             "title": title,
             "style": style,
             "lyrics": lyrics,
             "model": model,
             "instrumental": instrumental,
-            "prompt": prompt,
+            "prompt": prompt_text,
+            "input_text": prompt_text,
         }
         try:
             result, api_version = self.client.create_music(payload, req_id=req_id)
@@ -596,7 +604,7 @@ class SunoService:
                 task.task_id,
                 {
                     "user_id": int(user_id),
-                    "prompt": (prompt or "").strip(),
+                    "prompt": prompt_text,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -607,7 +615,7 @@ class SunoService:
             "chat_id": int(chat_id),
             "msg_id": int(msg_id),
             "user_id": int(user_id) if user_id is not None else None,
-            "prompt": (prompt or "").strip(),
+            "prompt": prompt_text,
             "title": title,
             "req_id": req_id,
         }
@@ -625,6 +633,75 @@ class SunoService:
             },
         )
         return task
+
+    def _coerce_music_envelope(self, payload: Any) -> CallbackEnvelope:
+        if isinstance(payload, Mapping):
+            return CallbackEnvelope.model_validate(dict(payload))
+        raw_payload = getattr(payload, "raw", None)
+        base: Dict[str, Any]
+        if isinstance(raw_payload, Mapping):
+            base = dict(raw_payload)
+        else:
+            base = {}
+        base.setdefault("code", getattr(payload, "code", None))
+        base.setdefault("msg", getattr(payload, "msg", None))
+        data_section = dict(base.get("data") or {})
+        task_id = getattr(payload, "task_id", None)
+        if task_id and "taskId" not in data_section:
+            data_section["taskId"] = task_id
+        callback_type = getattr(payload, "type", None) or getattr(payload, "status", None)
+        if callback_type and "callbackType" not in data_section:
+            data_section["callbackType"] = callback_type
+        tracks_payload: list[Dict[str, Any]] = []
+        for item in getattr(payload, "tracks", []) or []:
+            if hasattr(item, "raw") and isinstance(item.raw, Mapping):
+                track_payload = dict(item.raw)
+            elif isinstance(item, Mapping):
+                track_payload = dict(item)
+            else:
+                track_payload = {}
+                audio_id = getattr(item, "audio_id", None)
+                if audio_id is not None:
+                    track_payload.setdefault("audioId", audio_id)
+                audio_url = getattr(item, "audio_url", None)
+                if audio_url:
+                    track_payload.setdefault("audioUrl", audio_url)
+                image_url = getattr(item, "image_url", None)
+                if image_url:
+                    track_payload.setdefault("imageUrl", image_url)
+                video_url = getattr(item, "video_url", None)
+                if video_url:
+                    track_payload.setdefault("videoUrl", video_url)
+            if track_payload:
+                tracks_payload.append(track_payload)
+        if tracks_payload:
+            response = dict(data_section.get("response") or {})
+            existing_tracks = response.get("tracks")
+            if isinstance(existing_tracks, list):
+                response["tracks"] = [*existing_tracks, *tracks_payload]
+            else:
+                response["tracks"] = tracks_payload
+            data_section["response"] = response
+        base["data"] = data_section
+        return CallbackEnvelope.model_validate(base)
+
+    def handle_music_callback(self, payload: Any) -> None:
+        try:
+            envelope = self._coerce_music_envelope(payload)
+        except Exception:
+            log.warning("Failed to coerce music callback payload", exc_info=True)
+            return
+        task = SunoTask.from_envelope(envelope)
+        req_id: Optional[str] = None
+        if isinstance(payload, Mapping):
+            req_id = payload.get("request_id") or payload.get("requestId")
+        else:
+            raw_payload = getattr(payload, "raw", None)
+            if isinstance(raw_payload, Mapping):
+                req_id = raw_payload.get("request_id") or raw_payload.get("requestId")
+        if req_id is None:
+            req_id = getattr(payload, "request_id", None) or getattr(payload, "requestId", None)
+        self.handle_callback(task, req_id=req_id)
 
     def handle_callback(self, task: SunoTask, req_id: Optional[str] = None) -> None:
         if not task.task_id:

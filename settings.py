@@ -138,8 +138,8 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return value or default
 
 
-SUNO_GEN_PATH = _get_env("SUNO_GEN_PATH", "/api/v1/generate/music")
-SUNO_TASK_STATUS_PATH = _get_env("SUNO_TASK_STATUS_PATH", "/api/v1/generate/record-info")
+SUNO_GEN_PATH = _get_env("SUNO_GEN_PATH", "/api/v1/suno/generate/music")
+SUNO_TASK_STATUS_PATH = _get_env("SUNO_TASK_STATUS_PATH", "/api/v1/suno/record-info")
 SUNO_WAV_PATH = _get_env("SUNO_WAV_PATH", "/api/v1/wav/generate")
 SUNO_WAV_INFO_PATH = _get_env("SUNO_WAV_INFO_PATH", "/api/v1/wav/record-info")
 SUNO_MP4_PATH = _get_env("SUNO_MP4_PATH", "/api/v1/mp4/generate")
@@ -147,7 +147,7 @@ SUNO_MP4_INFO_PATH = _get_env("SUNO_MP4_INFO_PATH", "/api/v1/mp4/record-info")
 SUNO_STEM_PATH = _get_env("SUNO_STEM_PATH", "/api/v1/vocal-removal/generate")
 SUNO_STEM_INFO_PATH = _get_env("SUNO_STEM_INFO_PATH", "/api/v1/vocal-removal/record-info")
 SUNO_LYRICS_PATH = _get_env("SUNO_LYRICS_PATH", "/api/v1/generate/get-timestamped-lyrics")
-SUNO_UPLOAD_EXTEND_PATH = _get_env("SUNO_UPLOAD_EXTEND_PATH", "/api/v1/generate/upload-extend")
+SUNO_UPLOAD_EXTEND_PATH = _get_env("SUNO_UPLOAD_EXTEND_PATH", "/api/v1/suno/upload-extend")
 SUNO_COVER_INFO_PATH = _get_env("SUNO_COVER_INFO_PATH", "/api/v1/suno/cover/record-info")
 SUNO_INSTR_PATH = _get_env("SUNO_INSTR_PATH", "/api/v1/generate/add-instrumental")
 
