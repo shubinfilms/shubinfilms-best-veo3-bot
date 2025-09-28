@@ -14,23 +14,17 @@ from redis_utils import get_balance
 
 import html
 
-from utils.suno_state import style_preview as suno_style_preview
+from utils.suno_state import (
+    SunoState,
+    lyrics_preview as suno_lyrics_preview,
+    load as load_suno_state,
+    style_preview as suno_style_preview,
+)
 
 _SUNO_MODEL_RAW = (os.getenv("SUNO_MODEL") or "v5").strip()
 _SUNO_MODEL_LABEL = _SUNO_MODEL_RAW.upper() if _SUNO_MODEL_RAW else "V5"
 
 _COPY_TEXT_SUPPORTED = "copy_text" in inspect.signature(InlineKeyboardButton.__init__).parameters
-
-
-def _suno_preview(text: str, limit: int = 160) -> str:
-    raw = (text or "").strip()
-    if not raw:
-        return ""
-    if len(raw) <= limit:
-        return raw
-    clipped = raw[: limit - 1].rstrip()
-    return clipped + "…"
-
 
 async def upsert_card(
     ctx: Any,
@@ -137,15 +131,15 @@ async def refresh_balance_card_if_open(
     return mid
 
 
-def _suno_keyboard(state: dict[str, Any], price: int) -> InlineKeyboardMarkup:
-    instrumental = bool(state.get("suno_instrumental", True))
-    generating = bool(state.get("suno_generating"))
+def _suno_keyboard(
+    suno_state: SunoState, *, price: int, generating: bool
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
     rows.append([InlineKeyboardButton("✏️ Название", callback_data="suno:edit:title")])
     rows.append([InlineKeyboardButton("🎨 Стиль", callback_data="suno:edit:style")])
 
-    mode_label = "Инструментал" if instrumental else "Со словами"
+    mode_label = "Со словами" if suno_state.has_lyrics else "Инструментал"
     rows.append([
         InlineKeyboardButton(
             f"🎼 Режим: {mode_label}",
@@ -153,7 +147,7 @@ def _suno_keyboard(state: dict[str, Any], price: int) -> InlineKeyboardMarkup:
         )
     ])
 
-    if not instrumental:
+    if suno_state.has_lyrics:
         rows.append([
             InlineKeyboardButton("📝 Текст песни", callback_data="suno:edit:lyrics")
         ])
@@ -166,47 +160,36 @@ def _suno_keyboard(state: dict[str, Any], price: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def render_suno_card(state: dict[str, Any], *, price: int) -> Tuple[str, InlineKeyboardMarkup]:
-    title = (state.get("suno_title") or "").strip()
-    style = (state.get("suno_style") or "").strip()
-    lyrics = (state.get("suno_lyrics") or "").strip()
-    instrumental = bool(state.get("suno_instrumental", True))
-    generating = bool(state.get("suno_generating"))
-    balance = state.get("suno_balance")
-
-    safe_title = html.escape(title) if title else "—"
-    style_display = suno_style_preview(style, limit=120)
+def render_suno_card(
+    suno_state: SunoState,
+    *,
+    price: int,
+    balance: Optional[int] = None,
+    generating: bool = False,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    safe_title = html.escape(suno_state.title) if suno_state.title else "—"
+    style_display = suno_style_preview(suno_state.style, limit=120)
     safe_style = html.escape(style_display) if style_display else "—"
-    mode_label = "Инструментал" if instrumental else "Со словами"
-    lyrics_preview = _suno_preview(lyrics)
-    if lyrics_preview:
-        safe_preview = html.escape(lyrics_preview)
-    else:
-        safe_preview = "—"
+    mode_label = "Со словами" if suno_state.has_lyrics else "Инструментал"
+    lyrics_preview = suno_lyrics_preview(suno_state.lyrics if suno_state.has_lyrics else None)
+    safe_lyrics = html.escape(lyrics_preview) if lyrics_preview else "—"
 
-    lines = [
-        "🎵 <b>Генерация музыки</b>",
-        f"• Модель: <b>{html.escape(_SUNO_MODEL_LABEL)}</b>",
-        f"• Режим: <b>{mode_label}</b>",
-        f"• Название: <b>{safe_title}</b>",
-        f"• Стиль: <b>{safe_style}</b>",
-        f"• Текст: <code>{safe_preview}</code>",
-    ]
-
+    lines = ["🎵 Генерация музыки"]
     if balance is not None:
-        try:
-            balance_val = int(balance)
-            lines.insert(1, f"💎 Баланс: <b>{balance_val}</b>")
-        except Exception:
-            pass
-
+        lines.append(f"Баланс: {int(balance)}")
+    lines.append(f"Модель: {html.escape(_SUNO_MODEL_LABEL)}")
+    lines.append(f"Режим: {mode_label}")
+    lines.append(f"• Название: {safe_title}")
+    lines.append(f"• Стиль: {safe_style}")
+    if suno_state.has_lyrics:
+        lines.append(f"• Текст: <code>{safe_lyrics}</code>")
     lines.append("")
-    lines.append(f"💎 Цена: <b>{price}💎</b> за попытку")
+    lines.append(f"💎 Цена: {price}💎 за попытку")
     if generating:
         lines.append("⏳ Генерация запущена — ожидайте результат.")
 
     text = "\n".join(lines)
-    keyboard = _suno_keyboard(state, price)
+    keyboard = _suno_keyboard(suno_state, price=price, generating=generating)
     return text, keyboard
 
 
@@ -218,7 +201,20 @@ async def refresh_suno_card(
     price: int,
     state_key: str = "last_ui_msg_id_suno",
 ) -> Optional[int]:
-    text, markup = render_suno_card(state_dict, price=price)
+    suno_state_obj = load_suno_state(ctx)
+    state_dict["suno_state"] = suno_state_obj.to_dict()
+    generating = bool(state_dict.get("suno_generating"))
+    balance_val = state_dict.get("suno_balance")
+    try:
+        balance_num = int(balance_val) if balance_val is not None else None
+    except Exception:
+        balance_num = None
+    text, markup = render_suno_card(
+        suno_state_obj,
+        price=price,
+        balance=balance_num,
+        generating=generating,
+    )
     last_key = "_last_text_suno"
     if state_dict.get(last_key) == text and state_dict.get(state_key):
         return state_dict.get(state_key)
