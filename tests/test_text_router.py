@@ -485,7 +485,7 @@ class _FakeQuery:
         self.answered.append((text, show_alert))
 
 
-def test_mj_switch_engine_creates_banana_wait_state() -> None:
+def test_mj_switch_engine_creates_selector() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
     state_dict = bot_module.state(ctx)
     state_dict["aspect"] = "16:9"
@@ -494,14 +494,14 @@ def test_mj_switch_engine_creates_banana_wait_state() -> None:
 
     chat_id = 4242
     user_id = 313
-    card_calls: list[tuple[int, bool]] = []
+    selector_calls: list[bool] = []
 
-    async def fake_banana_entry(chat_id_param: int, ctx_param, *, force_new: bool = True) -> None:
-        card_calls.append((chat_id_param, force_new))
-        state_dict["last_ui_msg_id_banana"] = 808
+    async def fake_selector(chat_id_param: int, ctx_param, *, force_new: bool = False) -> None:
+        selector_calls.append(force_new)
+        state_dict["last_ui_msg_id_image_engine"] = 808
 
-    original_banana_entry = bot_module.banana_entry
-    bot_module.banana_entry = fake_banana_entry  # type: ignore[assignment]
+    original_selector = bot_module.show_image_engine_selector
+    bot_module.show_image_engine_selector = fake_selector  # type: ignore[assignment]
 
     message = _FakeMessage(chat_id)
     query = _FakeQuery("mj:switch_engine", message)
@@ -514,18 +514,18 @@ def test_mj_switch_engine_creates_banana_wait_state() -> None:
     try:
         asyncio.run(bot_module.on_callback(update, ctx))
     finally:
-        bot_module.banana_entry = original_banana_entry  # type: ignore[assignment]
+        bot_module.show_image_engine_selector = original_selector  # type: ignore[assignment]
 
     wait_state = get_wait_state(user_id)
     try:
-        assert card_calls == [(chat_id, True)]
-        assert wait_state is not None and wait_state.kind == WaitKind.BANANA_PROMPT
-        assert message.replies and bot_module.BANANA_MODE_HINT_MD in message.replies[-1][0]
+        assert selector_calls == [True]
+        assert wait_state is None
+        assert state_dict["image_engine"] is None
     finally:
         clear_wait_state(user_id)
 
 
-def test_banana_switch_engine_creates_mj_wait_state() -> None:
+def test_banana_switch_engine_creates_selector() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
     state_dict = bot_module.state(ctx)
     state_dict["aspect"] = "16:9"
@@ -533,14 +533,14 @@ def test_banana_switch_engine_creates_mj_wait_state() -> None:
 
     chat_id = 5151
     user_id = 707
-    card_calls: list[int] = []
+    selector_calls: list[bool] = []
 
-    async def fake_mj_entry(chat_id_param: int, ctx_param) -> None:
-        card_calls.append(chat_id_param)
-        state_dict["last_ui_msg_id_mj"] = 606
+    async def fake_selector(chat_id_param: int, ctx_param, *, force_new: bool = False) -> None:
+        selector_calls.append(force_new)
+        state_dict["last_ui_msg_id_image_engine"] = 909
 
-    original_mj_entry = bot_module.mj_entry
-    bot_module.mj_entry = fake_mj_entry  # type: ignore[assignment]
+    original_selector = bot_module.show_image_engine_selector
+    bot_module.show_image_engine_selector = fake_selector  # type: ignore[assignment]
 
     message = _FakeMessage(chat_id)
     query = _FakeQuery("banana:switch_engine", message)
@@ -553,12 +553,12 @@ def test_banana_switch_engine_creates_mj_wait_state() -> None:
     try:
         asyncio.run(bot_module.on_callback(update, ctx))
     finally:
-        bot_module.mj_entry = original_mj_entry  # type: ignore[assignment]
+        bot_module.show_image_engine_selector = original_selector  # type: ignore[assignment]
 
     wait_state = get_wait_state(user_id)
     try:
-        assert card_calls == [chat_id]
-        assert wait_state is not None and wait_state.kind == WaitKind.MJ_PROMPT
-        assert message.replies and bot_module.MJ_MODE_HINT_TEXT in message.replies[-1][0]
+        assert selector_calls == [True]
+        assert wait_state is None
+        assert state_dict["image_engine"] is None
     finally:
         clear_wait_state(user_id)
