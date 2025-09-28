@@ -11,6 +11,7 @@ from urllib.parse import quote_plus
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 
 from redis_utils import get_balance
 
@@ -24,6 +25,7 @@ from utils.suno_state import (
     style_preview as suno_style_preview,
 )
 from telegram_utils import safe_edit, SafeEditResult
+from utils.telegram_safe import safe_edit_message
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +52,20 @@ async def upsert_card(
     mid = state_dict.get(state_key)
     if mid:
         try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=mid,
-                text=text,
-                reply_markup=reply_markup,
+            await safe_edit_message(
+                ctx,
+                chat_id,
+                mid,
+                text,
+                reply_markup,
                 parse_mode=parse_mode,
                 disable_web_page_preview=disable_web_page_preview,
             )
             return mid
+        except BadRequest as exc:
+            logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+            logger.debug("edit %s bad request: %s", state_key, exc)
+            state_dict[state_key] = None
         except Exception as exc:  # pragma: no cover - network issues
             logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
             logger.warning("edit %s failed: %s", state_key, exc)

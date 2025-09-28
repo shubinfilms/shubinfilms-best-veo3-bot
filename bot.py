@@ -45,6 +45,7 @@ from telegram.ext import (
     filters,
     AIORateLimiter,
     PreCheckoutQueryHandler,
+    ApplicationHandlerStop,
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
@@ -2749,10 +2750,11 @@ async def _apply_wait_state_input(
     truncated = cleaned != normalized
 
     _wait_log.info(
-        "WAIT_INPUT kind=%s len=%s truncated=%s", wait_state.kind.value, len(cleaned), truncated
+        "INPUT_APPLY kind=%s len=%s truncated=%s",
+        wait_state.kind.value,
+        len(cleaned),
+        truncated,
     )
-
-    preview_text = _wait_preview(cleaned)
 
     handled = False
 
@@ -2823,10 +2825,45 @@ async def _apply_wait_state_input(
         handled = True
 
     if handled:
-        await message.reply_text(f'Сейчас: "{preview_text}"')
         if user_id is not None:
             clear_wait_state(user_id)
+        try:
+            await message.reply_text("✅ Принято")
+        except Exception:
+            _wait_log.debug(
+                "WAIT_ACK_FAILED",
+                extra={
+                    "kind": wait_state.kind.value,
+                    "user_id": user_id,
+                    "chat_id": getattr(message, "chat_id", None),
+                },
+            )
     return handled
+
+
+async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is None:
+        return
+
+    wait_state = get_wait_state(user_id)
+    if wait_state is None:
+        return
+
+    handled = await _apply_wait_state_input(
+        ctx,
+        message,
+        wait_state,
+        user_id=user_id,
+    )
+
+    if handled:
+        raise ApplicationHandlerStop
 
 async def _handle_suno_waiting_input(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -8141,18 +8178,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
-    wait_state_obj = get_wait_state(user_id) if user_id is not None else None
-    if wait_state_obj:
-        handled_wait = await _apply_wait_state_input(
-            ctx,
-            msg,
-            wait_state_obj,
-            user_id=user_id,
-        )
-        if handled_wait:
-            return
-
-    waiting_field = s.get("suno_waiting_state")
     waiting_for_input = _chat_state_waiting_input(s)
     if (
         waiting_for_input
@@ -8166,20 +8191,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lowered in {"меню", "menu", "главное меню"}:
         await handle_menu(update, ctx)
         return
-
-    if waiting_field in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS}:
-        if chat_id is None:
-            return
-        handled = await _handle_suno_waiting_input(
-            ctx,
-            chat_id,
-            msg,
-            s,
-            waiting_field,
-            user_id=user_id,
-        )
-        if handled:
-            return
 
     if state_mode == "promo":
         if not PROMO_ENABLED:
@@ -9307,6 +9318,10 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
 
 
 def register_handlers(application: Any) -> None:
+    text_router = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
+    text_router.block = False
+    application.add_handler(text_router, group=0)
+
     for names, callback in PRIORITY_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))
 
@@ -9335,9 +9350,9 @@ def register_handlers(application: Any) -> None:
 
     pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
     pm_handler.block = False
-    application.add_handler(pm_handler, group=0)
+    application.add_handler(pm_handler, group=1)
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=2)
 
 
 # ==========================
