@@ -1562,7 +1562,7 @@ async def _pm_apply_result(
         save_suno_state(ctx, suno_state_obj)
         s["suno_state"] = suno_state_obj.to_dict()
         s["suno_waiting_state"] = IDLE_SUNO
-        s["_last_text_suno"] = None
+        _reset_suno_card_cache(s)
         s.setdefault("mode", "suno")
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         return True, "Текст добавлен в карточку Suno."
@@ -2512,6 +2512,32 @@ WAIT_SUNO_LYRICS = "WAIT_SUNO_LYRICS"
 IDLE_SUNO = "IDLE_SUNO"
 
 
+_SUNO_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_SUNO_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _sanitize_suno_input(value: str, *, allow_newlines: bool) -> str:
+    text = str(value or "")
+    text = _SUNO_BR_RE.sub("\n" if allow_newlines else " ", text)
+    text = _SUNO_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not allow_newlines:
+        text = text.replace("\n", " ")
+    text = re.sub(r"[\t\f]+", " ", text)
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _reset_suno_card_cache(state_dict: Dict[str, Any]) -> None:
+    state_dict["_last_text_suno"] = None
+    card_state = state_dict.get("suno_card")
+    if isinstance(card_state, dict):
+        card_state["last_text_hash"] = None
+        card_state["last_markup_hash"] = None
+
+
 DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
@@ -2542,6 +2568,11 @@ DEFAULT_STATE = {
     "suno_last_params": None,
     "suno_balance": None,
     "chat_hint_sent": False,
+    "suno_card": {
+        "msg_id": None,
+        "last_text_hash": None,
+        "last_markup_hash": None,
+    },
 }
 
 
@@ -2578,7 +2609,7 @@ def _apply_state_defaults(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(value, list) and not isinstance(target[key], list):
             target[key] = []
         elif isinstance(value, dict) and not isinstance(target[key], dict):
-            target[key] = {}
+            target[key] = dict(value)
     if not isinstance(target.get("banana_images"), list):
         target["banana_images"] = []
     if not isinstance(target.get("msg_ids"), dict):
@@ -2607,6 +2638,18 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     waiting = state_dict.get("suno_waiting_state")
     if waiting not in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS}:
         state_dict["suno_waiting_state"] = IDLE_SUNO
+    card_meta = state_dict.get("suno_card")
+    if not isinstance(card_meta, dict):
+        card_meta = {
+            "msg_id": None,
+            "last_text_hash": None,
+            "last_markup_hash": None,
+        }
+        state_dict["suno_card"] = card_meta
+    else:
+        card_meta.setdefault("msg_id", None)
+        card_meta.setdefault("last_text_hash", None)
+        card_meta.setdefault("last_markup_hash", None)
     return state_dict
 
 
@@ -4123,7 +4166,7 @@ async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_ba
     s["mode"] = "suno"
     suno_state_obj = load_suno_state(ctx)
     s["suno_state"] = suno_state_obj.to_dict()
-    s["_last_text_suno"] = None
+    _reset_suno_card_cache(s)
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
 
 
@@ -4248,7 +4291,7 @@ async def _suno_issue_refund(
         s["suno_last_task_id"] = None
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
-    s["_last_text_suno"] = None
+    _reset_suno_card_cache(s)
     s["suno_waiting_state"] = IDLE_SUNO
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
     await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
@@ -4430,7 +4473,7 @@ async def _launch_suno_generation(
     }
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
-    s["_last_text_suno"] = None
+    _reset_suno_card_cache(s)
     s["suno_waiting_state"] = IDLE_SUNO
     s["suno_current_req_id"] = req_id
 
@@ -4680,7 +4723,7 @@ async def _launch_suno_generation(
         if s.get("suno_generating"):
             s["suno_generating"] = False
             s["suno_current_req_id"] = None
-            s["_last_text_suno"] = None
+            _reset_suno_card_cache(s)
             try:
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
             except Exception as exc:
@@ -4865,7 +4908,7 @@ async def _poll_suno_and_send(
                 s["suno_generating"] = False
                 s["suno_last_task_id"] = None
                 s["suno_balance"] = current_balance
-                s["_last_text_suno"] = None
+                _reset_suno_card_cache(s)
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
                 await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
                 return
@@ -4885,7 +4928,7 @@ async def _poll_suno_and_send(
             if s.get("suno_last_task_id") == task_id:
                 s["suno_last_task_id"] = None
             s["suno_generating"] = False
-            s["_last_text_suno"] = None
+            _reset_suno_card_cache(s)
             await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
 
 
@@ -6970,7 +7013,7 @@ async def prompt_master_insert_callback(update: Update, ctx: ContextTypes.DEFAUL
         save_suno_state(ctx, suno_state_obj)
         s["suno_state"] = suno_state_obj.to_dict()
         s["suno_waiting_state"] = IDLE_SUNO
-        s["_last_text_suno"] = None
+        _reset_suno_card_cache(s)
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await query.answer("Промпт вставлен в карточку Suno")
         return
@@ -7496,7 +7539,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_suno_state(ctx, suno_state_obj)
             s["suno_state"] = suno_state_obj.to_dict()
             s["suno_waiting_state"] = IDLE_SUNO
-            s["_last_text_suno"] = None
+            _reset_suno_card_cache(s)
             if chat_id is not None:
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
             mode_label = "Инструментал" if suno_state_obj.mode == "instrumental" else "Со словами"
@@ -7764,21 +7807,22 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_text = "Обновлено."
 
         if waiting_field == WAIT_SUNO_TITLE:
-            if is_clear or not stripped:
+            cleaned_value = _sanitize_suno_input(raw_value, allow_newlines=False)
+            if is_clear or not cleaned_value:
                 clear_suno_title(suno_state_obj)
                 reply_text = "Название очищено."
                 log.info("suno input cleared", extra={"field": "title", "user_id": user_id})
             else:
-                set_suno_title(suno_state_obj, raw_value)
+                set_suno_title(suno_state_obj, cleaned_value)
                 if suno_state_obj.title:
                     preview = _suno_log_preview(suno_state_obj.title, limit=60)
-                    reply_text = f"Название обновлено: {preview}"
+                    reply_text = "Название обновлено."
                     log.info(
                         "suno input set",
                         extra={
                             "field": "title",
                             "user_id": user_id,
-                            "value_preview": preview[:40],
+                            "value_preview": preview[:60],
                         },
                     )
                 else:
@@ -7787,12 +7831,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         "suno input cleared", extra={"field": "title", "user_id": user_id}
                     )
         elif waiting_field == WAIT_SUNO_STYLE:
-            if is_clear or not stripped:
+            cleaned_value = _sanitize_suno_input(raw_value, allow_newlines=True)
+            if is_clear or not cleaned_value:
                 clear_suno_style(suno_state_obj)
                 reply_text = "Стиль очищен."
                 log.info("suno input cleared", extra={"field": "style", "user_id": user_id})
             else:
-                set_suno_style(suno_state_obj, raw_value)
+                set_suno_style(suno_state_obj, cleaned_value)
                 if suno_state_obj.style:
                     preview = _suno_log_preview(suno_state_obj.style, limit=80)
                     reply_text = "Стиль обновлён."
@@ -7801,19 +7846,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         extra={
                             "field": "style",
                             "user_id": user_id,
-                            "value_preview": preview[:40],
+                            "value_preview": preview[:80],
                         },
                     )
                 else:
                     reply_text = "Стиль очищен."
                     log.info("suno input cleared", extra={"field": "style", "user_id": user_id})
         elif waiting_field == WAIT_SUNO_LYRICS:
-            if is_clear or not stripped:
+            cleaned_value = _sanitize_suno_input(raw_value, allow_newlines=True)
+            if is_clear or not cleaned_value:
                 clear_suno_lyrics(suno_state_obj)
                 reply_text = "Текст песни очищен."
                 log.info("suno input cleared", extra={"field": "lyrics", "user_id": user_id})
             else:
-                set_suno_lyrics(suno_state_obj, raw_value)
+                set_suno_lyrics(suno_state_obj, cleaned_value)
                 if suno_state_obj.lyrics:
                     preview = _suno_log_preview(suno_state_obj.lyrics, limit=80)
                     reply_text = "Текст песни обновлён."
@@ -7822,7 +7868,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         extra={
                             "field": "lyrics",
                             "user_id": user_id,
-                            "value_preview": preview[:40],
+                            "value_preview": preview[:80],
                         },
                     )
                 else:
@@ -7832,7 +7878,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_suno_state(ctx, suno_state_obj)
         s["suno_state"] = suno_state_obj.to_dict()
         s["suno_waiting_state"] = IDLE_SUNO
-        s["_last_text_suno"] = None
+        _reset_suno_card_cache(s)
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await _send_with_retry(lambda: msg.reply_text(reply_text))
         return
@@ -7851,7 +7897,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         clear_suno_style(suno_state_obj)
         save_suno_state(ctx, suno_state_obj)
         s["suno_state"] = suno_state_obj.to_dict()
-        s["_last_text_suno"] = None
+        _reset_suno_card_cache(s)
         log.info("suno input cleared", extra={"field": "reset", "user_id": user_id})
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await msg.reply_text("Название и стиль очищены.")

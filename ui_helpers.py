@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, MutableMapping
 
 from urllib.parse import quote_plus
 
@@ -18,8 +18,10 @@ from utils.suno_state import (
     SunoState,
     lyrics_preview as suno_lyrics_preview,
     load as load_suno_state,
+    save as save_suno_state,
     style_preview as suno_style_preview,
 )
+from telegram_utils import safe_edit, SafeEditResult
 
 _SUNO_MODEL_RAW = (os.getenv("SUNO_MODEL") or "v5").strip()
 _SUNO_MODEL_LABEL = _SUNO_MODEL_RAW.upper() if _SUNO_MODEL_RAW else "V5"
@@ -168,10 +170,11 @@ def render_suno_card(
     generating: bool = False,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     safe_title = html.escape(suno_state.title) if suno_state.title else "—"
-    style_display = suno_style_preview(suno_state.style, limit=120)
+    style_display = suno_style_preview(suno_state.style, limit=200)
     safe_style = html.escape(style_display) if style_display else "—"
     mode_label = "Со словами" if suno_state.has_lyrics else "Инструментал"
-    lyrics_preview = suno_lyrics_preview(suno_state.lyrics if suno_state.has_lyrics else None)
+    lyrics_source = suno_state.lyrics if suno_state.has_lyrics else None
+    lyrics_preview = suno_lyrics_preview(lyrics_source)
     safe_lyrics = html.escape(lyrics_preview) if lyrics_preview else "—"
 
     lines = ["🎵 Генерация музыки"]
@@ -179,12 +182,11 @@ def render_suno_card(
         lines.append(f"Баланс: {int(balance)}")
     lines.append(f"Модель: {html.escape(_SUNO_MODEL_LABEL)}")
     lines.append(f"Режим: {mode_label}")
-    lines.append(f"• Название: {safe_title}")
-    lines.append(f"• Стиль: {safe_style}")
-    if suno_state.has_lyrics:
-        lines.append(f"• Текст: <code>{safe_lyrics}</code>")
+    lines.append(f"• Название: <i>{safe_title}</i>")
+    lines.append(f"• Стиль: <i>{safe_style}</i>")
+    lines.append(f"• Текст: <i>{safe_lyrics}</i>")
     lines.append("")
-    lines.append(f"💎 Цена: {price}💎 за попытку")
+    lines.append(f"💎 Цена: {price} 💎 за попытку")
     if generating:
         lines.append("⏳ Генерация запущена — ожидайте результат.")
 
@@ -215,25 +217,48 @@ async def refresh_suno_card(
         balance=balance_num,
         generating=generating,
     )
-    last_key = "_last_text_suno"
-    if state_dict.get(last_key) == text and state_dict.get(state_key):
-        return state_dict.get(state_key)
+    card_state_raw = state_dict.get("suno_card")
+    card_state: MutableMapping[str, Any]
+    if isinstance(card_state_raw, MutableMapping):
+        card_state = card_state_raw
+    else:
+        card_state = {"msg_id": None, "last_text_hash": None, "last_markup_hash": None}
+        state_dict["suno_card"] = card_state
 
-    mid = await upsert_card(
-        ctx,
+    msg_id = card_state.get("msg_id")
+    if not isinstance(msg_id, int):
+        msg_id = state_dict.get(state_key)
+        if not isinstance(msg_id, int):
+            msg_id = None
+
+    result: SafeEditResult = await safe_edit(
+        ctx.bot,
         chat_id,
-        state_dict,
-        state_key,
+        msg_id,
         text,
-        reply_markup=markup,
+        markup,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        state=card_state,
     )
-    if mid:
-        state_dict[last_key] = text
-    else:
-        state_dict[last_key] = None
-    return mid
+
+    if result.message_id is not None:
+        state_dict[state_key] = result.message_id
+        card_state["msg_id"] = result.message_id
+        msg_ids = state_dict.get("msg_ids")
+        if isinstance(msg_ids, dict):
+            msg_ids["suno"] = result.message_id
+
+    suno_state_obj.card_message_id = card_state.get("msg_id") if isinstance(card_state.get("msg_id"), int) else None
+    card_text_hash = card_state.get("last_text_hash")
+    card_markup_hash = card_state.get("last_markup_hash")
+    suno_state_obj.card_text_hash = card_text_hash if isinstance(card_text_hash, str) else None
+    suno_state_obj.card_markup_hash = card_markup_hash if isinstance(card_markup_hash, str) else None
+    save_suno_state(ctx, suno_state_obj)
+    state_dict["suno_state"] = suno_state_obj.to_dict()
+
+    state_dict["_last_text_suno"] = text
+    return result.message_id or msg_id
 
 
 def referral_card_text(link: str, referrals: int, earned: int) -> str:

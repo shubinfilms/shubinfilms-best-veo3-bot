@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import random
 from asyncio.subprocess import PIPE
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, MutableMapping, Optional, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.constants import ParseMode
@@ -333,6 +336,123 @@ def build_inline_kb(
     return InlineKeyboardMarkup(keyboard_rows)
 
 
+@dataclass
+class SafeEditResult:
+    message_id: Optional[int]
+    status: str
+
+    @property
+    def changed(self) -> bool:
+        return self.status in {"edited", "sent", "resent"}
+
+
+def _hash_value(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def safe_edit(
+    bot: Any,
+    chat_id: int,
+    message_id: Optional[int],
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    parse_mode: str = "HTML",
+    *,
+    disable_web_page_preview: bool = True,
+    state: Optional[MutableMapping[str, Any]] = None,
+) -> SafeEditResult:
+    state_obj: MutableMapping[str, Any]
+    if isinstance(state, MutableMapping):
+        state_obj = state
+    else:
+        state_obj = {}
+
+    if reply_markup is None:
+        markup_payload: Any = None
+    else:
+        try:
+            markup_payload = reply_markup.to_dict()
+        except AttributeError:
+            markup_payload = reply_markup
+    markup_json = json.dumps(markup_payload, ensure_ascii=False, sort_keys=True)
+    text_hash = _hash_value(text)
+    markup_hash = _hash_value(markup_json)
+
+    last_text_hash = state_obj.get("last_text_hash") if isinstance(state_obj, MutableMapping) else None
+    last_markup_hash = state_obj.get("last_markup_hash") if isinstance(state_obj, MutableMapping) else None
+
+    if (
+        isinstance(last_text_hash, str)
+        and isinstance(last_markup_hash, str)
+        and last_text_hash == text_hash
+        and last_markup_hash == markup_hash
+        and message_id is not None
+    ):
+        log.info(
+            "safe_edit.skipped",
+            extra={"meta": {"chat_id": chat_id, "message_id": message_id}},
+        )
+        state_obj["last_text_hash"] = text_hash
+        state_obj["last_markup_hash"] = markup_hash
+        if isinstance(state_obj, MutableMapping):
+            state_obj.setdefault("msg_id", message_id)
+        return SafeEditResult(message_id=message_id, status="skipped")
+
+    async def _send_new() -> SafeEditResult:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+        new_id = getattr(sent, "message_id", None)
+        if isinstance(state_obj, MutableMapping):
+            state_obj["msg_id"] = new_id
+        state_obj["last_text_hash"] = text_hash
+        state_obj["last_markup_hash"] = markup_hash
+        return SafeEditResult(message_id=new_id, status="sent")
+
+    if message_id is None:
+        return await _send_new()
+
+    try:
+        edited = await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+        new_id = getattr(edited, "message_id", message_id)
+        if isinstance(state_obj, MutableMapping):
+            state_obj["msg_id"] = new_id
+        state_obj["last_text_hash"] = text_hash
+        state_obj["last_markup_hash"] = markup_hash
+        return SafeEditResult(message_id=new_id, status="edited")
+    except BadRequest as exc:
+        lowered = str(exc).lower()
+        if "message is not modified" in lowered:
+            log.info(
+                "safe_edit.noop",
+                extra={"meta": {"chat_id": chat_id, "message_id": message_id}},
+            )
+            state_obj["last_text_hash"] = text_hash
+            state_obj["last_markup_hash"] = markup_hash
+            return SafeEditResult(message_id=message_id, status="skipped")
+        if "message to edit not found" in lowered:
+            log.info(
+                "safe_edit.missing_message",
+                extra={"meta": {"chat_id": chat_id, "message_id": message_id}},
+            )
+            if isinstance(state_obj, MutableMapping):
+                state_obj["msg_id"] = None
+            resend = await _send_new()
+            return SafeEditResult(message_id=resend.message_id, status="resent")
+        raise
+
+
 async def safe_edit_markdown_v2(
     bot: Any,
     chat_id: int,
@@ -426,4 +546,6 @@ __all__ = [
     "run_ffmpeg",
     "md2_escape",
     "build_inline_kb",
+    "safe_edit",
+    "SafeEditResult",
 ]
