@@ -109,6 +109,7 @@ from utils.input_state import (
     clear_wait_state,
     clear_wait,
     get_wait,
+    is_command_text,
     refresh_card_pointer,
     set_wait,
     touch_wait,
@@ -2737,7 +2738,7 @@ def is_command_or_button(message: Message) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
-    if stripped.startswith("/"):
+    if is_command_text(stripped):
         return True
     return stripped in _KNOWN_BUTTON_LABELS
 
