@@ -10,6 +10,8 @@ import time
 
 from settings import REDIS_PREFIX
 
+from utils.telegram_utils import is_command_text
+
 try:  # pragma: no cover - optional redis backend
     from redis_utils import rds as _redis
 except Exception:  # pragma: no cover - fall back to None if redis unavailable
@@ -19,9 +21,6 @@ _logger = logging.getLogger("input-state")
 
 _KEY_TMPL = f"{REDIS_PREFIX}:wait-input:{{user_id}}"
 
-WAIT_TTL_SEC_DEFAULT = 180
-
-
 class WaitKind(str, Enum):
     VEO_PROMPT = "veo_prompt"
     BANANA_PROMPT = "banana_prompt"
@@ -29,43 +28,6 @@ class WaitKind(str, Enum):
     SUNO_STYLE = "suno_style"
     SUNO_LYRICS = "suno_lyrics"
     MJ_PROMPT = "mj_prompt"
-
-
-KNOWN_COMMAND_LABELS = {
-    "/menu",
-    "/video",
-    "/image",
-    "/music",
-    "/balance",
-    "🎬 ГЕНЕРАЦИЯ ВИДЕО",
-    "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ",
-    "🎵 Генерация музыки",
-    "🧠 Prompt-Master",
-    "💬 Обычный чат",
-    "💎 Баланс",
-    "Подтвердить",
-    "Сменить формат",
-    "Отменить",
-    "Назад",
-    "Видеопромпт (VEO)",
-    "Изображение (Midjourney)",
-    "Редактирование фото (Banana)",
-    "Оживление фото",
-    "Трек (Suno)",
-}
-
-
-def _norm(s: Optional[str]) -> str:
-    return (s or "").strip().lower()
-
-
-def is_command_text(s: Optional[str]) -> bool:
-    if not s:
-        return False
-    text = _norm(s)
-    if text.startswith("/"):
-        return True
-    return text in {_norm(label) for label in KNOWN_COMMAND_LABELS}
 
 
 @dataclass
@@ -293,57 +255,40 @@ def has_wait(user_id: int) -> bool:
     return is_waiting(user_id)
 
 
+WAIT_TTL = 180  # сек
+
+
 @dataclass
 class WaitState:
-    kind: WaitKind
+    kind: str
     card_msg_id: int
+    data: Dict[str, Any]
     expires_at: float
 
-    def is_expired(self) -> bool:
-        return time.time() >= self.expires_at
-
-    def touch(self, ttl: int = WAIT_TTL_SEC_DEFAULT) -> None:
-        self.expires_at = time.time() + ttl
+    def touch(self) -> None:
+        self.expires_at = time.time() + WAIT_TTL
 
 
-class InputState:
-    """In-memory wait state registry scoped by chat."""
+class InputRegistry:
+    """Простейший in-memory реестр ожидания ввода по chat_id."""
 
     def __init__(self) -> None:
         self._by_chat: Dict[int, WaitState] = {}
 
-    def set(self, chat_id: int, kind: WaitKind, card_msg_id: int, ttl: int = WAIT_TTL_SEC_DEFAULT) -> None:
-        self._by_chat[int(chat_id)] = WaitState(
-            kind=kind,
-            card_msg_id=int(card_msg_id),
-            expires_at=time.time() + ttl,
-        )
-
     def get(self, chat_id: int) -> Optional[WaitState]:
         state = self._by_chat.get(int(chat_id))
-        if state and state.is_expired():
-            self._by_chat.pop(int(chat_id), None)
-            return None
-        return state
+        if state and state.expires_at > time.time():
+            return state
+        self._by_chat.pop(int(chat_id), None)
+        return None
+
+    def set(self, chat_id: int, state: WaitState) -> None:
+        state.touch()
+        self._by_chat[int(chat_id)] = state
 
     def clear(self, chat_id: int) -> None:
         self._by_chat.pop(int(chat_id), None)
 
-    def touch(self, chat_id: int, ttl: int = WAIT_TTL_SEC_DEFAULT) -> None:
-        state = self.get(chat_id)
-        if state:
-            state.touch(ttl)
 
-    def should_capture_text(self, chat_id: int, text: Optional[str]) -> bool:
-        if not text or not text.strip():
-            return False
-        state = self.get(chat_id)
-        if not state:
-            return False
-        if is_command_text(text):
-            return False
-        return True
-
-
-input_state = InputState()
+input_state = InputRegistry()
 
