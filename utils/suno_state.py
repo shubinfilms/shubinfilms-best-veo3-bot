@@ -1,193 +1,211 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping, MutableMapping, Optional
+
 import re
-import unicodedata
-from typing import Any, Mapping, MutableMapping, Optional
-
-TITLE_MAX_LENGTH = 60
-STYLE_MAX_LENGTH = 500
-STYLE_PREVIEW_LIMIT = 120
-_DEFAULT_INSTRUMENTAL_PROMPT = "instrumental, cinematic, modern, dynamic"
-_DEFAULT_VOCAL_PROMPT = "pop, modern, upbeat"
-
-# Unicode zero-width and formatting characters that should be stripped
-_INVISIBLE_RE = re.compile(r"[\u200B\u200C\u200D\uFEFF]")
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_WHITESPACE_RE = re.compile(r"\s+")
 
 
-_DEFAULT_STATE: dict[str, Any] = {
-    "title": None,
-    "style": None,
-    "lyrics": None,
-    "mode": "instrumental",
-    "has_lyrics": False,
-}
+TITLE_MAX_LENGTH = 120
+STYLE_MAX_LENGTH = 300
+LYRICS_MAX_LENGTH = 2000
+LYRICS_PREVIEW_LIMIT = 160
+_STORAGE_KEY = "suno_state"
 
 
-def ensure_suno_state(container: MutableMapping[str, Any]) -> dict[str, Any]:
-    """Ensure that the mutable mapping contains a SUNO state dictionary."""
+_SPACE_RE = re.compile(r"\s+")
 
-    state = container.get("suno")
-    if not isinstance(state, dict):
-        state = {}
-        container["suno"] = state
-    for key, value in _DEFAULT_STATE.items():
-        state.setdefault(key, value)
+
+def _collapse_spaces(value: str) -> str:
+    return _SPACE_RE.sub(" ", value).strip()
+
+
+def _normalize_multiline(value: str) -> str:
+    normalized_lines: list[str] = []
+    for raw_line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        collapsed = _collapse_spaces(raw_line)
+        if collapsed:
+            normalized_lines.append(collapsed)
+    return "\n".join(normalized_lines).strip()
+
+
+def _normalize_lyrics(value: str) -> str:
+    cleaned = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in cleaned.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _apply_limit(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length].rstrip()
+
+
+def _clean_title(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = _collapse_spaces(str(value))
+    if not text:
+        return None
+    return _apply_limit(text, TITLE_MAX_LENGTH)
+
+
+def _clean_style(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = _normalize_multiline(str(value))
+    if not text:
+        return None
+    return _apply_limit(text, STYLE_MAX_LENGTH)
+
+
+def _clean_lyrics(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = _normalize_lyrics(str(value))
+    if not text:
+        return None
+    return _apply_limit(text, LYRICS_MAX_LENGTH)
+
+
+@dataclass
+class SunoState:
+    mode: Literal["instrumental", "lyrics"] = "instrumental"
+    title: Optional[str] = None
+    style: Optional[str] = None
+    lyrics: Optional[str] = None
+
+    @property
+    def has_lyrics(self) -> bool:
+        return self.mode == "lyrics"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "title": self.title,
+            "style": self.style,
+            "lyrics": self.lyrics,
+            "has_lyrics": self.has_lyrics,
+        }
+
+
+def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
+    raw_mode = payload.get("mode")
+    mode: Literal["instrumental", "lyrics"]
+    if isinstance(raw_mode, str) and raw_mode in {"instrumental", "lyrics"}:
+        mode = raw_mode  # type: ignore[assignment]
+    else:
+        mode = "lyrics" if bool(payload.get("has_lyrics")) else "instrumental"
+    state = SunoState(mode=mode)
+    set_title(state, payload.get("title"))
+    set_style(state, payload.get("style"))
+    set_lyrics(state, payload.get("lyrics"))
     return state
 
 
-def _strip_html(text: str) -> str:
-    return _HTML_TAG_RE.sub("", text)
+def load(ctx: Any) -> SunoState:
+    user_data = getattr(ctx, "user_data", None)
+    if isinstance(user_data, MutableMapping):
+        raw = user_data.get(_STORAGE_KEY)
+        if isinstance(raw, Mapping):
+            return _from_mapping(raw)
+        legacy = user_data.get("suno")
+        if isinstance(legacy, Mapping):
+            return _from_mapping(legacy)
+    return SunoState()
 
 
-def _strip_invisible(text: str) -> str:
-    cleaned = _INVISIBLE_RE.sub("", text)
-    return "".join(
-        ch
-        for ch in cleaned
-        if (ch == "\n")
-        or (ch == "\r")
-        or (ch == "\t")
-        or not unicodedata.category(ch).startswith("C")
-    )
+def save(ctx: Any, state: SunoState) -> None:
+    user_data = getattr(ctx, "user_data", None)
+    if not isinstance(user_data, MutableMapping):
+        return
+    user_data[_STORAGE_KEY] = state.to_dict()
 
 
-def _collapse_spaces(text: str) -> str:
-    return _WHITESPACE_RE.sub(" ", text).strip()
+def set_title(state: SunoState, value: Optional[str]) -> SunoState:
+    state.title = _clean_title(value)
+    return state
 
 
-def _normalize_whitespace_lines(text: str) -> str:
-    normalized: list[str] = []
-    for line in text.splitlines():
-        collapsed = _WHITESPACE_RE.sub(" ", line).strip()
-        if collapsed:
-            normalized.append(collapsed)
-    return "\n".join(normalized).strip()
+def clear_title(state: SunoState) -> SunoState:
+    state.title = None
+    return state
 
 
-def _collapse_emoji_runs(text: str, *, max_run: int = 2) -> str:
-    result: list[str] = []
-    last = ""
-    run = 0
-    for ch in text:
-        code = ord(ch)
-        is_emoji = (
-            0x1F000 <= code <= 0x1FAFF
-            or 0x2600 <= code <= 0x27BF
-            or 0x1F900 <= code <= 0x1F9FF
-        )
-        if is_emoji and ch == last:
-            run += 1
-            if run >= max_run:
-                continue
-        else:
-            run = 0
-        result.append(ch)
-        last = ch
-    return "".join(result)
+def set_style(state: SunoState, value: Optional[str]) -> SunoState:
+    state.style = _clean_style(value)
+    return state
 
 
-def sanitize_title(raw: str) -> str:
-    text = _strip_html(raw)
-    text = _strip_invisible(text)
-    text = _collapse_spaces(text)
-    if len(text) > TITLE_MAX_LENGTH:
-        return ""
-    return text
+def clear_style(state: SunoState) -> SunoState:
+    state.style = None
+    return state
 
 
-def sanitize_style(raw: str) -> str:
-    text = raw.replace("\r\n", "\n").replace("\r", "\n")
-    text = _strip_html(text)
-    text = _strip_invisible(text)
-    text = _collapse_emoji_runs(text)
-    text = _normalize_whitespace_lines(text)
-    if len(text) > STYLE_MAX_LENGTH:
-        return ""
-    return text
+def set_lyrics(state: SunoState, value: Optional[str]) -> SunoState:
+    state.lyrics = _clean_lyrics(value)
+    return state
 
 
-def process_title_input(raw: str) -> tuple[bool, Optional[str], Optional[str]]:
-    stripped = raw.strip()
-    if stripped in {"-", "—"}:
-        return True, None, None
-    sanitized = sanitize_title(stripped)
-    if not sanitized:
-        cleaned = _collapse_spaces(_strip_invisible(_strip_html(stripped)))
-        if cleaned and len(cleaned) > TITLE_MAX_LENGTH:
-            return (
-                False,
-                None,
-                f"⚠️ Название слишком длинное — {len(cleaned)} символов. Сократите до {TITLE_MAX_LENGTH}.",
-            )
-        return True, None, None
-    return True, sanitized, None
+def clear_lyrics(state: SunoState) -> SunoState:
+    state.lyrics = None
+    return state
 
 
-def process_style_input(raw: str) -> tuple[bool, Optional[str], Optional[str]]:
-    stripped = raw.strip()
-    if stripped in {"-", "—"}:
-        return True, None, None
-    sanitized = sanitize_style(raw)
-    if not sanitized:
-        cleaned = _normalize_whitespace_lines(_strip_invisible(_strip_html(raw)))
-        if cleaned and len(cleaned) > STYLE_MAX_LENGTH:
-            return (
-                False,
-                None,
-                f"⚠️ Стиль слишком длинный — {len(cleaned)} символов. Сократите до {STYLE_MAX_LENGTH}.",
-            )
-        return True, None, None
-    return True, sanitized, None
-
-
-def style_preview(value: Optional[str], limit: int = STYLE_PREVIEW_LIMIT) -> str:
+def style_preview(value: Optional[str], limit: int = 120) -> str:
     if not value:
         return ""
     text = value.strip()
     if len(text) <= limit:
         return text
-    clipped = text[: limit - 1].rstrip()
-    return clipped + "…"
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def lyrics_preview(value: Optional[str], limit: int = LYRICS_PREVIEW_LIMIT) -> str:
+    if not value:
+        return ""
+    single_line = _collapse_spaces(value.replace("\n", " "))
+    if len(single_line) <= limit:
+        return single_line
+    return single_line[: max(1, limit - 1)].rstrip() + "…"
 
 
 def build_generation_payload(
-    state: Mapping[str, Any],
+    state: SunoState,
     *,
-    instrumental: bool,
     model: str,
-    lang: str,
+    lang: Optional[str] = None,
 ) -> dict[str, Any]:
-    title = (state.get("title") or "").strip()
-    style = (state.get("style") or "").strip()
-    lyrics = (state.get("lyrics") or "").strip()
-    has_lyrics = bool(state.get("has_lyrics")) if not instrumental else False
-
-    final_title = title or "Untitled Track"
-    final_prompt = style or (
-        _DEFAULT_INSTRUMENTAL_PROMPT if instrumental else _DEFAULT_VOCAL_PROMPT
-    )
-
     payload: dict[str, Any] = {
         "model": model,
-        "instrumental": bool(instrumental),
-        "title": final_title,
-        "prompt": final_prompt,
-        "has_lyrics": bool(has_lyrics),
-        "lang": lang or "en",
+        "title": state.title or "",
+        "style": state.style or "",
+        "instrumental": not state.has_lyrics,
+        "has_lyrics": state.has_lyrics,
     }
-
-    if style:
-        payload["style"] = style
-    if not instrumental and lyrics:
-        payload["lyrics"] = lyrics
+    if state.has_lyrics:
+        payload["lyrics"] = state.lyrics or ""
+    if lang:
+        payload["lang"] = lang
+    if state.style:
+        payload["prompt"] = state.style
+    elif state.lyrics and state.has_lyrics:
+        payload["prompt"] = state.lyrics
+    elif state.title:
+        payload["prompt"] = state.title
     return payload
 
 
 def sanitize_payload_for_log(payload: Mapping[str, Any]) -> dict[str, Any]:
     preview: dict[str, Any] = {}
-    for key, value in payload.items():
+    for key in ("title", "style", "lyrics", "instrumental", "has_lyrics", "lang"):
+        if key not in payload:
+            continue
+        value = payload[key]
         if isinstance(value, str):
             preview[key] = style_preview(value, limit=120)
         else:
@@ -196,15 +214,21 @@ def sanitize_payload_for_log(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
-    "TITLE_MAX_LENGTH",
+    "LYRICS_MAX_LENGTH",
+    "LYRICS_PREVIEW_LIMIT",
     "STYLE_MAX_LENGTH",
-    "STYLE_PREVIEW_LIMIT",
-    "ensure_suno_state",
-    "process_title_input",
-    "process_style_input",
-    "sanitize_title",
-    "sanitize_style",
-    "style_preview",
+    "TITLE_MAX_LENGTH",
+    "SunoState",
     "build_generation_payload",
+    "clear_lyrics",
+    "clear_style",
+    "clear_title",
+    "lyrics_preview",
+    "load",
+    "save",
     "sanitize_payload_for_log",
+    "set_lyrics",
+    "set_style",
+    "set_title",
+    "style_preview",
 ]
