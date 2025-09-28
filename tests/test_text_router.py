@@ -103,7 +103,7 @@ def test_router_updates_veo_prompt() -> None:
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
 
     try:
-        _run(bot_module.handle_text_input(update, ctx))
+        _run(bot_module.handle_card_input(update, ctx))
     finally:
         bot_module.show_veo_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
@@ -135,7 +135,7 @@ def test_router_updates_banana_prompt() -> None:
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
 
     try:
-        _run(bot_module.handle_text_input(update, ctx))
+        _run(bot_module.handle_card_input(update, ctx))
     finally:
         bot_module.show_banana_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
@@ -167,7 +167,7 @@ def test_router_updates_mj_prompt() -> None:
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
 
     try:
-        _run(bot_module.handle_text_input(update, ctx))
+        _run(bot_module.handle_card_input(update, ctx))
     finally:
         bot_module.show_mj_prompt_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
@@ -201,7 +201,7 @@ def test_router_updates_suno_fields() -> None:
         )
         message = DummyMessage(chat_id=444, text="  My Song  ")
         update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
-        _run(bot_module.handle_text_input(update, ctx))
+        _run(bot_module.handle_card_input(update, ctx))
         suno_state = load_suno_state(ctx)
         assert suno_state.title == "My Song"
         assert message.replies == ["✅ Принято"]
@@ -216,7 +216,7 @@ def test_router_updates_suno_fields() -> None:
             effective_message=style_message,
             effective_user=SimpleNamespace(id=user_id),
         )
-        _run(bot_module.handle_text_input(update_style, ctx))
+        _run(bot_module.handle_card_input(update_style, ctx))
         suno_state = load_suno_state(ctx)
         assert suno_state.style == "Epic cinematic score"
         assert style_message.replies == ["✅ Принято"]
@@ -231,7 +231,7 @@ def test_router_updates_suno_fields() -> None:
             effective_message=lyrics_message,
             effective_user=SimpleNamespace(id=user_id),
         )
-        _run(bot_module.handle_text_input(update_lyrics, ctx))
+        _run(bot_module.handle_card_input(update_lyrics, ctx))
         suno_state = load_suno_state(ctx)
         assert suno_state.lyrics == "Line one\nLine two"
         assert lyrics_message.replies == ["✅ Принято"]
@@ -260,12 +260,12 @@ def test_router_handles_repeated_text_without_error() -> None:
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
 
     try:
-        _run(bot_module.handle_text_input(update, ctx))
+        _run(bot_module.handle_card_input(update, ctx))
     finally:
         clear_wait_state(user_id)
 
     assert bot.edit_calls  # attempted edit
-    assert bot.reply_markup_calls  # attempted markup update fallback
+    assert not bot.reply_markup_calls
     assert message.replies == ["✅ Принято"]
 
 
@@ -301,4 +301,5 @@ def test_safe_edit_message_handles_not_modified() -> None:
     )
 
     assert result is False
-    assert bot.edit_calls and bot.reply_markup_calls
+    assert bot.edit_calls
+    assert not bot.reply_markup_calls

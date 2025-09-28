@@ -107,9 +107,10 @@ from utils.input_state import (
     WaitInputState,
     WaitKind,
     clear_wait_state,
-    get_wait_state,
+    clear_wait,
+    get_wait,
     refresh_card_pointer,
-    set_wait_state,
+    set_wait,
 )
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
@@ -2712,13 +2713,13 @@ def _activate_wait_state(
     if user_id is None or chat_id is None:
         return
     payload_meta: Dict[str, Any] = dict(meta or {})
-    state = WaitInputState(
-        kind=kind,
-        card_msg_id=int(card_msg_id or 0),
-        chat_id=int(chat_id),
+    set_wait(
+        user_id,
+        kind.value,
+        card_msg_id,
+        chat_id=chat_id,
         meta=payload_meta,
     )
-    set_wait_state(user_id, state)
 
 
 def _wait_preview(text: str) -> str:
@@ -2853,7 +2854,7 @@ async def _apply_wait_state_input(
     return handled
 
 
-async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
         return
@@ -2863,7 +2864,7 @@ async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if user_id is None:
         return
 
-    wait_state = get_wait_state(user_id)
+    wait_state = get_wait(user_id)
     if wait_state is None:
         return
 
@@ -6619,6 +6620,7 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = user.id if user else None
     if user_id:
         set_mode(user_id, False)
+        clear_wait(user_id)
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
     menu_message = await safe_send(update, ctx, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
@@ -6658,6 +6660,14 @@ configure_faq(
 )
 
 
+async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    user = update.effective_user
+    if user:
+        clear_wait(user.id)
+    await handle_menu(update, ctx)
+
+
 async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     message = update.effective_message
@@ -6667,6 +6677,7 @@ async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user:
         set_mode(user.id, False)
+        clear_wait(user.id)
 
     if not _suno_configured():
         await _suno_notify(
@@ -6678,6 +6689,20 @@ async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await suno_entry(chat.id, ctx)
+
+    if user:
+        s = state(ctx)
+        card_id = s.get("last_ui_msg_id_suno") if isinstance(s.get("last_ui_msg_id_suno"), int) else None
+        try:
+            set_wait(
+                user.id,
+                WaitKind.SUNO_TITLE.value,
+                card_id,
+                chat_id=chat.id,
+                meta={"source": "command"},
+            )
+        except ValueError:
+            pass
 
 
 async def _ensure_admin(update: Update) -> bool:
@@ -6769,26 +6794,65 @@ async def suno_retry_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    message = update.effective_message
-    if message is None:
+    chat = update.effective_chat
+    if chat is None:
         return
     user = update.effective_user
-    if user:
-        set_mode(user.id, False)
-    state(ctx)["mode"] = None
-    await message.reply_text("🎬 Выберите тип генерации видео:", reply_markup=video_menu_kb())
+    user_id = user.id if user else None
+    if user_id:
+        set_mode(user_id, False)
+        clear_wait(user_id)
+
+    s = state(ctx)
+    s["mode"] = "veo_text_fast"
+    s["model"] = "veo3_fast"
+    if s.get("aspect") not in {"16:9", "9:16"}:
+        s["aspect"] = "16:9"
+    await veo_entry(chat.id, ctx)
+
+    if user_id is not None:
+        card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
+        try:
+            set_wait(
+                user_id,
+                WaitKind.VEO_PROMPT.value,
+                card_id,
+                chat_id=chat.id,
+                meta={"trigger": "command", "mode": s.get("mode")},
+            )
+        except ValueError:
+            pass
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    message = update.effective_message
-    if message is None:
+    chat = update.effective_chat
+    if chat is None:
         return
     user = update.effective_user
-    if user:
-        set_mode(user.id, False)
-    state(ctx)["mode"] = None
-    await message.reply_text("🖼️ Выберите режим работы с изображениями:", reply_markup=image_menu_kb())
+    user_id = user.id if user else None
+    if user_id:
+        set_mode(user_id, False)
+        clear_wait(user_id)
+
+    s = state(ctx)
+    s["mode"] = "mj_txt"
+    if s.get("aspect") not in {"16:9", "9:16"}:
+        s["aspect"] = "16:9"
+    await mj_entry(chat.id, ctx)
+
+    if user_id is not None:
+        card_id = s.get("last_ui_msg_id_mj") if isinstance(s.get("last_ui_msg_id_mj"), int) else None
+        try:
+            set_wait(
+                user_id,
+                WaitKind.MJ_PROMPT.value,
+                card_id,
+                chat_id=chat.id,
+                meta={"trigger": "command", "aspect": s.get("aspect")},
+            )
+        except ValueError:
+            pass
 
 
 async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -9295,22 +9359,22 @@ class RedisRunnerLock:
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("start",), start),
     (("menu",), menu_command),
+    (("cancel",), cancel_command),
     (("faq",), faq_command_entry),
     (("prompt_master",), prompt_master_command),
     (("pm_reset",), prompt_master_reset_command),
     (("chat",), chat_command),
     (("reset",), chat_reset_command),
     (("history",), chat_history_command),
-    (("image",), image_command),
-    (("video",), video_command),
-    (("music",), suno_command),
+    (("image", "mj"), image_command),
+    (("video", "veo"), video_command),
+    (("music", "suno"), suno_command),
     (("balance",), balance_command),
     (("help",), help_command),
 ]
 
 ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("buy",), buy_command),
-    (("suno",), suno_command),
     (("suno_last",), suno_last_command),
     (("suno_task",), suno_task_command),
     (("suno_retry",), suno_retry_command),
@@ -9352,9 +9416,12 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
 
 
 def register_handlers(application: Any) -> None:
-    text_router = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
-    text_router.block = False
-    application.add_handler(text_router, group=0)
+    card_input_handler = MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_card_input,
+    )
+    card_input_handler.block = False
+    application.add_handler(card_input_handler, group=1)
 
     for names, callback in PRIORITY_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))
@@ -9384,9 +9451,9 @@ def register_handlers(application: Any) -> None:
 
     pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
     pm_handler.block = False
-    application.add_handler(pm_handler, group=1)
+    application.add_handler(pm_handler, group=2)
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=2)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=10)
 
 
 # ==========================
