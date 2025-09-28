@@ -93,6 +93,7 @@ def test_wait_state_updates_veo_prompt() -> None:
 
     try:
         handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+        state_after = get_wait_state(user_id)
     finally:
         bot_module.show_veo_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
@@ -100,8 +101,8 @@ def test_wait_state_updates_veo_prompt() -> None:
     assert handled is True
     assert state_dict["last_prompt"] == "Test prompt"
     assert calls and calls[-1][0] == 777
-    assert not get_wait_state(user_id)
-    assert message.replies and message.replies[-1] == "✅ Принято"
+    assert state_after is not None and state_after.kind == WaitKind.VEO_PROMPT
+    assert message.replies == []
 
 
 def test_wait_state_updates_banana_prompt() -> None:
@@ -126,6 +127,7 @@ def test_wait_state_updates_banana_prompt() -> None:
 
     try:
         handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+        state_after = get_wait_state(user_id)
     finally:
         bot_module.show_banana_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
@@ -133,8 +135,8 @@ def test_wait_state_updates_banana_prompt() -> None:
     assert handled is True
     assert state_dict["last_prompt"] == "Fix face blemishes"
     assert calls and calls[-1][0] == 888
-    assert not get_wait_state(user_id)
-    assert message.replies and message.replies[-1] == "✅ Принято"
+    assert state_after is not None and state_after.kind == WaitKind.BANANA_PROMPT
+    assert message.replies == []
 
 
 def test_wait_state_suno_title_updates_card() -> None:
@@ -158,6 +160,7 @@ def test_wait_state_suno_title_updates_card() -> None:
 
     try:
         handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+        state_after = get_wait_state(user_id)
     finally:
         bot_module.refresh_suno_card = original_refresh  # type: ignore[assignment]
         clear_wait_state(user_id)
@@ -166,8 +169,8 @@ def test_wait_state_suno_title_updates_card() -> None:
     suno_state = bot_module.load_suno_state(ctx)
     assert suno_state.title == "My Song"
     assert refreshed and refreshed[-1][0] == 888
-    assert not get_wait_state(user_id)
-    assert message.replies and message.replies[-1] == "✅ Принято"
+    assert state_after is not None and state_after.kind == WaitKind.SUNO_TITLE
+    assert message.replies == []
 
 
 def test_safe_edit_resends_after_not_modified() -> None:

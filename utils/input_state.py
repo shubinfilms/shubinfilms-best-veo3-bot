@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Literal
 
+import time
+
 from settings import REDIS_PREFIX
 
 try:  # pragma: no cover - optional redis backend
@@ -33,6 +35,7 @@ class WaitInputState:
     card_msg_id: int
     chat_id: int
     meta: Dict[str, Any] = field(default_factory=dict)
+    expires_at: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         meta_payload: Dict[str, Any]
@@ -48,6 +51,7 @@ class WaitInputState:
             "card_msg_id": int(self.card_msg_id),
             "chat_id": int(self.chat_id),
             "meta": meta_payload,
+            "expires_at": self.expires_at,
         }
 
     @classmethod
@@ -69,9 +73,27 @@ class WaitInputState:
                 meta = dict(meta_raw)
             else:
                 meta = {}
+            raw_expires = data.get("expires_at")
+            expires_at: Optional[float]
+            if isinstance(raw_expires, (int, float)):
+                expires_at = float(raw_expires)
+            else:
+                expires_at = None
         except (ValueError, KeyError):
             return None
-        return cls(kind=kind, card_msg_id=card_msg_id, chat_id=chat_id, meta=meta)
+        return cls(
+            kind=kind,
+            card_msg_id=card_msg_id,
+            chat_id=chat_id,
+            meta=meta,
+            expires_at=expires_at,
+        )
+
+    def is_expired(self, *, now: Optional[float] = None) -> bool:
+        if self.expires_at is None:
+            return False
+        ts = time.time() if now is None else now
+        return ts >= self.expires_at
 
 
 _memory_store: Dict[int, Dict[str, Any]] = {}
@@ -81,26 +103,41 @@ def _key(user_id: int) -> str:
     return _KEY_TMPL.format(user_id=int(user_id))
 
 
-def set_wait_state(user_id: int, state: WaitInputState) -> None:
-    payload = json.dumps(state.to_dict(), ensure_ascii=False)
+_DEFAULT_TTL_SECONDS = 90
+
+
+def _with_new_expiry(state: WaitInputState, ttl_seconds: int) -> WaitInputState:
+    expires_at = time.time() + max(ttl_seconds, 1)
+    return WaitInputState(
+        kind=state.kind,
+        card_msg_id=state.card_msg_id,
+        chat_id=state.chat_id,
+        meta=dict(state.meta),
+        expires_at=expires_at,
+    )
+
+
+def set_wait_state(user_id: int, state: WaitInputState, *, ttl_seconds: int = _DEFAULT_TTL_SECONDS) -> None:
+    state_with_expiry = _with_new_expiry(state, ttl_seconds)
+    payload = json.dumps(state_with_expiry.to_dict(), ensure_ascii=False)
     storage_key = _key(user_id)
     if _redis:
         try:
             _redis.set(storage_key, payload, ex=24 * 60 * 60)
         except Exception:  # pragma: no cover - redis connectivity issues
             _logger.exception("Failed to save wait-state to redis", extra={"user_id": user_id})
-            _memory_store[int(user_id)] = state.to_dict()
+            _memory_store[int(user_id)] = state_with_expiry.to_dict()
     else:
-        _memory_store[int(user_id)] = state.to_dict()
+        _memory_store[int(user_id)] = state_with_expiry.to_dict()
     _logger.info(
         "WAIT_SET kind=%s user_id=%s card=%s",
-        state.kind.value,
+        state_with_expiry.kind.value,
         user_id,
-        state.card_msg_id,
+        state_with_expiry.card_msg_id,
     )
 
 
-def get_wait_state(user_id: int) -> Optional[WaitInputState]:
+def _load_wait_state(user_id: int) -> Optional[WaitInputState]:
     storage_key = _key(user_id)
     doc: Optional[Dict[str, Any]] = None
     if _redis:
@@ -124,7 +161,18 @@ def get_wait_state(user_id: int) -> Optional[WaitInputState]:
     return state
 
 
-def clear_wait_state(user_id: int) -> None:
+def get_wait_state(user_id: int, *, now: Optional[float] = None) -> Optional[WaitInputState]:
+    state = _load_wait_state(user_id)
+    if not state:
+        return None
+    current_ts = time.time() if now is None else now
+    if state.expires_at and state.expires_at <= current_ts:
+        clear_wait_state(user_id, reason="expired")
+        return None
+    return state
+
+
+def clear_wait_state(user_id: int, *, reason: str = "manual") -> None:
     storage_key = _key(user_id)
     if _redis:
         try:
@@ -132,7 +180,7 @@ def clear_wait_state(user_id: int) -> None:
         except Exception:  # pragma: no cover - redis connectivity issues
             _logger.exception("Failed to clear wait-state in redis", extra={"user_id": user_id})
     _memory_store.pop(int(user_id), None)
-    _logger.info("WAIT_CLEAR user_id=%s", user_id)
+    _logger.info("WAIT_CLEAR user_id=%s reason=%s", user_id, reason)
 
 
 def refresh_card_pointer(user_id: int, new_message_id: int) -> None:
@@ -144,6 +192,7 @@ def refresh_card_pointer(user_id: int, new_message_id: int) -> None:
         card_msg_id=int(new_message_id),
         chat_id=state.chat_id,
         meta=dict(state.meta),
+        expires_at=state.expires_at,
     )
     set_wait_state(user_id, updated)
 
@@ -184,8 +233,8 @@ def set_wait(
     set_wait_state(user_id, wait_state)
 
 
-def clear_wait(user_id: int) -> None:
-    clear_wait_state(user_id)
+def clear_wait(user_id: int, *, reason: str = "manual") -> None:
+    clear_wait_state(user_id, reason=reason)
 
 
 def get_wait(user_id: int) -> Optional[WaitState]:
@@ -194,4 +243,16 @@ def get_wait(user_id: int) -> Optional[WaitState]:
 
 def is_waiting(user_id: int) -> bool:
     return get_wait_state(user_id) is not None
+
+
+def touch_wait(user_id: int, *, ttl_seconds: int = _DEFAULT_TTL_SECONDS) -> Optional[WaitState]:
+    state = get_wait_state(user_id)
+    if not state:
+        return None
+    set_wait_state(user_id, state, ttl_seconds=ttl_seconds)
+    return get_wait_state(user_id)
+
+
+def has_wait(user_id: int) -> bool:
+    return is_waiting(user_id)
 

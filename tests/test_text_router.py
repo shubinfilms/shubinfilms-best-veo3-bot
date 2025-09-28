@@ -104,13 +104,14 @@ def test_router_updates_veo_prompt() -> None:
 
     try:
         _run(bot_module.handle_card_input(update, ctx))
+        state_after = get_wait_state(user_id)
     finally:
         bot_module.show_veo_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
 
     assert state_dict["last_prompt"] == "Test prompt"
     assert calls == [777]
-    assert not get_wait_state(user_id)
+    assert state_after is not None and state_after.kind == WaitKind.VEO_PROMPT
     assert message.replies == ["✅ Принято"]
 
 
@@ -136,13 +137,14 @@ def test_router_updates_banana_prompt() -> None:
 
     try:
         _run(bot_module.handle_card_input(update, ctx))
+        state_after = get_wait_state(user_id)
     finally:
         bot_module.show_banana_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
 
     assert state_dict["last_prompt"] == "Touch up portrait"
     assert calls == [321]
-    assert not get_wait_state(user_id)
+    assert state_after is not None and state_after.kind == WaitKind.BANANA_PROMPT
     assert message.replies == ["✅ Принято"]
 
 
@@ -168,13 +170,14 @@ def test_router_updates_mj_prompt() -> None:
 
     try:
         _run(bot_module.handle_card_input(update, ctx))
+        state_after = get_wait_state(user_id)
     finally:
         bot_module.show_mj_prompt_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
 
     assert state_dict["last_prompt"] == "Midjourney idea"
     assert calls == [888]
-    assert not get_wait_state(user_id)
+    assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
     assert message.replies == ["✅ Принято"]
 
 
@@ -267,6 +270,54 @@ def test_router_handles_repeated_text_without_error() -> None:
     assert bot.edit_calls  # attempted edit
     assert not bot.reply_markup_calls
     assert message.replies == ["✅ Принято"]
+
+
+def test_wait_state_filters_commands_during_wait() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    user_id = 606
+    state_dict = bot_module.state(ctx)
+    state_dict["last_ui_msg_id_mj"] = 432
+    set_wait_state(
+        user_id,
+        WaitInputState(kind=WaitKind.MJ_PROMPT, card_msg_id=432, chat_id=222, meta={}),
+    )
+
+    message = DummyMessage(chat_id=222, text="/menu")
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
+
+    try:
+        _run(bot_module.handle_card_input(update, ctx))
+        state_after = get_wait_state(user_id)
+    finally:
+        clear_wait_state(user_id)
+
+    assert state_dict.get("last_prompt") is None
+    assert message.replies == ["✅ Принято"]
+    assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
+
+
+def test_wait_state_filters_button_labels_during_wait() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    user_id = 607
+    state_dict = bot_module.state(ctx)
+    state_dict["last_ui_msg_id_mj"] = 765
+    set_wait_state(
+        user_id,
+        WaitInputState(kind=WaitKind.MJ_PROMPT, card_msg_id=765, chat_id=333, meta={}),
+    )
+
+    message = DummyMessage(chat_id=333, text=bot_module.MENU_BTN_VIDEO)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
+
+    try:
+        _run(bot_module.handle_card_input(update, ctx))
+        state_after = get_wait_state(user_id)
+    finally:
+        clear_wait_state(user_id)
+
+    assert state_dict.get("last_prompt") is None
+    assert message.replies == ["✅ Принято"]
+    assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
 
 
 def test_wait_state_blocks_prompt_master() -> None:
