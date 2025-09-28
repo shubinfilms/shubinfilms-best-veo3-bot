@@ -1,13 +1,45 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 
 _logger = logging.getLogger("telegram-safe")
+
+_MessageKey = Tuple[int, int]
+_MessageHashes: dict[_MessageKey, Tuple[str, str]] = {}
+
+
+def _serialize_markup(markup: Any) -> str:
+    if markup is None:
+        return ""
+    try:
+        payload = markup.to_dict()
+    except AttributeError:
+        payload = markup
+    try:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return str(payload)
+
+
+def _hash_payload(text: str, markup: Any) -> Tuple[str, str]:
+    markup_serialized = _serialize_markup(markup)
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    markup_hash = hashlib.sha256(markup_serialized.encode("utf-8")).hexdigest()
+    return text_hash, markup_hash
+
+
+def _store_hashes(key: _MessageKey, hashes: Tuple[str, str]) -> None:
+    # Keep the cache bounded to avoid unbounded growth in long-lived processes.
+    if len(_MessageHashes) > 2048:
+        _MessageHashes.clear()
+    _MessageHashes[key] = hashes
 
 
 async def safe_edit_message(
@@ -20,21 +52,22 @@ async def safe_edit_message(
     parse_mode: ParseMode = ParseMode.HTML,
     disable_web_page_preview: bool = True,
 ) -> bool:
-    """Safely edit a Telegram message without crashing on no-op updates.
-
-    Returns ``True`` if the message text or markup was edited. ``False`` means the
-    content was already up to date. Other exceptions are propagated to let the
-    caller decide how to recover (e.g. resend the card).
-    """
+    """Safely edit a Telegram message without triggering noisy errors."""
 
     bot = getattr(ctx, "bot", None)
     if bot is None:
         raise RuntimeError("Context has no bot instance")
 
-    if new_text is None:
-        text_payload = ""
-    else:
-        text_payload = str(new_text)
+    text_payload = "" if new_text is None else str(new_text)
+    key: _MessageKey = (int(chat_id), int(message_id))
+    new_hashes = _hash_payload(text_payload, reply_markup)
+
+    if _MessageHashes.get(key) == new_hashes:
+        _logger.info(
+            "card_edit_noop",
+            extra={"chat_id": chat_id, "message_id": message_id},
+        )
+        return False
 
     try:
         await bot.edit_message_text(
@@ -45,30 +78,15 @@ async def safe_edit_message(
             parse_mode=parse_mode,
             disable_web_page_preview=disable_web_page_preview,
         )
+        _store_hashes(key, new_hashes)
         return True
     except BadRequest as exc:
         lowered = str(exc).lower()
-        if "message is not modified" not in lowered:
-            raise
-        _logger.debug(
-            "safe_edit_message.noop",
-            extra={"chat_id": chat_id, "message_id": message_id},
-        )
-        if reply_markup is None:
-            return False
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=chat_id,
-                message_id=message_id,
-                reply_markup=reply_markup,
-            )
-        except BadRequest as markup_exc:
-            markup_lowered = str(markup_exc).lower()
-            if "message is not modified" not in markup_lowered:
-                raise
-            _logger.debug(
-                "safe_edit_message.reply_markup_noop",
+        if "message is not modified" in lowered:
+            _logger.info(
+                "card_edit_ignored_same_content",
                 extra={"chat_id": chat_id, "message_id": message_id},
             )
+            _store_hashes(key, new_hashes)
             return False
-        return True
+        raise

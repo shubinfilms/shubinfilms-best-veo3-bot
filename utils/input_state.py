@@ -4,7 +4,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Literal
 
 from settings import REDIS_PREFIX
 
@@ -146,4 +146,52 @@ def refresh_card_pointer(user_id: int, new_message_id: int) -> None:
         meta=dict(state.meta),
     )
     set_wait_state(user_id, updated)
+
+
+WaitState = WaitInputState
+
+
+def set_wait(
+    user_id: int,
+    kind: Literal[
+        "veo_prompt",
+        "mj_prompt",
+        "suno_title",
+        "suno_style",
+        "suno_lyrics",
+        "banana_prompt",
+    ],
+    card_msg_id: Optional[int],
+    *,
+    chat_id: Optional[int],
+    meta: Optional[Mapping[str, Any]] = None,
+) -> None:
+    if chat_id is None:
+        raise ValueError("chat_id is required to set wait state")
+
+    payload_meta: Dict[str, Any]
+    if isinstance(meta, Mapping):
+        payload_meta = dict(meta)
+    else:
+        payload_meta = {}
+
+    wait_state = WaitInputState(
+        kind=WaitKind(kind),
+        card_msg_id=int(card_msg_id or 0),
+        chat_id=int(chat_id),
+        meta=payload_meta,
+    )
+    set_wait_state(user_id, wait_state)
+
+
+def clear_wait(user_id: int) -> None:
+    clear_wait_state(user_id)
+
+
+def get_wait(user_id: int) -> Optional[WaitState]:
+    return get_wait_state(user_id)
+
+
+def is_waiting(user_id: int) -> bool:
+    return get_wait_state(user_id) is not None
 
