@@ -109,11 +109,11 @@ from utils.input_state import (
     clear_wait_state,
     clear_wait,
     get_wait,
-    is_command_text,
     refresh_card_pointer,
     set_wait,
     touch_wait,
 )
+from utils.telegram_utils import is_command_text, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
@@ -2735,12 +2735,7 @@ def is_command_or_button(message: Message) -> bool:
     text = message.text
     if not isinstance(text, str):
         return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if is_command_text(stripped):
-        return True
-    return stripped in _KNOWN_BUTTON_LABELS
+    return not should_capture_to_prompt(text)
 
 
 async def _wait_acknowledge(message: Message) -> None:
@@ -2886,7 +2881,6 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     if is_command_or_button(message):
         touch_wait(user_id)
-        await _wait_acknowledge(message)
         raise ApplicationHandlerStop
 
     handled = await _apply_wait_state_input(
@@ -3446,15 +3440,6 @@ MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
-
-_KNOWN_BUTTON_LABELS = {
-    MENU_BTN_VIDEO,
-    MENU_BTN_IMAGE,
-    MENU_BTN_SUNO,
-    MENU_BTN_PM,
-    MENU_BTN_CHAT,
-    MENU_BTN_BALANCE,
-}
 
 def _safe_get_balance(user_id: int) -> int:
     try:

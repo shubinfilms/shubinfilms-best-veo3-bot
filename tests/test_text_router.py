@@ -292,7 +292,7 @@ def test_wait_state_filters_commands_during_wait() -> None:
         clear_wait_state(user_id)
 
     assert state_dict.get("last_prompt") is None
-    assert message.replies == ["✅ Принято"]
+    assert message.replies == []
     assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
 
 
@@ -316,7 +316,7 @@ def test_wait_state_filters_button_labels_during_wait() -> None:
         clear_wait_state(user_id)
 
     assert state_dict.get("last_prompt") is None
-    assert message.replies == ["✅ Принято"]
+    assert message.replies == []
     assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
 
 
