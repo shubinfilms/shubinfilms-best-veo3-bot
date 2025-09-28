@@ -2470,6 +2470,9 @@ DEFAULT_STATE = {
     "_last_text_banana": None,
     "_last_text_mj": None,
     "_last_text_suno": None,
+    "veo_duration_hint": None,
+    "veo_lip_sync_required": False,
+    "veo_voiceover_origin": None,
     "msg_ids": {},
     "last_panel": None,
     "suno_title": None,
@@ -4765,15 +4768,25 @@ def veo_card_text(s: Dict[str, Any]) -> str:
     aspect = html.escape(s.get("aspect") or "16:9")
     model = "Veo Quality" if s.get("model") == "veo3" else "Veo Fast"
     img = "есть" if s.get("last_image_url") else "нет"
+    duration_hint = s.get("veo_duration_hint")
+    lip_sync = bool(s.get("veo_lip_sync_required"))
     lines = [
         "🟦 <b>Карточка VEO</b>",
         f"• Формат: <b>{aspect}</b>",
         f"• Модель: <b>{model}</b>",
         f"• Фото-референс: <b>{img}</b>",
-        "",
-        "🖊️ <b>Промпт:</b>",
-        f"<code>{prompt_html}</code>",
     ]
+    if duration_hint:
+        lines.append(f"• Длительность: <b>{html.escape(str(duration_hint))}</b>")
+    if lip_sync:
+        lines.append("• <b>lip-sync required</b>")
+    lines.extend(
+        [
+            "",
+            "🖊️ <b>Промпт:</b>",
+            f"<code>{prompt_html}</code>",
+        ]
+    )
     return "\n".join(lines)
 
 def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
