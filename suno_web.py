@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, Response
 from requests.adapters import HTTPAdapter
 from urllib3.util import Timeout
 
-from logging_utils import configure_logging
+from logging_utils import configure_logging, log_environment
 from metrics import (
     render_metrics,
     suno_callback_download_fail_total,
@@ -45,6 +45,7 @@ from suno.tempfiles import cleanup_old_directories, task_directory
 
 configure_logging("suno-web")
 log = logging.getLogger("suno-web")
+log_environment(log)
 
 app = FastAPI(title="Suno Callback Web", docs_url=None, redoc_url=None)
 service = SunoService()
@@ -62,6 +63,8 @@ _session.mount("http://", _adapter)
 _timeout = Timeout(connect=HTTP_TIMEOUT_CONNECT, read=HTTP_TIMEOUT_READ, total=HTTP_TIMEOUT_TOTAL)
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _WEB_LABELS = {"env": _ENV, "service": "web"}
+_EXPECTED_RENDER_BASE = (os.getenv("RENDER_EXTERNAL_URL") or "https://shubinfilms-best-veo3-bot.onrender.com").rstrip("/")
+_EXPECTED_CALLBACK_URL = f"{_EXPECTED_RENDER_BASE}/suno-callback"
 
 
 def _active_count() -> int:
@@ -93,8 +96,16 @@ async def _startup_event() -> None:
         "tmp_cleanup_hours": TMP_CLEANUP_HOURS,
     }
     log.info("configuration summary", extra={"meta": summary})
-    if not SUNO_ENABLED:
-        log.warning("suno disabled; callback endpoints not registered")
+    if SUNO_ENABLED and SUNO_CALLBACK_URL and SUNO_CALLBACK_URL.rstrip("/") != _EXPECTED_CALLBACK_URL:
+        log.warning(
+            "suno callback url mismatch",
+            extra={
+                "meta": {
+                    "configured": SUNO_CALLBACK_URL,
+                    "expected": _EXPECTED_CALLBACK_URL,
+                }
+            },
+        )
 
 
 @app.middleware("http")
@@ -259,10 +270,6 @@ async def suno_callback(
     request: Request,
     x_callback_secret: Optional[str] = Header(default=None, alias="X-Callback-Secret"),
 ):
-    if not SUNO_ENABLED:
-        log.warning("suno callback request rejected: integration disabled")
-        return JSONResponse({"error": "disabled"}, status_code=404)
-
     provided = (
         x_callback_secret
         or request.headers.get("X-Callback-Token")
@@ -287,6 +294,11 @@ async def suno_callback(
             extra={"meta": {"preview": body[:200].decode("utf-8", errors="replace")}},
         )
         return JSONResponse({"status": "ignored"}, status_code=400)
+
+    log.info(
+        "Received SUNO callback",
+        extra={"meta": {"content_length": len(body), "path": str(request.url.path)}},
+    )
 
     envelope = CallbackEnvelope.model_validate(payload)
     task = SunoTask.from_envelope(envelope)
@@ -333,10 +345,6 @@ async def suno_callback(
         )
     suno_callback_total.labels(status="ok", **_WEB_LABELS).inc()
     return {"ok": True}
-
-
-if not SUNO_ENABLED:
-    log.warning("suno callback endpoint disabled by configuration")
 
 
 __all__ = ["app"]

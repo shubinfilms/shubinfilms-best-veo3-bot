@@ -9,11 +9,12 @@
 import logging
 import os
 
-from logging_utils import configure_logging
+from logging_utils import configure_logging, log_environment
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 configure_logging("bot")
+log_environment(logging.getLogger("bot"))
 
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math
 import threading
@@ -126,7 +127,12 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
-from settings import REDIS_PREFIX, SUNO_LOG_KEY
+from settings import (
+    REDIS_PREFIX,
+    SUNO_CALLBACK_URL as SETTINGS_SUNO_CALLBACK_URL,
+    SUNO_ENABLED as SETTINGS_SUNO_ENABLED,
+    SUNO_LOG_KEY,
+)
 from suno.service import SunoService, SunoAPIError
 from chat_service import (
     append_ctx,
@@ -213,6 +219,7 @@ _SUNO_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
 
 _SUNO_REFUND_PENDING_LOCK = threading.Lock()
 _SUNO_REFUND_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
+_SUNO_ENQUEUE_MAX_ATTEMPTS = 3
 
 
 def _suno_lock_key(user_id: int) -> str:
@@ -464,6 +471,20 @@ def _env_float(k: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = raw.strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _env_int(k: str, default: int) -> int:
     raw = _env(k, str(default))
     if not raw:
@@ -594,9 +615,10 @@ def _load_suno_config() -> SunoConfig:
     model = os.getenv("SUNO_MODEL", "V5").upper()  # всегда "V5"
     price = _env_int("SUNO_PRICE", 30)
     timeout_sec = _env_int("SUNO_TIMEOUT_SEC", 180)
-    enabled = _env("SUNO_ENABLED", "false").lower() == "true"
+    enabled_value = _env_bool("SUNO_ENABLED", bool(SETTINGS_SUNO_ENABLED))
+    enabled = bool(enabled_value)
     has_key = bool(_env("KIE_API_KEY"))
-    return SunoConfig(
+    config = SunoConfig(
         base=base,
         prefix=prefix,
         gen_path=gen_path,
@@ -609,6 +631,20 @@ def _load_suno_config() -> SunoConfig:
         enabled=enabled,
         has_key=has_key,
     )
+    if enabled:
+        logging.getLogger("veo3-bot").info(
+            "suno configuration",
+            extra={
+                "meta": {
+                    "base": base,
+                    "gen_path": gen_path,
+                    "status_path": status_path,
+                    "callback_url": SETTINGS_SUNO_CALLBACK_URL,
+                    "enabled": enabled,
+                }
+            },
+        )
+    return config
 
 
 SUNO_CONFIG = _load_suno_config()
@@ -4419,20 +4455,41 @@ async def _launch_suno_generation(
             if part and part.strip()
         )
 
+        task = None
         try:
-            task = await asyncio.to_thread(
-                SUNO_SERVICE.start_music,
-                chat_id,
-                reply_message_id,
-                title=title or None,
-                style=style or None,
-                lyrics=(lyrics if (lyrics and not instrumental) else None),
-                model=model,
-                instrumental=instrumental,
-                user_id=user_id,
-                prompt=prompt_text,
-                req_id=req_id,
-            )
+            for attempt in range(1, _SUNO_ENQUEUE_MAX_ATTEMPTS + 1):
+                try:
+                    task = await asyncio.to_thread(
+                        SUNO_SERVICE.start_music,
+                        chat_id,
+                        reply_message_id,
+                        title=title or None,
+                        style=style or None,
+                        lyrics=(lyrics if (lyrics and not instrumental) else None),
+                        model=model,
+                        instrumental=instrumental,
+                        user_id=user_id,
+                        prompt=prompt_text,
+                        req_id=req_id,
+                    )
+                    break
+                except SunoAPIError as exc:
+                    status = exc.status
+                    retryable = status is None or (isinstance(status, int) and status >= 500)
+                    if retryable and attempt < _SUNO_ENQUEUE_MAX_ATTEMPTS:
+                        wait_for = min(5.0, attempt * 2.0)
+                        log.warning(
+                            "[SUNO] enqueue retry | req_id=%s attempt=%s status=%s wait=%.1f",
+                            req_id,
+                            attempt,
+                            status,
+                            wait_for,
+                        )
+                        await asyncio.sleep(wait_for)
+                        continue
+                    raise
+            if task is None:
+                raise RuntimeError("Suno start_music returned no task")
         except SunoAPIError as exc:
             duration = time.monotonic() - enqueue_started
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))

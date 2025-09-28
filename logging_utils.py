@@ -118,6 +118,28 @@ _CONFIGURED = False
 _CONFIG_LOCK = threading.Lock()
 
 
+def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
+    """Log the current environment variables in a safe way.
+
+    Secrets are always redacted regardless of the ``redact`` flag. When
+    ``redact`` is true, additional scrubbing (token patterns, truncation) is
+    applied to the values before logging.
+    """
+
+    safe_env: dict[str, str] = {}
+    for name in sorted(os.environ):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        upper = name.upper()
+        if upper.endswith(("_TOKEN", "_KEY", "_SECRET")) or upper in _SECRET_ENV_KEYS:
+            safe_env[name] = "***"
+            continue
+        safe_env[name] = _redact_text(value) if redact else value
+
+    logger.info("environment", extra={"meta": {"env": safe_env}})
+
+
 def configure_logging(app_name: str) -> None:
     """Configure root logging to emit JSON logs with secret redaction."""
 
@@ -147,5 +169,6 @@ def configure_logging(app_name: str) -> None:
 __all__ = [
     "JsonFormatter",
     "configure_logging",
+    "log_environment",
     "refresh_secret_cache",
 ]
