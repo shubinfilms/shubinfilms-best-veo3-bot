@@ -3,26 +3,43 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, MutableMapping, Optional
 
+import html
 import re
 
 
-TITLE_MAX_LENGTH = 120
-STYLE_MAX_LENGTH = 300
+TITLE_MAX_LENGTH = 300
+STYLE_MAX_LENGTH = 500
 LYRICS_MAX_LENGTH = 2000
 LYRICS_PREVIEW_LIMIT = 160
 _STORAGE_KEY = "suno_state"
 
 
 _SPACE_RE = re.compile(r"\s+")
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _collapse_spaces(value: str) -> str:
     return _SPACE_RE.sub(" ", value).strip()
 
 
+def _strip_html(value: str, *, keep_newlines: bool = True) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    if keep_newlines:
+        text = _BR_RE.sub("\n", text)
+    else:
+        text = _BR_RE.sub(" ", text)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    return text
+
+
 def _normalize_multiline(value: str) -> str:
     normalized_lines: list[str] = []
-    for raw_line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    stripped = _strip_html(value, keep_newlines=True)
+    for raw_line in stripped.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         collapsed = _collapse_spaces(raw_line)
         if collapsed:
             normalized_lines.append(collapsed)
@@ -30,7 +47,8 @@ def _normalize_multiline(value: str) -> str:
 
 
 def _normalize_lyrics(value: str) -> str:
-    cleaned = value.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = _strip_html(value, keep_newlines=True)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.strip() for line in cleaned.split("\n")]
     while lines and not lines[0]:
         lines.pop(0)
@@ -48,7 +66,8 @@ def _apply_limit(value: str, max_length: int) -> str:
 def _clean_title(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    text = _collapse_spaces(str(value))
+    text = _strip_html(str(value), keep_newlines=False)
+    text = _collapse_spaces(text.replace("\n", " "))
     if not text:
         return None
     return _apply_limit(text, TITLE_MAX_LENGTH)
@@ -78,6 +97,9 @@ class SunoState:
     title: Optional[str] = None
     style: Optional[str] = None
     lyrics: Optional[str] = None
+    card_message_id: Optional[int] = None
+    card_text_hash: Optional[str] = None
+    card_markup_hash: Optional[str] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -90,6 +112,9 @@ class SunoState:
             "style": self.style,
             "lyrics": self.lyrics,
             "has_lyrics": self.has_lyrics,
+            "card_message_id": self.card_message_id,
+            "card_text_hash": self.card_text_hash,
+            "card_markup_hash": self.card_markup_hash,
         }
 
 
@@ -104,6 +129,15 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     set_title(state, payload.get("title"))
     set_style(state, payload.get("style"))
     set_lyrics(state, payload.get("lyrics"))
+    raw_msg_id = payload.get("card_message_id")
+    if isinstance(raw_msg_id, int):
+        state.card_message_id = raw_msg_id
+    raw_text_hash = payload.get("card_text_hash")
+    if isinstance(raw_text_hash, str):
+        state.card_text_hash = raw_text_hash
+    raw_markup_hash = payload.get("card_markup_hash")
+    if isinstance(raw_markup_hash, str):
+        state.card_markup_hash = raw_markup_hash
     return state
 
 
@@ -168,10 +202,17 @@ def style_preview(value: Optional[str], limit: int = 120) -> str:
 def lyrics_preview(value: Optional[str], limit: int = LYRICS_PREVIEW_LIMIT) -> str:
     if not value:
         return ""
-    single_line = _collapse_spaces(value.replace("\n", " "))
-    if len(single_line) <= limit:
-        return single_line
-    return single_line[: max(1, limit - 1)].rstrip() + "…"
+    first_line: Optional[str] = None
+    for raw_line in value.split("\n"):
+        collapsed = _collapse_spaces(raw_line)
+        if collapsed:
+            first_line = collapsed
+            break
+    if not first_line:
+        return ""
+    if len(first_line) <= limit:
+        return first_line
+    return first_line[: max(1, limit - 1)].rstrip() + "…"
 
 
 def build_generation_payload(
