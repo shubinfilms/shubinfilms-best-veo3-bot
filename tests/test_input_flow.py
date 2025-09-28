@@ -101,7 +101,7 @@ def test_wait_state_updates_veo_prompt() -> None:
     assert state_dict["last_prompt"] == "Test prompt"
     assert calls and calls[-1][0] == 777
     assert not get_wait_state(user_id)
-    assert message.replies and "Сейчас" in message.replies[-1]
+    assert message.replies and message.replies[-1] == "✅ Принято"
 
 
 def test_wait_state_suno_title_updates_card() -> None:
@@ -134,7 +134,7 @@ def test_wait_state_suno_title_updates_card() -> None:
     assert suno_state.title == "My Song"
     assert refreshed and refreshed[-1][0] == 888
     assert not get_wait_state(user_id)
-    assert message.replies and "My Song" in message.replies[-1]
+    assert message.replies and message.replies[-1] == "✅ Принято"
 
 
 def test_safe_edit_resends_after_not_modified() -> None:

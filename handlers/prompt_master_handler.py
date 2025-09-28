@@ -31,6 +31,7 @@ from prompt_master import (
 )
 from utils.html_render import html_to_plain, render_pm_html, safe_lines
 from utils.safe_send import sanitize_html, safe_send, send_html_with_fallback
+from utils.input_state import get_wait_state
 
 logger = logging.getLogger(__name__)
 
@@ -501,6 +502,10 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = getattr(update, "effective_user", None)
+    if user and get_wait_state(user.id):
+        return
+
     message = update.message
     if message is None or not isinstance(message.text, str):
         return
