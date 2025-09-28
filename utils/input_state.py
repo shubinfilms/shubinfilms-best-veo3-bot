@@ -20,6 +20,7 @@ _KEY_TMPL = f"{REDIS_PREFIX}:wait-input:{{user_id}}"
 
 class WaitKind(str, Enum):
     VEO_PROMPT = "veo_prompt"
+    BANANA_PROMPT = "banana_prompt"
     SUNO_TITLE = "suno_title"
     SUNO_STYLE = "suno_style"
     SUNO_LYRICS = "suno_lyrics"
@@ -92,10 +93,9 @@ def set_wait_state(user_id: int, state: WaitInputState) -> None:
     else:
         _memory_store[int(user_id)] = state.to_dict()
     _logger.info(
-        "WAIT_SET kind=%s user_id=%s chat=%s card=%s",
+        "WAIT_SET kind=%s user_id=%s card=%s",
         state.kind.value,
         user_id,
-        state.chat_id,
         state.card_msg_id,
     )
 
