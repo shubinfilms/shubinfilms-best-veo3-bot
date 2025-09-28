@@ -185,6 +185,12 @@ class SunoClient:
         title = payload.get("title")
         if title is not None and str(title).strip():
             body["title"] = str(title).strip()
+        has_lyrics = payload.get("has_lyrics")
+        if has_lyrics is not None:
+            body["has_lyrics"] = bool(has_lyrics)
+        lang = payload.get("lang")
+        if lang is not None and str(lang).strip():
+            body["lang"] = str(lang).strip().lower()
         negative = payload.get("negative_tags") or payload.get("negativeTags")
         if negative is not None and str(negative).strip():
             body["negative_tags"] = str(negative).strip()

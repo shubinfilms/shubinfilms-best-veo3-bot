@@ -14,6 +14,8 @@ from redis_utils import get_balance
 
 import html
 
+from utils.suno_state import style_preview as suno_style_preview
+
 _SUNO_MODEL_RAW = (os.getenv("SUNO_MODEL") or "v5").strip()
 _SUNO_MODEL_LABEL = _SUNO_MODEL_RAW.upper() if _SUNO_MODEL_RAW else "V5"
 
@@ -173,7 +175,8 @@ def render_suno_card(state: dict[str, Any], *, price: int) -> Tuple[str, InlineK
     balance = state.get("suno_balance")
 
     safe_title = html.escape(title) if title else "—"
-    safe_style = html.escape(style) if style else "—"
+    style_display = suno_style_preview(style, limit=120)
+    safe_style = html.escape(style_display) if style_display else "—"
     mode_label = "Инструментал" if instrumental else "Со словами"
     lyrics_preview = _suno_preview(lyrics)
     if lyrics_preview:

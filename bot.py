@@ -89,6 +89,14 @@ from ui_helpers import (
     pm_result_kb,
 )
 
+from utils.suno_state import (
+    build_generation_payload as build_suno_generation_payload,
+    ensure_suno_state as ensure_suno_user_state,
+    process_style_input,
+    process_title_input,
+    sanitize_payload_for_log,
+)
+
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
 
 from redis_utils import (
@@ -1543,7 +1551,7 @@ async def _pm_apply_result(
         return True, "JSON установлен для Midjourney."
     if kind == "suno":
         s["suno_lyrics"] = raw
-        s["suno_waiting_field"] = None
+        s["suno_waiting_state"] = None
         s["_last_text_suno"] = None
         s.setdefault("mode", "suno")
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
@@ -2488,6 +2496,11 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
     return f"https://api.telegram.org/file/bot{bot_token}/{p.lstrip('/')}"
 
 # ---------- User state ----------
+WAIT_SUNO_TITLE = "WAIT_SUNO_TITLE"
+WAIT_SUNO_STYLE = "WAIT_SUNO_STYLE"
+WAIT_SUNO_LYRICS = "WAIT_SUNO_LYRICS"
+
+
 DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
@@ -2515,7 +2528,7 @@ DEFAULT_STATE = {
     "suno_style": None,
     "suno_lyrics": None,
     "suno_instrumental": True,
-    "suno_waiting_field": None,
+    "suno_waiting_state": None,
     "suno_generating": False,
     "suno_last_task_id": None,
     "suno_last_params": None,
@@ -2565,8 +2578,34 @@ def _apply_state_defaults(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return target
 
 
+def _suno_log_preview(value: Optional[str], limit: int = 60) -> str:
+    if not value:
+        return "—"
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    return _apply_state_defaults(ensure_state(ctx))
+    state_dict = _apply_state_defaults(ensure_state(ctx))
+    user_data = getattr(ctx, "user_data", None)
+    if isinstance(user_data, dict):
+        try:
+            suno_state = ensure_suno_user_state(user_data)
+        except Exception:
+            suno_state = None
+        if isinstance(suno_state, dict):
+            state_dict["suno_title"] = suno_state.get("title")
+            state_dict["suno_style"] = suno_state.get("style")
+            state_dict["suno_lyrics"] = suno_state.get("lyrics")
+            if state_dict.get("suno_instrumental"):
+                suno_state["mode"] = "instrumental"
+                suno_state["has_lyrics"] = False
+            else:
+                suno_state["mode"] = "add_vocals"
+                suno_state["has_lyrics"] = bool(suno_state.get("lyrics"))
+    return state_dict
 
 
 _CHAT_HINT_TEXT = "💬 Обычный чат включён автоматически. Пишите вопрос! /reset — очистить контекст."
@@ -2576,7 +2615,7 @@ def _chat_state_waiting_input(state_dict: Dict[str, Any]) -> bool:
     mode = state_dict.get("mode")
     if mode and str(mode) not in {"", "chat", "none", "null"}:
         return True
-    if state_dict.get("suno_waiting_field"):
+    if state_dict.get("suno_waiting_state"):
         return True
     if state_dict.get("banana_active_op_key"):
         return True
@@ -4031,16 +4070,27 @@ async def _run_suno_probe() -> None:
             log.warning("SUNO probe stderr: %s", err_text)
 
 
-def _suno_collect_params(state_obj: Dict[str, Any]) -> Dict[str, Any]:
-    title = (state_obj.get("suno_title") or "").strip()
-    style = (state_obj.get("suno_style") or "").strip()
-    lyrics = state_obj.get("suno_lyrics") or ""
+def _suno_collect_params(
+    state_obj: Dict[str, Any],
+    suno_user_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    source = suno_user_state if isinstance(suno_user_state, dict) else {}
+    title = (source.get("title") or state_obj.get("suno_title") or "").strip()
+    style = (source.get("style") or state_obj.get("suno_style") or "").strip()
+    lyrics = (source.get("lyrics") or state_obj.get("suno_lyrics") or "").strip()
     instrumental = bool(state_obj.get("suno_instrumental", True))
+    if isinstance(suno_user_state, dict):
+        suno_user_state["title"] = title or None
+        suno_user_state["style"] = style or None
+        suno_user_state["lyrics"] = lyrics or None
+        suno_user_state["mode"] = "instrumental" if instrumental else "add_vocals"
+        suno_user_state["has_lyrics"] = bool(lyrics) if not instrumental else False
     return {
         "title": title,
         "style": style,
         "lyrics": lyrics,
         "instrumental": instrumental,
+        "has_lyrics": bool(lyrics) if not instrumental else False,
     }
 
 
@@ -4065,7 +4115,7 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 
 async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_balance: bool = True) -> None:
     s = state(ctx)
-    s["suno_waiting_field"] = None
+    s["suno_waiting_state"] = None
     uid = get_user_id(ctx)
     if uid:
         set_mode(uid, False)
@@ -4208,7 +4258,7 @@ async def _suno_issue_refund(
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
     s["_last_text_suno"] = None
-    s["suno_waiting_field"] = None
+    s["suno_waiting_state"] = None
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
     await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
 
@@ -4287,7 +4337,8 @@ async def _launch_suno_generation(
     instrumental = bool(params.get("instrumental", True))
     title = (params.get("title") or "").strip()
     style = (params.get("style") or "").strip()
-    lyrics = params.get("lyrics") or ""
+    lyrics = (params.get("lyrics") or "").strip()
+    has_lyrics = bool(params.get("has_lyrics")) if not instrumental else False
     model = SUNO_MODEL or "V5"
     existing_req_id = s.get("suno_current_req_id")
     req_id = (
@@ -4295,6 +4346,23 @@ async def _launch_suno_generation(
         if isinstance(existing_req_id, str) and existing_req_id.strip()
         else str(uuid.uuid4())
     )
+
+    lang_source = style or lyrics or title
+    lang = detect_lang(lang_source or title or "")
+    payload_state = {
+        "title": title,
+        "style": style,
+        "lyrics": lyrics if not instrumental else "",
+        "has_lyrics": has_lyrics,
+    }
+    payload = build_suno_generation_payload(
+        payload_state,
+        instrumental=instrumental,
+        model=model,
+        lang=lang,
+    )
+    payload_preview = sanitize_payload_for_log(payload)
+    log.info("SUNO_ENQUEUE payload_preview=%s", payload_preview)
 
     existing_pending = _suno_pending_load(req_id)
     if existing_pending and existing_pending.get("status") == "queued" and existing_pending.get("task_id"):
@@ -4309,10 +4377,10 @@ async def _launch_suno_generation(
         "task_id": None,
         "model": model,
         "instrumental": instrumental,
-        "has_lyrics": bool(lyrics) if not instrumental else False,
-        "prompt_len": len(lyrics or "") if not instrumental else 0,
-        "title": title,
-        "style": style,
+        "has_lyrics": payload.get("has_lyrics", False),
+        "prompt_len": len(payload.get("prompt") or ""),
+        "title": payload.get("title"),
+        "style": payload.get("style"),
         "trigger": trigger,
         "req_id": req_id,
     }
@@ -4325,7 +4393,7 @@ async def _launch_suno_generation(
                 "user_id": user_id,
                 "req_id": req_id,
                 "instrumental": instrumental,
-                "has_lyrics": bool(lyrics),
+                "has_lyrics": payload.get("has_lyrics", False),
                 "trigger": trigger,
             }
         },
@@ -4353,15 +4421,18 @@ async def _launch_suno_generation(
     s["suno_generating"] = True
     s["suno_last_task_id"] = None
     s["suno_last_params"] = {
-        "title": title,
-        "style": style,
-        "lyrics": lyrics,
+        "title": payload.get("title"),
+        "style": payload.get("style"),
+        "lyrics": payload.get("lyrics"),
         "instrumental": instrumental,
+        "prompt": payload.get("prompt"),
+        "lang": payload.get("lang"),
+        "has_lyrics": payload.get("has_lyrics", False),
     }
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
     s["_last_text_suno"] = None
-    s["suno_waiting_field"] = None
+    s["suno_waiting_state"] = None
     s["suno_current_req_id"] = req_id
 
     try:
@@ -4445,15 +4516,7 @@ async def _launch_suno_generation(
             reply_message_id = int(reply_to.message_id)
 
         enqueue_started = time.monotonic()
-        prompt_text = "\n".join(
-            part.strip()
-            for part in (
-                title or "",
-                style or "",
-                (lyrics or "") if (lyrics and not instrumental) else "",
-            )
-            if part and part.strip()
-        )
+        prompt_text = payload.get("prompt") or ""
 
         task = None
         try:
@@ -4463,14 +4526,16 @@ async def _launch_suno_generation(
                         SUNO_SERVICE.start_music,
                         chat_id,
                         reply_message_id,
-                        title=title or None,
-                        style=style or None,
-                        lyrics=(lyrics if (lyrics and not instrumental) else None),
-                        model=model,
-                        instrumental=instrumental,
+                        title=payload.get("title"),
+                        style=payload.get("style"),
+                        lyrics=(payload.get("lyrics") if (payload.get("lyrics") and not instrumental) else None),
+                        model=payload.get("model", model),
+                        instrumental=payload.get("instrumental", instrumental),
                         user_id=user_id,
                         prompt=prompt_text,
                         req_id=req_id,
+                        lang=payload.get("lang"),
+                        has_lyrics=payload.get("has_lyrics", False),
                     )
                     break
                 except SunoAPIError as exc:
@@ -6901,7 +6966,7 @@ async def prompt_master_insert_callback(update: Update, ctx: ContextTypes.DEFAUL
         return
     if engine == "suno":
         s["suno_lyrics"] = body_text
-        s["suno_waiting_field"] = None
+        s["suno_waiting_state"] = None
         s["_last_text_suno"] = None
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await query.answer("Промпт вставлен в карточку Suno")
@@ -7388,17 +7453,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         uid = user.id if user else None
         s["mode"] = "suno"
+        suno_user_state = ensure_suno_user_state(getattr(ctx, "user_data", {}))
 
         if action == "edit":
             field = argument
             if field not in {"title", "style", "lyrics"}:
                 await q.answer("Недоступное поле", show_alert=True)
                 return
-            s["suno_waiting_field"] = field
+            if field == "title":
+                s["suno_waiting_state"] = WAIT_SUNO_TITLE
+                log.info("SUNO_WAIT title | user_id=%s", uid)
+            elif field == "style":
+                s["suno_waiting_state"] = WAIT_SUNO_STYLE
+                log.info("SUNO_WAIT style | user_id=%s", uid)
+            else:
+                s["suno_waiting_state"] = WAIT_SUNO_LYRICS
+                log.info("SUNO_WAIT lyrics | user_id=%s", uid)
             prompts = {
-                "title": "Введите название трека. Для очистки отправьте «-». Отмена — /cancel.",
-                "style": "Опишите стиль музыки. Для очистки отправьте «-». Отмена — /cancel.",
-                "lyrics": "Пришлите текст песни (8–16 строк). Для очистки отправьте «-». Отмена — /cancel.",
+                "title": "Введите название трека. Для очистки отправьте -. Отмена — /cancel.",
+                "style": "Опишите стиль музыки (жанр/настроение/инструменты). Для очистки отправьте -. Отмена — /cancel.",
+                "lyrics": "Пришлите текст песни (8–16 строк). Для очистки отправьте -. Отмена — /cancel.",
             }
             msg_text = prompts.get(field, "Введите значение.")
             await q.answer()
@@ -7416,8 +7490,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "toggle" and argument == "instrumental":
             new_value = not bool(s.get("suno_instrumental", True))
             s["suno_instrumental"] = new_value
-            s["suno_waiting_field"] = None
+            s["suno_waiting_state"] = None
             s["_last_text_suno"] = None
+            if new_value:
+                suno_user_state["mode"] = "instrumental"
+                suno_user_state["has_lyrics"] = False
+            else:
+                suno_user_state["mode"] = "add_vocals"
+                suno_user_state["has_lyrics"] = bool(suno_user_state.get("lyrics"))
             if chat_id is not None:
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
             await q.answer("Режим: " + ("Инструментал" if new_value else "Со словами"))
@@ -7428,7 +7508,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Нет чата", show_alert=True)
                 return
             await q.answer()
-            params = _suno_collect_params(s)
+            params = _suno_collect_params(s, suno_user_state)
             lock_acquired = False
             if uid is not None:
                 lock_acquired = _acquire_suno_lock(int(uid))
@@ -7651,7 +7731,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
-    waiting_field = s.get("suno_waiting_field")
+    waiting_field = s.get("suno_waiting_state")
     waiting_for_input = _chat_state_waiting_input(s)
     if (
         waiting_for_input
@@ -7668,32 +7748,80 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if waiting_field:
         lowered = text.lower()
+        suno_user_state = ensure_suno_user_state(getattr(ctx, "user_data", {}))
         if lowered == "/cancel":
-            s["suno_waiting_field"] = None
+            s["suno_waiting_state"] = None
+            await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
             await msg.reply_text("✏️ Изменение отменено.")
             return
 
-        clear_requested = text in {"-", "—"}
-        updated_message = "Обновлено."
-        if waiting_field == "title":
-            new_value = "" if clear_requested else text
-            s["suno_title"] = new_value or None
-            updated_message = "Название обновлено." if new_value else "Название очищено."
-        elif waiting_field == "style":
-            new_value = "" if clear_requested else text
-            s["suno_style"] = new_value or None
-            updated_message = "Стиль обновлён." if new_value else "Стиль очищен."
-        elif waiting_field == "lyrics":
-            new_value = "" if clear_requested else raw_text.strip()
+        reply_text = "Обновлено."
+        if waiting_field == WAIT_SUNO_TITLE:
+            ok, value, error_text = process_title_input(raw_text)
+            if not ok:
+                log.warning(
+                    "SUNO_VALIDATE title | user_id=%s reason=%s", user_id, error_text
+                )
+                await msg.reply_text(error_text or "⚠️ Название слишком длинное.")
+                return
+            s["suno_title"] = value
+            suno_user_state["title"] = value
+            if value:
+                preview = _suno_log_preview(value)
+                reply_text = f"Название обновлено: {preview}"
+                log.info(
+                    "SUNO_SET title | user_id=%s len=%s preview=%s",
+                    user_id,
+                    len(value),
+                    preview,
+                )
+            else:
+                reply_text = "Название очищено."
+                log.info("SUNO_SET title | user_id=%s cleared", user_id)
+        elif waiting_field == WAIT_SUNO_STYLE:
+            ok, value, error_text = process_style_input(raw_text)
+            if not ok:
+                log.warning(
+                    "SUNO_VALIDATE style | user_id=%s reason=%s", user_id, error_text
+                )
+                await msg.reply_text(error_text or "⚠️ Стиль слишком длинный.")
+                return
+            s["suno_style"] = value
+            suno_user_state["style"] = value
+            if value:
+                preview = _suno_log_preview(value, limit=80)
+                reply_text = "Стиль обновлён."
+                log.info(
+                    "SUNO_SET style | user_id=%s len=%s preview=%s",
+                    user_id,
+                    len(value),
+                    preview,
+                )
+            else:
+                reply_text = "Стиль очищен."
+                log.info("SUNO_SET style | user_id=%s cleared", user_id)
+        elif waiting_field == WAIT_SUNO_LYRICS:
+            new_value = "" if raw_text.strip() in {"-", "—"} else raw_text.strip()
             s["suno_lyrics"] = new_value or None
-            updated_message = "Текст песни обновлён." if new_value else "Текст песни очищен."
-        else:
-            new_value = text
+            suno_user_state["lyrics"] = new_value or None
+            suno_user_state["has_lyrics"] = bool(new_value)
+            if new_value:
+                preview = _suno_log_preview(new_value, limit=80)
+                reply_text = "Текст песни обновлён."
+                log.info(
+                    "SUNO_SET lyrics | user_id=%s len=%s preview=%s",
+                    user_id,
+                    len(new_value),
+                    preview,
+                )
+            else:
+                reply_text = "Текст песни очищен."
+                log.info("SUNO_SET lyrics | user_id=%s cleared", user_id)
 
-        s["suno_waiting_field"] = None
+        s["suno_waiting_state"] = None
         s["_last_text_suno"] = None
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
-        await _send_with_retry(lambda: msg.reply_text(updated_message))
+        await _send_with_retry(lambda: msg.reply_text(reply_text))
         return
 
     if state_mode == "promo":
@@ -7702,6 +7830,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mode"] = None
             return
         await process_promo_submission(update, ctx, text)
+        return
+
+    if state_mode == "suno" and lowered == "reset":
+        suno_user_state = ensure_suno_user_state(getattr(ctx, "user_data", {}))
+        s["suno_title"] = None
+        s["suno_style"] = None
+        suno_user_state["title"] = None
+        suno_user_state["style"] = None
+        s["_last_text_suno"] = None
+        log.info("SUNO_SET reset | user_id=%s", user_id)
+        await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await msg.reply_text("Название и стиль очищены.")
         return
 
     if user_mode == MODE_PM:
