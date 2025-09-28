@@ -111,6 +111,7 @@ from utils.input_state import (
     get_wait,
     refresh_card_pointer,
     set_wait,
+    touch_wait,
 )
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
@@ -2729,6 +2730,31 @@ def _wait_preview(text: str) -> str:
     return truncate_text(normalized, 120) or "—"
 
 
+def is_command_or_button(message: Message) -> bool:
+    text = message.text
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("/"):
+        return True
+    return stripped in _KNOWN_BUTTON_LABELS
+
+
+async def _wait_acknowledge(message: Message) -> None:
+    try:
+        await message.reply_text("✅ Принято")
+    except Exception:
+        _wait_log.debug(
+            "WAIT_ACK_FAILED",
+            extra={
+                "user_id": getattr(message.from_user, "id", None),
+                "chat_id": getattr(message, "chat_id", None),
+            },
+        )
+
+
 async def _apply_wait_state_input(
     ctx: ContextTypes.DEFAULT_TYPE,
     message: Message,
@@ -2736,11 +2762,10 @@ async def _apply_wait_state_input(
     *,
     user_id: Optional[int],
 ) -> bool:
-    if message.text is None:
+    raw_text = message.text
+    if raw_text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
         return True
-
-    raw_text = message.text
     stripped = raw_text.strip()
     if stripped in _WAIT_CLEAR_VALUES:
         normalized = ""
@@ -2753,7 +2778,7 @@ async def _apply_wait_state_input(
     truncated = cleaned != normalized
 
     _wait_log.info(
-        "INPUT_APPLY kind=%s len=%s truncated=%s",
+        "WAIT_INPUT kind=%s text_len=%s truncated=%s",
         wait_state.kind.value,
         len(cleaned),
         truncated,
@@ -2837,20 +2862,6 @@ async def _apply_wait_state_input(
                 refresh_card_pointer(user_id, card_id)
         handled = True
 
-    if handled:
-        if user_id is not None:
-            clear_wait_state(user_id)
-        try:
-            await message.reply_text("✅ Принято")
-        except Exception:
-            _wait_log.debug(
-                "WAIT_ACK_FAILED",
-                extra={
-                    "kind": wait_state.kind.value,
-                    "user_id": user_id,
-                    "chat_id": getattr(message, "chat_id", None),
-                },
-            )
     return handled
 
 
@@ -2868,6 +2879,15 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if wait_state is None:
         return
 
+    if message.text is None:
+        await message.reply_text("⚠️ Отправьте текстовое сообщение.")
+        raise ApplicationHandlerStop
+
+    if is_command_or_button(message):
+        touch_wait(user_id)
+        await _wait_acknowledge(message)
+        raise ApplicationHandlerStop
+
     handled = await _apply_wait_state_input(
         ctx,
         message,
@@ -2876,6 +2896,8 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     if handled:
+        touch_wait(user_id)
+        await _wait_acknowledge(message)
         raise ApplicationHandlerStop
 
 async def _handle_suno_waiting_input(
@@ -3423,6 +3445,15 @@ MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
+
+_KNOWN_BUTTON_LABELS = {
+    MENU_BTN_VIDEO,
+    MENU_BTN_IMAGE,
+    MENU_BTN_SUNO,
+    MENU_BTN_PM,
+    MENU_BTN_CHAT,
+    MENU_BTN_BALANCE,
+}
 
 def _safe_get_balance(user_id: int) -> int:
     try:
@@ -9417,7 +9448,7 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
 
 def register_handlers(application: Any) -> None:
     card_input_handler = MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
+        filters.TEXT,
         handle_card_input,
     )
     card_input_handler.block = False
