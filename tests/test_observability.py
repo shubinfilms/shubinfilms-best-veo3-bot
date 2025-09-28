@@ -101,7 +101,7 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
             responses.append({"status_code": 200, "json": {"task_id": "ok"}})
         else:
             responses.append({"status_code": status, "json": {"message": "err"}})
-    requests_mock.post("https://example.com/suno-api/generate", responses)
+    requests_mock.post("https://example.com/api/v1/suno/generate/music", responses)
     suno_client = SunoClient(base_url="https://example.com", token="tkn", max_retries=3)
     if status_codes[0] == 403:
         with pytest.raises(SunoAPIError):

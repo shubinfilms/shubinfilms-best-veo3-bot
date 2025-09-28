@@ -35,11 +35,13 @@ class MusicCallback:
     type: Literal["text", "first", "complete", "error"]
     code: int
     msg: str
+    status: str = "unknown"
+    result_url: Optional[str] = None
     tracks: List[Track] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
-_KNOWN_TYPES = {"text", "first", "complete", "error"}
+_KNOWN_TYPES = {"text", "first", "complete", "error", "success"}
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -153,16 +155,54 @@ def _parse_tracks(response: Dict[str, Any]) -> List[Track]:
 
 def parse_music_callback(payload: Dict[str, Any]) -> MusicCallback:
     if not isinstance(payload, dict):
-        return MusicCallback(task_id="", type="error", code=0, msg="invalid payload", tracks=[], raw={})
+        return MusicCallback(
+            task_id="",
+            type="error",
+            code=0,
+            msg="invalid payload",
+            tracks=[],
+            raw={},
+        )
     data = payload.get("data") or {}
-    task_id = str(data.get("taskId") or "")
-    callback_type = str(data.get("callbackType") or "text").lower()
+    task_id = str(
+        payload.get("task_id")
+        or payload.get("taskId")
+        or data.get("task_id")
+        or data.get("taskId")
+        or ""
+    )
+    status = str(
+        payload.get("status")
+        or data.get("status")
+        or payload.get("callbackType")
+        or data.get("callbackType")
+        or "unknown"
+    ).lower()
+    callback_type = status if status in _KNOWN_TYPES else str(data.get("callbackType") or "text").lower()
     code = _as_int(payload.get("code"), default=0)
     msg = str(payload.get("msg") or "")
     if callback_type not in _KNOWN_TYPES:
         callback_type = "error" if code and code != 200 else "text"
-    tracks = _parse_tracks(data.get("response") or {})
-    return MusicCallback(task_id=task_id, type=callback_type, code=code or 0, msg=msg, tracks=tracks, raw=payload)
+    tracks = _parse_tracks(data.get("response") or payload.get("response") or {})
+    result_url: Optional[str] = None
+    for key in ("result_url", "resultUrl", "audio_url", "audioUrl"):
+        candidate = payload.get(key) or data.get(key)
+        if candidate:
+            result_url = str(candidate)
+            break
+    if not result_url and tracks:
+        primary = tracks[0]
+        result_url = primary.audio_url or primary.video_url or primary.image_url
+    return MusicCallback(
+        task_id=task_id,
+        type=callback_type,
+        code=code or 0,
+        msg=msg,
+        status=status,
+        result_url=result_url,
+        tracks=tracks,
+        raw=payload,
+    )
 
 
 @lru_cache
@@ -189,6 +229,17 @@ def _handle(service_method: str, payload: Any) -> Response:
 def music_callback() -> Response:
     payload = request.get_json(silent=True, force=False) or {}
     callback = parse_music_callback(payload)
+    meta = {
+        "task_id": callback.task_id,
+        "status": callback.status,
+        "type": callback.type,
+        "code": callback.code,
+        "result_url": callback.result_url,
+    }
+    log_level = logging.INFO
+    if not callback.task_id or callback.type == "error" or (callback.code and callback.code != 200):
+        log_level = logging.WARNING
+    logger.log(log_level, "suno music callback received", extra={"meta": meta})
     return _handle("handle_music_callback", callback)
 
 

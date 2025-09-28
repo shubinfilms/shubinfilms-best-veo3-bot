@@ -4116,6 +4116,7 @@ async def _suno_issue_refund(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     reply_to: Optional["telegram.Message"] = None,
     req_id: Optional[str] = None,
+    user_message: Optional[str] = None,
 ) -> None:
     meta = dict(base_meta or {})
     if task_id:
@@ -4175,10 +4176,11 @@ async def _suno_issue_refund(
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
     await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
 
+    message = user_message or f"❌ Не удалось сгенерировать. Средства возвращены (+{PRICE_SUNO}💎)."
     await _suno_notify(
         ctx,
         chat_id,
-        f"❌ Не удалось сгенерировать. Средства возвращены (+{PRICE_SUNO}💎).",
+        message,
         req_id=req_id,
         reply_to=reply_to,
         reply_markup=reply_markup,
@@ -4346,7 +4348,8 @@ async def _launch_suno_generation(
         )
 
         notify_text = (
-            f"✅ Списано {PRICE_SUNO}💎 (req {req_label}). Задача создана и отправлена в Suno. "
+            f"✅ Списано {PRICE_SUNO}💎 (req {req_label}).\n"
+            "Задача создана, ждём результат…\n"
             "Как только получим коллбек — пришлю аудио/ссылки."
         )
         notify_exc: Optional[Exception] = None
@@ -4517,6 +4520,10 @@ async def _launch_suno_generation(
                 reason="suno:refund:create_err",
                 req_id=req_id,
                 reply_to=reply_to,
+                user_message=(
+                    "Ошибка API Suno: не удалось создать задачу. Попробуйте другой запрос.\n"
+                    f"Средства возвращены (+{PRICE_SUNO}💎)."
+                ),
             )
             return
 

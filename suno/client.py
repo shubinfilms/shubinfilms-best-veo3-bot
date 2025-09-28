@@ -84,8 +84,8 @@ class SunoClient:
         self.token = (token or SUNO_API_TOKEN or "").strip()
         if not self.token:
             raise RuntimeError("SUNO_API_TOKEN is not configured")
-        self._primary_gen_path = self._normalize_path(SUNO_GEN_PATH or "/api/v1/generate/music")
-        self._primary_status_path = self._normalize_path(SUNO_TASK_STATUS_PATH or "/api/v1/generate/record-info")
+        self._primary_gen_path = self._normalize_path(SUNO_GEN_PATH or "/api/v1/suno/generate/music")
+        self._primary_status_path = self._normalize_path(SUNO_TASK_STATUS_PATH or "/api/v1/suno/record-info")
         self._wav_path = self._normalize_path(SUNO_WAV_PATH or "/api/v1/wav/generate")
         self._wav_info_path = self._normalize_path(SUNO_WAV_INFO_PATH or "/api/v1/wav/record-info")
         self._mp4_path = self._normalize_path(SUNO_MP4_PATH or "/api/v1/mp4/generate")
@@ -95,7 +95,7 @@ class SunoClient:
         self._stem_path = self._normalize_path(SUNO_STEM_PATH or "/api/v1/vocal-removal/generate")
         self._stem_info_path = self._normalize_path(SUNO_STEM_INFO_PATH or "/api/v1/vocal-removal/record-info")
         self._instrumental_path = self._normalize_path(SUNO_INSTR_PATH or "/api/v1/generate/add-instrumental")
-        self._extend_path = self._normalize_path(SUNO_UPLOAD_EXTEND_PATH or "/api/v1/generate/upload-extend")
+        self._extend_path = self._normalize_path(SUNO_UPLOAD_EXTEND_PATH or "/api/v1/suno/upload-extend")
         self.session = session or requests.Session()
         adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
         self.session.mount("https://", adapter)
@@ -158,22 +158,39 @@ class SunoClient:
         return normalized
 
     def _build_v5_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        prompt_candidates = (
+            payload.get("prompt"),
+            payload.get("input_text"),
+            payload.get("lyrics"),
+            payload.get("title"),
+        )
+        prompt_text = ""
+        for candidate in prompt_candidates:
+            if candidate is None:
+                continue
+            text = str(candidate).strip()
+            if text:
+                prompt_text = text
+                break
+        if not prompt_text:
+            prompt_text = "Untitled track"
         body: dict[str, Any] = {
             "model": self._normalize_model(str(payload.get("model") or "")),
-            "input": {},
+            "input_text": prompt_text,
+            "instrumental": bool(payload.get("instrumental")),
         }
-        input_block = body["input"]
-        prompt = payload.get("prompt") or payload.get("lyrics") or payload.get("title")
-        if prompt is not None and str(prompt).strip():
-            input_block["prompt"] = str(prompt)
         style = payload.get("style")
         if style is not None and str(style).strip():
-            input_block["style"] = str(style)
-        if "instrumental" in payload:
-            input_block["instrumental"] = bool(payload.get("instrumental"))
+            body["style"] = str(style).strip()
         title = payload.get("title")
         if title is not None and str(title).strip():
-            input_block["title"] = str(title)
+            body["title"] = str(title).strip()
+        negative = payload.get("negative_tags") or payload.get("negativeTags")
+        if negative is not None and str(negative).strip():
+            body["negative_tags"] = str(negative).strip()
+        lyrics = payload.get("lyrics")
+        if lyrics is not None and str(lyrics).strip():
+            body["lyrics"] = str(lyrics).strip()
         if SUNO_CALLBACK_URL:
             body["callbackUrl"] = SUNO_CALLBACK_URL
         return body
@@ -397,18 +414,13 @@ class SunoClient:
         self, payload: Mapping[str, Any], *, req_id: Optional[str] = None
     ) -> tuple[Mapping[str, Any], str]:
         body_v5 = self._build_v5_payload(payload)
-        prompt_source = (
-            payload.get("prompt")
-            or payload.get("lyrics")
-            or payload.get("title")
-            or ""
-        )
+        prompt_source = body_v5.get("input_text") or ""
         context = {
             "model": body_v5.get("model"),
             "prompt_len": len(str(prompt_source or "")),
         }
-        if "instrumental" in payload:
-            context["instrumental"] = bool(payload.get("instrumental"))
+        if "instrumental" in body_v5:
+            context["instrumental"] = bool(body_v5.get("instrumental"))
         try:
             response = self._request(
                 "POST",
@@ -426,6 +438,8 @@ class SunoClient:
 
     def get_task_status(self, task_id: str, *, req_id: Optional[str] = None) -> Mapping[str, Any]:
         params_v5 = {"taskId": task_id}
+        if req_id:
+            params_v5["requestId"] = req_id
         try:
             response = self._request(
                 "GET",
