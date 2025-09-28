@@ -17,7 +17,15 @@ from metrics import bot_telegram_send_fail_total, suno_requests_total, suno_task
 from suno.client import SunoClient, SunoAPIError
 from suno.schemas import SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
-from settings import HTTP_POOL_CONNECTIONS, HTTP_POOL_PER_HOST, REDIS_PREFIX
+from settings import (
+    HTTP_POOL_CONNECTIONS,
+    HTTP_POOL_PER_HOST,
+    REDIS_PREFIX,
+    SUNO_API_BASE,
+    SUNO_CALLBACK_SECRET,
+    SUNO_CALLBACK_URL,
+    SUNO_ENABLED,
+)
 
 try:  # pragma: no cover - optional runtime dependency
     from redis import Redis
@@ -82,6 +90,12 @@ class SunoService:
         self._bot_session.mount("http://", adapter)
         self._admin_ids = self._parse_admins(os.getenv("ADMIN_IDS"))
         self._log_once_memory: MutableMapping[str, float] = {}
+        summary = {
+            "suno_enabled": bool(SUNO_ENABLED),
+            "api_base": SUNO_API_BASE,
+            "callback_configured": bool(SUNO_CALLBACK_URL and SUNO_CALLBACK_SECRET),
+        }
+        log.info("configuration summary", extra={"meta": summary})
         cleanup_old_directories()
 
     # ------------------------------------------------------------------ storage

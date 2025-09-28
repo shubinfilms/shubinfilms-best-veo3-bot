@@ -93,6 +93,8 @@ async def _startup_event() -> None:
         "tmp_cleanup_hours": TMP_CLEANUP_HOURS,
     }
     log.info("configuration summary", extra={"meta": summary})
+    if not SUNO_ENABLED:
+        log.warning("suno disabled; callback endpoints not registered")
 
 
 @app.middleware("http")
@@ -252,78 +254,86 @@ def _prepare_assets(task: SunoTask) -> None:
             track.image_url = _download(track.image_url, target)
 
 
-@app.post("/suno-callback")
-async def suno_callback(
-    request: Request,
-    x_callback_token: Optional[str] = Header(default=None),
-):
-    if not SUNO_ENABLED:
-        log.warning("callback ignored (disabled)", extra={"meta": {"path": str(request.url.path)}})
-        suno_callback_total.labels(status="disabled", **_WEB_LABELS).inc()
-        return JSONResponse({"error": "disabled"}, status_code=503)
+if SUNO_ENABLED:
 
-    provided = x_callback_token or request.query_params.get("token")
-    if SUNO_CALLBACK_SECRET and provided != SUNO_CALLBACK_SECRET:
-        log.warning("forbidden callback", extra={"meta": {"provided": bool(provided)}})
-        suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-
-    body = await request.body()
-    if len(body) > _MAX_JSON_BYTES:
-        log.warning("payload too large", extra={"meta": {"size": len(body)}})
-        raise HTTPException(status_code=413, detail="payload too large")
-
-    try:
-        payload = json.loads(body or b"{}")
-    except json.JSONDecodeError:
-        log.error("invalid json payload", extra={"meta": {"preview": body[:200].decode("utf-8", errors="replace")}})
-        return JSONResponse({"status": "ignored"}, status_code=400)
-
-    envelope = CallbackEnvelope.model_validate(payload)
-    task = SunoTask.from_envelope(envelope)
-    header_req_id = (
-        request.headers.get("X-Request-ID")
-        or request.headers.get("X-Req-Id")
-        or request.headers.get("X-Req-ID")
-    )
-    req_id = header_req_id or service.get_request_id(task.task_id)
-    start_ts = service.get_start_timestamp(task.task_id)
-    if start_ts:
-        started_at = _parse_iso8601(start_ts)
-        if started_at is not None:
-            elapsed = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
-            suno_latency_seconds.labels(**_WEB_LABELS).observe(elapsed)
-    key = _idempotency_key(task.task_id, task.callback_type)
-    if not _register_once(key):
-        log.info(
-            "duplicate callback ignored",
-            extra={"meta": {"key": key, "task_id": task.task_id, "req_id": req_id}},
+    @app.post("/suno-callback")
+    async def suno_callback(
+        request: Request,
+        x_callback_secret: Optional[str] = Header(default=None, alias="X-Callback-Secret"),
+    ):
+        provided = (
+            x_callback_secret
+            or request.headers.get("X-Callback-Token")
+            or request.query_params.get("secret")
+            or request.query_params.get("token")
         )
-        suno_callback_total.labels(status="skipped", **_WEB_LABELS).inc()
-        return {"ok": True, "duplicate": True}
+        if SUNO_CALLBACK_SECRET and provided != SUNO_CALLBACK_SECRET:
+            log.warning("forbidden callback", extra={"meta": {"provided": bool(provided)}})
+            suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
+            return JSONResponse({"error": "forbidden"}, status_code=403)
 
-    _prepare_assets(task)
-    service.handle_callback(task, req_id=req_id)
-    status_name = (task.callback_type or "").lower()
-    if status_name in {"complete", "success"}:
-        log.info(
-            "suno callback success",
-            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "code": task.code}},
+        body = await request.body()
+        if len(body) > _MAX_JSON_BYTES:
+            log.warning("payload too large", extra={"meta": {"size": len(body)}})
+            raise HTTPException(status_code=413, detail="payload too large")
+
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            log.error(
+                "invalid json payload",
+                extra={"meta": {"preview": body[:200].decode("utf-8", errors="replace")}},
+            )
+            return JSONResponse({"status": "ignored"}, status_code=400)
+
+        envelope = CallbackEnvelope.model_validate(payload)
+        task = SunoTask.from_envelope(envelope)
+        header_req_id = (
+            request.headers.get("X-Request-ID")
+            or request.headers.get("X-Req-Id")
+            or request.headers.get("X-Req-ID")
         )
-    else:
-        log.warning(
-            "suno callback processed",
-            extra={
-                "meta": {
-                    "task_id": task.task_id,
-                    "req_id": req_id,
-                    "code": task.code,
-                    "type": status_name,
-                }
-            },
-        )
-    suno_callback_total.labels(status="ok", **_WEB_LABELS).inc()
-    return {"ok": True}
+        req_id = header_req_id or service.get_request_id(task.task_id)
+        start_ts = service.get_start_timestamp(task.task_id)
+        if start_ts:
+            started_at = _parse_iso8601(start_ts)
+            if started_at is not None:
+                elapsed = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+                suno_latency_seconds.labels(**_WEB_LABELS).observe(elapsed)
+        key = _idempotency_key(task.task_id, task.callback_type)
+        if not _register_once(key):
+            log.info(
+                "duplicate callback ignored",
+                extra={"meta": {"key": key, "task_id": task.task_id, "req_id": req_id}},
+            )
+            suno_callback_total.labels(status="skipped", **_WEB_LABELS).inc()
+            return {"ok": True, "duplicate": True}
+
+        _prepare_assets(task)
+        service.handle_callback(task, req_id=req_id)
+        status_name = (task.callback_type or "").lower()
+        if status_name in {"complete", "success"}:
+            log.info(
+                "suno callback success",
+                extra={"meta": {"task_id": task.task_id, "req_id": req_id, "code": task.code}},
+            )
+        else:
+            log.warning(
+                "suno callback processed",
+                extra={
+                    "meta": {
+                        "task_id": task.task_id,
+                        "req_id": req_id,
+                        "code": task.code,
+                        "type": status_name,
+                    }
+                },
+            )
+        suno_callback_total.labels(status="ok", **_WEB_LABELS).inc()
+        return {"ok": True}
+
+else:
+    log.warning("suno callback endpoint disabled by configuration")
 
 
 __all__ = ["app"]
