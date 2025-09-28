@@ -104,6 +104,39 @@ def test_wait_state_updates_veo_prompt() -> None:
     assert message.replies and message.replies[-1] == "✅ Принято"
 
 
+def test_wait_state_updates_banana_prompt() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    state_dict = bot_module.state(ctx)
+    state_dict["last_ui_msg_id_banana"] = 111
+    wait_state = WaitInputState(kind=WaitKind.BANANA_PROMPT, card_msg_id=111, chat_id=888, meta={})
+    user_id = 556
+    set_wait_state(user_id, wait_state)
+
+    calls: list[tuple[int, object]] = []
+
+    original_show = bot_module.show_banana_card
+
+    async def fake_show(chat_id: int, ctx_param):
+        calls.append((chat_id, ctx_param))
+        state_dict["last_ui_msg_id_banana"] = 222
+
+    bot_module.show_banana_card = fake_show  # type: ignore[assignment]
+
+    message = DummyMessage(chat_id=888, text="  Fix face blemishes  ")
+
+    try:
+        handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+    finally:
+        bot_module.show_banana_card = original_show  # type: ignore[assignment]
+        clear_wait_state(user_id)
+
+    assert handled is True
+    assert state_dict["last_prompt"] == "Fix face blemishes"
+    assert calls and calls[-1][0] == 888
+    assert not get_wait_state(user_id)
+    assert message.replies and message.replies[-1] == "✅ Принято"
+
+
 def test_wait_state_suno_title_updates_card() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
     state_dict = bot_module.state(ctx)

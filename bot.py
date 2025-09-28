@@ -2528,6 +2528,7 @@ _WAIT_LIMITS = {
     WaitKind.SUNO_LYRICS: 3000,
     WaitKind.VEO_PROMPT: 3000,
     WaitKind.MJ_PROMPT: 2000,
+    WaitKind.BANANA_PROMPT: 2000,
 }
 
 _WAIT_ALLOW_NEWLINES = {
@@ -2535,6 +2536,7 @@ _WAIT_ALLOW_NEWLINES = {
     WaitKind.SUNO_LYRICS,
     WaitKind.VEO_PROMPT,
     WaitKind.MJ_PROMPT,
+    WaitKind.BANANA_PROMPT,
 }
 
 _WAIT_CLEAR_VALUES = {"-", "—"}
@@ -2820,6 +2822,16 @@ async def _apply_wait_state_input(
         await show_mj_prompt_card(wait_state.chat_id, ctx)
         if user_id is not None:
             card_id = s.get("last_ui_msg_id_mj")
+            if isinstance(card_id, int):
+                refresh_card_pointer(user_id, card_id)
+        handled = True
+    elif wait_state.kind == WaitKind.BANANA_PROMPT:
+        s = state(ctx)
+        s["last_prompt"] = cleaned or None
+        s["_last_text_banana"] = None
+        await show_banana_card(wait_state.chat_id, ctx)
+        if user_id is not None:
+            card_id = s.get("last_ui_msg_id_banana")
             if isinstance(card_id, int):
                 refresh_card_pointer(user_id, card_id)
         handled = True
@@ -7626,7 +7638,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if selected_mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
             await q.message.reply_text("🍌 Banana включён\nСначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить.", parse_mode=ParseMode.MARKDOWN)
-            await banana_entry(update.effective_chat.id, ctx); return
+            await banana_entry(update.effective_chat.id, ctx)
+            card_id = s.get("last_ui_msg_id_banana") if isinstance(s.get("last_ui_msg_id_banana"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id_val,
+                card_msg_id=card_id,
+                kind=WaitKind.BANANA_PROMPT,
+                meta={"mode": "banana"},
+            )
+            return
 
     if data.startswith("mj:"):
         chat = update.effective_chat
@@ -7805,7 +7826,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["_last_text_banana"] = None
             await q.message.reply_text("🧹 Фото очищены."); await show_banana_card(update.effective_chat.id, ctx); return
         if act == "edit_prompt":
-            await q.message.reply_text("✍️ Пришлите новый промпт для Banana."); return
+            user_obj = update.effective_user
+            uid_val = user_obj.id if user_obj else None
+            chat_ctx = update.effective_chat
+            chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
+            card_id = s.get("last_ui_msg_id_banana") if isinstance(s.get("last_ui_msg_id_banana"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id_val,
+                card_msg_id=card_id,
+                kind=WaitKind.BANANA_PROMPT,
+                meta={"action": "edit"},
+            )
+            await q.message.reply_text("✍️ Пришлите новый промпт для Banana.")
+            return
         if act == "start":
             imgs = s.get("banana_images") or []
             prompt = (s.get("last_prompt") or "").strip()

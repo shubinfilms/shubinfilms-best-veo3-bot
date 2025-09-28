@@ -114,6 +114,38 @@ def test_router_updates_veo_prompt() -> None:
     assert message.replies == ["✅ Принято"]
 
 
+def test_router_updates_banana_prompt() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    state_dict = bot_module.state(ctx)
+    state_dict["last_ui_msg_id_banana"] = 42
+    user_id = 909
+    wait_state = WaitInputState(kind=WaitKind.BANANA_PROMPT, card_msg_id=42, chat_id=321, meta={})
+    set_wait_state(user_id, wait_state)
+
+    calls: list[int] = []
+    original_show = bot_module.show_banana_card
+
+    async def fake_show(chat_id: int, ctx_param):
+        calls.append(chat_id)
+        state_dict["last_ui_msg_id_banana"] = 84
+
+    bot_module.show_banana_card = fake_show  # type: ignore[assignment]
+
+    message = DummyMessage(chat_id=321, text="  Touch up portrait  ")
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
+
+    try:
+        _run(bot_module.handle_text_input(update, ctx))
+    finally:
+        bot_module.show_banana_card = original_show  # type: ignore[assignment]
+        clear_wait_state(user_id)
+
+    assert state_dict["last_prompt"] == "Touch up portrait"
+    assert calls == [321]
+    assert not get_wait_state(user_id)
+    assert message.replies == ["✅ Принято"]
+
+
 def test_router_updates_mj_prompt() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
     state_dict = bot_module.state(ctx)
