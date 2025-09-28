@@ -538,6 +538,8 @@ class SunoService:
         user_id: Optional[int] = None,
         prompt: Optional[str] = None,
         req_id: Optional[str] = None,
+        lang: Optional[str] = None,
+        has_lyrics: bool = False,
     ) -> SunoTask:
         prompt_text = str(
             (prompt if prompt is not None else "")
@@ -554,7 +556,10 @@ class SunoService:
             "instrumental": instrumental,
             "prompt": prompt_text,
             "input_text": prompt_text,
+            "has_lyrics": bool(has_lyrics),
         }
+        if lang:
+            payload["lang"] = str(lang).strip()
         try:
             result, api_version = self.client.create_music(payload, req_id=req_id)
         except SunoAPIError as exc:
@@ -618,6 +623,8 @@ class SunoService:
             "prompt": prompt_text,
             "title": title,
             "req_id": req_id,
+            "lang": str(lang).strip().lower() if lang else None,
+            "has_lyrics": bool(has_lyrics),
         }
         self._save_task_record(task.task_id, record)
         log.info(

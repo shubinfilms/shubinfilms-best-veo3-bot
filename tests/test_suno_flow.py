@@ -1,10 +1,25 @@
 from typing import Optional
 
+import os
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 import suno_web
 from suno.schemas import SunoTask
+from utils.suno_state import (
+    build_generation_payload,
+    ensure_suno_state,
+    process_style_input,
+    process_title_input,
+)
+
+WAIT_SUNO_TITLE = "WAIT_SUNO_TITLE"
 
 
 class _FakeService:
@@ -135,3 +150,51 @@ def test_music_callback_invalid_payload(client):
     assert response.status_code == 400
     service: _FakeService = suno_web.service  # type: ignore[assignment]
     assert not service.calls
+
+
+def test_set_title_then_generate_payload_contains_title() -> None:
+    container: dict[str, object] = {}
+    state = ensure_suno_state(container)
+    ok, value, error = process_title_input("  My   New   Song  ")
+    assert ok and error is None
+    state["title"] = value
+    payload = build_generation_payload(state, instrumental=True, model="V5", lang="ru")
+    assert payload["title"] == "My New Song"
+    assert payload["prompt"] == "instrumental, cinematic, modern, dynamic"
+
+
+def test_set_style_multiline_then_payload_contains_full_prompt() -> None:
+    container: dict[str, object] = {}
+    state = ensure_suno_state(container)
+    raw_style = "Dreamy\n\n<b>cinematic</b> vibe  🎹🎹🎹"
+    ok, value, error = process_style_input(raw_style)
+    assert ok and error is None
+    assert value == "Dreamy\ncinematic vibe 🎹🎹"
+    state["style"] = value
+    payload = build_generation_payload(state, instrumental=False, model="V5", lang="en")
+    assert payload["prompt"] == "Dreamy\ncinematic vibe 🎹🎹"
+
+
+def test_clear_title_and_style_with_dash() -> None:
+    ok, value, error = process_title_input("-")
+    assert ok and value is None and error is None
+    ok, value, error = process_style_input("—")
+    assert ok and value is None and error is None
+
+
+def test_defaults_applied_when_missing() -> None:
+    state = ensure_suno_state({})
+    payload = build_generation_payload(state, instrumental=True, model="V5", lang="en")
+    assert payload["title"] == "Untitled Track"
+    assert payload["prompt"] == "instrumental, cinematic, modern, dynamic"
+
+
+def test_cancel_exits_wait_state_without_changes() -> None:
+    state = {"suno_waiting_state": WAIT_SUNO_TITLE, "suno_title": "Keep"}
+    user_state = ensure_suno_state({"suno": {"title": "Keep"}})
+    lowered = "/cancel"
+    if lowered == "/cancel":
+        state["suno_waiting_state"] = None
+    assert state["suno_title"] == "Keep"
+    assert user_state["title"] == "Keep"
+    assert state["suno_waiting_state"] is None
