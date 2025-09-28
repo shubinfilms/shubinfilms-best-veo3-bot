@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from contextlib import suppress
 import re
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -78,13 +81,18 @@ _ENGINE_DISPLAY = {
 }
 
 PM_STATUS_TEXT = {
-    "ru": "🧠 Пишу промпт…",
-    "en": "🧠 Crafting your prompt…",
+    "default": {"ru": "🧠 Пишу промпт…", "en": "🧠 Crafting your prompt…"},
+    "veo": {
+        "ru": "⚙️ Начинаю собирать промпт для VEO… (≈8 c)",
+        "en": "⚙️ Starting VEO prompt build… (≈8 s)",
+    },
 }
 
+PM_SLOW_TEXT = {"ru": "⏳ Форматирую JSON…", "en": "⏳ Formatting JSON…"}
+
 PM_ERROR_TEXT = {
-    "ru": "❌ Не удалось собрать промпт. Попробуйте ещё раз.",
-    "en": "❌ Failed to build the prompt. Try again.",
+    "ru": "⚠️ Системная ошибка. Попробуйте ещё раз.",
+    "en": "⚠️ System error. Please try again.",
 }
 
 PM_WARNING_TEXT = {
@@ -119,6 +127,16 @@ def _chunk_plain(text: str, *, limit: int = 3500) -> Iterable[str]:
 
 def detect_language(text: str) -> str:
     return "ru" if CYRILLIC_RE.search(text or "") else "en"
+
+
+def _status_message(engine: Optional[str], lang: str) -> str:
+    key = "veo" if engine == "veo" else "default"
+    bucket = PM_STATUS_TEXT.get(key, PM_STATUS_TEXT["default"])
+    return bucket.get(lang, bucket.get("en", ""))
+
+
+def _slow_status(lang: str) -> str:
+    return PM_SLOW_TEXT.get(lang, PM_SLOW_TEXT.get("en", "⏳"))
 
 
 def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
@@ -400,8 +418,21 @@ async def _handle_insert(
     state["lang"] = lang
     state["result"] = payload
     state["prompt"] = payload.get("card_text") or payload.get("copy_text") or ""
+    raw_payload = payload.get("raw_payload") or {}
+    if engine == "veo":
+        state["veo_duration_hint"] = raw_payload.get("duration_hint")
+        state["veo_lip_sync_required"] = bool(raw_payload.get("lip_sync_required"))
+        state["veo_voiceover_origin"] = raw_payload.get("voiceover_origin")
     _store_prompt(chat_id, engine, payload)
     await _upsert_card(update, context, engine=engine, state=state, lang=lang)
+    logger.info(
+        "pm.insert.success",
+        extra={
+            "engine": engine,
+            "duration_hint": raw_payload.get("duration_hint"),
+            "lip_sync": raw_payload.get("lip_sync_required"),
+        },
+    )
     await query.answer("Вставлено" if lang == "ru" else "Inserted")
 
 
@@ -491,17 +522,41 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
 
     chat = update.effective_chat
     chat_id = chat.id if chat else None
-    logger.info("pm.start", extra={"engine": engine})
+    build_started = time.monotonic()
+    logger.info("pm.start", extra={"engine": engine, "lang": lang})
+    status_keyboard = prompt_master_mode_keyboard(lang)
+    status_text = _status_message(engine, lang)
     status = (
         await send_html_with_fallback(
             context.bot,
             chat_id,
-            PM_STATUS_TEXT.get(lang, PM_STATUS_TEXT["en"]),
-            reply_markup=prompt_master_mode_keyboard(lang),
+            status_text,
+            reply_markup=status_keyboard,
         )
         if chat_id is not None
         else None
     )
+    slow_task: Optional[asyncio.Task[None]] = None
+    slow_state = {"done": False}
+    if status is not None:
+        async def _slow_notice() -> None:
+            try:
+                await asyncio.sleep(3.0)
+                if slow_state.get("done"):
+                    return
+                await _edit_with_fallback(
+                    context,
+                    status.chat_id,
+                    status.message_id,
+                    f"{status_text}<br>{_slow_status(lang)}",
+                    status_keyboard,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.debug("prompt_master.slow_status.fail", exc_info=True)
+
+        slow_task = asyncio.create_task(_slow_notice())
 
     builder = ENGINE_BUILDERS.get(engine)
     result_payload: Optional[PMResult] = None
@@ -511,12 +566,17 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
         logger.exception("prompt_master.build_failed", extra={"engine": engine})
 
     if result_payload is None:
+        slow_state["done"] = True
+        if slow_task:
+            slow_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await slow_task
         await _handle_render_failure(
             context,
             status,
             lang,
             engine,
-            prompt_master_mode_keyboard(lang),
+            status_keyboard,
             chat_id,
         )
         return
@@ -528,15 +588,37 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
     result_html = result_payload.get("body_html", "")
     if not result_html:
         logger.error("pm.render.empty", extra={"engine": engine})
+        slow_state["done"] = True
+        if slow_task:
+            slow_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await slow_task
         await _handle_render_failure(
             context,
             status,
             lang,
             engine,
-            prompt_master_mode_keyboard(lang),
+            status_keyboard,
             chat_id,
         )
         return
+    slow_state["done"] = True
+    if slow_task:
+        slow_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await slow_task
+    meta = result_payload.get("raw_payload") or {}
+    duration = time.monotonic() - build_started
+    logger.info(
+        "pm.build.success",
+        extra={
+            "engine": engine,
+            "duration": round(duration, 3),
+            "lang": lang,
+            "voiceover_origin": meta.get("voiceover_origin"),
+            "voiceover_requested": meta.get("voiceover_requested"),
+        },
+    )
     markup = prompt_master_result_keyboard(engine, lang)
     if status is not None:
         try:

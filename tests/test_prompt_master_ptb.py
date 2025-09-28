@@ -21,7 +21,12 @@ from handlers.prompt_master_handler import (
     prompt_master_open,
     prompt_master_text_handler,
 )
-from keyboards import CB_PM_PREFIX, prompt_master_keyboard, prompt_master_mode_keyboard
+from keyboards import (
+    CB_PM_PREFIX,
+    prompt_master_keyboard,
+    prompt_master_mode_keyboard,
+    prompt_master_result_keyboard,
+)
 from prompt_master import Engine, build_banana_prompt, build_mj_prompt, build_prompt, build_veo_prompt
 from utils.html_render import render_pm_html
 from utils.safe_send import send_html_with_fallback
@@ -125,6 +130,18 @@ def test_prompt_master_keyboard_layout_ru() -> None:
     assert layout == expected
 
 
+def test_prompt_master_result_keyboard_layout() -> None:
+    keyboard = prompt_master_result_keyboard("veo", "ru")
+    rows = keyboard.inline_keyboard
+    assert len(rows) == 2
+    copy_row = rows[0]
+    back_row = rows[1]
+    assert copy_row[0].callback_data == f"{CB_PM_PREFIX}copy:veo"
+    assert copy_row[1].callback_data == f"{CB_PM_PREFIX}insert:veo"
+    assert back_row[0].callback_data == f"{CB_PM_PREFIX}back"
+    assert back_row[1].callback_data == f"{CB_PM_PREFIX}switch"
+
+
 def test_prompt_master_open_uses_safe_send_html() -> None:
     bot = FakeBot()
     update = SimpleNamespace(
@@ -182,12 +199,27 @@ def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> Non
     assert "Ready prompt" in final_text
     assert "<pre><code>" in final_text
     assert "<br/>" not in final_text
-    buttons = final_kwargs["reply_markup"].inline_keyboard[-1]
-    assert buttons[0].callback_data == "pm:copy:mj"
+    buttons = final_kwargs["reply_markup"].inline_keyboard
+    assert buttons[0][0].callback_data == "pm:copy:mj"
+    assert buttons[0][1].callback_data == "pm:insert:mj"
+    assert buttons[1][0].callback_data == "pm:back"
+    assert buttons[1][1].callback_data == "pm:switch"
     cached = get_pm_prompt(333, "mj")
     assert cached is not None
     assert cached["engine"] == "mj"
     assert cached["copy_text"].strip().startswith("{")
+
+
+def test_prompt_master_status_message_for_veo() -> None:
+    bot = FakeBot()
+    state = {"engine": "veo", "card_msg_id": None, "autodelete": False}
+    ctx = SimpleNamespace(bot=bot, user_data={PM_STATE_KEY: state})
+    message = SimpleNamespace(text="Два героя спорят у окна во время грозы.", chat=SimpleNamespace(id=555, type=ChatType.PRIVATE))
+    update = SimpleNamespace(message=message, effective_chat=message.chat)
+    asyncio.run(prompt_master_text_handler(update, ctx))
+    assert len(bot.sent) >= 2
+    status_text = bot.sent[1][1]
+    assert status_text.startswith("⚙️ Начинаю собирать промпт для VEO")
 
 
 def test_prompt_master_insert_uses_cached_payload() -> None:
@@ -210,6 +242,30 @@ def test_prompt_master_insert_uses_cached_payload() -> None:
     asyncio.run(prompt_master_callback(update, ctx))
     assert ctx.user_data[PM_STATE_KEY]["prompt"] == payload.get("card_text")
     assert bot.sent, "card should be rendered on insert"
+
+
+def test_prompt_master_insert_sets_veo_metadata() -> None:
+    bot = FakeBot()
+    ctx = SimpleNamespace(bot=bot, user_data={PM_STATE_KEY: {"engine": "veo", "card_msg_id": None}})
+    chat_id = 999
+    clear_pm_prompts(chat_id)
+    from handlers.prompt_master_handler import _store_prompt  # type: ignore
+
+    payload = build_veo_prompt("Two detectives argue", "en")
+    _store_prompt(chat_id, "veo", payload)
+
+    query = FakeQuery(f"{CB_PM_PREFIX}insert:veo", bot)
+    query.message.chat.id = chat_id
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(language_code="en"),
+    )
+    asyncio.run(prompt_master_callback(update, ctx))
+    state = ctx.user_data[PM_STATE_KEY]
+    assert state["veo_duration_hint"]
+    assert state["veo_lip_sync_required"] == bool(payload["raw_payload"]["lip_sync_required"])
+    assert state["veo_voiceover_origin"] == payload["raw_payload"].get("voiceover_origin")
 
 
 def test_prompt_master_copy_sends_plain_text() -> None:
@@ -265,7 +321,7 @@ def test_render_payload_snapshot_veo() -> None:
     payload = build_veo_prompt("cinematic hero", "en")
     html_text = payload["body_html"]
     assert "<b>Ready prompt for VEO</b>" in html_text
-    assert "&quot;scene&quot;" in html_text
+    assert "&quot;idea&quot;" in html_text
 
 
 def test_render_payload_snapshot_banana() -> None:
@@ -278,7 +334,20 @@ def test_render_payload_snapshot_banana() -> None:
 def test_build_prompt_veo_json_structure() -> None:
     prompt = asyncio.run(build_prompt(Engine.VEO_VIDEO, "cinematic sunrise", "en"))
     payload = json.loads(prompt["copy_text"])
-    assert {"scene", "camera", "motion", "lighting", "palette", "details"} <= set(payload.keys())
+    expected_keys = {
+        "idea",
+        "scene_description",
+        "timeline",
+        "camera",
+        "lighting",
+        "palette",
+        "details",
+        "audio",
+        "notes",
+        "safety",
+    }
+    assert expected_keys <= set(payload.keys())
+    assert len(payload["timeline"]) == 4
 
 
 def test_detect_language_simple() -> None:
