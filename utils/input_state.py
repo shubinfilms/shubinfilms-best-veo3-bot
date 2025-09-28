@@ -198,6 +198,39 @@ def refresh_card_pointer(user_id: int, new_message_id: int) -> None:
     set_wait_state(user_id, updated)
 
 
+class InputRegistry:
+    def __init__(self):
+        self._by_chat: Dict[int, Dict[str, Any]] = {}
+
+    def start(self, chat_id: int, kind: str, card_msg_id: Optional[int], ttl_sec: int = 180) -> None:
+        expires_at = time.time() + max(ttl_sec, 1)
+        self._by_chat[int(chat_id)] = {
+            "kind": kind,
+            "card_msg_id": card_msg_id,
+            "expires_at": expires_at,
+        }
+
+    def get(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        entry = self._by_chat.get(int(chat_id))
+        if not entry:
+            return None
+        if entry.get("expires_at", 0.0) < time.time():
+            self.clear(chat_id, reason="expired")
+            return None
+        return entry
+
+    def touch(self, chat_id: int, ttl_sec: int = 180) -> None:
+        entry = self.get(chat_id)
+        if entry:
+            entry["expires_at"] = time.time() + max(ttl_sec, 1)
+
+    def clear(self, chat_id: int, reason: str = "manual") -> None:
+        self._by_chat.pop(int(chat_id), None)
+
+
+input_registry = InputRegistry()
+
+
 def set_wait(
     user_id: int,
     kind: Literal[

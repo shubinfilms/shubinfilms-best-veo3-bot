@@ -25,7 +25,7 @@ from utils.suno_state import (
     style_preview as suno_style_preview,
 )
 from telegram_utils import safe_edit, SafeEditResult
-from utils.telegram_safe import safe_edit_message
+from utils.telegram_utils import show_card
 
 logger = logging.getLogger(__name__)
 
@@ -43,48 +43,45 @@ async def upsert_card(
     reply_markup: Optional[Any] = None,
     parse_mode: ParseMode = ParseMode.HTML,
     disable_web_page_preview: bool = True,
+    *,
+    force_new: bool = False,
 ) -> Optional[int]:
     """Update an existing UI card or send a new one.
 
     Returns the message id of the card on success, otherwise ``None``.
     """
 
-    mid = state_dict.get(state_key)
-    if mid:
-        try:
-            await safe_edit_message(
-                ctx,
-                chat_id,
-                mid,
-                text,
-                reply_markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
-            )
-            return mid
-        except BadRequest as exc:
-            logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-            logger.debug("edit %s bad request: %s", state_key, exc)
-            state_dict[state_key] = None
-        except Exception as exc:  # pragma: no cover - network issues
-            logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-            logger.warning("edit %s failed: %s", state_key, exc)
-            state_dict[state_key] = None
+    prev_id = state_dict.get(state_key)
+    prev_msg_id: Optional[int]
+    try:
+        prev_msg_id = int(prev_id)
+    except Exception:
+        prev_msg_id = None
 
     try:
-        msg = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
+        new_id = await show_card(
+            ctx.bot,
+            chat_id,
+            text,
+            reply_markup,
+            prev_msg_id,
+            force_new=force_new,
             disable_web_page_preview=disable_web_page_preview,
+            parse_mode=parse_mode,
         )
-        state_dict[state_key] = msg.message_id
-        return msg.message_id
+    except BadRequest as exc:
+        logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
+        logger.debug("card %s bad request: %s", state_key, exc)
+        state_dict[state_key] = None
+        return None
     except Exception as exc:  # pragma: no cover - network issues
         logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-        logger.error("send %s failed: %s", state_key, exc)
+        logger.error("card %s send failed: %s", state_key, exc)
         return None
+
+    if new_id is not None:
+        state_dict[state_key] = new_id
+    return new_id
 
 
 async def refresh_balance_card_if_open(

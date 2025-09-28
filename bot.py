@@ -109,11 +109,17 @@ from utils.input_state import (
     clear_wait_state,
     clear_wait,
     get_wait,
+    input_registry,
     refresh_card_pointer,
     set_wait,
     touch_wait,
 )
-from utils.telegram_utils import is_command_text, should_capture_to_prompt
+from utils.telegram_utils import (
+    is_ack_needed_for_text,
+    is_command_text,
+    should_capture_to_prompt,
+    show_card,
+)
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
@@ -2722,6 +2728,7 @@ def _activate_wait_state(
         chat_id=chat_id,
         meta=payload_meta,
     )
+    input_registry.start(chat_id, kind.value, card_msg_id)
 
 
 def _wait_preview(text: str) -> str:
@@ -2739,6 +2746,8 @@ def is_command_or_button(message: Message) -> bool:
 
 
 async def _wait_acknowledge(message: Message) -> None:
+    if not is_ack_needed_for_text(message.text):
+        return
     try:
         await message.reply_text("✅ Принято")
     except Exception:
@@ -2871,6 +2880,8 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if user_id is None:
         return
 
+    chat_id = message.chat_id
+
     wait_state = get_wait(user_id)
     if wait_state is None:
         return
@@ -2879,9 +2890,15 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
         raise ApplicationHandlerStop
 
+    text_value = message.text
+    if is_command_text(text_value):
+        input_registry.clear(chat_id, reason="command")
+        touch_wait(user_id)
+        return
     if is_command_or_button(message):
         touch_wait(user_id)
-        raise ApplicationHandlerStop
+        input_registry.touch(chat_id)
+        return
 
     handled = await _apply_wait_state_input(
         ctx,
@@ -2892,6 +2909,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     if handled:
         touch_wait(user_id)
+        input_registry.touch(chat_id)
         await _wait_acknowledge(message)
         raise ApplicationHandlerStop
 
@@ -3649,7 +3667,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if user_id:
             set_mode(user_id, False)
         await query.answer()
-        await suno_entry(chat_id, ctx)
+        await suno_entry(chat_id, ctx, force_new=True)
         return
 
     if action == "prompt":
@@ -3784,7 +3802,12 @@ def balance_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-async def show_balance_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+async def show_balance_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_new: bool = False,
+) -> Optional[int]:
     s = state(ctx)
     uid = get_user_id(ctx) or chat_id
     balance = _safe_get_balance(uid)
@@ -3799,6 +3822,7 @@ async def show_balance_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Opt
         reply_markup=balance_menu_kb(),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
+        force_new=force_new,
     )
     if mid:
         msg_ids = s.get("msg_ids")
@@ -4049,29 +4073,63 @@ def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
         ],
     ])
 
-async def _update_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: str,
-                                reply_markup: Optional[InlineKeyboardMarkup], *, force: bool = False) -> None:
+async def _update_mj_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    *,
+    force: bool = False,
+) -> None:
     s = state(ctx)
-    if not force and text == s.get("_last_text_mj"):
-        return
-    mid = await upsert_card(ctx, chat_id, s, "last_ui_msg_id_mj", text, reply_markup)
+    mid = await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        "last_ui_msg_id_mj",
+        text,
+        reply_markup,
+        force_new=force,
+    )
     if mid:
         s["_last_text_mj"] = text
     elif force:
         s["_last_text_mj"] = None
 
-async def show_mj_format_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_mj_format_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_new: bool = False,
+) -> None:
     s = state(ctx)
     aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
     s["aspect"] = aspect
     s["last_prompt"] = None
-    await _update_mj_card(chat_id, ctx, _mj_format_card_text(aspect), _mj_format_keyboard(aspect))
+    await _update_mj_card(
+        chat_id,
+        ctx,
+        _mj_format_card_text(aspect),
+        _mj_format_keyboard(aspect),
+        force=force_new,
+    )
 
-async def show_mj_prompt_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_mj_prompt_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_new: bool = False,
+) -> None:
     s = state(ctx)
     aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
     s["aspect"] = aspect
-    await _update_mj_card(chat_id, ctx, _mj_prompt_card_text(aspect, s.get("last_prompt")), _mj_prompt_keyboard())
+    await _update_mj_card(
+        chat_id,
+        ctx,
+        _mj_prompt_card_text(aspect, s.get("last_prompt")),
+        _mj_prompt_keyboard(),
+        force=force_new,
+    )
 
 async def show_mj_generating_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, prompt: str, aspect: str) -> None:
     aspect = "9:16" if aspect == "9:16" else "16:9"
@@ -4083,7 +4141,7 @@ async def show_mj_generating_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, 
     )
     await _update_mj_card(chat_id, ctx, text, None)
 
-async def mj_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def mj_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = False) -> None:
     s = state(ctx)
     mid = s.get("last_ui_msg_id_mj")
     if mid:
@@ -4091,7 +4149,7 @@ async def mj_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await ctx.bot.delete_message(chat_id, mid)
     s["last_ui_msg_id_mj"] = None
     s["_last_text_mj"] = None
-    await show_mj_format_card(chat_id, ctx)
+    await show_mj_format_card(chat_id, ctx, force_new=force_new)
 
 def banana_examples_block() -> str:
     return (
@@ -4500,7 +4558,13 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_balance: bool = True) -> None:
+async def suno_entry(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    refresh_balance: bool = True,
+    force_new: bool = False,
+) -> Optional[int]:
     s = state(ctx)
     s["suno_waiting_state"] = IDLE_SUNO
     uid = get_user_id(ctx)
@@ -4512,7 +4576,7 @@ async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_ba
             chat_id,
             "⚠️ Suno API не настроен. Обратитесь к поддержке.",
         )
-        return
+        return None
     if refresh_balance:
         balance_uid = uid or chat_id
         if balance_uid:
@@ -4521,7 +4585,15 @@ async def suno_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, refresh_ba
     suno_state_obj = load_suno_state(ctx)
     s["suno_state"] = suno_state_obj.to_dict()
     _reset_suno_card_cache(s)
-    await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+    if force_new:
+        s["last_ui_msg_id_suno"] = None
+        card_meta = s.get("suno_card")
+        if isinstance(card_meta, dict):
+            card_meta["msg_id"] = None
+            card_meta["last_text_hash"] = None
+            card_meta["last_markup_hash"] = None
+    msg_id = await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+    return msg_id
 
 
 async def _suno_notify(
@@ -6695,6 +6767,7 @@ async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user:
         set_mode(user.id, False)
         clear_wait(user.id)
+        input_registry.clear(chat.id, reason="music_command")
 
     if not _suno_configured():
         await _suno_notify(
@@ -6705,17 +6778,15 @@ async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await suno_entry(chat.id, ctx)
+    card_msg_id = await suno_entry(chat.id, ctx, force_new=True)
 
     if user:
-        s = state(ctx)
-        card_id = s.get("last_ui_msg_id_suno") if isinstance(s.get("last_ui_msg_id_suno"), int) else None
         try:
-            set_wait(
-                user.id,
-                WaitKind.SUNO_TITLE.value,
-                card_id,
+            _activate_wait_state(
+                user_id=user.id,
                 chat_id=chat.id,
+                card_msg_id=card_msg_id,
+                kind=WaitKind.SUNO_TITLE,
                 meta={"source": "command"},
             )
         except ValueError:
@@ -6819,22 +6890,23 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user_id:
         set_mode(user_id, False)
         clear_wait(user_id)
+        input_registry.clear(chat.id, reason="video_command")
 
     s = state(ctx)
     s["mode"] = "veo_text_fast"
     s["model"] = "veo3_fast"
     if s.get("aspect") not in {"16:9", "9:16"}:
         s["aspect"] = "16:9"
-    await veo_entry(chat.id, ctx)
+    await veo_entry(chat.id, ctx, force_new=True)
 
     if user_id is not None:
         card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
         try:
-            set_wait(
-                user_id,
-                WaitKind.VEO_PROMPT.value,
-                card_id,
+            _activate_wait_state(
+                user_id=user_id,
                 chat_id=chat.id,
+                card_msg_id=card_id,
+                kind=WaitKind.VEO_PROMPT,
                 meta={"trigger": "command", "mode": s.get("mode")},
             )
         except ValueError:
@@ -6851,21 +6923,22 @@ async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user_id:
         set_mode(user_id, False)
         clear_wait(user_id)
+        input_registry.clear(chat.id, reason="image_command")
 
     s = state(ctx)
     s["mode"] = "mj_txt"
     if s.get("aspect") not in {"16:9", "9:16"}:
         s["aspect"] = "16:9"
-    await mj_entry(chat.id, ctx)
+    await mj_entry(chat.id, ctx, force_new=True)
 
     if user_id is not None:
         card_id = s.get("last_ui_msg_id_mj") if isinstance(s.get("last_ui_msg_id_mj"), int) else None
         try:
-            set_wait(
-                user_id,
-                WaitKind.MJ_PROMPT.value,
-                card_id,
+            _activate_wait_state(
+                user_id=user_id,
                 chat_id=chat.id,
+                card_msg_id=card_id,
+                kind=WaitKind.MJ_PROMPT,
                 meta={"trigger": "command", "aspect": s.get("aspect")},
             )
         except ValueError:
@@ -6956,7 +7029,7 @@ async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat is None:
         return
-    mid = await show_balance_card(chat.id, ctx)
+    mid = await show_balance_card(chat.id, ctx, force_new=True)
     if mid is None:
         user = update.effective_user
         if user is None or update.message is None:
@@ -7323,19 +7396,25 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
     except Exception:
         pass
 
-async def show_banana_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_banana_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = False) -> None:
     s = state(ctx)
     text = banana_card_text(s)
-    if text == s.get("_last_text_banana"):
-        return
     kb = banana_kb()
-    mid = await upsert_card(ctx, chat_id, s, "last_ui_msg_id_banana", text, kb)
+    mid = await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        "last_ui_msg_id_banana",
+        text,
+        kb,
+        force_new=force_new,
+    )
     if mid:
         s["_last_text_banana"] = text
     else:
         s["_last_text_banana"] = None
 
-async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = False) -> None:
     s = state(ctx)
     mid = s.get("last_ui_msg_id_banana")
     if mid:
@@ -7343,7 +7422,7 @@ async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await ctx.bot.delete_message(chat_id, mid)
     s["last_ui_msg_id_banana"] = None
     s["_last_text_banana"] = None
-    await show_banana_card(chat_id, ctx)
+    await show_banana_card(chat_id, ctx, force_new=force_new)
 
 async def on_banana_photo_received(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
     s = state(ctx)
@@ -7357,19 +7436,25 @@ async def on_banana_prompt_saved(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, t
     s["_last_text_banana"] = None
     await show_banana_card(chat_id, ctx)
 
-async def show_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_veo_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = False) -> None:
     s = state(ctx)
     text = veo_card_text(s)
-    if text == s.get("_last_text_veo"):
-        return
     kb = veo_kb(s)
-    mid = await upsert_card(ctx, chat_id, s, "last_ui_msg_id_veo", text, kb)
+    mid = await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        "last_ui_msg_id_veo",
+        text,
+        kb,
+        force_new=force_new,
+    )
     if mid:
         s["_last_text_veo"] = text
     else:
         s["_last_text_veo"] = None
 
-async def veo_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def veo_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = False) -> None:
     s = state(ctx)
     mid = s.get("last_ui_msg_id_veo")
     if mid:
@@ -7377,7 +7462,7 @@ async def veo_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await ctx.bot.delete_message(chat_id, mid)
     s["last_ui_msg_id_veo"] = None
     s["_last_text_veo"] = None
-    await show_veo_card(chat_id, ctx)
+    await show_veo_card(chat_id, ctx, force_new=force_new)
 
 async def set_veo_card_prompt(chat_id: int, prompt_text: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
@@ -7672,6 +7757,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid_val = user_obj.id if user_obj else None
         if uid_val is not None:
             clear_wait_state(uid_val)
+        if chat_id_val is not None:
+            input_registry.clear(chat_id_val, reason="mode_select")
         if selected_mode in ("veo_text_fast", "veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
             await veo_entry(update.effective_chat.id, ctx)
@@ -7764,6 +7851,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.message.reply_text("⏳ Дождитесь завершения текущей генерации."); return
             if uid_val is not None:
                 clear_wait_state(uid_val)
+            input_registry.clear(chat_id, reason="mj_change_format")
             await show_mj_format_card(chat_id, ctx)
             return
 
@@ -7775,6 +7863,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_last_wait_ts"] = 0.0
             if uid_val is not None:
                 clear_wait_state(uid_val)
+            input_registry.clear(chat_id, reason="mj_cancel")
             mid = s.get("last_ui_msg_id_mj")
             if mid:
                 try:
@@ -7991,6 +8080,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = user.id if user else None
         if uid is not None:
             clear_wait_state(uid)
+        if chat_id is not None:
+            input_registry.clear(chat_id, reason="suno_action")
         s["mode"] = "suno"
         suno_state_obj = load_suno_state(ctx)
         s["suno_state"] = suno_state_obj.to_dict()
