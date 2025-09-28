@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import hashlib
 import logging
 import os
 from typing import Any, Optional, Tuple, MutableMapping
@@ -22,6 +24,8 @@ from utils.suno_state import (
     style_preview as suno_style_preview,
 )
 from telegram_utils import safe_edit, SafeEditResult
+
+logger = logging.getLogger(__name__)
 
 _SUNO_MODEL_RAW = (os.getenv("SUNO_MODEL") or "v5").strip()
 _SUNO_MODEL_LABEL = _SUNO_MODEL_RAW.upper() if _SUNO_MODEL_RAW else "V5"
@@ -231,6 +235,71 @@ async def refresh_suno_card(
         if not isinstance(msg_id, int):
             msg_id = None
 
+    if markup is None:
+        markup_payload: Any = None
+    else:
+        try:
+            markup_payload = markup.to_dict()
+        except AttributeError:
+            markup_payload = markup
+    markup_json = json.dumps(markup_payload, ensure_ascii=False, sort_keys=True)
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    markup_hash = hashlib.sha256(markup_json.encode("utf-8")).hexdigest()
+
+    last_text_hash = card_state.get("last_text_hash") if isinstance(card_state, MutableMapping) else None
+    last_markup_hash = card_state.get("last_markup_hash") if isinstance(card_state, MutableMapping) else None
+
+    payload_changed = not (
+        isinstance(last_text_hash, str)
+        and isinstance(last_markup_hash, str)
+        and last_text_hash == text_hash
+        and last_markup_hash == markup_hash
+        and isinstance(msg_id, int)
+    )
+
+    def _log_card_event(method: str, reason: str, old_id: Optional[int], new_id: Optional[int]) -> None:
+        try:
+            payload = json.dumps(
+                {
+                    "card_msg_id_old": old_id,
+                    "card_msg_id_new": new_id,
+                    "method": method,
+                    "reason": reason,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception:
+            payload = str(
+                {
+                    "card_msg_id_old": old_id,
+                    "card_msg_id_new": new_id,
+                    "method": method,
+                    "reason": reason,
+                }
+            )
+        logger.info("EVT_CARD_EDIT | %s", payload)
+
+    if not payload_changed and isinstance(msg_id, int):
+        card_state["msg_id"] = msg_id
+        card_state["last_text_hash"] = text_hash
+        card_state["last_markup_hash"] = markup_hash
+        card_state["chat_id"] = chat_id
+        suno_state_obj.card_message_id = msg_id
+        suno_state_obj.card_text_hash = text_hash
+        suno_state_obj.card_markup_hash = markup_hash
+        suno_state_obj.card_chat_id = chat_id
+        suno_state_obj.last_card_hash = text_hash
+        save_suno_state(ctx, suno_state_obj)
+        state_dict["suno_state"] = suno_state_obj.to_dict()
+        state_dict[state_key] = msg_id
+        msg_ids = state_dict.get("msg_ids")
+        if isinstance(msg_ids, dict):
+            msg_ids["suno"] = msg_id
+        state_dict["_last_text_suno"] = text
+        _log_card_event("skip", "not_changed", msg_id, msg_id)
+        return msg_id
+
     result: SafeEditResult = await safe_edit(
         ctx.bot,
         chat_id,
@@ -240,25 +309,44 @@ async def refresh_suno_card(
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         state=card_state,
+        resend_on_not_modified=True,
     )
 
-    if result.message_id is not None:
-        state_dict[state_key] = result.message_id
-        card_state["msg_id"] = result.message_id
+    new_msg_id = result.message_id or card_state.get("msg_id")
+    if isinstance(new_msg_id, int):
+        state_dict[state_key] = new_msg_id
+        card_state["msg_id"] = new_msg_id
         msg_ids = state_dict.get("msg_ids")
         if isinstance(msg_ids, dict):
-            msg_ids["suno"] = result.message_id
+            msg_ids["suno"] = new_msg_id
+    card_state["chat_id"] = chat_id
 
     suno_state_obj.card_message_id = card_state.get("msg_id") if isinstance(card_state.get("msg_id"), int) else None
     card_text_hash = card_state.get("last_text_hash")
     card_markup_hash = card_state.get("last_markup_hash")
     suno_state_obj.card_text_hash = card_text_hash if isinstance(card_text_hash, str) else None
     suno_state_obj.card_markup_hash = card_markup_hash if isinstance(card_markup_hash, str) else None
+    suno_state_obj.card_chat_id = chat_id
+    suno_state_obj.last_card_hash = suno_state_obj.card_text_hash
     save_suno_state(ctx, suno_state_obj)
     state_dict["suno_state"] = suno_state_obj.to_dict()
 
+    reason = "changed"
+    method = "edit"
+    if result.status == "sent":
+        method = "send"
+        reason = "missing_msg"
+    elif result.status == "resent":
+        method = "send"
+        reason = result.reason or "missing_msg"
+    elif result.status == "skipped":
+        method = "skip"
+        reason = result.reason or "not_modified"
+
+    _log_card_event(method, reason, msg_id, new_msg_id if isinstance(new_msg_id, int) else None)
+
     state_dict["_last_text_suno"] = text
-    return result.message_id or msg_id
+    return new_msg_id if isinstance(new_msg_id, int) else msg_id
 
 
 def referral_card_text(link: str, referrals: int, earned: int) -> str:

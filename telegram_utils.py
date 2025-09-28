@@ -340,10 +340,11 @@ def build_inline_kb(
 class SafeEditResult:
     message_id: Optional[int]
     status: str
+    reason: Optional[str] = None
 
     @property
     def changed(self) -> bool:
-        return self.status in {"edited", "sent", "resent"}
+        return self.status.startswith(("edited", "sent", "resent"))
 
 
 def _hash_value(value: str) -> str:
@@ -360,6 +361,7 @@ async def safe_edit(
     *,
     disable_web_page_preview: bool = True,
     state: Optional[MutableMapping[str, Any]] = None,
+    resend_on_not_modified: bool = False,
 ) -> SafeEditResult:
     state_obj: MutableMapping[str, Any]
     if isinstance(state, MutableMapping):
@@ -434,13 +436,32 @@ async def safe_edit(
     except BadRequest as exc:
         lowered = str(exc).lower()
         if "message is not modified" in lowered:
-            log.info(
+            log_func = log.warning if resend_on_not_modified else log.info
+            log_func(
                 "safe_edit.noop",
-                extra={"meta": {"chat_id": chat_id, "message_id": message_id}},
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "last_text_hash": state_obj.get("last_text_hash"),
+                        "new_text_hash": text_hash,
+                        "last_markup_hash": state_obj.get("last_markup_hash"),
+                        "new_markup_hash": markup_hash,
+                    }
+                },
             )
             state_obj["last_text_hash"] = text_hash
             state_obj["last_markup_hash"] = markup_hash
-            return SafeEditResult(message_id=message_id, status="skipped")
+            if resend_on_not_modified:
+                if isinstance(state_obj, MutableMapping):
+                    state_obj["msg_id"] = None
+                resend = await _send_new()
+                return SafeEditResult(
+                    message_id=resend.message_id,
+                    status="resent",
+                    reason="not_modified",
+                )
+            return SafeEditResult(message_id=message_id, status="skipped", reason="not_modified")
         if "message to edit not found" in lowered:
             log.info(
                 "safe_edit.missing_message",
@@ -449,7 +470,7 @@ async def safe_edit(
             if isinstance(state_obj, MutableMapping):
                 state_obj["msg_id"] = None
             resend = await _send_new()
-            return SafeEditResult(message_id=resend.message_id, status="resent")
+            return SafeEditResult(message_id=resend.message_id, status="resent", reason="missing_msg")
         raise
 
 

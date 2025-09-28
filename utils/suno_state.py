@@ -100,6 +100,8 @@ class SunoState:
     card_message_id: Optional[int] = None
     card_text_hash: Optional[str] = None
     card_markup_hash: Optional[str] = None
+    card_chat_id: Optional[int] = None
+    last_card_hash: Optional[str] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -115,6 +117,8 @@ class SunoState:
             "card_message_id": self.card_message_id,
             "card_text_hash": self.card_text_hash,
             "card_markup_hash": self.card_markup_hash,
+            "card_chat_id": self.card_chat_id,
+            "last_card_hash": self.last_card_hash,
         }
 
 
@@ -138,6 +142,12 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     raw_markup_hash = payload.get("card_markup_hash")
     if isinstance(raw_markup_hash, str):
         state.card_markup_hash = raw_markup_hash
+    raw_chat_id = payload.get("card_chat_id")
+    if isinstance(raw_chat_id, int):
+        state.card_chat_id = raw_chat_id
+    raw_last_hash = payload.get("last_card_hash")
+    if isinstance(raw_last_hash, str):
+        state.last_card_hash = raw_last_hash
     return state
 
 
