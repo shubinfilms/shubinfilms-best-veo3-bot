@@ -351,6 +351,15 @@ def _hash_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _bust_cache_text(text: str) -> str:
+    """Append an invisible character to force Telegram to treat text as changed."""
+
+    suffix = "\u2060"
+    if text.endswith(suffix):
+        return text + suffix
+    return text + suffix
+
+
 async def safe_edit(
     bot: Any,
     chat_id: int,
@@ -453,14 +462,52 @@ async def safe_edit(
             state_obj["last_text_hash"] = text_hash
             state_obj["last_markup_hash"] = markup_hash
             if resend_on_not_modified:
-                if isinstance(state_obj, MutableMapping):
-                    state_obj["msg_id"] = None
-                resend = await _send_new()
-                return SafeEditResult(
-                    message_id=resend.message_id,
-                    status="resent",
-                    reason="not_modified",
-                )
+                busted_text = _bust_cache_text(text)
+                try:
+                    edited = await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=busted_text,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=disable_web_page_preview,
+                    )
+                except BadRequest as second_exc:
+                    lowered_second = str(second_exc).lower()
+                    if "message is not modified" not in lowered_second:
+                        raise
+                    try:
+                        await bot.delete_message(chat_id, message_id)
+                    except Exception as delete_exc:  # pragma: no cover - network issues
+                        log.warning(
+                            "safe_edit.delete_failed",
+                            extra={
+                                "meta": {
+                                    "chat_id": chat_id,
+                                    "message_id": message_id,
+                                    "error": str(delete_exc),
+                                }
+                            },
+                        )
+                    if isinstance(state_obj, MutableMapping):
+                        state_obj["msg_id"] = None
+                    resend = await _send_new()
+                    return SafeEditResult(
+                        message_id=resend.message_id,
+                        status="resent",
+                        reason="not_modified",
+                    )
+                else:
+                    new_id = getattr(edited, "message_id", message_id)
+                    if isinstance(state_obj, MutableMapping):
+                        state_obj["msg_id"] = new_id
+                    state_obj["last_text_hash"] = text_hash
+                    state_obj["last_markup_hash"] = markup_hash
+                    return SafeEditResult(
+                        message_id=new_id,
+                        status="edited",
+                        reason="bust",
+                    )
             return SafeEditResult(message_id=message_id, status="skipped", reason="not_modified")
         if "message to edit not found" in lowered:
             log.info(
