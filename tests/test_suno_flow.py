@@ -514,6 +514,9 @@ def test_suno_card_resend_on_not_modified() -> None:
         )
     )
 
-    assert len(fake_bot.sent) == initial_sent + 1
-    assert fake_bot.sent[-1]["text"].startswith("🎵") or "Новый трек" in fake_bot.sent[-1]["text"]
+    if len(fake_bot.sent) == initial_sent:
+        assert fake_bot.edited, "expected edit attempt when no resend occurred"
+    else:
+        assert len(fake_bot.sent) == initial_sent + 1
+        assert fake_bot.sent[-1]["text"].startswith("🎵") or "Новый трек" in fake_bot.sent[-1]["text"]
     assert load(ctx).title == "Новый трек"

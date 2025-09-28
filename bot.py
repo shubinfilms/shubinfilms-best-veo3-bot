@@ -102,6 +102,15 @@ from utils.suno_state import (
     set_style as set_suno_style,
     set_title as set_suno_title,
 )
+from utils.input_state import (
+    WaitInputState,
+    WaitKind,
+    clear_wait_state,
+    get_wait_state,
+    refresh_card_pointer,
+    set_wait_state,
+)
+from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
 
@@ -2512,22 +2521,32 @@ WAIT_SUNO_LYRICS = "WAIT_SUNO_LYRICS"
 IDLE_SUNO = "IDLE_SUNO"
 
 
+_WAIT_LIMITS = {
+    WaitKind.SUNO_TITLE: 300,
+    WaitKind.SUNO_STYLE: 500,
+    WaitKind.SUNO_LYRICS: 3000,
+    WaitKind.VEO_PROMPT: 3000,
+    WaitKind.MJ_PROMPT: 2000,
+}
+
+_WAIT_ALLOW_NEWLINES = {
+    WaitKind.SUNO_STYLE,
+    WaitKind.SUNO_LYRICS,
+    WaitKind.VEO_PROMPT,
+    WaitKind.MJ_PROMPT,
+}
+
+_WAIT_CLEAR_VALUES = {"-", "—"}
+
+_wait_log = logging.getLogger("wait-input")
+
+
 _SUNO_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _SUNO_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _sanitize_suno_input(value: str, *, allow_newlines: bool) -> str:
-    text = str(value or "")
-    text = _SUNO_BR_RE.sub("\n" if allow_newlines else " ", text)
-    text = _SUNO_TAG_RE.sub(" ", text)
-    text = html.unescape(text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not allow_newlines:
-        text = text.replace("\n", " ")
-    text = re.sub(r"[\t\f]+", " ", text)
-    text = re.sub(r" {2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return normalize_input(value, allow_newlines=allow_newlines)
 
 
 def _reset_suno_card_cache(state_dict: Dict[str, Any]) -> None:
@@ -2678,6 +2697,136 @@ def _suno_preview_for_log(value: Optional[str]) -> str:
 def _suno_field_from_waiting(waiting_field: str) -> Optional[str]:
     return _SUNO_WAIT_TO_FIELD.get(waiting_field)
 
+
+def _activate_wait_state(
+    *,
+    user_id: Optional[int],
+    chat_id: Optional[int],
+    card_msg_id: Optional[int],
+    kind: WaitKind,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    if user_id is None or chat_id is None:
+        return
+    payload_meta: Dict[str, Any] = dict(meta or {})
+    state = WaitInputState(
+        kind=kind,
+        card_msg_id=int(card_msg_id or 0),
+        chat_id=int(chat_id),
+        meta=payload_meta,
+    )
+    set_wait_state(user_id, state)
+
+
+def _wait_preview(text: str) -> str:
+    if not text:
+        return "—"
+    normalized = collapse_spaces(text.replace("\n", " "))
+    return truncate_text(normalized, 120) or "—"
+
+
+async def _apply_wait_state_input(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    wait_state: WaitInputState,
+    *,
+    user_id: Optional[int],
+) -> bool:
+    if message.text is None:
+        await message.reply_text("⚠️ Отправьте текстовое сообщение.")
+        return True
+
+    raw_text = message.text
+    stripped = raw_text.strip()
+    if stripped in _WAIT_CLEAR_VALUES:
+        normalized = ""
+    else:
+        allow_newlines = wait_state.kind in _WAIT_ALLOW_NEWLINES
+        normalized = normalize_input(raw_text, allow_newlines=allow_newlines)
+
+    limit = _WAIT_LIMITS.get(wait_state.kind, 3000)
+    cleaned = truncate_text(normalized, limit)
+    truncated = cleaned != normalized
+
+    _wait_log.info(
+        "WAIT_INPUT kind=%s len=%s truncated=%s", wait_state.kind.value, len(cleaned), truncated
+    )
+
+    preview_text = _wait_preview(cleaned)
+
+    handled = False
+
+    if wait_state.kind in {WaitKind.SUNO_TITLE, WaitKind.SUNO_STYLE, WaitKind.SUNO_LYRICS}:
+        suno_state_obj = load_suno_state(ctx)
+        before_title = suno_state_obj.title
+        before_style = suno_state_obj.style
+        before_lyrics = suno_state_obj.lyrics
+        if wait_state.kind == WaitKind.SUNO_TITLE:
+            if cleaned:
+                set_suno_title(suno_state_obj, cleaned)
+            else:
+                clear_suno_title(suno_state_obj)
+        elif wait_state.kind == WaitKind.SUNO_STYLE:
+            if cleaned:
+                set_suno_style(suno_state_obj, cleaned)
+            else:
+                clear_suno_style(suno_state_obj)
+        else:
+            if cleaned:
+                set_suno_lyrics(suno_state_obj, cleaned)
+                suno_state_obj.mode = "lyrics"
+            else:
+                clear_suno_lyrics(suno_state_obj)
+        save_suno_state(ctx, suno_state_obj)
+        s = state(ctx)
+        s["suno_state"] = suno_state_obj.to_dict()
+        s["suno_waiting_state"] = IDLE_SUNO
+        msg_id = await refresh_suno_card(ctx, wait_state.chat_id, s, price=PRICE_SUNO)
+        if user_id is not None:
+            if isinstance(msg_id, int):
+                refresh_card_pointer(user_id, msg_id)
+            else:
+                state_card = s.get("last_ui_msg_id_suno")
+                if isinstance(state_card, int):
+                    refresh_card_pointer(user_id, state_card)
+        after_title = suno_state_obj.title
+        after_style = suno_state_obj.style
+        after_lyrics = suno_state_obj.lyrics
+        _wait_log.info(
+            "WAIT_INPUT_SUNO kind=%s changed=%s", wait_state.kind.value,
+            (
+                (before_title or "") != (after_title or "")
+                or (before_style or "") != (after_style or "")
+                or (before_lyrics or "") != (after_lyrics or "")
+            ),
+        )
+        handled = True
+    elif wait_state.kind == WaitKind.VEO_PROMPT:
+        s = state(ctx)
+        s["last_prompt"] = cleaned or None
+        s["_last_text_veo"] = None
+        await show_veo_card(wait_state.chat_id, ctx)
+        if user_id is not None:
+            card_id = s.get("last_ui_msg_id_veo")
+            if isinstance(card_id, int):
+                refresh_card_pointer(user_id, card_id)
+        handled = True
+    elif wait_state.kind == WaitKind.MJ_PROMPT:
+        s = state(ctx)
+        s["last_prompt"] = cleaned or None
+        s["_last_text_mj"] = None
+        await show_mj_prompt_card(wait_state.chat_id, ctx)
+        if user_id is not None:
+            card_id = s.get("last_ui_msg_id_mj")
+            if isinstance(card_id, int):
+                refresh_card_pointer(user_id, card_id)
+        handled = True
+
+    if handled:
+        await message.reply_text(f'Сейчас: "{preview_text}"')
+        if user_id is not None:
+            clear_wait_state(user_id)
+    return handled
 
 async def _handle_suno_waiting_input(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -7387,14 +7536,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("mode:"):
         selected_mode = data.split(":", 1)[1]
         s["mode"] = selected_mode
+        chat = update.effective_chat
+        chat_id_val = chat.id if chat else None
+        user_obj = update.effective_user
+        uid_val = user_obj.id if user_obj else None
+        if uid_val is not None:
+            clear_wait_state(uid_val)
         if selected_mode in ("veo_text_fast", "veo_text_quality"):
             s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
             await veo_entry(update.effective_chat.id, ctx)
+            card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id_val,
+                card_msg_id=card_id,
+                kind=WaitKind.VEO_PROMPT,
+                meta={"mode": selected_mode},
+            )
             await q.message.reply_text("✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.")
             return
         if selected_mode == "veo_photo":
             s["aspect"] = "9:16"; s["model"] = "veo3_fast"
             await veo_entry(update.effective_chat.id, ctx)
+            card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id_val,
+                card_msg_id=card_id,
+                kind=WaitKind.VEO_PROMPT,
+                meta={"mode": selected_mode},
+            )
             await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
             return
         if selected_mode == "chat":
@@ -7406,6 +7577,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_last_wait_ts"] = 0.0
             s["last_mj_task_id"] = None
             await mj_entry(update.effective_chat.id, ctx)
+            card_id = s.get("last_ui_msg_id_mj") if isinstance(s.get("last_ui_msg_id_mj"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id_val,
+                card_msg_id=card_id,
+                kind=WaitKind.MJ_PROMPT,
+                meta={"aspect": s.get("aspect")},
+            )
             return
         if selected_mode == "banana":
             s["banana_images"] = []; s["last_prompt"] = None
@@ -7421,6 +7600,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         payload = parts[2] if len(parts) > 2 else ""
         chat_id = chat.id
         current_aspect = "9:16" if s.get("aspect") == "9:16" else "16:9"
+        user_obj = update.effective_user
+        uid_val = user_obj.id if user_obj else None
 
         if action == "aspect":
             if s.get("mj_generating"):
@@ -7429,11 +7610,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["aspect"] = new_aspect
             s["last_prompt"] = None
             await show_mj_prompt_card(chat_id, ctx)
+            card_id = s.get("last_ui_msg_id_mj") if isinstance(s.get("last_ui_msg_id_mj"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id,
+                card_msg_id=card_id,
+                kind=WaitKind.MJ_PROMPT,
+                meta={"aspect": new_aspect},
+            )
             return
 
         if action == "change_format":
             if s.get("mj_generating"):
                 await q.message.reply_text("⏳ Дождитесь завершения текущей генерации."); return
+            if uid_val is not None:
+                clear_wait_state(uid_val)
             await show_mj_format_card(chat_id, ctx)
             return
 
@@ -7443,6 +7634,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_generating"] = False
             s["last_mj_task_id"] = None
             s["mj_last_wait_ts"] = 0.0
+            if uid_val is not None:
+                clear_wait_state(uid_val)
             mid = s.get("last_ui_msg_id_mj")
             if mid:
                 try:
@@ -7552,6 +7745,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["mj_last_wait_ts"] = 0.0
             s["last_mj_task_id"] = None
             await show_mj_prompt_card(chat_id, ctx)
+            card_id = s.get("last_ui_msg_id_mj") if isinstance(s.get("last_ui_msg_id_mj"), int) else None
+            _activate_wait_state(
+                user_id=uid_val,
+                chat_id=chat_id,
+                card_msg_id=card_id,
+                kind=WaitKind.MJ_PROMPT,
+                meta={"aspect": s.get("aspect")},
+            )
             await q.message.reply_text("✍️ Пришлите новый промпт для Midjourney.")
             return
 
@@ -7636,6 +7837,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = chat.id if chat else None
         user = update.effective_user
         uid = user.id if user else None
+        if uid is not None:
+            clear_wait_state(uid)
         s["mode"] = "suno"
         suno_state_obj = load_suno_state(ctx)
         s["suno_state"] = suno_state_obj.to_dict()
@@ -7682,6 +7885,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 card_msg_id=card_msg_id,
                 user_id=uid,
             )
+            wait_kind_map = {
+                WAIT_SUNO_TITLE: WaitKind.SUNO_TITLE,
+                WAIT_SUNO_STYLE: WaitKind.SUNO_STYLE,
+                WAIT_SUNO_LYRICS: WaitKind.SUNO_LYRICS,
+            }
+            wait_kind = wait_kind_map.get(waiting_state)
+            if wait_kind is not None:
+                _activate_wait_state(
+                    user_id=uid,
+                    chat_id=target_chat,
+                    card_msg_id=card_msg_id,
+                    kind=wait_kind,
+                    meta={"field": field},
+                )
             return
 
         if action == "toggle" and argument == "instrumental":
@@ -7923,6 +8140,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = user.id if user else None
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
+
+    wait_state_obj = get_wait_state(user_id) if user_id is not None else None
+    if wait_state_obj:
+        handled_wait = await _apply_wait_state_input(
+            ctx,
+            msg,
+            wait_state_obj,
+            user_id=user_id,
+        )
+        if handled_wait:
+            return
 
     waiting_field = s.get("suno_waiting_state")
     waiting_for_input = _chat_state_waiting_input(s)
