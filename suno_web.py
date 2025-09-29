@@ -405,11 +405,16 @@ async def suno_callback(
     request: Request,
     x_callback_secret: Optional[str] = Header(default=None, alias="X-Callback-Secret"),
 ):
-    provided = x_callback_secret
-    if not SUNO_CALLBACK_SECRET or provided != SUNO_CALLBACK_SECRET:
-        log.warning("forbidden callback", extra={"meta": {"provided": bool(provided)}})
-        suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
-        return Response(status_code=403)
+    expected_secret = (SUNO_CALLBACK_SECRET or "").strip()
+    provided = x_callback_secret or request.headers.get("X-Callback-Token")
+    if expected_secret:
+        if provided != expected_secret:
+            log.warning(
+                "forbidden callback",
+                extra={"meta": {"provided": bool(provided), "has_secret": True}},
+            )
+            suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
+            return Response(status_code=403)
 
     body = await request.body()
     if len(body) > _MAX_JSON_BYTES:
@@ -438,10 +443,10 @@ async def suno_callback(
 
     normalized_payload, flat_payload, key_list = _normalize_callback_payload(payload)
     envelope = CallbackEnvelope.model_validate(normalized_payload)
+    data_map: Mapping[str, Any] = envelope.data or {}
     task = SunoTask.from_envelope(envelope)
     items_count = len(task.items or [])
     callback_type = (task.callback_type or "").lower() or (_callback_status(data_map) or "unknown").lower()
-    data_map: Mapping[str, Any] = envelope.data or {}
     payload_req_id = _first_identifier(data_map, ("req_id", "requestId", "request_id"))
     if not payload_req_id:
         payload_req_id = _first_identifier(flat_payload, ("req_id", "requestId", "request_id"))

@@ -650,7 +650,7 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
     assert attempts["count"] == 3
     assert debit_calls["count"] == 1
     assert status_texts and status_texts[0] == "⏳ Sending request…"
-    assert edited_messages and edited_messages[-1].startswith("✅ Списано")
+    assert edited_messages and edited_messages[-1].startswith("✅ Task created")
     assert not refunds
 
 
