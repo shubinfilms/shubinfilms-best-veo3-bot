@@ -114,3 +114,38 @@ def test_switching_engines_resets_prompts() -> None:
     final_state = bot_module.state(ctx)
     assert final_state["image_engine"] == "mj"
     assert final_state.get("last_prompt") is None
+
+
+def test_suno_disabled_shows_message(monkeypatch):
+    bot = bot_module
+    ctx = SimpleNamespace(bot=FakeBot(), user_data={})
+    messages: list[str] = []
+
+    async def capture_notify(_ctx, _chat_id, text: str, **_kwargs):
+        messages.append(text)
+
+    async def async_noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_suno_notify", capture_notify)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", False, raising=False)
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+
+    def _fail_debit(*_args, **_kwargs):  # pragma: no cover - should not be called
+        raise AssertionError("debit_try must not be invoked when Suno is unavailable")
+
+    monkeypatch.setattr(bot, "debit_try", _fail_debit)
+
+    _run(
+        bot._launch_suno_generation(
+            chat_id=555,
+            ctx=ctx,
+            params={"instrumental": True},
+            user_id=4242,
+            reply_to=None,
+            trigger="test",
+        )
+    )
+
+    assert messages and messages[-1] == "Suno временно недоступен"

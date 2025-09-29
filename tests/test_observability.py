@@ -95,19 +95,22 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
     from suno import client as client_module
 
     monkeypatch.setattr(client_module.time, "sleep", lambda _: None)
-    responses = []
+    response_list = []
     for status in status_codes:
         if status == 200:
-            responses.append({"status_code": 200, "json": {"task_id": "ok"}})
+            response_list.append({"status_code": 200, "json": {"task_id": "ok"}})
         else:
-            responses.append({"status_code": status, "json": {"message": "err"}})
-    requests_mock.post("https://example.com/api/v1/generate/add-vocals", responses)
+            response_list.append({"status_code": status, "json": {"message": "err"}})
+    requests_mock.post(
+        "https://example.com/api/v1/generate/add-vocals",
+        response_list=response_list,
+    )
     suno_client = SunoClient(base_url="https://example.com", token="tkn", max_retries=3)
     if status_codes[0] == 403:
         with pytest.raises(SunoAPIError):
-            suno_client.create_music({"instrumental": False})
+            suno_client.create_music({"instrumental": False, "userId": 7})
     else:
-        payload, version = suno_client.create_music({"instrumental": False})
+        payload, version = suno_client.create_music({"instrumental": False, "userId": 7})
         assert payload["task_id"] == "ok"
         assert version == "v5"
     assert requests_mock.call_count == expected_calls

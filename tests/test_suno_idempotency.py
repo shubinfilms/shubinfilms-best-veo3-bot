@@ -48,6 +48,7 @@ def test_duplicate_req_id_skips_enqueue(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(bot_module, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot_module, "_suno_cooldown_remaining", lambda uid: 0)
     monkeypatch.setattr(bot_module, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot_module, "SUNO_MODE_AVAILABLE", True, raising=False)
     monkeypatch.setattr(
         bot_module,
         "build_suno_generation_payload",

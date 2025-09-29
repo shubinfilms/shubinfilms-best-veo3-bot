@@ -163,6 +163,7 @@ from settings import (
     SUNO_ENABLED as SETTINGS_SUNO_ENABLED,
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
+    SUNO_READY,
 )
 from suno.service import SunoService, SunoAPIError
 from suno.client import SunoServerError
@@ -719,7 +720,7 @@ SUNO_STATUS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_STATUS_PATH)
 SUNO_EXTEND_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_EXTEND_PATH)
 SUNO_LYRICS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_LYRICS_PATH)
 SUNO_PRICE = SUNO_CONFIG.price
-SUNO_MODE_AVAILABLE = bool(SETTINGS_SUNO_ENABLED and SETTINGS_SUNO_API_TOKEN)
+SUNO_MODE_AVAILABLE = bool(SUNO_READY)
 SUNO_POLL_INTERVAL = 3.0
 SUNO_POLL_TIMEOUT = float(SUNO_CONFIG.timeout_sec)
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"

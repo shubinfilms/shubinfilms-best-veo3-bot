@@ -34,7 +34,7 @@ os.environ.setdefault("SUNO_CALLBACK_URL", "https://callback.local/suno-callback
 import suno_web
 from suno_web import app
 import suno.tempfiles as tempfiles
-from suno.client import SunoAPIError, SunoClient, SunoClientError
+from suno.client import EnqueueResult, SunoAPIError, SunoClient, SunoClientError
 from suno.service import SunoService
 from suno.schemas import CallbackEnvelope, SunoTask
 
@@ -146,16 +146,25 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
         "https://api.example.com/api/v1/generate/add-vocals",
         json={"task_id": "task-new"},
     )
-    payload, version = client.create_music({"prompt": "hello", "style": "pop", "instrumental": False, "model": "V5"})
+    payload, version = client.create_music(
+        {
+            "prompt": "hello",
+            "style": "pop",
+            "instrumental": False,
+            "model": "V5",
+            "userId": 777,
+        }
+    )
     assert version == "v5"
     assert payload["task_id"] == "task-new"
     assert requests_mock.call_count == 1
     sent = requests_mock.last_request.json()
-    assert sent["model"] == "suno-v5"
-    assert sent["input_text"] == "hello"
+    assert sent["model"] == "V5"
+    assert sent["prompt"] == "hello"
     assert sent["instrumental"] is False
-    assert sent["style"] == "pop"
-    assert sent["callbackUrl"] == "https://callback.local/suno-callback"
+    assert sent["customMode"] == "vocals"
+    assert sent["callBackUrl"] == "https://callback.local/suno-callback"
+    assert sent["userId"] == "777"
 
 
 def test_payload_shape_v5(monkeypatch, requests_mock):
@@ -165,12 +174,20 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
         "https://api.example.com/api/v1/generate/add-instrumental",
         json={"task_id": "task-shape"},
     )
-    client.create_music({"title": "Title", "prompt": "lyrics", "instrumental": True})
+    client.create_music(
+        {
+            "title": "Title",
+            "prompt": "lyrics",
+            "instrumental": True,
+            "userId": "88",
+        }
+    )
     body = requests_mock.last_request.json()
-    assert body["model"] == "suno-v5"
-    assert body["input_text"] == "lyrics"
+    assert body["model"] == "V5"
+    assert body["prompt"] == "lyrics"
     assert body["title"] == "Title"
     assert body["instrumental"] is True
+    assert body["customMode"] == "instrumental"
 
 
 def test_payload_uses_default_prompt(monkeypatch, requests_mock):
@@ -180,10 +197,11 @@ def test_payload_uses_default_prompt(monkeypatch, requests_mock):
         "https://api.example.com/api/v1/generate/add-vocals",
         json={"task_id": "task-default"},
     )
-    client.create_music({"instrumental": False})
+    client.create_music({"instrumental": False, "userId": 100})
     body = requests_mock.last_request.json()
-    assert body["input_text"] == "Untitled track"
+    assert body["prompt"] == "Untitled track"
     assert body["instrumental"] is False
+    assert body["customMode"] == "vocals"
 
 
 def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
@@ -195,7 +213,7 @@ def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
         json={"message": "not found"},
     )
     with pytest.raises(SunoAPIError) as exc:
-        client.create_music({"prompt": "hello", "instrumental": False})
+        client.create_music({"prompt": "hello", "instrumental": False, "userId": 1})
     assert exc.value.status == 404
     assert exc.value.api_version == "v5"
     assert isinstance(exc.value, SunoClientError)
@@ -210,7 +228,7 @@ def test_suno_v5_enqueue_code_404_raises(monkeypatch, requests_mock):
         json={"code": 404, "message": "not found"},
     )
     with pytest.raises(SunoAPIError) as exc:
-        client.create_music({"prompt": "fallback"})
+        client.create_music({"prompt": "fallback", "userId": "42"})
     assert exc.value.api_version == "v5"
     assert isinstance(exc.value, SunoClientError)
     assert requests_mock.call_count == 1
@@ -239,10 +257,10 @@ def test_status_includes_request_id(monkeypatch, requests_mock):
         "https://api.example.com/api/v1/generate/record-info",
         json={"status": "queued"},
     )
-    client.get_task_status("abc", req_id="req-1")
+    client.get_task_status("req-1", task_id="abc")
     qs = {k.lower(): v for k, v in requests_mock.last_request.qs.items()}
     assert qs.get("taskid") == ["abc"]
-    assert qs.get("requestid") == ["req-1"]
+    assert qs.get("req_id") == ["req-1"]
 
 
 def test_suno_wav_helpers(monkeypatch, requests_mock):
@@ -334,24 +352,6 @@ def test_callback_accepts_header_token(monkeypatch):
     assert received["req_id"] == "req-header"
 
 
-def test_callback_accepts_query_token(monkeypatch):
-    received = {}
-
-    def fake_handle(task, req_id=None):
-        received["task"] = task
-        received["req_id"] = req_id
-
-    monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
-    client = _client()
-    response = client.post(
-        "/suno-callback?secret=secret-token",
-        json=_build_payload("query-token"),
-    )
-    assert response.status_code == 200
-    assert response.json()["ok"] is True
-    assert received["task"].task_id == "query-token"
-
-
 def test_callback_rejects_missing_token():
     client = _client()
     response = client.post(
@@ -359,7 +359,7 @@ def test_callback_rejects_missing_token():
         json=_build_payload(),
     )
     assert response.status_code == 403
-    assert response.json()["error"] == "forbidden"
+    assert response.content == b""
 
 
 def test_callback_rejects_wrong_token():
@@ -370,7 +370,7 @@ def test_callback_rejects_wrong_token():
         json=_build_payload(),
     )
     assert response.status_code == 403
-    assert response.json()["error"] == "forbidden"
+    assert response.content == b""
 
 
 def test_duplicate_callbacks_processed_once(monkeypatch):
@@ -463,9 +463,21 @@ def test_suno_service_records_request_id(monkeypatch):
         def __init__(self):
             self.captured_req_id = None
 
+        def enqueue_music(self, **kwargs):
+            self.captured_req_id = kwargs.get("req_id")
+            body = {"task_id": "task-req", "req_id": self.captured_req_id}
+            return EnqueueResult(
+                body=body,
+                req_id=self.captured_req_id,
+                task_id="task-req",
+                status="ok",
+                path="/api/v1/generate/add-vocals",
+                custom_mode="vocals",
+            )
+
         def create_music(self, payload, *, req_id=None):
-            self.captured_req_id = req_id
-            return {"task_id": "task-req"}, "v5"
+            result = self.enqueue_music(req_id=req_id)
+            return result.body, "v5"
 
     service = SunoService(client=FakeClient(), redis=None, telegram_token="dummy")
     task = service.start_music(
@@ -496,8 +508,21 @@ def test_suno_service_records_request_id(monkeypatch):
 )
 def test_suno_service_extracts_enqueue_ids(response, expected_req, expected_task):
     class FakeClient:
+        def enqueue_music(self, **kwargs):
+            req_id = kwargs.get("req_id")
+            task_id = response.get("task_id") or response.get("taskId")
+            return EnqueueResult(
+                body=response,
+                req_id=response.get("req_id") or response.get("requestId") or req_id,
+                task_id=task_id,
+                status=str(response.get("status") or response.get("code") or "ok"),
+                path="/api/v1/generate/add-vocals",
+                custom_mode="vocals",
+            )
+
         def create_music(self, payload, *, req_id=None):
-            return response, "v5"
+            result = self.enqueue_music(req_id=req_id)
+            return result.body, "v5"
 
     service = SunoService(client=FakeClient(), redis=None, telegram_token="dummy")
     task = service.start_music(
@@ -548,8 +573,9 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
 
     assert task.task_id == "task-flow"
     sent_body = requests_mock.last_request.json()
-    assert sent_body["input_text"] == "Test instrumental track"
+    assert sent_body["prompt"] == "Test instrumental track"
     assert sent_body["instrumental"] is True
+    assert sent_body["customMode"] == "instrumental"
 
     envelope = CallbackEnvelope(
         code=200,
@@ -580,8 +606,21 @@ def test_callback_restores_missing_req_id(monkeypatch):
         def __init__(self, task_id: str):
             self.task_id = task_id
 
+        def enqueue_music(self, **kwargs):
+            req_id = kwargs.get("req_id")
+            body = {"task_id": self.task_id, "req_id": req_id}
+            return EnqueueResult(
+                body=body,
+                req_id=req_id,
+                task_id=self.task_id,
+                status="ok",
+                path="/api/v1/generate/add-vocals",
+                custom_mode="vocals",
+            )
+
         def create_music(self, payload, *, req_id=None):
-            return {"task_id": self.task_id}, "legacy"
+            result = self.enqueue_music(req_id=req_id)
+            return result.body, "legacy"
 
     fake_client = FakeClient("restore-task")
     service = SunoService(client=fake_client, redis=None, telegram_token="dummy")
@@ -599,7 +638,8 @@ def test_callback_restores_missing_req_id(monkeypatch):
 
     client = _client()
     response = client.post(
-        "/suno-callback?token=secret-token",
+        "/suno-callback",
+        headers={"X-Callback-Secret": "secret-token"},
         json=_build_payload("restore-task"),
     )
     assert response.status_code == 200
@@ -679,6 +719,7 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     monkeypatch.setattr(bot, "rds", fake_redis)
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
     bot.SUNO_PER_USER_COOLDOWN_SEC = 0
 
     async def async_noop(*args, **kwargs):
@@ -803,6 +844,7 @@ def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
     monkeypatch.setattr(bot, "rds", fake_redis)
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
     bot.SUNO_PER_USER_COOLDOWN_SEC = 0
 
     async def async_noop(*args, **kwargs):
@@ -899,6 +941,7 @@ def test_launch_suno_failure_marks_refund(monkeypatch, bot_module):
     monkeypatch.setattr(bot, "rds", fake_redis)
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
     bot.SUNO_PER_USER_COOLDOWN_SEC = 0
 
     async def async_noop(*args, **kwargs):
@@ -984,6 +1027,7 @@ def test_launch_suno_duplicate_req_id_no_double_charge(monkeypatch, bot_module):
     monkeypatch.setattr(bot, "rds", fake_redis)
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
     bot.SUNO_PER_USER_COOLDOWN_SEC = 0
 
     async def async_noop(*args, **kwargs):
