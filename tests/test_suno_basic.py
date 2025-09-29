@@ -104,8 +104,8 @@ def _setup_client_env(monkeypatch) -> None:
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_URL", "https://callback.local/suno-callback", raising=False)
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_SECRET", "secret-token", raising=False)
     monkeypatch.setattr("suno.client.SUNO_MODEL", "suno-v5", raising=False)
-    monkeypatch.setattr("suno.client.SUNO_GEN_PATH", "/api/v1/suno/generate/music", raising=False)
-    monkeypatch.setattr("suno.client.SUNO_TASK_STATUS_PATH", "/api/v1/suno/record-info", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_GEN_PATH", "/api/v1/generate/add-vocals", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_TASK_STATUS_PATH", "/api/v1/generate/record-info", raising=False)
     monkeypatch.setattr("suno.client.SUNO_WAV_PATH", "/api/v1/wav/generate", raising=False)
     monkeypatch.setattr("suno.client.SUNO_WAV_INFO_PATH", "/api/v1/wav/record-info", raising=False)
     monkeypatch.setattr("suno.client.SUNO_MP4_PATH", "/api/v1/mp4/generate", raising=False)
@@ -122,7 +122,7 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/suno/generate/music",
+        "https://api.example.com/api/v1/generate/add-vocals",
         json={"task_id": "task-new"},
     )
     payload, version = client.create_music({"prompt": "hello", "style": "pop", "instrumental": False, "model": "V5"})
@@ -140,7 +140,10 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
 def test_payload_shape_v5(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
-    requests_mock.post("https://api.example.com/api/v1/suno/generate/music", json={"task_id": "task-shape"})
+    requests_mock.post(
+        "https://api.example.com/api/v1/generate/add-instrumental",
+        json={"task_id": "task-shape"},
+    )
     client.create_music({"title": "Title", "prompt": "lyrics", "instrumental": True})
     body = requests_mock.last_request.json()
     assert body["model"] == "suno-v5"
@@ -152,7 +155,10 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
 def test_payload_uses_default_prompt(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
-    requests_mock.post("https://api.example.com/api/v1/suno/generate/music", json={"task_id": "task-default"})
+    requests_mock.post(
+        "https://api.example.com/api/v1/generate/add-vocals",
+        json={"task_id": "task-default"},
+    )
     client.create_music({"instrumental": False})
     body = requests_mock.last_request.json()
     assert body["input_text"] == "Untitled track"
@@ -163,7 +169,7 @@ def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/suno/generate/music",
+        "https://api.example.com/api/v1/generate/add-vocals",
         status_code=404,
         json={"message": "not found"},
     )
@@ -179,7 +185,7 @@ def test_suno_v5_enqueue_code_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/suno/generate/music",
+        "https://api.example.com/api/v1/generate/add-vocals",
         json={"code": 404, "message": "not found"},
     )
     with pytest.raises(SunoAPIError) as exc:
@@ -193,7 +199,7 @@ def test_suno_status_v5_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.get(
-        "https://api.example.com/api/v1/suno/record-info",
+        "https://api.example.com/api/v1/generate/record-info",
         status_code=404,
         json={"message": "not found"},
     )
@@ -208,7 +214,10 @@ def test_suno_status_v5_404_raises(monkeypatch, requests_mock):
 def test_status_includes_request_id(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
-    requests_mock.get("https://api.example.com/api/v1/suno/record-info", json={"status": "queued"})
+    requests_mock.get(
+        "https://api.example.com/api/v1/generate/record-info",
+        json={"status": "queued"},
+    )
     client.get_task_status("abc", req_id="req-1")
     qs = {k.lower(): v for k, v in requests_mock.last_request.qs.items()}
     assert qs.get("taskid") == ["abc"]
@@ -459,7 +468,7 @@ def test_suno_service_records_request_id(monkeypatch):
 def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     requests_mock.post(
-        "https://api.example.com/api/v1/suno/generate/music",
+        "https://api.example.com/api/v1/generate/add-instrumental",
         json={"task_id": "task-flow"},
     )
     service = SunoService(client=SunoClient(base_url="https://api.example.com", token="token"), redis=None, telegram_token="dummy")

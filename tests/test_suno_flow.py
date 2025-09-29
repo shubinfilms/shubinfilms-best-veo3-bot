@@ -741,8 +741,8 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
     assert attempts["count"] == bot._SUNO_ENQUEUE_MAX_ATTEMPTS
     assert sum(sleeps) <= bot._SUNO_ENQUEUE_MAX_DELAY + 1e-6
     assert status_texts and status_texts[0] == "⏳ Sending request…"
-    assert edited_messages and edited_messages[-1].startswith("⚠️ Generation failed")
-    assert refunds and refunds[-1]["user_message"].startswith("⚠️ Generation failed")
+    assert edited_messages and edited_messages[-1] == "⚠️ Generation failed: boom"
+    assert refunds and refunds[-1]["user_message"].startswith("⚠️ Generation failed: boom")
 
 
 def test_suno_enqueue_dedupes_failed_req(monkeypatch) -> None:
