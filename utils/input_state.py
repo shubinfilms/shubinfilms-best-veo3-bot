@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Literal
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import time
 
 from settings import REDIS_PREFIX
 
-from utils.telegram_utils import is_command_text
+from utils.telegram_utils import should_capture_to_prompt
 
 try:  # pragma: no cover - optional redis backend
     from redis_utils import rds as _redis
@@ -28,6 +29,25 @@ class WaitKind(str, Enum):
     SUNO_STYLE = "suno_style"
     SUNO_LYRICS = "suno_lyrics"
     MJ_PROMPT = "mj_prompt"
+
+
+def classify_wait_input(text: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Return whether ``text`` should be captured together with ignore reason."""
+
+    if text is None:
+        return False, "none"
+    stripped = text.strip()
+    stripped_for_match = stripped
+    if "<" in stripped_for_match and ">" in stripped_for_match:
+        cleaned = re.sub(r"<[^>]*>", " ", stripped_for_match)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned:
+            stripped_for_match = cleaned
+    if not stripped:
+        return False, "empty"
+    if not should_capture_to_prompt(stripped_for_match):
+        return False, "command_label"
+    return True, None
 
 
 @dataclass

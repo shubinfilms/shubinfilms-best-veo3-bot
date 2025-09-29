@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
 import random
+import re
 from asyncio.subprocess import PIPE
 from contextlib import suppress
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, MutableMapping, Optional, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -28,6 +31,109 @@ _PERM_ERROR_CODES = {400, 403, 404}
 
 _DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
 _HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL
+
+_ALLOWED_HTML_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "blockquote", "tg-spoiler"}
+_ALLOWED_HTML_ATTRS = {"a": {"href"}}
+_HTML_REMAP = {"strong": "b", "em": "i"}
+
+
+class _TelegramHTMLSanitizer(HTMLParser):
+    """Sanitize limited HTML subset supported by Telegram."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._parts: list[str] = []
+        self._stack: list[str] = []
+
+    def _append(self, value: str) -> None:
+        if value:
+            self._parts.append(value)
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        normalized = _HTML_REMAP.get(tag.lower(), tag.lower())
+        if normalized == "br":
+            self._append("\n")
+            return
+        if normalized not in _ALLOWED_HTML_TAGS:
+            return
+        filtered = []
+        allowed_attrs = _ALLOWED_HTML_ATTRS.get(normalized, set())
+        for name, value in attrs:
+            if value is None:
+                continue
+            attr_name = (name or "").lower()
+            if attr_name not in allowed_attrs:
+                continue
+            if normalized == "a" and value.lower().startswith("javascript:"):
+                continue
+            filtered.append((attr_name, value))
+        attr_payload = "".join(
+            f' {name}="{html.escape(value, quote=True)}"' for name, value in filtered
+        )
+        self._append(f"<{normalized}{attr_payload}>")
+        self._stack.append(normalized)
+
+    def handle_startendtag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        normalized = _HTML_REMAP.get(tag.lower(), tag.lower())
+        if normalized == "br":
+            self._append("\n")
+            return
+        # Treat <tag/> as <tag></tag> when allowed.
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        normalized = _HTML_REMAP.get(tag.lower(), tag.lower())
+        if normalized == "br":
+            return
+        if normalized not in _ALLOWED_HTML_TAGS:
+            return
+        while self._stack:
+            top = self._stack.pop()
+            self._append(f"</{top}>")
+            if top == normalized:
+                break
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if not data:
+            return
+        self._append(html.escape(data))
+
+    def handle_entityref(self, name: str) -> None:  # type: ignore[override]
+        self._append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:  # type: ignore[override]
+        self._append(f"&#{name};")
+
+    def get_text(self) -> str:
+        return "".join(self._parts)
+
+
+def _should_sanitize(parse_mode: Any) -> bool:
+    if parse_mode is None:
+        return False
+    if isinstance(parse_mode, ParseMode):
+        return parse_mode == ParseMode.HTML
+    if isinstance(parse_mode, str):
+        return parse_mode.upper() == "HTML"
+    return False
+
+
+def sanitize_html(text: str) -> str:
+    """Convert HTML into Telegram-safe subset."""
+
+    if not text:
+        return ""
+    normalized = text.replace("\r", "")
+    normalized = re.sub(r"<br\s*/?>", "\n", normalized, flags=re.IGNORECASE)
+    parser = _TelegramHTMLSanitizer()
+    try:
+        parser.feed(normalized)
+        parser.close()
+    except Exception:  # pragma: no cover - defensive fallback
+        log.exception("sanitize_html.failure")
+        return html.escape(normalized)
+    return parser.get_text()
 
 
 def build_hub_text(user_balance: int) -> str:
@@ -110,6 +216,12 @@ async def safe_send(
     **kwargs: Any,
 ) -> Any:
     """Call a Telegram Bot API coroutine with retry handling."""
+
+    if _should_sanitize(kwargs.get("parse_mode")) and "text" in kwargs:
+        text_value = kwargs.get("text")
+        if text_value is not None:
+            kwargs = dict(kwargs)
+            kwargs["text"] = sanitize_html(str(text_value))
 
     attempt = 0
     while attempt < max_attempts:
@@ -372,6 +484,11 @@ async def safe_edit(
     state: Optional[MutableMapping[str, Any]] = None,
     resend_on_not_modified: bool = False,
 ) -> SafeEditResult:
+    if _should_sanitize(parse_mode):
+        text_to_send = sanitize_html(text)
+    else:
+        text_to_send = text
+
     state_obj: MutableMapping[str, Any]
     if isinstance(state, MutableMapping):
         state_obj = state
@@ -386,7 +503,7 @@ async def safe_edit(
         except AttributeError:
             markup_payload = reply_markup
     markup_json = json.dumps(markup_payload, ensure_ascii=False, sort_keys=True)
-    text_hash = _hash_value(text)
+    text_hash = _hash_value(text_to_send)
     markup_hash = _hash_value(markup_json)
 
     last_text_hash = state_obj.get("last_text_hash") if isinstance(state_obj, MutableMapping) else None
@@ -412,7 +529,7 @@ async def safe_edit(
     async def _send_new() -> SafeEditResult:
         sent = await bot.send_message(
             chat_id=chat_id,
-            text=text,
+            text=text_to_send,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
             disable_web_page_preview=disable_web_page_preview,
@@ -431,7 +548,7 @@ async def safe_edit(
         edited = await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text=text,
+            text=text_to_send,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
             disable_web_page_preview=disable_web_page_preview,
@@ -462,7 +579,7 @@ async def safe_edit(
             state_obj["last_text_hash"] = text_hash
             state_obj["last_markup_hash"] = markup_hash
             if resend_on_not_modified:
-                busted_text = _bust_cache_text(text)
+                busted_text = _bust_cache_text(text_to_send)
                 try:
                     edited = await bot.edit_message_text(
                         chat_id=chat_id,
@@ -616,4 +733,5 @@ __all__ = [
     "build_inline_kb",
     "safe_edit",
     "SafeEditResult",
+    "sanitize_html",
 ]

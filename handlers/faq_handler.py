@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes
 
 from keyboards import CB_FAQ_PREFIX, faq_keyboard
 from texts import FAQ_INTRO, FAQ_SECTIONS
-from utils.safe_send import safe_send
+from telegram_utils import safe_edit, safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +52,14 @@ async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:  # pragma: no cover - metrics should not break flow
             logger.exception("faq.root_metric_failed")
     await safe_send(
-        context.bot,
-        message.chat_id,
-        _markdown_to_html(FAQ_INTRO),
+        context.bot.send_message,
+        method_name="send_message",
+        kind="faq",
+        chat_id=message.chat_id,
+        text=_markdown_to_html(FAQ_INTRO),
         reply_markup=faq_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -79,7 +83,15 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         chat = query.message.chat if query.message else update.effective_chat
         if chat is not None:
-            await safe_send(context.bot, chat.id, _markdown_to_html("📋 Главное меню"))
+            await safe_send(
+                context.bot.send_message,
+                method_name="send_message",
+                kind="faq",
+                chat_id=chat.id,
+                text=_markdown_to_html("📋 Главное меню"),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         return
 
     text = FAQ_SECTIONS.get(key, "Раздел не найден.")
@@ -90,11 +102,21 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.exception("faq.section_metric_failed | section=%s", key)
 
     await query.answer()
-    await query.edit_message_text(
+    message = query.message
+    if message is None:
+        return
+    chat = message.chat
+    if chat is None:
+        return
+    await safe_edit(
+        context.bot,
+        chat.id,
+        message.message_id,
         _markdown_to_html(text),
-        reply_markup=faq_keyboard(),
+        faq_keyboard(),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        state=None,
     )
 
 

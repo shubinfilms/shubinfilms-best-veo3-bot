@@ -106,6 +106,7 @@ from utils.suno_state import (
 from utils.input_state import (
     WaitInputState,
     WaitKind,
+    classify_wait_input,
     clear_wait_state,
     clear_wait,
     get_wait,
@@ -113,7 +114,7 @@ from utils.input_state import (
     set_wait,
     touch_wait,
 )
-from utils.telegram_utils import is_command_text, should_capture_to_prompt
+from utils.telegram_utils import should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
@@ -2765,6 +2766,12 @@ async def _apply_wait_state_input(
     if raw_text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
         return True
+    allowed, reason = classify_wait_input(raw_text)
+    if not allowed and reason == "command_label":
+        _wait_log.info(
+            "WAIT_INPUT_IGNORE kind=%s reason=%s", wait_state.kind.value, reason
+        )
+        return False
     stripped = raw_text.strip()
     if stripped in _WAIT_CLEAR_VALUES:
         normalized = ""
@@ -4044,9 +4051,8 @@ def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
         'Введите промпт сообщением. После этого нажмите «Подтвердить».',
         f"Текущий формат: <b>{aspect}</b>",
     ]
-    snippet = _short_prompt(prompt)
-    if snippet:
-        lines.extend(["", f"Последний промпт: <i>{html.escape(snippet)}</i>"])
+    snippet = _short_prompt(prompt) or "—"
+    lines.extend(["", f"Промпт: <i>{html.escape(snippet)}</i>"])
     return "\n".join(lines)
 
 def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -5488,8 +5494,9 @@ async def _poll_suno_and_send(
 
 # --------- VEO Card ----------
 def veo_card_text(s: Dict[str, Any]) -> str:
-    prompt = (s.get("last_prompt") or "").strip()
-    prompt_html = html.escape(prompt)
+    prompt_raw = (s.get("last_prompt") or "").strip()
+    prompt_display = prompt_raw or "—"
+    prompt_html = html.escape(prompt_display)
     aspect = html.escape(s.get("aspect") or "16:9")
     model = "Veo Quality" if s.get("model") == "veo3" else "Veo Fast"
     img = "есть" if s.get("last_image_url") else "нет"
@@ -5509,7 +5516,7 @@ def veo_card_text(s: Dict[str, Any]) -> str:
         [
             "",
             "🖊️ <b>Промпт:</b>",
-            f"<code>{prompt_html}</code>" if prompt else "<code></code>",
+            f"<code>{prompt_html}</code>",
         ]
     )
     return "\n".join(lines)

@@ -48,10 +48,10 @@ def test_card_prompt_empty_on_open() -> None:
     state["aspect"] = "16:9"
 
     veo_text = bot_module.veo_card_text(state)
-    assert "<code></code>" in veo_text
+    assert "<code>—</code>" in veo_text
 
     mj_text = bot_module._mj_prompt_card_text("16:9", state.get("last_prompt"))
-    assert "Последний промпт" not in mj_text
+    assert "Промпт: <i>—</i>" in mj_text
 
 
 def test_menu_labels_not_saved_as_prompt() -> None:
