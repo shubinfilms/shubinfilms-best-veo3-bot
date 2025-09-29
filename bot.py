@@ -163,6 +163,7 @@ from settings import (
     SUNO_LOG_KEY,
 )
 from suno.service import SunoService, SunoAPIError
+from suno.client import SunoServerError
 from chat_service import (
     append_ctx,
     build_messages,
@@ -250,7 +251,8 @@ _SUNO_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
 
 _SUNO_REFUND_PENDING_LOCK = threading.Lock()
 _SUNO_REFUND_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
-_SUNO_ENQUEUE_MAX_ATTEMPTS = 3
+_SUNO_ENQUEUE_MAX_ATTEMPTS = 4
+_SUNO_ENQUEUE_MAX_DELAY = 12.0
 
 
 def _suno_lock_key(user_id: int) -> str:
@@ -447,25 +449,43 @@ def _suno_refund_pending_clear(req_id: Optional[str]) -> None:
         _SUNO_REFUND_PENDING_MEMORY.pop(key, None)
 
 
-def _suno_acquire_refund(task_id: Optional[str]) -> bool:
-    if not task_id:
+def _suno_refund_req_key(req_id: str) -> str:
+    return f"{REDIS_PREFIX}:suno:refund:req:{req_id}"
+
+
+_SUNO_REFUND_REQ_MEMORY: Dict[str, float] = {}
+
+
+def _suno_acquire_refund(task_id: Optional[str], *, req_id: Optional[str] = None) -> bool:
+    key: Optional[str]
+    if task_id:
+        key = _suno_refund_key(task_id)
+    elif req_id:
+        key = _suno_refund_req_key(req_id)
+    else:
         return True
-    key = _suno_refund_key(task_id)
+    assert key is not None
     if rds:
         try:
             stored = rds.set(key, "1", nx=True, ex=_SUNO_REFUND_TTL)
         except Exception as exc:
-            log.warning("Suno refund redis error | task=%s err=%s", task_id, exc)
+            log.warning("Suno refund redis error | key=%s err=%s", key, exc)
         else:
             if stored:
                 return True
             return False
     now = time.time()
     expires_at = now + _SUNO_REFUND_TTL
-    current = _SUNO_REFUND_MEMORY.get(key)
+    if task_id:
+        current = _SUNO_REFUND_MEMORY.get(key)
+    else:
+        current = _SUNO_REFUND_REQ_MEMORY.get(key)
     if current and current > now:
         return False
-    _SUNO_REFUND_MEMORY[key] = expires_at
+    if task_id:
+        _SUNO_REFUND_MEMORY[key] = expires_at
+    else:
+        _SUNO_REFUND_REQ_MEMORY[key] = expires_at
     return True
 
 
@@ -4827,7 +4847,7 @@ async def _suno_issue_refund(
             })
             _suno_pending_store(req_id, pending_meta)
 
-    allow_refund = _suno_acquire_refund(task_id)
+    allow_refund = _suno_acquire_refund(task_id, req_id=req_id)
     if allow_refund:
         try:
             new_balance = credit_balance(user_id, PRICE_SUNO, reason, meta=meta)
@@ -4853,6 +4873,7 @@ async def _suno_issue_refund(
 
     s = state(ctx)
     s["suno_generating"] = False
+    s["suno_current_req_id"] = None
     if task_id and s.get("suno_last_task_id") == task_id:
         s["suno_last_task_id"] = None
     if isinstance(new_balance, int):
@@ -4941,11 +4962,10 @@ async def _launch_suno_generation(
     has_lyrics = bool(params.get("has_lyrics")) if not instrumental else False
     model = SUNO_MODEL or "V5"
     existing_req_id = s.get("suno_current_req_id")
-    req_id = (
-        existing_req_id
-        if isinstance(existing_req_id, str) and existing_req_id.strip()
-        else str(uuid.uuid4())
-    )
+    if isinstance(existing_req_id, str) and existing_req_id.strip():
+        req_id = existing_req_id.strip()
+    else:
+        req_id = f"suno:{uuid.uuid4()}"
 
     lang_source = style or lyrics or title
     lang = detect_lang(lang_source or title or "")
@@ -4973,13 +4993,22 @@ async def _launch_suno_generation(
     )
 
     existing_pending = _suno_pending_load(req_id)
-    if existing_pending and existing_pending.get("status") == "queued" and existing_pending.get("task_id"):
-        log.info(
-            "[SUNO] duplicate launch skip | req_id=%s task_id=%s",
-            req_id,
-            existing_pending.get("task_id"),
-        )
-        return
+    if existing_pending:
+        status = str(existing_pending.get("status") or "").lower()
+        if status == "queued" and existing_pending.get("task_id"):
+            log.info(
+                "[SUNO] duplicate launch skip | req_id=%s task_id=%s",
+                req_id,
+                existing_pending.get("task_id"),
+            )
+            return
+        if status in {"failed", "refunded", "api_error"}:
+            log.info(
+                "[SUNO] duplicate failure skip | req_id=%s status=%s",
+                req_id,
+                status,
+            )
+            return
 
     meta: Dict[str, Any] = {
         "task_id": None,
@@ -5188,6 +5217,8 @@ async def _launch_suno_generation(
             )
 
         def _retry_filter(exc: BaseException) -> bool:
+            if isinstance(exc, SunoServerError):
+                return True
             if isinstance(exc, SunoAPIError):
                 status = exc.status
                 return status is None or (isinstance(status, int) and status >= 500)
@@ -5200,6 +5231,8 @@ async def _launch_suno_generation(
                 base_delay=1.0,
                 max_delay=6.0,
                 backoff_factor=2.0,
+                jitter=(0.0, 0.6),
+                max_total_delay=_SUNO_ENQUEUE_MAX_DELAY,
                 logger=log,
                 log_context={"req_id": req_id, "stage": "suno.enqueue"},
                 retry_filter=_retry_filter,
