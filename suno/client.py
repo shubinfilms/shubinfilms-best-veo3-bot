@@ -5,8 +5,8 @@ import json
 import logging
 import random
 import time
-from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+import re
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 from urllib.parse import urljoin
 
 import requests
@@ -27,7 +27,6 @@ from settings import (
     SUNO_CALLBACK_URL,
     SUNO_COVER_INFO_PATH,
     SUNO_GEN_PATH,
-    SUNO_INSTR_PATH,
     SUNO_LYRICS_PATH,
     SUNO_MAX_RETRIES,
     SUNO_MODEL,
@@ -41,24 +40,11 @@ from settings import (
     SUNO_WAV_PATH,
     KIE_BASE_URL,
     resolve_outbound_ip,
-    SUNO_VOCAL_PATH,
 )
 
 log = logging.getLogger("suno.client")
 
 _API_V5 = "v5"
-
-
-@dataclass(frozen=True)
-class EnqueueResult:
-    """Result returned by :meth:`SunoClient.enqueue_music`."""
-
-    body: Mapping[str, Any]
-    req_id: Optional[str]
-    task_id: Optional[str]
-    status: Optional[str]
-    path: str
-    custom_mode: bool
 
 
 class SunoAPIError(RuntimeError):
@@ -110,8 +96,6 @@ class SunoClient:
         self._lyrics_path = self._normalize_path(SUNO_LYRICS_PATH or "/api/v1/generate/get-timestamped-lyrics")
         self._stem_path = self._normalize_path(SUNO_STEM_PATH or "/api/v1/vocal-removal/generate")
         self._stem_info_path = self._normalize_path(SUNO_STEM_INFO_PATH or "/api/v1/vocal-removal/record-info")
-        self._instrumental_path = self._normalize_path(SUNO_INSTR_PATH or "/api/v1/generate/add-instrumental")
-        self._vocal_path = self._normalize_path(SUNO_VOCAL_PATH or "/api/v1/generate/add-vocals")
         self._extend_path = self._normalize_path(SUNO_UPLOAD_EXTEND_PATH or "/api/v1/suno/upload-extend")
         self.session = session or requests.Session()
         adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
@@ -236,33 +220,6 @@ class SunoClient:
             if nested_message:
                 return nested_message
         return None
-
-    @staticmethod
-    def _is_user_id_empty_error(payload: Any) -> bool:
-        if not isinstance(payload, Mapping):
-            return False
-        texts: list[str] = []
-        for key in ("message", "msg"):
-            value = payload.get(key)
-            if value:
-                texts.append(str(value))
-        detail = payload.get("detail")
-        if isinstance(detail, str):
-            texts.append(detail)
-        elif isinstance(detail, Mapping):
-            nested = SunoClient._payload_message(detail)
-            if nested:
-                texts.append(nested)
-        elif isinstance(detail, Sequence) and not isinstance(detail, (str, bytes, bytearray)):
-            for item in detail:
-                if isinstance(item, Mapping):
-                    nested = SunoClient._payload_message(item)
-                    if nested:
-                        texts.append(nested)
-                elif isinstance(item, str):
-                    texts.append(item)
-        combined = " ".join(text.lower() for text in texts if text)
-        return "userid" in combined and "empty" in combined
 
     @staticmethod
     def _format_422_error(payload: Mapping[str, Any]) -> str:
@@ -586,22 +543,71 @@ class SunoClient:
         )
         raise SunoServerError("Suno request exhausted retries", payload=getattr(last_error, "response", None))
 
-    # ------------------------------------------------------------------ public API
-    def enqueue_music(
+    # ------------------------------------------------------------------ helpers (payload)
+    @staticmethod
+    def _normalize_model(model: Optional[str]) -> str:
+        model_text = str(model or SUNO_MODEL or "V5").strip() or "V5"
+        if model_text.lower() in {"v5", "suno-v5"}:
+            return "V5"
+        return model_text
+
+    @staticmethod
+    def _normalize_tags(tags: Optional[Iterable[Any]]) -> list[str]:
+        normalized: list[str] = []
+        if tags is None:
+            return normalized
+        seen: set[str] = set()
+        for value in tags:
+            if value is None:
+                continue
+            if isinstance(value, str):
+                parts = re.split(r"[\s,;/\\|]+", value)
+            else:
+                parts = [str(value)]
+            for part in parts:
+                text = part.strip().strip("#")
+                if not text:
+                    continue
+                lowered = text.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                normalized.append(lowered)
+        return normalized
+
+    @staticmethod
+    def _derive_tags_from_prompt(prompt: str, *, instrumental: bool) -> list[str]:
+        prompt_text = str(prompt or "").strip()
+        tokens = re.findall(r"[\w\-]+", prompt_text.lower())
+        if tokens:
+            derived = []
+            for token in tokens:
+                clean = token.strip("-_")
+                if clean and clean not in derived:
+                    derived.append(clean)
+                if len(derived) >= 3:
+                    break
+            if derived:
+                return derived
+        if instrumental:
+            return ["ambient", "chill"]
+        return ["pop", "ballad"]
+
+    def build_payload(
         self,
         *,
         user_id: int | str,
-        title: str,
-        prompt: str,
+        title: Optional[str],
+        prompt: Optional[str],
         instrumental: bool,
         has_lyrics: bool,
         lyrics: Optional[str],
         prompt_len: int = 16,
         model: Optional[str] = None,
-        req_id: Optional[str] = None,
         call_back_url: Optional[str] = None,
         call_back_secret: Optional[str] = None,
-    ) -> EnqueueResult:
+        tags: Optional[Iterable[Any]] = None,
+    ) -> dict[str, Any]:
         if not self.token:
             raise SunoClientError("SUNO_API_TOKEN is not configured", status=401)
         callback_url = (call_back_url or SUNO_CALLBACK_URL or "").strip()
@@ -610,42 +616,47 @@ class SunoClient:
             raise SunoClientError("Suno callback configuration missing", status=422)
         title_text = str(title or "").strip()
         prompt_text = str(prompt or "").strip()
-        if not title_text:
-            title_text = prompt_text or "Untitled track"
         if not prompt_text:
             prompt_text = title_text or "Untitled track"
+        if not title_text:
+            title_text = prompt_text or "Untitled track"
         try:
             prompt_length = max(1, int(prompt_len))
         except (TypeError, ValueError):
             prompt_length = 16
-        normalized_model = str(model or SUNO_MODEL or "V5").strip()
-        if normalized_model.lower() in {"v5", "suno-v5"}:
-            normalized_model = "V5"
+        normalized_tags = self._normalize_tags(tags)
+        if not normalized_tags:
+            normalized_tags = self._derive_tags_from_prompt(prompt_text, instrumental=instrumental)
+        model_name = self._normalize_model(model)
         payload: dict[str, Any] = {
-            "model": normalized_model or "V5",
+            "model": model_name,
             "title": title_text,
             "prompt": prompt_text,
             "instrumental": bool(instrumental),
             "has_lyrics": bool(has_lyrics),
+            "lyrics": str(lyrics or "") if has_lyrics else "",
+            "tags": normalized_tags,
+            "negativeTags": [],
             "prompt_len": prompt_length,
+            "customMode": False,
             "userId": str(user_id),
             "callBackUrl": callback_url,
-            "tags": [],
-            "negativeTags": [],
-            "customMode": False,
         }
-        if has_lyrics:
-            payload["lyrics"] = str(lyrics or "")
+        return payload
+
+    def enqueue(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        req_id: Optional[str] = None,
+    ) -> str:
         path = self._primary_gen_path
-        context = {
-            "phase": "enqueue",
-            "path": path,
-            "custom_mode": False,
-            "instrumental": bool(instrumental),
-            "has_lyrics": bool(has_lyrics),
-            "prompt_len": prompt_length,
-            "model": payload["model"],
-        }
+        safe_payload = dict(payload)
+        if "callBackUrl" in safe_payload:
+            safe_payload["callBackUrl"] = str(safe_payload["callBackUrl"])
+        log.info(
+            "Suno enqueue payload", extra={"meta": {"payload": safe_payload, "path": path, "req_id": req_id}}
+        )
         try:
             response = self._request(
                 "POST",
@@ -653,25 +664,60 @@ class SunoClient:
                 json_payload=payload,
                 req_id=req_id,
                 op="enqueue",
-                log_context=context,
+                log_context={"phase": "enqueue", "path": path},
             )
         except SunoAPIError as exc:
             exc.api_version = _API_V5
             raise
-        task_identifier = self._extract_identifier(response, ("task_id", "taskId"))
-        req_identifier = task_identifier or req_id or self._extract_identifier(
-            response, ("req_id", "requestId", "request_id")
-        )
-        status_label = response.get("status") or response.get("code")
         self._raise_if_not_found(response)
-        return EnqueueResult(
-            body=response,
-            req_id=req_identifier,
-            task_id=task_identifier,
-            status=str(status_label) if status_label is not None else None,
-            path=path,
-            custom_mode=False,
+        task_identifier = self._extract_identifier(response, ("task_id", "taskId"))
+        if not task_identifier:
+            raise SunoAPIError("Suno did not return taskId", payload=response, status=response.get("code"))
+        status_url = f"{self._url(self._primary_status_path)}?taskId={task_identifier}"
+        log.info(
+            "Suno enqueue success",
+            extra={
+                "meta": {
+                    "taskId": task_identifier,
+                    "status_url": status_url,
+                    "path": path,
+                    "req_id": req_id or task_identifier,
+                }
+            },
         )
+        return task_identifier
+
+    # ------------------------------------------------------------------ public API
+    def enqueue_music(
+        self,
+        *,
+        user_id: int | str,
+        title: Optional[str],
+        prompt: Optional[str],
+        instrumental: bool,
+        has_lyrics: bool,
+        lyrics: Optional[str],
+        prompt_len: int = 16,
+        model: Optional[str] = None,
+        req_id: Optional[str] = None,
+        call_back_url: Optional[str] = None,
+        call_back_secret: Optional[str] = None,
+        tags: Optional[Iterable[Any]] = None,
+    ) -> str:
+        payload = self.build_payload(
+            user_id=user_id,
+            title=title,
+            prompt=prompt,
+            instrumental=instrumental,
+            has_lyrics=has_lyrics,
+            lyrics=lyrics,
+            prompt_len=prompt_len,
+            model=model,
+            call_back_url=call_back_url,
+            call_back_secret=call_back_secret,
+            tags=tags,
+        )
+        return self.enqueue(payload, req_id=req_id)
 
     def create_music(
         self, payload: Mapping[str, Any], *, req_id: Optional[str] = None
@@ -693,7 +739,18 @@ class SunoClient:
         except (TypeError, ValueError):
             prompt_length = 16
         model_value = payload.get("model") or SUNO_MODEL
-        result = self.enqueue_music(
+        tags_value = payload.get("tags") if isinstance(payload, Mapping) else None
+        if tags_value is None and style:
+            tags_value = [style]
+        if isinstance(tags_value, str):
+            normalized_tags_value: Optional[Iterable[Any]] = [tags_value]
+        elif isinstance(tags_value, Iterable):
+            normalized_tags_value = tags_value
+        elif tags_value is not None:
+            normalized_tags_value = [tags_value]
+        else:
+            normalized_tags_value = None
+        built_payload = self.build_payload(
             user_id=user_identifier,
             title=title,
             prompt=prompt,
@@ -702,31 +759,27 @@ class SunoClient:
             lyrics=str(lyrics_value) if lyrics_value is not None else None,
             prompt_len=prompt_length,
             model=str(model_value) if model_value is not None else None,
-            req_id=req_id,
+            tags=normalized_tags_value,
         )
-        return result.body, _API_V5
+        task_identifier = self.enqueue(built_payload, req_id=req_id)
+        return {"taskId": task_identifier}, _API_V5
 
     def get_task_status(
         self,
-        req_id: str,
+        task_id: str,
         *,
-        user_id: Optional[str] = None,
-        task_id: Optional[str] = None,
+        req_id: Optional[str] = None,
     ) -> Mapping[str, Any]:
         lookup_id = task_id or req_id
         if not lookup_id:
-            raise SunoClientError("req_id is required for status check", status=422)
+            raise SunoClientError("taskId is required for status check", status=422)
         params: dict[str, Any] = {"taskId": str(lookup_id)}
-        user_param = str(user_id).strip() if user_id is not None else None
-        if user_param:
-            params["userId"] = user_param
         context = {
             "req_id": req_id or lookup_id,
-            "userId": user_param,
             "taskId": str(lookup_id),
             "path": self._primary_status_path,
         }
-        identifier = req_id or task_id or str(lookup_id)
+        identifier = req_id or str(lookup_id)
         try:
             response = self._request(
                 "GET",
@@ -736,23 +789,6 @@ class SunoClient:
                 op="status",
                 log_context=context,
             )
-        except SunoClientError as exc:
-            if user_param and exc.status == 422 and self._is_user_id_empty_error(exc.payload):
-                trimmed_context = dict(context)
-                trimmed_context["userId"] = None
-                trimmed_context["hint"] = "retry_without_userId"
-                retry_params = {"taskId": str(lookup_id)}
-                response = self._request(
-                    "GET",
-                    self._primary_status_path,
-                    params=retry_params,
-                    req_id=identifier,
-                    op="status",
-                    log_context=trimmed_context,
-                )
-            else:
-                exc.api_version = _API_V5
-                raise
         except SunoAPIError as exc:
             exc.api_version = _API_V5
             raise
@@ -914,25 +950,6 @@ class SunoClient:
         self._raise_if_not_found(response)
         return response
 
-    def add_instrumental(
-        self,
-        task_id: str,
-        *,
-        req_id: Optional[str] = None,
-        payload: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        body = self._task_payload(task_id, payload)
-        response = self._request(
-            "POST",
-            self._instrumental_path,
-            json_payload=body,
-            req_id=req_id,
-            op="instrumental",
-            log_context={"task_id": task_id},
-        )
-        self._raise_if_not_found(response)
-        return response
-
     def upload_extend(
         self,
         payload: Mapping[str, Any],
@@ -956,7 +973,6 @@ class SunoClient:
 
 
 __all__ = [
-    "EnqueueResult",
     "SunoClient",
     "SunoAPIError",
     "SunoClientError",

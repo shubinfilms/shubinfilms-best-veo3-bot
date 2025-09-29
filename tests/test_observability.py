@@ -98,7 +98,7 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
     response_list = []
     for status in status_codes:
         if status == 200:
-            response_list.append({"status_code": 200, "json": {"task_id": "ok"}})
+            response_list.append({"status_code": 200, "json": {"taskId": "ok"}})
         else:
             response_list.append({"status_code": status, "json": {"message": "err"}})
     requests_mock.post(
@@ -111,7 +111,7 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
             suno_client.create_music({"instrumental": False, "userId": 7})
     else:
         payload, version = suno_client.create_music({"instrumental": False, "userId": 7})
-        assert payload["task_id"] == "ok"
+        assert payload["taskId"] == "ok"
         assert version == "v5"
     assert requests_mock.call_count == expected_calls
 

@@ -5028,12 +5028,66 @@ async def _launch_suno_generation(
             )
             return
 
+    try:
+        prepared_payload = SUNO_SERVICE.client.build_payload(
+            user_id=str(user_id),
+            title=payload.get("title"),
+            prompt=payload.get("prompt"),
+            instrumental=bool(payload.get("instrumental", True)),
+            has_lyrics=bool(payload.get("has_lyrics")),
+            lyrics=payload.get("lyrics"),
+            prompt_len=payload.get("prompt_len", 16),
+            model=model,
+            tags=payload.get("tags"),
+        )
+    except SunoAPIError as exc:
+        log.warning(
+            "[SUNO] build payload failed | user_id=%s err=%s", user_id, exc,
+            extra={"meta": {"status": exc.status, "payload": payload}},
+        )
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "⚠️ Suno API не настроен. Обратитесь к поддержке.",
+            reply_to=reply_to,
+        )
+        return
+    except Exception as exc:
+        log.exception("[SUNO] unexpected payload build error | user_id=%s", user_id, exc_info=exc)
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "⚠️ Не удалось подготовить запрос. Попробуйте позже.",
+            reply_to=reply_to,
+        )
+        return
+
+    required_title = str(prepared_payload.get("title") or "").strip()
+    required_prompt = str(prepared_payload.get("prompt") or "").strip()
+    required_tags = [tag for tag in prepared_payload.get("tags", []) if str(tag).strip()]
+    if not required_title or not required_prompt or not required_tags:
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "⚠️ Укажите стиль (теги). Пример: ambient, chill…",
+            reply_to=reply_to,
+        )
+        return
+
+    payload.update(
+        {
+            "title": prepared_payload.get("title"),
+            "prompt": prepared_payload.get("prompt"),
+            "tags": prepared_payload.get("tags"),
+        }
+    )
+
     meta: Dict[str, Any] = {
         "task_id": None,
         "model": model,
         "instrumental": not suno_payload_state.has_lyrics,
         "has_lyrics": suno_payload_state.has_lyrics,
-        "prompt_len": len(payload.get("prompt") or ""),
+        "prompt_len": len(str(prepared_payload.get("prompt") or "")),
         "title": payload.get("title"),
         "style": payload.get("style"),
         "trigger": trigger,
@@ -5242,14 +5296,19 @@ async def _launch_suno_generation(
                 return _sanitize_reason_text(str(exc))
             return _sanitize_reason_text(str(exc))
 
-        def _format_failure(reason: Optional[str]) -> str:
+        def _format_failure(reason: Optional[str], *, status: Optional[int] = None) -> str:
+            if status in {401, 422}:
+                base = "⚠️ Ошибка генерации"
+                if reason:
+                    return f"{base}: {md2_escape(reason)}"
+                return f"{base}."
             base = "⚠️ Generation failed"
             if reason:
                 return f"{base}: {md2_escape(reason)}"
             return f"{base}, please try later."
 
-        def _build_refund_message(reason: Optional[str]) -> str:
-            return f"{_format_failure(reason)}\n💎 Токены возвращены (+{PRICE_SUNO}💎)."
+        def _build_refund_message(reason: Optional[str], *, status: Optional[int] = None) -> str:
+            return f"{_format_failure(reason, status=status)}\n💎 Токены возвращены (+{PRICE_SUNO}💎)."
 
         def _start_music_call() -> Awaitable[Any]:
             return asyncio.to_thread(
@@ -5266,6 +5325,7 @@ async def _launch_suno_generation(
                 req_id=req_id,
                 lang=payload.get("lang"),
                 has_lyrics=payload.get("has_lyrics", False),
+                prepared_payload=prepared_payload,
             )
 
         def _retry_filter(exc: BaseException) -> bool:
@@ -5296,8 +5356,8 @@ async def _launch_suno_generation(
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
             suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
             reason_text = _reason_from_exception(exc)
-            failure_text = _format_failure(reason_text)
-            refund_message = _build_refund_message(reason_text)
+            failure_text = _format_failure(reason_text, status=exc.status)
+            refund_message = _build_refund_message(reason_text, status=exc.status)
             pending_meta.update(
                 {
                     "status": "api_error",
