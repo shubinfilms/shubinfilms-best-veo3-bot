@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -65,6 +65,94 @@ _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _WEB_LABELS = {"env": _ENV, "service": "web"}
 _EXPECTED_RENDER_BASE = (os.getenv("RENDER_EXTERNAL_URL") or "https://shubinfilms-best-veo3-bot.onrender.com").rstrip("/")
 _EXPECTED_CALLBACK_URL = f"{_EXPECTED_RENDER_BASE}/suno-callback"
+
+
+def _mask_tokens(text: str) -> str:
+    secrets = [
+        SUNO_CALLBACK_SECRET or "",
+        os.getenv("SUNO_API_TOKEN") or "",
+        os.getenv("TELEGRAM_TOKEN") or "",
+    ]
+    cleaned = text
+    for token in secrets:
+        trimmed = token.strip()
+        if trimmed:
+            cleaned = cleaned.replace(trimmed, "***")
+    return cleaned
+
+
+def _json_preview(payload: Any, *, limit: int = 700) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        text = str(payload)
+    text = _mask_tokens(text)
+    if len(text) > limit:
+        return f"{text[:limit]}…"
+    return text
+
+
+def _normalize_callback_payload(raw: Any) -> tuple[dict[str, Any], Dict[str, Any], list[str]]:
+    if not isinstance(raw, Mapping):
+        return {"code": None, "msg": None, "data": {}}, {}, []
+    layers: list[Dict[str, Any]] = []
+    current: Mapping[str, Any] = raw
+    while True:
+        materialized = dict(current)
+        layers.append(materialized)
+        next_layer: Optional[Mapping[str, Any]] = None
+        for key in ("payload", "data"):
+            candidate = materialized.get(key)
+            if isinstance(candidate, Mapping):
+                next_layer = candidate
+                break
+        if next_layer is None:
+            break
+        current = next_layer
+    innermost = layers[-1]
+    base_data_candidate = innermost.get("data") if isinstance(innermost.get("data"), Mapping) else None
+    if isinstance(base_data_candidate, Mapping):
+        base_data = dict(base_data_candidate)
+    else:
+        base_data = dict(innermost)
+    code_value: Any = None
+    msg_value: Any = None
+    for layer in layers:
+        if code_value is None and layer.get("code") not in (None, ""):
+            code_value = layer.get("code")
+        message_candidate = layer.get("msg") or layer.get("message")
+        if msg_value is None and message_candidate not in (None, ""):
+            msg_value = message_candidate
+        for key, value in layer.items():
+            if key in {"payload", "data", "code", "msg", "message"}:
+                continue
+            base_data.setdefault(key, value)
+    if "results" in base_data and "items" not in base_data:
+        base_data["items"] = base_data["results"]
+    if "type" in base_data and "callbackType" not in base_data:
+        base_data.setdefault("callbackType", base_data["type"])
+    if "status" in base_data and "callbackType" not in base_data:
+        base_data.setdefault("callbackType", base_data["status"])
+    all_keys = sorted({key for layer in layers for key in layer.keys()})
+    return {"code": code_value, "msg": msg_value, "data": base_data}, dict(layers[0]), all_keys
+
+
+def _callback_status(data: Mapping[str, Any]) -> Optional[str]:
+    for key in ("status", "callbackType", "callback_type", "type"):
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _first_identifier(data: Mapping[str, Any], keys: Iterable[str]) -> Optional[str]:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            text = str(value).strip()
+            if text:
+                return text
+    return None
 
 
 def _active_count() -> int:
@@ -300,14 +388,55 @@ async def suno_callback(
         extra={"meta": {"content_length": len(body), "path": str(request.url.path)}},
     )
 
-    envelope = CallbackEnvelope.model_validate(payload)
+    normalized_payload, flat_payload, key_list = _normalize_callback_payload(payload)
+    envelope = CallbackEnvelope.model_validate(normalized_payload)
     task = SunoTask.from_envelope(envelope)
+    data_map: Mapping[str, Any] = envelope.data or {}
+    payload_req_id = _first_identifier(data_map, ("req_id", "requestId", "request_id"))
+    if not payload_req_id:
+        payload_req_id = _first_identifier(flat_payload, ("req_id", "requestId", "request_id"))
+    payload_task_id = _first_identifier(data_map, ("task_id", "taskId"))
+    if not payload_task_id:
+        payload_task_id = _first_identifier(flat_payload, ("task_id", "taskId"))
+    if payload_task_id and not task.task_id:
+        task = task.model_copy(update={"task_id": payload_task_id})
     header_req_id = (
         request.headers.get("X-Request-ID")
         or request.headers.get("X-Req-Id")
         or request.headers.get("X-Req-ID")
     )
-    req_id = header_req_id or service.get_request_id(task.task_id)
+    initial_req_id = header_req_id or payload_req_id
+    status_hint = (_callback_status(data_map) or "unknown").lower()
+    preview = _json_preview(payload)
+    keys_preview = key_list[:8]
+    keys_repr = "[" + ", ".join(keys_preview) + (", …]" if len(key_list) > len(keys_preview) else "]")
+    log.info(
+        "SUNO[callback] status=%s req_id=%s keys=%s body_start=%s",
+        status_hint,
+        initial_req_id or "—",
+        keys_repr,
+        preview,
+    )
+    if not initial_req_id or status_hint == "unknown":
+        log.warning(
+            "Suno callback missing identifiers | status=%s req_id=%s body=%s",
+            status_hint,
+            initial_req_id,
+            preview,
+        )
+    if not task.task_id and initial_req_id:
+        mapped_task = service.get_task_id_by_request(initial_req_id)
+        if mapped_task:
+            task = task.model_copy(update={"task_id": mapped_task})
+    req_id = initial_req_id or service.get_request_id(task.task_id)
+    if not req_id and payload_req_id:
+        req_id = payload_req_id
+    if not task.task_id and req_id:
+        mapped_task = service.get_task_id_by_request(req_id)
+        if mapped_task:
+            task = task.model_copy(update={"task_id": mapped_task})
+    if not req_id and task.task_id:
+        req_id = service.get_request_id(task.task_id)
     start_ts = service.get_start_timestamp(task.task_id)
     if start_ts:
         started_at = _parse_iso8601(start_ts)
