@@ -59,15 +59,16 @@ async def request_with_retries(
             delay = max(0.0, base_delay * (backoff_factor ** (attempt - 1)))
             delay = min(max_delay, delay)
             if jitter:
-                low: float
-                high: float
                 if isinstance(jitter, tuple):
                     low, high = jitter
+                    if high < low:
+                        low, high = high, low
+                    jitter_value = random.uniform(low, high)
                 else:
-                    low, high = 0.0, float(jitter)
-                if high < low:
-                    low, high = high, low
-                jitter_value = random.uniform(low, high)
+                    pct = float(jitter)
+                    pct = max(min(pct, 1.0), 0.0)
+                    spread = delay * pct
+                    jitter_value = random.uniform(-spread, spread)
                 delay = min(max(delay + jitter_value, 0.0), max_delay)
             if max_total_delay is not None:
                 remaining = max_total_delay - total_delay

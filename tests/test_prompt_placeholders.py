@@ -96,7 +96,7 @@ def test_veo_card_opens_with_empty_prompt() -> None:
         bot_module.set_mode = original_set_mode  # type: ignore[assignment]
 
     assert captured, "card render not captured"
-    assert "Введите промпт…" in captured[-1]
+    assert "<code> </code>" in captured[-1]
 
 
 def test_mj_card_opens_with_empty_prompt() -> None:
@@ -151,7 +151,7 @@ def test_mj_card_opens_with_empty_prompt() -> None:
         bot_module.set_mode = original_set_mode  # type: ignore[assignment]
 
     assert captured, "card render not captured"
-    assert "Введите промпт…" in captured[-1]
+    assert "Промпт: <i> </i>" in captured[-1]
 
 
 def test_menu_label_not_saved_as_prompt() -> None:
