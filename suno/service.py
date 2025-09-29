@@ -46,6 +46,73 @@ _LOG_ONCE_TTL = 48 * 60 * 60
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 
 
+def _mask_tokens(text: str) -> str:
+    """Mask known sensitive tokens in ``text`` before logging."""
+
+    secrets = [
+        SUNO_CALLBACK_SECRET or "",
+        os.getenv("SUNO_API_TOKEN") or "",
+        os.getenv("TELEGRAM_TOKEN") or "",
+    ]
+    cleaned = text
+    for secret in secrets:
+        token = secret.strip()
+        if token:
+            cleaned = cleaned.replace(token, "***")
+    return cleaned
+
+
+def _json_preview(payload: Any, *, limit: int = 700) -> str:
+    """Return a trimmed JSON representation of ``payload`` for logs."""
+
+    try:
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        text = str(payload)
+    text = _mask_tokens(text)
+    if len(text) > limit:
+        return f"{text[:limit]}…"
+    return text
+
+
+def _extract_enqueue_identifiers(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(request_id, task_id)`` discovered in ``payload``."""
+
+    if not isinstance(payload, Mapping):
+        return None, None
+    seen: set[int] = set()
+    stack: list[Mapping[str, Any]] = [payload]
+    request_id: Optional[str] = None
+    task_id: Optional[str] = None
+    while stack:
+        current = stack.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        for key in ("req_id", "requestId", "request_id"):
+            if request_id:
+                break
+            value = current.get(key)
+            if value not in (None, ""):
+                candidate = str(value).strip()
+                if candidate:
+                    request_id = candidate
+        for key in ("task_id", "taskId", "id", "taskID", "job_id", "jobId"):
+            if task_id:
+                break
+            value = current.get(key)
+            if value not in (None, ""):
+                candidate = str(value).strip()
+                if candidate:
+                    task_id = candidate
+        for nested_key in ("data", "payload", "result"):
+            nested = current.get(nested_key)
+            if isinstance(nested, Mapping):
+                stack.append(nested)
+    return request_id, task_id
+
+
 def _metric_labels(service: str) -> dict[str, str]:
     return {"env": _ENV, "service": service}
 
@@ -83,6 +150,7 @@ class SunoService:
         self._user_memory: MutableMapping[str, tuple[float, str]] = {}
         self._task_records_memory: MutableMapping[str, tuple[float, str]] = {}
         self._req_memory: MutableMapping[str, tuple[float, str]] = {}
+        self._req_index_memory: MutableMapping[str, tuple[float, str]] = {}
         self._task_order: list[str] = []
         self._bot_session = requests.Session()
         adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
@@ -113,6 +181,9 @@ class SunoService:
 
     def _req_key(self, task_id: str) -> str:
         return f"{REDIS_PREFIX}:suno:req:{task_id}"
+
+    def _req_index_key(self, req_id: str) -> str:
+        return f"{REDIS_PREFIX}:suno:req-index:{req_id}"
 
     def _log_once_key(self, task_id: str, callback_type: Optional[str]) -> str:
         kind = (callback_type or "unknown").lower()
@@ -214,14 +285,19 @@ class SunoService:
         if not task_id or not req_id:
             return
         key = self._req_key(task_id)
+        req_index_key = self._req_index_key(req_id)
         if self.redis is not None:
             try:
-                self.redis.setex(key, _REQ_TTL, req_id)
+                pipe = self.redis.pipeline()
+                pipe.setex(key, _REQ_TTL, req_id)
+                pipe.setex(req_index_key, _REQ_TTL, task_id)
+                pipe.execute()
                 return
             except Exception:  # pragma: no cover - Redis failure
                 log.warning("SunoService redis.setex req-id failed", exc_info=True)
         expires_at = time.time() + _REQ_TTL
         self._req_memory[key] = (expires_at, req_id)
+        self._req_index_memory[req_index_key] = (expires_at, task_id)
 
     def _load_mapping(self, task_id: str) -> Optional[TelegramMeta]:
         key = self._redis_key(task_id)
@@ -267,12 +343,26 @@ class SunoService:
                 log.warning("SunoService redis.delete failed", exc_info=True)
         self._memory.pop(key, None)
         req_key = self._req_key(task_id)
+        req_id: Optional[str] = None
         if self.redis is not None:
             try:
+                stored_req = self.redis.get(req_key)
+                if isinstance(stored_req, bytes):
+                    req_id = stored_req.decode("utf-8", errors="ignore")
+                elif isinstance(stored_req, str):
+                    req_id = stored_req
                 self.redis.delete(req_key)
             except Exception:  # pragma: no cover - Redis failure
                 log.warning("SunoService redis.delete req-id failed", exc_info=True)
         self._req_memory.pop(req_key, None)
+        if req_id:
+            index_key = self._req_index_key(req_id)
+            if self.redis is not None:
+                try:
+                    self.redis.delete(index_key)
+                except Exception:  # pragma: no cover - Redis failure
+                    log.warning("SunoService redis.delete req-index failed", exc_info=True)
+            self._req_index_memory.pop(index_key, None)
 
     def _load_req_id(self, task_id: str) -> Optional[str]:
         if not task_id:
@@ -297,6 +387,30 @@ class SunoService:
 
     def get_request_id(self, task_id: str) -> Optional[str]:
         return self._load_req_id(task_id)
+
+    def _load_task_id_for_req(self, req_id: str) -> Optional[str]:
+        if not req_id:
+            return None
+        index_key = self._req_index_key(req_id)
+        if self.redis is not None:
+            try:
+                value = self.redis.get(index_key)
+            except Exception:  # pragma: no cover - Redis failure
+                log.warning("SunoService redis.get req-index failed", exc_info=True)
+            else:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="ignore")
+                if isinstance(value, str):
+                    return value
+        if index_key in self._req_index_memory:
+            expires_at, value = self._req_index_memory[index_key]
+            if expires_at > time.time():
+                return value
+            self._req_index_memory.pop(index_key, None)
+        return None
+
+    def get_task_id_by_request(self, req_id: str) -> Optional[str]:
+        return self._load_task_id_for_req(req_id)
 
     def get_start_timestamp(self, task_id: str) -> Optional[str]:
         meta = self._load_mapping(task_id)
@@ -586,12 +700,30 @@ class SunoService:
                 api_version=api_version,
                 **_metric_labels("bot"),
             ).inc()
-        task_id = str(
-            result.get("task_id")
-            or result.get("id")
-            or (result.get("data") or {}).get("task_id")
-            or ""
+        parsed_req_id, parsed_task_id = _extract_enqueue_identifiers(result)
+        if parsed_req_id and req_id and parsed_req_id != req_id:
+            log.warning(
+                "Suno enqueue req_id mismatch", extra={"meta": {"provided": req_id, "received": parsed_req_id}}
+            )
+        req_id = req_id or parsed_req_id
+        data_section = result.get("data") if isinstance(result.get("data"), Mapping) else {}
+        task_id = (
+            parsed_task_id
+            or str(result.get("task_id") or "").strip()
+            or str(result.get("id") or "").strip()
+            or str((data_section or {}).get("task_id") or "").strip()
+            or str((data_section or {}).get("taskId") or "").strip()
         )
+        status_label = result.get("status") or result.get("code")
+        log.info(
+            "SUNO[enqueue] status=%s req_id=%s task_id=%s body_start=%s",
+            status_label,
+            req_id or "—",
+            task_id or "",
+            _json_preview(result),
+        )
+        if not req_id:
+            log.warning("Suno enqueue response missing request id")
         if not task_id:
             raise SunoAPIError("Suno did not return task_id", payload=result)
         task = SunoTask(task_id=task_id, callback_type="start", items=[], msg=result.get("msg"), code=result.get("code"))
@@ -699,6 +831,7 @@ class SunoService:
             log.warning("Failed to coerce music callback payload", exc_info=True)
             return
         task = SunoTask.from_envelope(envelope)
+        data_payload: Mapping[str, Any] = envelope.data or {}
         req_id: Optional[str] = None
         if isinstance(payload, Mapping):
             req_id = payload.get("request_id") or payload.get("requestId")
@@ -708,6 +841,15 @@ class SunoService:
                 req_id = raw_payload.get("request_id") or raw_payload.get("requestId")
         if req_id is None:
             req_id = getattr(payload, "request_id", None) or getattr(payload, "requestId", None)
+        data_req_id, data_task_id = _extract_enqueue_identifiers(data_payload)
+        if data_req_id and not req_id:
+            req_id = data_req_id
+        if data_task_id and not task.task_id:
+            task = task.model_copy(update={"task_id": data_task_id})
+        if not task.task_id and req_id:
+            mapped = self._load_task_id_for_req(req_id)
+            if mapped:
+                task = task.model_copy(update={"task_id": mapped})
         self.handle_callback(task, req_id=req_id)
 
     def handle_callback(self, task: SunoTask, req_id: Optional[str] = None) -> None:
@@ -721,6 +863,8 @@ class SunoService:
             req_id = meta.req_id
         if req_id is None:
             req_id = self._load_req_id(task.task_id)
+        if req_id and task.task_id:
+            self._store_req_id(task.task_id, req_id)
         log.info(
             "Suno callback received",
             extra={

@@ -20,6 +20,7 @@ os.environ.setdefault("LEDGER_BACKEND", "memory")
 os.environ.setdefault("LOG_JSON", "false")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 
+from utils.input_state import classify_wait_input
 from utils.telegram_utils import should_capture_to_prompt
 import bot as bot_module
 
@@ -81,6 +82,12 @@ def test_balance_button_not_captured() -> None:
     assert not should_capture_to_prompt("Balance")
     assert not should_capture_to_prompt("  💎 Баланс  ")
     assert not should_capture_to_prompt("balance")
+
+
+def test_balance_button_bypasses_prompt_capture() -> None:
+    should, reason = classify_wait_input("💎 Баланс")
+    assert not should
+    assert reason == "command_label"
 
 
 def test_switching_engines_resets_prompts() -> None:

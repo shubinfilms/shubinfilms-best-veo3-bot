@@ -31,9 +31,9 @@ class SunoTask(BaseModel):
     @classmethod
     def from_envelope(cls, envelope: "CallbackEnvelope") -> "SunoTask":
         data = envelope.data or {}
-        task_id = _first(data, "task_id", "taskId", "id") or ""
+        task_id = _first(data, "task_id", "taskId", "taskID", "id") or ""
         callback_type = (
-            _first(data, "callback_type", "callbackType") or "unknown"
+            _first(data, "callback_type", "callbackType", "status", "type") or "unknown"
         )
         raw_items = _extract_items(data)
         tracks = [_build_track(item, index) for index, item in enumerate(raw_items, start=1)]
@@ -73,19 +73,19 @@ def _ensure_iterable(value: Any) -> Iterable[Any]:
 
 
 def _extract_items(data: dict[str, Any]) -> Iterable[Any]:
-    for key in ("tracks", "items", "data"):
+    for key in ("tracks", "items", "results", "data"):
         maybe = data.get(key)
         if maybe:
             return _ensure_iterable(maybe)
     input_section = data.get("input")
     if isinstance(input_section, Mapping):
-        for key in ("tracks", "items", "data"):
+        for key in ("tracks", "items", "results", "data"):
             maybe = input_section.get(key)
             if maybe:
                 return _ensure_iterable(maybe)
     response = data.get("response")
     if isinstance(response, dict):
-        for key in ("data", "items", "tracks"):
+        for key in ("data", "items", "results", "tracks"):
             maybe = response.get(key)
             if maybe:
                 return _ensure_iterable(maybe)

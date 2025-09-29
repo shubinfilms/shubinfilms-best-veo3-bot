@@ -6,7 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 import requests
@@ -60,6 +60,27 @@ def _build_payload(task_id: str = "task-1", callback_type: str = "complete") -> 
             },
         },
     }
+
+
+class StubService:
+    def __init__(self, req_map: Optional[dict[str, str]] = None) -> None:
+        self.req_map = req_map or {}
+        self.captured: dict[str, Any] = {}
+
+    def get_request_id(self, task_id: str) -> Optional[str]:
+        return None
+
+    def get_task_id_by_request(self, req_id: Optional[str]) -> Optional[str]:
+        if not req_id:
+            return None
+        return self.req_map.get(req_id)
+
+    def get_start_timestamp(self, task_id: str) -> Optional[str]:
+        return None
+
+    def handle_callback(self, task: SunoTask, req_id: Optional[str] = None) -> None:
+        self.captured["task"] = task
+        self.captured["req_id"] = req_id
 
 
 @pytest.fixture(autouse=True)
@@ -465,6 +486,36 @@ def test_suno_service_records_request_id(monkeypatch):
     assert ts is not None
 
 
+@pytest.mark.parametrize(
+    "response, expected_req, expected_task",
+    [
+        ({"req_id": "req-1", "task_id": "task-1"}, "req-1", "task-1"),
+        ({"data": {"req_id": "req-2", "task_id": "task-2"}}, "req-2", "task-2"),
+        ({"requestId": "req-3", "taskId": "task-3"}, "req-3", "task-3"),
+    ],
+)
+def test_suno_service_extracts_enqueue_ids(response, expected_req, expected_task):
+    class FakeClient:
+        def create_music(self, payload, *, req_id=None):
+            return response, "v5"
+
+    service = SunoService(client=FakeClient(), redis=None, telegram_token="dummy")
+    task = service.start_music(
+        10,
+        20,
+        title="Demo",
+        style=None,
+        lyrics=None,
+        instrumental=False,
+        user_id=1,
+        prompt="Prompt",
+        req_id=None,
+    )
+    assert task.task_id == expected_task
+    assert service.get_request_id(expected_task) == expected_req
+    assert service.get_task_id_by_request(expected_req) == expected_task
+
+
 def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     requests_mock.post(
@@ -554,6 +605,72 @@ def test_callback_restores_missing_req_id(monkeypatch):
     assert response.status_code == 200
     assert captured["task"].task_id == "restore-task"
     assert captured["req_id"] == "req-restore"
+
+
+@pytest.mark.parametrize(
+    "payload, expected_req, expected_task, req_map",
+    [
+        (
+            {
+                "code": 200,
+                "msg": "ok",
+                "payload": {
+                    "requestId": "req-wrap",
+                    "taskId": "task-wrap",
+                    "status": "complete",
+                    "results": [{"audioUrl": "https://cdn.example.com/a.mp3"}],
+                },
+            },
+            "req-wrap",
+            "task-wrap",
+            {},
+        ),
+        (
+            {
+                "data": {
+                    "payload": {
+                        "data": {
+                            "req_id": "req-nest",
+                            "task_id": "task-nest",
+                            "type": "complete",
+                            "items": [
+                                {
+                                    "audio_url": "https://cdn.example.com/b.mp3",
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+            "req-nest",
+            "task-nest",
+            {},
+        ),
+        (
+            {
+                "requestId": "req-map",
+                "status": "complete",
+                "results": [{"audioUrl": "https://cdn.example.com/c.mp3"}],
+            },
+            "req-map",
+            "task-from-map",
+            {"req-map": "task-from-map"},
+        ),
+    ],
+)
+def test_suno_callback_parses_wrapped_payload(monkeypatch, payload, expected_req, expected_task, req_map):
+    stub_service = StubService(req_map)
+    monkeypatch.setattr(suno_web, "service", stub_service, raising=False)
+    monkeypatch.setattr(suno_web, "_prepare_assets", lambda task: None)
+    client = _client()
+    response = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Secret": "secret-token"},
+        json=payload,
+    )
+    assert response.status_code == 200
+    assert stub_service.captured["req_id"] == expected_req
+    assert stub_service.captured["task"].task_id == expected_task
 
 
 def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
