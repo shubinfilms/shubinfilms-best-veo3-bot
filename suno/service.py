@@ -8,14 +8,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Literal, Mapping, MutableMapping, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 
 from metrics import bot_telegram_send_fail_total, suno_requests_total, suno_task_store_total
 from suno.client import SunoClient, SunoAPIError
-from suno.schemas import CallbackEnvelope, SunoTask, SunoTrack
+from suno.schemas import ApiEnvelope, CallbackEnvelope, SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
 from settings import (
     HTTP_POOL_CONNECTIONS,
@@ -38,6 +38,146 @@ except Exception:  # pragma: no cover - optional import
     _redis_instance = None
 
 log = logging.getLogger("suno.service")
+
+API_BASE = (os.getenv("SUNO_API_BASE") or "https://api.kie.ai").rstrip("/")
+API_KEY = os.getenv("SUNO_API_KEY")
+CALLBACK_URL = os.getenv("SUNO_CALLBACK_URL")
+
+
+class SunoError(Exception):
+    """Raised when the lightweight Suno API reports an error."""
+
+
+def _check(env: ApiEnvelope, resp: requests.Response) -> ApiEnvelope:
+    """Validate the response envelope and raise ``SunoError`` on failure."""
+
+    if resp.ok and env.code == 200:
+        return env
+    raise SunoError(env.msg or resp.text)
+
+
+def _make_headers() -> Dict[str, str]:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    return headers
+
+
+def _post(path: str, payload: Dict[str, Any]) -> ApiEnvelope:
+    response = requests.post(
+        f"{API_BASE}{path}",
+        headers=_make_headers(),
+        json=payload,
+        timeout=20,
+    )
+    envelope = ApiEnvelope.model_validate(response.json())
+    return _check(envelope, response)
+
+
+def _get(path: str, params: Dict[str, Any]) -> ApiEnvelope:
+    response = requests.get(
+        f"{API_BASE}{path}",
+        headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else None,
+        params=params,
+        timeout=15,
+    )
+    envelope = ApiEnvelope.model_validate(response.json())
+    return _check(envelope, response)
+
+
+def _extract_task_id(data: Any) -> str:
+    if isinstance(data, Mapping) and data.get("taskId"):
+        return str(data["taskId"])
+    if hasattr(data, "taskId") and getattr(data, "taskId"):
+        return str(getattr(data, "taskId"))
+    raise SunoError("Missing taskId in response")
+
+
+def suno_generate(
+    *,
+    prompt: str,
+    model: Literal["V3_5", "V4", "V4_5", "V4_5PLUS", "V5"] = "V5",
+    customMode: bool = True,
+    instrumental: bool = False,
+    title: Optional[str] = None,
+    style: Optional[str] = None,
+    negativeTags: Optional[str] = None,
+    vocalGender: Optional[Literal["m", "f"]] = None,
+    styleWeight: Optional[float] = None,
+    weirdnessConstraint: Optional[float] = None,
+    audioWeight: Optional[float] = None,
+    callback_url: Optional[str] = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "prompt": prompt,
+        "model": model,
+        "customMode": customMode,
+        "instrumental": instrumental,
+        "callBackUrl": callback_url or CALLBACK_URL,
+    }
+    if title:
+        payload["title"] = title
+    if style:
+        payload["style"] = style
+    if negativeTags:
+        payload["negativeTags"] = negativeTags
+    if vocalGender:
+        payload["vocalGender"] = vocalGender
+    if styleWeight is not None:
+        payload["styleWeight"] = styleWeight
+    if weirdnessConstraint is not None:
+        payload["weirdnessConstraint"] = weirdnessConstraint
+    if audioWeight is not None:
+        payload["audioWeight"] = audioWeight
+
+    envelope = _post("/api/v1/generate", payload)
+    return _extract_task_id(envelope.data)
+
+
+def suno_add_instrumental(
+    *,
+    uploadUrl: str,
+    model: str = "V4_5PLUS",
+    title: Optional[str] = None,
+    tags: Optional[str] = None,
+    negativeTags: Optional[str] = None,
+) -> str:
+    payload: Dict[str, Any] = {"uploadUrl": uploadUrl, "model": model}
+    if title:
+        payload["title"] = title
+    if tags:
+        payload["tags"] = tags
+    if negativeTags:
+        payload["negativeTags"] = negativeTags
+    envelope = _post("/api/v1/generate/add-instrumental", payload)
+    return _extract_task_id(envelope.data)
+
+
+def suno_add_vocals(
+    *,
+    title: str,
+    lyrics: str,
+    model: str = "V5",
+    has_lyrics: bool = True,
+) -> str:
+    payload = {
+        "title": title,
+        "lyrics": lyrics,
+        "model": model,
+        "has_lyrics": has_lyrics,
+    }
+    envelope = _post("/api/v1/generate/add-vocals", payload)
+    return _extract_task_id(envelope.data)
+
+
+def suno_record_info(task_id: str) -> Dict[str, Any]:
+    envelope = _get("/api/v1/generate/record-info", {"taskId": task_id})
+    data = envelope.data or {}
+    if isinstance(data, Mapping):
+        return dict(data)
+    if hasattr(data, "model_dump"):
+        return data.model_dump()
+    return {"data": data}
 
 _TASK_TTL = 24 * 60 * 60
 _USER_LINK_TTL = 7 * 24 * 60 * 60
@@ -974,4 +1114,15 @@ class SunoService:
                 self._delete_user_link(task.task_id)
 
 
-__all__ = ["SunoService", "SunoClient", "SunoAPIError", "SunoTask", "SunoTrack"]
+__all__ = [
+    "SunoService",
+    "SunoClient",
+    "SunoAPIError",
+    "SunoTask",
+    "SunoTrack",
+    "SunoError",
+    "suno_generate",
+    "suno_add_instrumental",
+    "suno_add_vocals",
+    "suno_record_info",
+]
