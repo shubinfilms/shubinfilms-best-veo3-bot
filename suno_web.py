@@ -34,10 +34,18 @@ from settings import (
     HTTP_TIMEOUT_TOTAL,
     REDIS_PREFIX,
     SUNO_API_BASE,
+    SUNO_API_TOKEN,
     SUNO_CALLBACK_SECRET,
     SUNO_CALLBACK_URL,
     SUNO_ENABLED,
+    SUNO_GEN_PATH,
+    SUNO_TASK_STATUS_PATH,
+    SUNO_INSTR_PATH,
+    SUNO_VOCAL_PATH,
     TMP_CLEANUP_HOURS,
+    KIE_BASE_URL,
+    resolve_outbound_ip,
+    token_tail,
 )
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.service import SunoService
@@ -49,6 +57,9 @@ log_environment(log)
 
 app = FastAPI(title="Suno Callback Web", docs_url=None, redoc_url=None)
 service = SunoService()
+
+_SUNO_AVAILABLE = bool(SUNO_ENABLED and SUNO_API_TOKEN)
+_OUTBOUND_IP: Optional[str] = None
 
 _MAX_JSON_BYTES = 512 * 1024
 _ALLOWED_CORS_PATHS = {"/healthz", "/callbackz"}
@@ -177,6 +188,16 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 @app.on_event("startup")
 async def _startup_event() -> None:
     cleanup_old_directories()
+    global _OUTBOUND_IP
+    _OUTBOUND_IP = resolve_outbound_ip()
+    token_suffix = token_tail(SUNO_API_TOKEN or "")
+    tail_display = f"****{token_suffix}" if token_suffix else "none"
+    log.info(
+        "ENV Suno: base=%s, gen=%s, token_tail=%s",
+        SUNO_API_BASE or KIE_BASE_URL,
+        SUNO_GEN_PATH,
+        tail_display,
+    )
     summary = {
         "suno_enabled": SUNO_ENABLED,
         "api_base": SUNO_API_BASE,
@@ -234,13 +255,33 @@ def root() -> dict[str, bool]:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, bool]:
-    return {"ok": True}
+def healthz() -> JSONResponse:
+    payload = {"ok": True, "suno_enabled": _SUNO_AVAILABLE, "base": KIE_BASE_URL}
+    return JSONResponse(payload)
 
 
 @app.get("/callbackz")
 def callbackz() -> dict[str, str | bool]:
     return {"ok": True, "endpoint": "/suno-callback"}
+
+
+@app.get("/debug/env")
+def debug_env(token: Optional[str] = None) -> JSONResponse:
+    if not SUNO_CALLBACK_SECRET:
+        raise HTTPException(status_code=503, detail="callback secret not configured")
+    if token != SUNO_CALLBACK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    tail = token_tail(SUNO_API_TOKEN or "")
+    payload = {
+        "KIE_BASE_URL": KIE_BASE_URL,
+        "SUNO_GEN_PATH": SUNO_GEN_PATH,
+        "SUNO_TASK_STATUS_PATH": SUNO_TASK_STATUS_PATH,
+        "SUNO_INSTR_PATH": SUNO_INSTR_PATH,
+        "SUNO_VOCAL_PATH": SUNO_VOCAL_PATH,
+        "SUNO_API_TOKEN_TAIL": f"****{tail}" if tail else "",
+        "OUTBOUND_IP": _OUTBOUND_IP,
+    }
+    return JSONResponse(payload)
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -353,21 +394,21 @@ def _prepare_assets(task: SunoTask) -> None:
             track.image_url = _download(track.image_url, target)
 
 
+@app.get("/suno-callback")
+async def suno_callback_get() -> Response:
+    return Response(status_code=405)
+
+
 @app.post("/suno-callback")
 async def suno_callback(
     request: Request,
     x_callback_secret: Optional[str] = Header(default=None, alias="X-Callback-Secret"),
 ):
-    provided = (
-        x_callback_secret
-        or request.headers.get("X-Callback-Token")
-        or request.query_params.get("secret")
-        or request.query_params.get("token")
-    )
-    if SUNO_CALLBACK_SECRET and provided != SUNO_CALLBACK_SECRET:
+    provided = x_callback_secret
+    if not SUNO_CALLBACK_SECRET or provided != SUNO_CALLBACK_SECRET:
         log.warning("forbidden callback", extra={"meta": {"provided": bool(provided)}})
         suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
-        return JSONResponse({"error": "forbidden"}, status_code=403)
+        return Response(status_code=403)
 
     body = await request.body()
     if len(body) > _MAX_JSON_BYTES:
@@ -391,6 +432,14 @@ async def suno_callback(
     normalized_payload, flat_payload, key_list = _normalize_callback_payload(payload)
     envelope = CallbackEnvelope.model_validate(normalized_payload)
     task = SunoTask.from_envelope(envelope)
+    items_count = len(task.items or [])
+    log.info(
+        "suno.callback code=%s task_id=%s type=%s items=%s",
+        task.code,
+        task.task_id or "",
+        task.callback_type or "",
+        items_count,
+    )
     data_map: Mapping[str, Any] = envelope.data or {}
     payload_req_id = _first_identifier(data_map, ("req_id", "requestId", "request_id"))
     if not payload_req_id:
@@ -452,28 +501,33 @@ async def suno_callback(
         suno_callback_total.labels(status="skipped", **_WEB_LABELS).inc()
         return {"ok": True, "duplicate": True}
 
-    _prepare_assets(task)
-    service.handle_callback(task, req_id=req_id)
-    status_name = (task.callback_type or "").lower()
-    if status_name in {"complete", "success"}:
-        log.info(
-            "suno callback success",
-            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "code": task.code}},
+    process_status = "ok"
+    try:
+        _prepare_assets(task)
+    except Exception as exc:  # pragma: no cover - defensive
+        process_status = "error"
+        log.exception(
+            "suno callback asset prep failed",
+            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}},
+        )
+    try:
+        service.handle_callback(task, req_id=req_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        process_status = "error"
+        log.exception(
+            "suno callback handler failed",
+            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}},
         )
     else:
-        log.warning(
-            "suno callback processed",
-            extra={
-                "meta": {
-                    "task_id": task.task_id,
-                    "req_id": req_id,
-                    "code": task.code,
-                    "type": status_name,
-                }
-            },
-        )
-    suno_callback_total.labels(status="ok", **_WEB_LABELS).inc()
-    return {"ok": True}
+        status_name = (task.callback_type or "").lower()
+        meta = {"task_id": task.task_id, "req_id": req_id, "code": task.code}
+        if status_name in {"complete", "success"}:
+            log.info("suno callback success", extra={"meta": meta})
+        else:
+            meta["type"] = status_name
+            log.warning("suno callback processed", extra={"meta": meta})
+    suno_callback_total.labels(status=process_status, **_WEB_LABELS).inc()
+    return {"ok": process_status == "ok"}
 
 
 __all__ = ["app"]

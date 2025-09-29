@@ -5,11 +5,9 @@ services:
     region: frankfurt
     buildCommand: pip install -r requirements.txt
     startCommand: >
-      gunicorn suno_web:app
-      -k uvicorn.workers.UvicornWorker
-      --bind 0.0.0.0:$PORT
-      --access-logfile -
-      --error-logfile -
+      uvicorn suno_web:app
+      --host 0.0.0.0
+      --port $PORT
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"

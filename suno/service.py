@@ -22,6 +22,7 @@ from settings import (
     HTTP_POOL_PER_HOST,
     REDIS_PREFIX,
     SUNO_API_BASE,
+    SUNO_API_TOKEN,
     SUNO_CALLBACK_SECRET,
     SUNO_CALLBACK_URL,
     SUNO_ENABLED,
@@ -39,9 +40,9 @@ except Exception:  # pragma: no cover - optional import
 
 log = logging.getLogger("suno.service")
 
-API_BASE = (os.getenv("SUNO_API_BASE") or "https://api.kie.ai").rstrip("/")
-API_KEY = os.getenv("SUNO_API_KEY")
-CALLBACK_URL = os.getenv("SUNO_CALLBACK_URL")
+API_BASE = SUNO_API_BASE
+API_KEY = SUNO_API_TOKEN
+CALLBACK_URL = SUNO_CALLBACK_URL
 
 
 class SunoError(Exception):
@@ -814,6 +815,8 @@ class SunoService:
         }
         if lang:
             payload["lang"] = str(lang).strip()
+        if user_id is not None:
+            payload["userId"] = str(user_id)
         try:
             result, api_version = self.client.create_music(payload, req_id=req_id)
         except SunoAPIError as exc:

@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 load_dotenv()
+
+log = logging.getLogger("config")
+_CONFIG_WARNINGS: list[str] = []
+
+
+def _push_warning(message: str) -> None:
+    if message not in _CONFIG_WARNINGS:
+        _CONFIG_WARNINGS.append(message)
 
 _VALID_LEVELS = {name for name in logging._nameToLevel if isinstance(name, str)}
 
@@ -31,13 +40,30 @@ class _AppSettings(BaseModel):
 
     TMP_CLEANUP_HOURS: int = Field(default=24, ge=1, le=240)
 
+    KIE_BASE_URL: str = Field(default="https://api.kie.ai")
+    KIE_API_KEY: Optional[str] = Field(default=None)
+
     SUNO_ENABLED: bool = Field(default=False)
-    SUNO_API_BASE: Optional[str] = Field(default="https://api.kie.ai")
+    SUNO_API_BASE: Optional[str] = Field(default=None)
     SUNO_API_TOKEN: Optional[str] = Field(default=None)
     SUNO_CALLBACK_SECRET: Optional[str] = Field(default=None)
     SUNO_CALLBACK_URL: Optional[str] = Field(default=None)
     SUNO_TIMEOUT_SEC: Optional[float] = Field(default=None)
     SUNO_MAX_RETRIES: Optional[int] = Field(default=None)
+    SUNO_GEN_PATH: str = Field(default="/api/v1/generate")
+    SUNO_TASK_STATUS_PATH: str = Field(default="/api/v1/generate/record-info")
+    SUNO_WAV_PATH: str = Field(default="/api/v1/wav/generate")
+    SUNO_WAV_INFO_PATH: str = Field(default="/api/v1/wav/record-info")
+    SUNO_MP4_PATH: str = Field(default="/api/v1/mp4/generate")
+    SUNO_MP4_INFO_PATH: str = Field(default="/api/v1/mp4/record-info")
+    SUNO_STEM_PATH: str = Field(default="/api/v1/vocal-removal/generate")
+    SUNO_STEM_INFO_PATH: str = Field(default="/api/v1/vocal-removal/record-info")
+    SUNO_LYRICS_PATH: str = Field(default="/api/v1/generate/get-timestamped-lyrics")
+    SUNO_UPLOAD_EXTEND_PATH: str = Field(default="/api/v1/suno/upload-extend")
+    SUNO_COVER_INFO_PATH: str = Field(default="/api/v1/suno/cover/record-info")
+    SUNO_INSTR_PATH: str = Field(default="/api/v1/generate/add-instrumental")
+    SUNO_VOCAL_PATH: str = Field(default="/api/v1/generate/add-vocals")
+    SUNO_MODEL: Optional[str] = Field(default=None)
 
     @field_validator("LOG_LEVEL", mode="before")
     def _normalize_level(cls, value: object) -> str:
@@ -49,6 +75,8 @@ class _AppSettings(BaseModel):
         return text
 
     @field_validator(
+        "KIE_BASE_URL",
+        "KIE_API_KEY",
         "SUNO_API_BASE",
         "SUNO_API_TOKEN",
         "SUNO_CALLBACK_SECRET",
@@ -61,6 +89,34 @@ class _AppSettings(BaseModel):
         text = str(value).strip()
         return text or None
 
+    @field_validator(
+        "SUNO_GEN_PATH",
+        "SUNO_TASK_STATUS_PATH",
+        "SUNO_WAV_PATH",
+        "SUNO_WAV_INFO_PATH",
+        "SUNO_MP4_PATH",
+        "SUNO_MP4_INFO_PATH",
+        "SUNO_STEM_PATH",
+        "SUNO_STEM_INFO_PATH",
+        "SUNO_LYRICS_PATH",
+        "SUNO_UPLOAD_EXTEND_PATH",
+        "SUNO_COVER_INFO_PATH",
+        "SUNO_INSTR_PATH",
+        "SUNO_VOCAL_PATH",
+        mode="before",
+    )
+    def _normalize_path(cls, value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "/"
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+        if not text.startswith("/"):
+            text = f"/{text}"
+        while "//" in text:
+            text = text.replace("//", "/")
+        return text
+
     @model_validator(mode="after")
     def _validate_timeouts(self) -> "_AppSettings":
         max_required = max(self.HTTP_TIMEOUT_CONNECT, self.HTTP_TIMEOUT_READ)
@@ -70,15 +126,21 @@ class _AppSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_suno(self) -> "_AppSettings":
+        if not self.SUNO_API_BASE:
+            self.SUNO_API_BASE = self.KIE_BASE_URL
+        if not self.SUNO_API_TOKEN and self.KIE_API_KEY:
+            self.SUNO_API_TOKEN = self.KIE_API_KEY
         if self.SUNO_ENABLED:
             missing = [
                 name
-                for name in ("SUNO_API_BASE", "SUNO_API_TOKEN", "SUNO_CALLBACK_SECRET", "SUNO_CALLBACK_URL")
+                for name in ("SUNO_API_TOKEN", "SUNO_CALLBACK_SECRET", "SUNO_CALLBACK_URL")
                 if not getattr(self, name)
             ]
             if missing:
                 joined = ", ".join(missing)
-                raise ValueError(f"SUNO_ENABLED=true requires {joined}")
+                _push_warning(
+                    f"SUNO_ENABLED=true but missing configuration: {joined}"
+                )
         return self
 
 
@@ -121,37 +183,99 @@ TMP_CLEANUP_HOURS = int(_APP_SETTINGS.TMP_CLEANUP_HOURS)
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 
-SUNO_API_BASE = (_APP_SETTINGS.SUNO_API_BASE or "https://api.kie.ai").rstrip("/")
-SUNO_API_TOKEN = _APP_SETTINGS.SUNO_API_TOKEN
-SUNO_CALLBACK_SECRET = _APP_SETTINGS.SUNO_CALLBACK_SECRET
-SUNO_CALLBACK_URL = _APP_SETTINGS.SUNO_CALLBACK_URL
+
+def _strip_optional(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+KIE_BASE_URL = (_strip_optional(_APP_SETTINGS.KIE_BASE_URL) or "https://api.kie.ai").rstrip("/")
+KIE_API_KEY = _strip_optional(_APP_SETTINGS.KIE_API_KEY)
+
+_suno_base_candidate = _APP_SETTINGS.SUNO_API_BASE or KIE_BASE_URL
+SUNO_API_BASE = (_strip_optional(_suno_base_candidate) or KIE_BASE_URL).rstrip("/")
+SUNO_API_TOKEN = _strip_optional(_APP_SETTINGS.SUNO_API_TOKEN or KIE_API_KEY)
+SUNO_CALLBACK_SECRET = _strip_optional(_APP_SETTINGS.SUNO_CALLBACK_SECRET)
+SUNO_CALLBACK_URL = _strip_optional(_APP_SETTINGS.SUNO_CALLBACK_URL)
 SUNO_TIMEOUT_SEC = int(round(HTTP_TIMEOUT_TOTAL))
 SUNO_MAX_RETRIES = max(1, HTTP_RETRY_ATTEMPTS)
 SUNO_ENABLED = bool(_APP_SETTINGS.SUNO_ENABLED)
 
+SUNO_GEN_PATH = _APP_SETTINGS.SUNO_GEN_PATH
+SUNO_TASK_STATUS_PATH = _APP_SETTINGS.SUNO_TASK_STATUS_PATH
+SUNO_WAV_PATH = _APP_SETTINGS.SUNO_WAV_PATH
+SUNO_WAV_INFO_PATH = _APP_SETTINGS.SUNO_WAV_INFO_PATH
+SUNO_MP4_PATH = _APP_SETTINGS.SUNO_MP4_PATH
+SUNO_MP4_INFO_PATH = _APP_SETTINGS.SUNO_MP4_INFO_PATH
+SUNO_STEM_PATH = _APP_SETTINGS.SUNO_STEM_PATH
+SUNO_STEM_INFO_PATH = _APP_SETTINGS.SUNO_STEM_INFO_PATH
+SUNO_LYRICS_PATH = _APP_SETTINGS.SUNO_LYRICS_PATH
+SUNO_UPLOAD_EXTEND_PATH = _APP_SETTINGS.SUNO_UPLOAD_EXTEND_PATH
+SUNO_COVER_INFO_PATH = _APP_SETTINGS.SUNO_COVER_INFO_PATH
+SUNO_INSTR_PATH = _APP_SETTINGS.SUNO_INSTR_PATH
+SUNO_VOCAL_PATH = _APP_SETTINGS.SUNO_VOCAL_PATH
+SUNO_MODEL = _strip_optional(_APP_SETTINGS.SUNO_MODEL)
 
-def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    value = value.strip()
-    return value or default
+
+def _emit_warnings() -> None:
+    if not KIE_API_KEY:
+        _push_warning("KIE_API_KEY is not configured")
+    for name, value in {
+        "SUNO_API_TOKEN": SUNO_API_TOKEN,
+        "SUNO_CALLBACK_SECRET": SUNO_CALLBACK_SECRET,
+        "SUNO_CALLBACK_URL": SUNO_CALLBACK_URL,
+    }.items():
+        if not value:
+            _push_warning(f"{name} is not configured")
+    for message in _CONFIG_WARNINGS:
+        log.warning("config warning: %s", message)
 
 
-SUNO_GEN_PATH = _get_env("SUNO_GEN_PATH", "/api/v1/generate/add-vocals")
-SUNO_TASK_STATUS_PATH = _get_env("SUNO_TASK_STATUS_PATH", "/api/v1/generate/record-info")
-SUNO_WAV_PATH = _get_env("SUNO_WAV_PATH", "/api/v1/wav/generate")
-SUNO_WAV_INFO_PATH = _get_env("SUNO_WAV_INFO_PATH", "/api/v1/wav/record-info")
-SUNO_MP4_PATH = _get_env("SUNO_MP4_PATH", "/api/v1/mp4/generate")
-SUNO_MP4_INFO_PATH = _get_env("SUNO_MP4_INFO_PATH", "/api/v1/mp4/record-info")
-SUNO_STEM_PATH = _get_env("SUNO_STEM_PATH", "/api/v1/vocal-removal/generate")
-SUNO_STEM_INFO_PATH = _get_env("SUNO_STEM_INFO_PATH", "/api/v1/vocal-removal/record-info")
-SUNO_LYRICS_PATH = _get_env("SUNO_LYRICS_PATH", "/api/v1/generate/get-timestamped-lyrics")
-SUNO_UPLOAD_EXTEND_PATH = _get_env("SUNO_UPLOAD_EXTEND_PATH", "/api/v1/suno/upload-extend")
-SUNO_COVER_INFO_PATH = _get_env("SUNO_COVER_INFO_PATH", "/api/v1/suno/cover/record-info")
-SUNO_INSTR_PATH = _get_env("SUNO_INSTR_PATH", "/api/v1/generate/add-instrumental")
+_emit_warnings()
 
-SUNO_MODEL = _get_env("SUNO_MODEL")
+
+_OUTBOUND_IP: Optional[str] = None
+_OUTBOUND_LOCK = threading.Lock()
+
+
+def resolve_outbound_ip(*, force: bool = False, timeout: float = 5.0) -> Optional[str]:
+    """Resolve and cache the container outbound IP address."""
+
+    global _OUTBOUND_IP
+    if not force and _OUTBOUND_IP:
+        return _OUTBOUND_IP
+    with _OUTBOUND_LOCK:
+        if not force and _OUTBOUND_IP:
+            return _OUTBOUND_IP
+        url = os.getenv("OUTBOUND_IP_ECHO_URL") or "https://api.ipify.org"
+        try:
+            import httpx
+
+            with httpx.Client(timeout=timeout) as client:
+                response = client.get(url, params={"format": "text"})
+                response.raise_for_status()
+        except Exception as exc:  # pragma: no cover - network best effort
+            log.warning("outbound ip detection failed: %s", exc)
+            return _OUTBOUND_IP
+        ip = (response.text or "").strip()
+        if not ip:
+            log.warning("outbound ip detection returned empty response")
+            return _OUTBOUND_IP
+        _OUTBOUND_IP = ip
+        return _OUTBOUND_IP
+
+
+def token_tail(token: Optional[str]) -> str:
+    """Return masked token tail for logging/diagnostics."""
+
+    if not token:
+        return ""
+    text = token.strip()
+    if len(text) <= 4:
+        return text
+    return text[-4:]
 
 __all__ = [
     "LOG_LEVEL",
@@ -164,6 +288,8 @@ __all__ = [
     "HTTP_POOL_CONNECTIONS",
     "HTTP_POOL_PER_HOST",
     "TMP_CLEANUP_HOURS",
+    "KIE_BASE_URL",
+    "KIE_API_KEY",
     "REDIS_PREFIX",
     "SUNO_LOG_KEY",
     "SUNO_API_BASE",
@@ -184,6 +310,9 @@ __all__ = [
     "SUNO_UPLOAD_EXTEND_PATH",
     "SUNO_COVER_INFO_PATH",
     "SUNO_INSTR_PATH",
+    "SUNO_VOCAL_PATH",
     "SUNO_MODEL",
     "SUNO_ENABLED",
+    "resolve_outbound_ip",
+    "token_tail",
 ]

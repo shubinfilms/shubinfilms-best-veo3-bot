@@ -161,6 +161,7 @@ from settings import (
     REDIS_PREFIX,
     SUNO_CALLBACK_URL as SETTINGS_SUNO_CALLBACK_URL,
     SUNO_ENABLED as SETTINGS_SUNO_ENABLED,
+    SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
 )
 from suno.service import SunoService, SunoAPIError
@@ -718,6 +719,7 @@ SUNO_STATUS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_STATUS_PATH)
 SUNO_EXTEND_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_EXTEND_PATH)
 SUNO_LYRICS_URL = _compose_suno_url(SUNO_BASE_URL, SUNO_LYRICS_PATH)
 SUNO_PRICE = SUNO_CONFIG.price
+SUNO_MODE_AVAILABLE = bool(SETTINGS_SUNO_ENABLED and SETTINGS_SUNO_API_TOKEN)
 SUNO_POLL_INTERVAL = 3.0
 SUNO_POLL_TIMEOUT = float(SUNO_CONFIG.timeout_sec)
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
@@ -4911,6 +4913,14 @@ async def _launch_suno_generation(
     trigger: str,
 ) -> None:
     s = state(ctx)
+    if not SUNO_MODE_AVAILABLE:
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "Suno временно недоступен",
+            reply_to=reply_to,
+        )
+        return
     if s.get("suno_generating"):
         await _suno_notify(
             ctx,
