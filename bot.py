@@ -245,14 +245,14 @@ _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
 _SUNO_LOCK_MEMORY: set[int] = set()
 
-_SUNO_PENDING_TTL = 24 * 60 * 60
+_SUNO_PENDING_TTL = 20 * 60
 _SUNO_PENDING_LOCK = threading.Lock()
 _SUNO_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
 
 _SUNO_REFUND_PENDING_LOCK = threading.Lock()
 _SUNO_REFUND_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
 _SUNO_ENQUEUE_MAX_ATTEMPTS = 4
-_SUNO_ENQUEUE_MAX_DELAY = 12.0
+_SUNO_ENQUEUE_MAX_DELAY = 15.0
 
 
 def _suno_lock_key(user_id: int) -> str:
@@ -284,6 +284,12 @@ def _release_suno_lock(user_id: int) -> None:
             log.warning("Suno lock release redis error | user=%s err=%s", user_id, exc)
     with _SUNO_LOCK_GUARD:
         _SUNO_LOCK_MEMORY.discard(user_id)
+
+
+def _generate_suno_request_id(user_id: int) -> str:
+    """Return a deterministic prefix request id for Suno enqueue calls."""
+
+    return f"suno:{int(user_id)}:{uuid.uuid4()}"
 
 
 def _suno_cooldown_key(user_id: int) -> str:
@@ -4077,7 +4083,7 @@ def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
     ]
     snippet = _short_prompt(prompt)
     snippet_html = html.escape(snippet) if snippet else ""
-    display = snippet_html if snippet_html else html.escape(_PROMPT_PLACEHOLDER)
+    display = snippet_html if snippet_html else " "
     lines.extend(["", f"Промпт: <i>{display}</i>"])
     return "\n".join(lines)
 
@@ -4965,7 +4971,7 @@ async def _launch_suno_generation(
     if isinstance(existing_req_id, str) and existing_req_id.strip():
         req_id = existing_req_id.strip()
     else:
-        req_id = f"suno:{uuid.uuid4()}"
+        req_id = _generate_suno_request_id(int(user_id))
 
     lang_source = style or lyrics or title
     lang = detect_lang(lang_source or title or "")
@@ -4995,7 +5001,7 @@ async def _launch_suno_generation(
     existing_pending = _suno_pending_load(req_id)
     if existing_pending:
         status = str(existing_pending.get("status") or "").lower()
-        if status == "queued" and existing_pending.get("task_id"):
+        if status in {"enqueued", "processing"} and existing_pending.get("task_id"):
             log.info(
                 "[SUNO] duplicate launch skip | req_id=%s task_id=%s",
                 req_id,
@@ -5089,7 +5095,7 @@ async def _launch_suno_generation(
                 "req_id": req_id,
                 "req_short": req_label,
                 "charged": True,
-                "status": "enqueueing",
+                "status": "new",
             }
         )
 
@@ -5231,7 +5237,7 @@ async def _launch_suno_generation(
                 base_delay=1.0,
                 max_delay=6.0,
                 backoff_factor=2.0,
-                jitter=(0.0, 0.6),
+                jitter=0.3,
                 max_total_delay=_SUNO_ENQUEUE_MAX_DELAY,
                 logger=log,
                 log_context={"req_id": req_id, "stage": "suno.enqueue"},
@@ -5350,7 +5356,7 @@ async def _launch_suno_generation(
         pending_meta.update(
             {
                 "task_id": task_id,
-                "status": "queued",
+                "status": "enqueued",
                 "updated_ts": _utcnow_iso(),
             }
         )
@@ -5607,7 +5613,7 @@ def veo_card_text(s: Dict[str, Any]) -> str:
     if prompt_html:
         code_line = f"<code>{prompt_html}</code>"
     else:
-        code_line = f"<code>{html.escape(_PROMPT_PLACEHOLDER)}</code>"
+        code_line = "<code> </code>"
     lines.extend([
         "",
         "🖊️ <b>Промпт:</b>",

@@ -621,13 +621,20 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
     params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    user_id = 888
+    user_id = 777
+    user_id = 888
+    user_id = 777
+    user_id = 888
+    user_id = 777
+    user_id = 555
 
     async def _run():
         await bot._launch_suno_generation(
             chat_id=123,
             ctx=ctx,
             params=params,
-            user_id=555,
+            user_id=user_id,
             reply_to=None,
             trigger="test",
         )
@@ -652,13 +659,13 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
 
-    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:suno:{user_id}:{str(fixed_uuid)}"
     assert pending_key in fake_redis.store
     record = json.loads(fake_redis.store[pending_key])
     assert record["notify_ok"] is True
     assert record["task_id"] == "task-xyz"
-    assert record["status"] == "queued"
-    assert record["req_short"] == "000000"
+    assert record["status"] == "enqueued"
+    assert record["req_short"] == "SUNO:5"
     state = bot.state(ctx)
     assert state["suno_generating"] is False
     assert state["suno_current_req_id"] is None
@@ -727,13 +734,13 @@ def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
     params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
-
+    user_id = 777
     async def _run():
         await bot._launch_suno_generation(
             chat_id=321,
             ctx=ctx,
             params=params,
-            user_id=777,
+            user_id=user_id,
             reply_to=None,
             trigger="test",
         )
@@ -751,11 +758,11 @@ def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
 
-    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:suno:{user_id}:{str(fixed_uuid)}"
     record = json.loads(fake_redis.store[pending_key])
     assert record["notify_ok"] is False
     assert record["task_id"] == "task-fail-ok"
-    assert record["status"] == "queued"
+    assert record["status"] == "enqueued"
     state = bot.state(ctx)
     assert state["suno_generating"] is False
 
@@ -816,13 +823,13 @@ def test_launch_suno_failure_marks_refund(monkeypatch, bot_module):
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
     params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
-
+    user_id = 888
     async def _run():
         await bot._launch_suno_generation(
             chat_id=654,
             ctx=ctx,
             params=params,
-            user_id=888,
+            user_id=user_id,
             reply_to=None,
             trigger="test",
         )
@@ -834,12 +841,12 @@ def test_launch_suno_failure_marks_refund(monkeypatch, bot_module):
     assert debit_calls["count"] == 1
     assert refund_calls["count"] == 1
 
-    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:suno:{user_id}:{str(fixed_uuid)}"
     record = json.loads(fake_redis.store[pending_key])
     assert record["status"] == "failed"
     assert record["notify_ok"] is False
 
-    refund_key = f"{bot.REDIS_PREFIX}:suno:refund:pending:{str(fixed_uuid)}"
+    refund_key = f"{bot.REDIS_PREFIX}:suno:refund:pending:suno:{user_id}:{str(fixed_uuid)}"
     assert refund_key in fake_redis.store
     refund_record = json.loads(fake_redis.store[refund_key])
     assert refund_record["status"] == "failed"
@@ -924,5 +931,5 @@ def test_launch_suno_duplicate_req_id_no_double_charge(monkeypatch, bot_module):
 
     assert debit_calls["count"] == 1
     assert start_calls["count"] == 1
-    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:{str(fixed_uuid)}"
+    pending_key = f"{bot.REDIS_PREFIX}:suno:pending:suno:999:{str(fixed_uuid)}"
     assert pending_key in fake_redis.store
