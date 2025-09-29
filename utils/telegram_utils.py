@@ -118,6 +118,12 @@ _LABEL_PATTERN_PARTS.append(_COMMAND_PATTERN)
 
 COMMAND_OR_BUTTON_REGEX = re.compile("|".join(_LABEL_PATTERN_PARTS))
 
+_PLACEHOLDER_PROMPTS = {
+    "⏳ sending request…",
+    "⚠️ generation failed, please try later.",
+    "⚠️ generation failed, please try later. 💎 токены возвращены.",
+}
+
 
 BUTTON_LABELS = set(MENU_LABELS)
 
@@ -166,6 +172,8 @@ def should_capture_to_prompt(text: Optional[str]) -> bool:
     if is_command_text(stripped):
         return False
     if is_button_label(stripped):
+        return False
+    if stripped.casefold() in _PLACEHOLDER_PROMPTS:
         return False
     return True
 

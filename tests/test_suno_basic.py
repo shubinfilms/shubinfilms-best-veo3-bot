@@ -581,12 +581,19 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     monkeypatch.setattr(bot, "debit_try", fake_debit_try)
 
     notify_calls = {"count": 0}
+    edited_payloads: list[str] = []
 
     async def fake_notify(*args, **kwargs):
         notify_calls["count"] += 1
         return SimpleNamespace(message_id=111)
 
     monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    async def fake_safe_edit_message(ctx_param, chat_id_param, message_id_param, new_text, **kwargs):
+        edited_payloads.append(new_text)
+        return True
+
+    monkeypatch.setattr(bot, "safe_edit_message", fake_safe_edit_message)
 
     async def fake_to_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
@@ -641,6 +648,7 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     assert notify_total_after == notify_total_before + 1
     assert enqueue_total_after == enqueue_total_before + 1
     assert notify_calls["count"] == 1
+    assert edited_payloads and edited_payloads[-1].startswith("✅ Списано")
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
 
