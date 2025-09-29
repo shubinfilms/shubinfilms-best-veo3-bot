@@ -48,6 +48,7 @@ from settings import (
     resolve_outbound_ip,
     token_tail,
 )
+from telegram_utils import mask_tokens
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.service import SunoService
 from suno.tempfiles import cleanup_old_directories, task_directory
@@ -79,26 +80,12 @@ _EXPECTED_RENDER_BASE = (os.getenv("RENDER_EXTERNAL_URL") or "https://shubinfilm
 _EXPECTED_CALLBACK_URL = f"{_EXPECTED_RENDER_BASE}/suno-callback"
 
 
-def _mask_tokens(text: str) -> str:
-    secrets = [
-        SUNO_CALLBACK_SECRET or "",
-        os.getenv("SUNO_API_TOKEN") or "",
-        os.getenv("TELEGRAM_TOKEN") or "",
-    ]
-    cleaned = text
-    for token in secrets:
-        trimmed = token.strip()
-        if trimmed:
-            cleaned = cleaned.replace(trimmed, "***")
-    return cleaned
-
-
 def _json_preview(payload: Any, *, limit: int = 700) -> str:
     try:
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     except Exception:
         text = str(payload)
-    text = _mask_tokens(text)
+    text = mask_tokens(text)
     if len(text) > limit:
         return f"{text[:limit]}…"
     return text

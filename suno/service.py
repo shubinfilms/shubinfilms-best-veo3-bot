@@ -28,6 +28,7 @@ from settings import (
     SUNO_CALLBACK_URL,
     SUNO_ENABLED,
 )
+from telegram_utils import mask_tokens
 
 try:  # pragma: no cover - optional runtime dependency
     from redis import Redis
@@ -226,22 +227,6 @@ _LOG_ONCE_TTL = 48 * 60 * 60
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 
 
-def _mask_tokens(text: str) -> str:
-    """Mask known sensitive tokens in ``text`` before logging."""
-
-    secrets = [
-        SUNO_CALLBACK_SECRET or "",
-        os.getenv("SUNO_API_TOKEN") or "",
-        os.getenv("TELEGRAM_TOKEN") or "",
-    ]
-    cleaned = text
-    for secret in secrets:
-        token = secret.strip()
-        if token:
-            cleaned = cleaned.replace(token, "***")
-    return cleaned
-
-
 def _json_preview(payload: Any, *, limit: int = 700) -> str:
     """Return a trimmed JSON representation of ``payload`` for logs."""
 
@@ -249,7 +234,7 @@ def _json_preview(payload: Any, *, limit: int = 700) -> str:
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     except Exception:
         text = str(payload)
-    text = _mask_tokens(text)
+    text = mask_tokens(text)
     if len(text) > limit:
         return f"{text[:limit]}…"
     return text
@@ -1151,7 +1136,9 @@ class SunoService:
         if not resp.ok:
             bot_telegram_send_fail_total.labels(method=method).inc()
             log.warning(
-                "Telegram sendAudio failed | status=%s text=%s", resp.status_code, _mask_tokens(resp.text)
+                "Telegram sendAudio failed | status=%s text=%s",
+                resp.status_code,
+                mask_tokens(resp.text),
             )
             return False
         return True
@@ -1188,7 +1175,9 @@ class SunoService:
         if not resp.ok:
             bot_telegram_send_fail_total.labels(method=method).inc()
             log.warning(
-                "Telegram sendPhoto failed | status=%s text=%s", resp.status_code, _mask_tokens(resp.text)
+                "Telegram sendPhoto failed | status=%s text=%s",
+                resp.status_code,
+                mask_tokens(resp.text),
             )
             return False
         return True
@@ -1545,67 +1534,88 @@ class SunoService:
                 resolved_audio = track.source_audio_url or track.audio_url
                 thumb_url = track.source_image_url or track.image_url
                 send_title = f"{title} ({take_label})" if take_label else title
+                duration_label = self._format_duration_label(track.duration)
+                fallback_lines: list[str] = []
+                if track.audio_url:
+                    fallback_lines.append(f"🔗 Аудио ({title}): {track.audio_url}")
+                elif resolved_audio:
+                    fallback_lines.append(f"🔗 Аудио ({title}): {resolved_audio}")
+                if track.tags:
+                    fallback_lines.append(f"🏷️ {track.tags}")
+                if duration_label:
+                    fallback_lines.append(f"⏱️ {duration_label}")
+                if track.image_url:
+                    fallback_lines.append(f"🖼️ Обложка ({title}): {track.image_url}")
+                if not fallback_lines:
+                    fallback_lines.append(f"⚠️ Не удалось отправить трек {title}.")
+                fallback_text = "\n".join(fallback_lines)
                 audio_sent = False
-                if resolved_audio and self._send_audio_url(
-                    chat_id,
-                    resolved_audio,
-                    caption=caption,
-                    reply_to=None,
-                    title=send_title,
-                    thumb=thumb_url,
-                ):
-                    audio_sent = True
-                    log.info(
-                        "Suno audio url sent | task=%s track=%s url=%s",
-                        task.task_id,
-                        track_id,
-                        _mask_tokens(resolved_audio),
-                    )
-                else:
-                    audio_path = self._find_local_file(base_dir, track_id)
-                    if audio_path and self._send_audio(chat_id, audio_path, title=title, reply_to=None):
+                image_sent = False
+                try:
+                    if resolved_audio and self._send_audio_url(
+                        chat_id,
+                        resolved_audio,
+                        caption=caption,
+                        reply_to=None,
+                        title=send_title,
+                        thumb=thumb_url,
+                    ):
                         audio_sent = True
                         log.info(
-                            "Suno audio sent | task=%s track=%s path=%s",
+                            "Suno audio url sent | task=%s track=%s url=%s",
                             task.task_id,
                             track_id,
-                            audio_path,
+                            mask_tokens(resolved_audio),
                         )
-                if not audio_sent and track.audio_url:
-                    text_lines = [f"🔗 Аудио ({title}): {track.audio_url}"]
-                    if track.tags:
-                        text_lines.append(f"🏷️ {track.tags}")
-                    duration_label = self._format_duration_label(track.duration)
-                    if duration_label:
-                        text_lines.append(f"⏱️ {duration_label}")
-                    self._send_text(chat_id, "\n".join(text_lines))
-                image_caption = f"🖼️ {title} (обложка)"
-                image_sent = False
-                if track.image_url and self._send_image_url(
-                    chat_id,
-                    track.image_url,
-                    caption=image_caption,
-                    reply_to=None,
-                ):
-                    image_sent = True
-                    log.info(
-                        "Suno cover url sent | task=%s track=%s url=%s",
-                        task.task_id,
-                        track_id,
-                        _mask_tokens(track.image_url),
-                    )
-                else:
-                    image_path = self._find_local_file(base_dir, f"{track_id}_cover")
-                    if image_path and self._send_image(chat_id, image_path, title=title, reply_to=None):
+                    else:
+                        audio_path = self._find_local_file(base_dir, track_id)
+                        if audio_path and self._send_audio(chat_id, audio_path, title=title, reply_to=None):
+                            audio_sent = True
+                            log.info(
+                                "Suno audio sent | task=%s track=%s path=%s",
+                                task.task_id,
+                                track_id,
+                                audio_path,
+                            )
+                    image_caption = f"🖼️ {title} (обложка)"
+                    if track.image_url and self._send_image_url(
+                        chat_id,
+                        track.image_url,
+                        caption=image_caption,
+                        reply_to=None,
+                    ):
                         image_sent = True
                         log.info(
-                            "Suno cover sent | task=%s track=%s path=%s",
+                            "Suno cover url sent | task=%s track=%s url=%s",
                             task.task_id,
                             track_id,
-                            image_path,
+                            mask_tokens(track.image_url),
                         )
-                if not image_sent and track.image_url:
+                    else:
+                        image_path = self._find_local_file(base_dir, f"{track_id}_cover")
+                        if image_path and self._send_image(chat_id, image_path, title=title, reply_to=None):
+                            image_sent = True
+                            log.info(
+                                "Suno cover sent | task=%s track=%s path=%s",
+                                task.task_id,
+                                track_id,
+                                image_path,
+                            )
+                except Exception as send_exc:
+                    log.error(
+                        "Failed to send audio %s, chat %s, error=%s",
+                        task.task_id,
+                        chat_id,
+                        send_exc,
+                        exc_info=True,
+                    )
+                    audio_sent = False
+                    image_sent = False
+                if not audio_sent:
+                    self._send_text(chat_id, fallback_text)
+                elif not image_sent and track.image_url:
                     self._send_text(chat_id, f"🖼️ Обложка ({title}): {track.image_url}")
+                log.info("Delivered track %s to chat %s", task.task_id, chat_id)
                 track_records.append(
                     {
                         "id": track_id,

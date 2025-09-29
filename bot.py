@@ -212,6 +212,7 @@ from telegram_utils import (
     safe_edit_markdown_v2,
     run_ffmpeg,
     md2_escape,
+    mask_tokens,
 )
 from utils.api_client import request_with_retries
 from utils.telegram_safe import safe_edit_message
@@ -5745,16 +5746,22 @@ async def _poll_suno_and_send(
         }
 
         duration_value = _poll_duration(details)
-        audio_url_preview = None
+        audio_url_preview = ""
         if tracks_payload:
-            audio_url_preview = tracks_payload[0].get("audioUrl") or tracks_payload[0].get("audio_url")
+            preview_candidate = (
+                tracks_payload[0].get("audioUrl")
+                or tracks_payload[0].get("audio_url")
+                or ""
+            )
+            if preview_candidate:
+                audio_url_preview = str(preview_candidate)
         log.info(
             "[SUNO] poll success",
             extra={
                 "meta": {
                     "taskId": task_id,
                     "duration": duration_value,
-                    "audioUrl": _mask_tokens(str(audio_url_preview)) if audio_url_preview else None,
+                    "audioUrl": mask_tokens(audio_url_preview) if audio_url_preview else "",
                     "tags": _poll_tags(details),
                 }
             },
