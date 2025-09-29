@@ -29,6 +29,24 @@ _RETRY_SCHEDULE = (0.6, 1.0, 1.6)
 _TEMP_ERROR_CODES = {409, 420, 429}
 _PERM_ERROR_CODES = {400, 403, 404}
 
+
+def mask_tokens(text: Any) -> str:
+    """Mask known sensitive tokens in ``text`` before logging."""
+
+    if text is None:
+        return ""
+    secrets = [
+        os.getenv("SUNO_CALLBACK_SECRET") or "",
+        os.getenv("SUNO_API_TOKEN") or "",
+        os.getenv("TELEGRAM_TOKEN") or "",
+    ]
+    cleaned = str(text)
+    for secret in secrets:
+        token = secret.strip()
+        if token:
+            cleaned = cleaned.replace(token, "***")
+    return cleaned
+
 _DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
 _HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL
 
@@ -734,4 +752,5 @@ __all__ = [
     "safe_edit",
     "SafeEditResult",
     "sanitize_html",
+    "mask_tokens",
 ]
