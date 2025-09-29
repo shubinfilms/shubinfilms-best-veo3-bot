@@ -42,8 +42,6 @@ from settings import (
 
 log = logging.getLogger("suno.client")
 
-_RETRYABLE_CODES = {408, 429}
-_BACKOFF_SCHEDULE = (1, 3, 7)
 _API_V5 = "v5"
 
 
@@ -84,8 +82,10 @@ class SunoClient:
         self.token = (token or SUNO_API_TOKEN or "").strip()
         if not self.token:
             raise RuntimeError("SUNO_API_TOKEN is not configured")
-        self._primary_gen_path = self._normalize_path(SUNO_GEN_PATH or "/api/v1/suno/generate/music")
-        self._primary_status_path = self._normalize_path(SUNO_TASK_STATUS_PATH or "/api/v1/suno/record-info")
+        self._primary_gen_path = self._normalize_path(SUNO_GEN_PATH or "/api/v1/generate/add-vocals")
+        self._primary_status_path = self._normalize_path(
+            SUNO_TASK_STATUS_PATH or "/api/v1/generate/record-info"
+        )
         self._wav_path = self._normalize_path(SUNO_WAV_PATH or "/api/v1/wav/generate")
         self._wav_info_path = self._normalize_path(SUNO_WAV_INFO_PATH or "/api/v1/wav/record-info")
         self._mp4_path = self._normalize_path(SUNO_MP4_PATH or "/api/v1/mp4/generate")
@@ -102,6 +102,8 @@ class SunoClient:
         self.session.mount("http://", adapter)
         retries = max_retries if max_retries is not None else SUNO_MAX_RETRIES or HTTP_RETRY_ATTEMPTS
         self.max_attempts = max(1, int(retries))
+        self._retry_total_cap = 40.0
+        self._retry_max_delay = 12.0
         if timeout is None:
             self.timeout = Timeout(
                 total=HTTP_TIMEOUT_TOTAL,
@@ -233,28 +235,16 @@ class SunoClient:
             return payload
         return {"data": payload}
 
-    def _maybe_backoff(self, code: Optional[int], attempt: int, *, req_id: Optional[str] = None) -> bool:
+    def _compute_backoff(self, code: Optional[int], attempt: int) -> Optional[float]:
         if attempt >= self.max_attempts:
-            return False
-        retryable = code is None or code in _RETRYABLE_CODES or (code is not None and code >= 500)
-        if retryable:
-            base = _BACKOFF_SCHEDULE[min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1)]
-            jitter = random.uniform(0.0, 1.0)
-            delay = base + jitter
-            log.warning(
-                "suno.http retry",
-                extra={
-                    "meta": {
-                        "code": code or "error",
-                        "attempt": attempt,
-                        "delay": round(delay, 3),
-                        "req_id": req_id,
-                    }
-                },
-            )
-            time.sleep(delay)
-            return True
-        return False
+            return None
+        retryable = code is None or code == 429 or (code is not None and code >= 500)
+        if not retryable:
+            return None
+        base_delay = 1.0 * (2 ** max(attempt - 1, 0))
+        capped_base = min(base_delay, self._retry_max_delay)
+        jitter = random.uniform(0.3, 1.3)
+        return min(max(capped_base * jitter, 0.1), self._retry_max_delay)
 
     @staticmethod
     def _response_request_id(response: Response) -> Optional[str]:
@@ -304,6 +294,28 @@ class SunoClient:
             payload[key] = value
         return payload
 
+    def _log_retry(
+        self,
+        *,
+        code: Optional[int],
+        attempt: int,
+        delay: float,
+        req_id: Optional[str],
+        path: str,
+    ) -> None:
+        log.warning(
+            "suno.http retry",
+            extra={
+                "meta": {
+                    "code": code or "error",
+                    "attempt": attempt,
+                    "delay": round(delay, 3),
+                    "req_id": req_id,
+                    "path": path,
+                }
+            },
+        )
+
     def _request(
         self,
         method: str,
@@ -321,6 +333,9 @@ class SunoClient:
         last_status: Any = None
         last_req_id = req_id
         last_duration = 0.0
+        log_context = dict(log_context or {})
+        log_context.setdefault("path", path)
+        total_backoff = 0.0
         while attempt < self.max_attempts:
             attempt += 1
             start_ts = time.monotonic()
@@ -338,31 +353,51 @@ class SunoClient:
                 last_error = exc
                 last_status = "network_error"
                 last_duration = duration_ms
-                if not self._maybe_backoff(None, attempt, req_id=req_id):
-                    context = dict(log_context or {})
-                    context.setdefault("error", str(exc))
-                    self._log_request(
-                        op,
-                        level=logging.ERROR,
-                        method=method,
-                        url=url,
-                        status="network_error",
-                        req_id=req_id,
-                        duration_ms=duration_ms,
-                        attempt=attempt,
-                        context=context,
-                    )
-                    raise SunoServerError("Network error talking to Suno") from exc
-                continue
+                delay = self._compute_backoff(None, attempt)
+                remaining = self._retry_total_cap - total_backoff
+                if delay is not None and remaining > 0:
+                    actual_delay = min(delay, remaining)
+                    if actual_delay > 0:
+                        self._log_retry(code=None, attempt=attempt, delay=actual_delay, req_id=req_id, path=path)
+                        time.sleep(actual_delay)
+                        total_backoff += actual_delay
+                        continue
+                context = dict(log_context or {})
+                context.setdefault("error", str(exc))
+                self._log_request(
+                    op,
+                    level=logging.ERROR,
+                    method=method,
+                    url=url,
+                    status="network_error",
+                    req_id=req_id,
+                    duration_ms=duration_ms,
+                    attempt=attempt,
+                    context=context,
+                )
+                raise SunoServerError("Network error talking to Suno") from exc
 
             status = response.status_code
             duration_ms = max(0.0, (time.monotonic() - start_ts) * 1000.0)
             response_req_id = self._response_request_id(response) or req_id
-            if self._maybe_backoff(status, attempt, req_id=req_id):
-                last_status = status
-                last_req_id = response_req_id
-                last_duration = duration_ms
-                continue
+            delay = self._compute_backoff(status, attempt)
+            remaining = self._retry_total_cap - total_backoff
+            if delay is not None and remaining > 0:
+                actual_delay = min(delay, remaining)
+                if actual_delay > 0:
+                    self._log_retry(
+                        code=status,
+                        attempt=attempt,
+                        delay=actual_delay,
+                        req_id=req_id,
+                        path=path,
+                    )
+                    time.sleep(actual_delay)
+                    total_backoff += actual_delay
+                    last_status = status
+                    last_req_id = response_req_id
+                    last_duration = duration_ms
+                    continue
 
             payload = self._parse_json(response)
             if status >= 400:
@@ -427,10 +462,12 @@ class SunoClient:
         }
         if "instrumental" in body_v5:
             context["instrumental"] = bool(body_v5.get("instrumental"))
+        path = self._instrumental_path if bool(body_v5.get("instrumental")) else self._primary_gen_path
+        context["path"] = path
         try:
             response = self._request(
                 "POST",
-                self._primary_gen_path,
+                path,
                 json_payload=body_v5,
                 req_id=req_id,
                 op="enqueue",

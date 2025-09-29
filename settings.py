@@ -138,8 +138,8 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return value or default
 
 
-SUNO_GEN_PATH = _get_env("SUNO_GEN_PATH", "/api/v1/suno/generate/music")
-SUNO_TASK_STATUS_PATH = _get_env("SUNO_TASK_STATUS_PATH", "/api/v1/suno/record-info")
+SUNO_GEN_PATH = _get_env("SUNO_GEN_PATH", "/api/v1/generate/add-vocals")
+SUNO_TASK_STATUS_PATH = _get_env("SUNO_TASK_STATUS_PATH", "/api/v1/generate/record-info")
 SUNO_WAV_PATH = _get_env("SUNO_WAV_PATH", "/api/v1/wav/generate")
 SUNO_WAV_INFO_PATH = _get_env("SUNO_WAV_INFO_PATH", "/api/v1/wav/record-info")
 SUNO_MP4_PATH = _get_env("SUNO_MP4_PATH", "/api/v1/mp4/generate")

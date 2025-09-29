@@ -21,6 +21,7 @@ import threading
 import atexit
 from pathlib import Path
 # main
+from collections.abc import Mapping
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union
 from datetime import datetime, timezone
 from contextlib import suppress
@@ -5199,11 +5200,45 @@ async def _launch_suno_generation(
 
         enqueue_started = time.monotonic()
         prompt_text = payload.get("prompt") or ""
-        failure_text = "⚠️ Generation failed, please try later."
-        refund_message = (
-            f"{failure_text}\n"
-            f"💎 Токены возвращены (+{PRICE_SUNO}💎)."
-        )
+
+        def _sanitize_reason_text(text: Optional[str]) -> Optional[str]:
+            if text is None:
+                return None
+            cleaned = collapse_spaces(str(text))
+            cleaned = cleaned.strip().strip(". ")
+            if not cleaned:
+                return None
+            return cleaned[:160]
+
+        def _reason_from_payload(payload: Any) -> Optional[str]:
+            if isinstance(payload, Mapping):
+                for key in ("message", "msg", "error", "detail", "reason"):
+                    value = payload.get(key)
+                    sanitized = _sanitize_reason_text(value)
+                    if sanitized:
+                        return sanitized
+                data_section = payload.get("data")
+                nested = _reason_from_payload(data_section)
+                if nested:
+                    return nested
+            return _sanitize_reason_text(payload)
+
+        def _reason_from_exception(exc: BaseException) -> Optional[str]:
+            if isinstance(exc, SunoAPIError):
+                payload_reason = _reason_from_payload(getattr(exc, "payload", None))
+                if payload_reason:
+                    return payload_reason
+                return _sanitize_reason_text(str(exc))
+            return _sanitize_reason_text(str(exc))
+
+        def _format_failure(reason: Optional[str]) -> str:
+            base = "⚠️ Generation failed"
+            if reason:
+                return f"{base}: {md2_escape(reason)}"
+            return f"{base}, please try later."
+
+        def _build_refund_message(reason: Optional[str]) -> str:
+            return f"{_format_failure(reason)}\n💎 Токены возвращены (+{PRICE_SUNO}💎)."
 
         def _start_music_call() -> Awaitable[Any]:
             return asyncio.to_thread(
@@ -5249,6 +5284,9 @@ async def _launch_suno_generation(
             duration = time.monotonic() - enqueue_started
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
             suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
+            reason_text = _reason_from_exception(exc)
+            failure_text = _format_failure(reason_text)
+            refund_message = _build_refund_message(reason_text)
             pending_meta.update(
                 {
                     "status": "api_error",
@@ -5282,6 +5320,9 @@ async def _launch_suno_generation(
             duration = time.monotonic() - enqueue_started
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
             suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
+            reason_text = _reason_from_exception(exc)
+            failure_text = _format_failure(reason_text)
+            refund_message = _build_refund_message(reason_text)
             pending_meta.update(
                 {
                     "status": "failed",

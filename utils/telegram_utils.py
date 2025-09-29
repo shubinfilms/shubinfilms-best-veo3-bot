@@ -100,7 +100,15 @@ _register_label(
 )
 _register_label("🎵 Генерация музыки", "🎵 Музыка", "🎵 Музыка (Suno)", "🎵 Track (Suno)", "🎵 Suno", prefix=True)
 _register_label("🧠 Prompt-Master", "🧠", prefix=True)
-_register_label("💎 Баланс", "Баланс", "💎", prefix=True, command="balance.show")
+_register_label(
+    "💎 Баланс",
+    "Баланс",
+    "💎",
+    "Balance",
+    "balance",
+    prefix=True,
+    command="balance.show",
+)
 _register_label("💬 Обычный чат", "💬", prefix=True)
 _register_label("🏠 В меню", "⬅️ В меню")
 _register_label("ℹ️ FAQ", "ℹ️ Общие вопросы", "⚡ Токены и возвраты")
