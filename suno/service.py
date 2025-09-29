@@ -798,27 +798,27 @@ class SunoService:
     ) -> SunoTask:
         prompt_text = str(
             (prompt if prompt is not None else "")
+            or (style if style is not None else "")
             or (lyrics if lyrics is not None else "")
             or (title if title is not None else "")
         ).strip()
         if not prompt_text:
             prompt_text = "Untitled track"
-        payload = {
-            "title": title,
-            "style": style,
-            "lyrics": lyrics,
-            "model": model,
-            "instrumental": instrumental,
-            "prompt": prompt_text,
-            "input_text": prompt_text,
-            "has_lyrics": bool(has_lyrics),
-        }
-        if lang:
-            payload["lang"] = str(lang).strip()
-        if user_id is not None:
-            payload["userId"] = str(user_id)
+        prompt_len = 16
+        model_name = model or "V5"
+        lyrics_text = lyrics if has_lyrics else None
         try:
-            result, api_version = self.client.create_music(payload, req_id=req_id)
+            enqueue_result = self.client.enqueue_music(
+                user_id=str(user_id) if user_id is not None else "0",
+                title=title or prompt_text,
+                prompt=prompt_text,
+                instrumental=instrumental,
+                has_lyrics=bool(has_lyrics),
+                lyrics=lyrics_text,
+                prompt_len=prompt_len,
+                model=model_name,
+                req_id=req_id,
+            )
         except SunoAPIError as exc:
             version = getattr(exc, "api_version", "v5") or "v5"
             suno_requests_total.labels(
@@ -840,10 +840,17 @@ class SunoService:
             suno_requests_total.labels(
                 result="ok",
                 reason="start_music",
-                api_version=api_version,
+                api_version="v5",
                 **_metric_labels("bot"),
             ).inc()
-        parsed_req_id, parsed_task_id = _extract_enqueue_identifiers(result)
+        result = enqueue_result.body
+        parsed_req_id = enqueue_result.req_id or None
+        parsed_task_id = enqueue_result.task_id or None
+        fallback_req_id, fallback_task_id = _extract_enqueue_identifiers(result)
+        if not parsed_req_id:
+            parsed_req_id = fallback_req_id
+        if not parsed_task_id:
+            parsed_task_id = fallback_task_id
         if parsed_req_id and req_id and parsed_req_id != req_id:
             log.warning(
                 "Suno enqueue req_id mismatch", extra={"meta": {"provided": req_id, "received": parsed_req_id}}
@@ -857,7 +864,7 @@ class SunoService:
             or str((data_section or {}).get("task_id") or "").strip()
             or str((data_section or {}).get("taskId") or "").strip()
         )
-        status_label = result.get("status") or result.get("code")
+        status_label = enqueue_result.status or result.get("status") or result.get("code")
         log.info(
             "SUNO[enqueue] status=%s req_id=%s task_id=%s body_start=%s",
             status_label,

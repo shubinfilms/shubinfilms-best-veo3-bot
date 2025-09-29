@@ -42,6 +42,7 @@ from settings import (
     SUNO_TASK_STATUS_PATH,
     SUNO_INSTR_PATH,
     SUNO_VOCAL_PATH,
+    SUNO_READY,
     TMP_CLEANUP_HOURS,
     KIE_BASE_URL,
     resolve_outbound_ip,
@@ -58,7 +59,7 @@ log_environment(log)
 app = FastAPI(title="Suno Callback Web", docs_url=None, redoc_url=None)
 service = SunoService()
 
-_SUNO_AVAILABLE = bool(SUNO_ENABLED and SUNO_API_TOKEN)
+_SUNO_AVAILABLE = bool(SUNO_READY)
 _OUTBOUND_IP: Optional[str] = None
 
 _MAX_JSON_BYTES = 512 * 1024
@@ -426,20 +427,20 @@ async def suno_callback(
 
     log.info(
         "Received SUNO callback",
-        extra={"meta": {"content_length": len(body), "path": str(request.url.path)}},
+        extra={
+            "meta": {
+                "phase": "callback",
+                "content_length": len(body),
+                "path": str(request.url.path),
+            }
+        },
     )
 
     normalized_payload, flat_payload, key_list = _normalize_callback_payload(payload)
     envelope = CallbackEnvelope.model_validate(normalized_payload)
     task = SunoTask.from_envelope(envelope)
     items_count = len(task.items or [])
-    log.info(
-        "suno.callback code=%s task_id=%s type=%s items=%s",
-        task.code,
-        task.task_id or "",
-        task.callback_type or "",
-        items_count,
-    )
+    callback_type = (task.callback_type or "").lower() or (_callback_status(data_map) or "unknown").lower()
     data_map: Mapping[str, Any] = envelope.data or {}
     payload_req_id = _first_identifier(data_map, ("req_id", "requestId", "request_id"))
     if not payload_req_id:
@@ -455,23 +456,19 @@ async def suno_callback(
         or request.headers.get("X-Req-ID")
     )
     initial_req_id = header_req_id or payload_req_id
-    status_hint = (_callback_status(data_map) or "unknown").lower()
+    status_hint = callback_type or "unknown"
     preview = _json_preview(payload)
-    keys_preview = key_list[:8]
-    keys_repr = "[" + ", ".join(keys_preview) + (", …]" if len(key_list) > len(keys_preview) else "]")
-    log.info(
-        "SUNO[callback] status=%s req_id=%s keys=%s body_start=%s",
-        status_hint,
-        initial_req_id or "—",
-        keys_repr,
-        preview,
-    )
     if not initial_req_id or status_hint == "unknown":
         log.warning(
-            "Suno callback missing identifiers | status=%s req_id=%s body=%s",
-            status_hint,
-            initial_req_id,
-            preview,
+            "Suno callback missing identifiers",
+            extra={
+                "meta": {
+                    "phase": "callback",
+                    "status": status_hint,
+                    "req_id": initial_req_id,
+                    "preview": preview,
+                }
+            },
         )
     if not task.task_id and initial_req_id:
         mapped_task = service.get_task_id_by_request(initial_req_id)
@@ -486,6 +483,15 @@ async def suno_callback(
             task = task.model_copy(update={"task_id": mapped_task})
     if not req_id and task.task_id:
         req_id = service.get_request_id(task.task_id)
+    summary_meta = {
+        "phase": "callback",
+        "req_id": req_id or initial_req_id or payload_req_id,
+        "task_id": task.task_id or payload_task_id,
+        "status": status_hint,
+        "items": items_count,
+        "type": callback_type,
+    }
+    log.info("suno callback", extra={"meta": summary_meta})
     start_ts = service.get_start_timestamp(task.task_id)
     if start_ts:
         started_at = _parse_iso8601(start_ts)
@@ -496,7 +502,14 @@ async def suno_callback(
     if not _register_once(key):
         log.info(
             "duplicate callback ignored",
-            extra={"meta": {"key": key, "task_id": task.task_id, "req_id": req_id}},
+            extra={
+                "meta": {
+                    "phase": "callback",
+                    "key": key,
+                    "task_id": task.task_id,
+                    "req_id": req_id,
+                }
+            },
         )
         suno_callback_total.labels(status="skipped", **_WEB_LABELS).inc()
         return {"ok": True, "duplicate": True}
@@ -519,13 +532,16 @@ async def suno_callback(
             extra={"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}},
         )
     else:
-        status_name = (task.callback_type or "").lower()
-        meta = {"task_id": task.task_id, "req_id": req_id, "code": task.code}
-        if status_name in {"complete", "success"}:
-            log.info("suno callback success", extra={"meta": meta})
-        else:
-            meta["type"] = status_name
-            log.warning("suno callback processed", extra={"meta": meta})
+        meta = {
+            "phase": "callback",
+            "task_id": task.task_id,
+            "req_id": req_id,
+            "code": task.code,
+            "status": status_hint,
+            "items": items_count,
+            "type": callback_type,
+        }
+        log.info("suno callback processed", extra={"meta": meta})
     suno_callback_total.labels(status=process_status, **_WEB_LABELS).inc()
     return {"ok": process_status == "ok"}
 

@@ -558,6 +558,7 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
     bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
 
     async def async_noop(*args, **kwargs):
         return None
@@ -634,6 +635,7 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
     params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
 
     async def _run() -> None:
+        assert bot.SUNO_MODE_AVAILABLE is True
         await bot._launch_suno_generation(
             chat_id=111,
             ctx=ctx,
@@ -664,6 +666,7 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
     bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
 
     async def async_noop(*args, **kwargs):
         return None
@@ -790,6 +793,7 @@ def test_suno_enqueue_dedupes_failed_req(monkeypatch) -> None:
 
     monkeypatch.setattr(bot, "_suno_notify", fake_notify)
     monkeypatch.setattr(bot, "_suno_issue_refund", async_noop)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
     state_dict = bot.state(ctx)
@@ -811,6 +815,7 @@ def test_suno_enqueue_dedupes_failed_req(monkeypatch) -> None:
     params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
 
     async def _run() -> None:
+        assert bot.SUNO_MODE_AVAILABLE is True
         await bot._launch_suno_generation(
             chat_id=303,
             ctx=ctx,

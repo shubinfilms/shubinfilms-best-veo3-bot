@@ -44,7 +44,7 @@ class _AppSettings(BaseModel):
     KIE_API_KEY: Optional[str] = Field(default=None)
 
     SUNO_ENABLED: bool = Field(default=False)
-    SUNO_API_BASE: Optional[str] = Field(default=None)
+    SUNO_API_BASE: Optional[str] = Field(default="https://api.kie.ai")
     SUNO_API_TOKEN: Optional[str] = Field(default=None)
     SUNO_CALLBACK_SECRET: Optional[str] = Field(default=None)
     SUNO_CALLBACK_URL: Optional[str] = Field(default=None)
@@ -63,7 +63,7 @@ class _AppSettings(BaseModel):
     SUNO_COVER_INFO_PATH: str = Field(default="/api/v1/suno/cover/record-info")
     SUNO_INSTR_PATH: str = Field(default="/api/v1/generate/add-instrumental")
     SUNO_VOCAL_PATH: str = Field(default="/api/v1/generate/add-vocals")
-    SUNO_MODEL: Optional[str] = Field(default=None)
+    SUNO_MODEL: str = Field(default="V5")
 
     @field_validator("LOG_LEVEL", mode="before")
     def _normalize_level(cls, value: object) -> str:
@@ -115,6 +115,16 @@ class _AppSettings(BaseModel):
             text = f"/{text}"
         while "//" in text:
             text = text.replace("//", "/")
+        return text
+
+    @field_validator("SUNO_MODEL", mode="before")
+    def _normalize_model(cls, value: object) -> str:
+        text = str(value or "V5").strip()
+        if not text:
+            return "V5"
+        lowered = text.lower()
+        if lowered in {"v5", "suno-v5"}:
+            return "V5"
         return text
 
     @model_validator(mode="after")
@@ -216,7 +226,10 @@ SUNO_UPLOAD_EXTEND_PATH = _APP_SETTINGS.SUNO_UPLOAD_EXTEND_PATH
 SUNO_COVER_INFO_PATH = _APP_SETTINGS.SUNO_COVER_INFO_PATH
 SUNO_INSTR_PATH = _APP_SETTINGS.SUNO_INSTR_PATH
 SUNO_VOCAL_PATH = _APP_SETTINGS.SUNO_VOCAL_PATH
-SUNO_MODEL = _strip_optional(_APP_SETTINGS.SUNO_MODEL)
+SUNO_MODEL = _APP_SETTINGS.SUNO_MODEL or "V5"
+SUNO_READY = bool(
+    SUNO_ENABLED and SUNO_API_TOKEN and SUNO_CALLBACK_SECRET and SUNO_CALLBACK_URL
+)
 
 
 def _emit_warnings() -> None:
@@ -312,6 +325,7 @@ __all__ = [
     "SUNO_INSTR_PATH",
     "SUNO_VOCAL_PATH",
     "SUNO_MODEL",
+    "SUNO_READY",
     "SUNO_ENABLED",
     "resolve_outbound_ip",
     "token_tail",

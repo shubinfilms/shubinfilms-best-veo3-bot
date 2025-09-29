@@ -5,7 +5,8 @@ import json
 import logging
 import random
 import time
-from typing import Any, Mapping, MutableMapping, Optional
+from dataclasses import dataclass
+from typing import Any, Mapping, MutableMapping, Optional, Sequence
 from urllib.parse import urljoin
 
 import requests
@@ -46,6 +47,18 @@ from settings import (
 log = logging.getLogger("suno.client")
 
 _API_V5 = "v5"
+
+
+@dataclass(frozen=True)
+class EnqueueResult:
+    """Result returned by :meth:`SunoClient.enqueue_music`."""
+
+    body: Mapping[str, Any]
+    req_id: Optional[str]
+    task_id: Optional[str]
+    status: Optional[str]
+    path: str
+    custom_mode: str
 
 
 class SunoAPIError(RuntimeError):
@@ -154,73 +167,6 @@ class SunoClient:
         return text
 
     @staticmethod
-    def _normalize_model(value: Optional[str]) -> str:
-        raw = (value or SUNO_MODEL or "suno-v5" or "").strip()
-        if not raw:
-            return "suno-v5"
-        normalized = raw.replace("_", "-")
-        if normalized.lower() in {"v5", "suno-v5"}:
-            return "suno-v5"
-        return normalized
-
-    def _build_v5_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        prompt_candidates = (
-            payload.get("prompt"),
-            payload.get("input_text"),
-            payload.get("lyrics"),
-            payload.get("title"),
-        )
-        prompt_text = ""
-        for candidate in prompt_candidates:
-            if candidate is None:
-                continue
-            text = str(candidate).strip()
-            if text:
-                prompt_text = text
-                break
-        if not prompt_text:
-            prompt_text = "Untitled track"
-        model = str(payload.get("model") or "V5").strip().upper() or "V5"
-        has_lyrics_flag = bool(payload.get("has_lyrics") or payload.get("lyrics"))
-        lyrics_text = str(payload.get("lyrics") or "").strip()
-        if has_lyrics_flag and not lyrics_text:
-            raise SunoClientError(
-                "Lyrics are required when has_lyrics=true",
-                status=422,
-            )
-        flags = {
-            "instrumental": bool(payload.get("instrumental")),
-            "has_lyrics": has_lyrics_flag,
-        }
-        body: dict[str, Any] = {
-            "model": model,
-            "prompt": prompt_text,
-            "prompt_len": len(prompt_text),
-            "flags": flags,
-        }
-        title = str(payload.get("title") or "").strip()
-        if title:
-            body["title"] = title
-        style = str(payload.get("style") or "").strip()
-        if style:
-            body["style"] = style
-        lang = str(payload.get("lang") or "").strip()
-        if lang:
-            body["lang"] = lang.lower()
-        negative = payload.get("negative_tags") or payload.get("negativeTags")
-        negative_text = str(negative or "").strip()
-        if negative_text:
-            body["negative_tags"] = negative_text
-        if has_lyrics_flag:
-            body["lyrics"] = lyrics_text
-        user_id = payload.get("userId") or payload.get("user_id")
-        if user_id is not None:
-            body["userId"] = str(user_id)
-        if SUNO_CALLBACK_URL:
-            body.setdefault("callbackUrl", SUNO_CALLBACK_URL)
-        return body
-
-    @staticmethod
     def _is_not_found_code(value: Any) -> bool:
         try:
             return int(value) == 404
@@ -262,6 +208,63 @@ class SunoClient:
         if isinstance(field_list, (list, tuple)):
             missing.extend(str(value) for value in field_list)
         return missing
+
+    @staticmethod
+    def _format_422_error(payload: Mapping[str, Any]) -> str:
+        detail_messages: list[str] = []
+        detail = payload.get("detail")
+        if isinstance(detail, list):
+            for item in detail:
+                if not isinstance(item, Mapping):
+                    continue
+                msg = str(item.get("msg") or item.get("message") or "").strip()
+                field_name: Optional[str] = None
+                loc = item.get("loc")
+                if isinstance(loc, (list, tuple)) and loc:
+                    field_name = str(loc[-1])
+                elif isinstance(item.get("field"), str):
+                    field_name = str(item["field"])
+                if field_name and msg:
+                    detail_messages.append(f"{field_name}: {msg}")
+                elif field_name:
+                    detail_messages.append(field_name)
+                elif msg:
+                    detail_messages.append(msg)
+        missing = SunoClient._missing_fields(payload)
+        segments: list[str] = []
+        base_message = str(payload.get("message") or payload.get("msg") or "").strip()
+        if base_message:
+            segments.append(base_message)
+        if detail_messages:
+            segments.append("; ".join(detail_messages))
+        if missing:
+            unique_missing = ", ".join(sorted({field for field in missing if field}))
+            if unique_missing:
+                segments.append(f"missing: {unique_missing}")
+        summary = " | ".join(segment for segment in segments if segment)
+        if not summary:
+            summary = "Unprocessable request"
+        return f"Suno validation error: {summary}"
+
+    @staticmethod
+    def _extract_identifier(payload: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
+        for key in keys:
+            value = payload.get(key)
+            if value not in (None, ""):
+                text = str(value).strip()
+                if text:
+                    return text
+        nested = payload.get("data")
+        if isinstance(nested, Mapping):
+            found = SunoClient._extract_identifier(nested, keys)
+            if found:
+                return found
+        nested = payload.get("payload")
+        if isinstance(nested, Mapping):
+            found = SunoClient._extract_identifier(nested, keys)
+            if found:
+                return found
+        return None
 
     @staticmethod
     def _parse_json(response: Response) -> Mapping[str, Any]:
@@ -453,7 +456,7 @@ class SunoClient:
                         outbound_ip,
                         extra={"meta": {"outbound_ip": outbound_ip, "base": self.base_url}},
                     )
-                    message = "bad token or IP whitelist"
+                    message = "Suno: invalid credentials or IP not whitelisted"
                 elif status == 404:
                     context["path"] = path_hint
                     context["base"] = self.base_url
@@ -463,13 +466,14 @@ class SunoClient:
                         path_hint,
                         extra={"meta": {"base": self.base_url, "path": path_hint}},
                     )
+                    message = "Suno endpoint not found (check paths)"
                 elif status == 422:
                     missing_fields = self._missing_fields(payload)
                     if missing_fields:
                         unique_missing = sorted({field for field in missing_fields if field})
                         if unique_missing:
                             context["missing"] = unique_missing
-                            message = f"Missing field(s): {', '.join(unique_missing)}"
+                    message = self._format_422_error(payload)
                 context.setdefault("error", message)
                 level = logging.WARNING if 400 <= status < 500 else logging.ERROR
                 self._log_request(
@@ -518,33 +522,72 @@ class SunoClient:
         raise SunoServerError("Suno request exhausted retries", payload=getattr(last_error, "response", None))
 
     # ------------------------------------------------------------------ public API
-    def create_music(
-        self, payload: Mapping[str, Any], *, req_id: Optional[str] = None
-    ) -> tuple[Mapping[str, Any], str]:
-        body_v5 = self._build_v5_payload(payload)
+    def enqueue_music(
+        self,
+        *,
+        user_id: int | str,
+        title: str,
+        prompt: str,
+        instrumental: bool,
+        has_lyrics: bool,
+        lyrics: Optional[str],
+        prompt_len: int = 16,
+        model: Optional[str] = None,
+        req_id: Optional[str] = None,
+        call_back_url: Optional[str] = None,
+        call_back_secret: Optional[str] = None,
+    ) -> EnqueueResult:
         if not self.token:
             raise SunoClientError("SUNO_API_TOKEN is not configured", status=401)
-        prompt_source = body_v5.get("prompt") or ""
-        flags = body_v5.get("flags") if isinstance(body_v5.get("flags"), Mapping) else {}
-        is_instrumental = bool(flags.get("instrumental"))
-        has_lyrics = bool(flags.get("has_lyrics"))
-        context = {
-            "model": body_v5.get("model"),
-            "prompt_len": len(str(prompt_source or "")),
+        callback_url = (call_back_url or SUNO_CALLBACK_URL or "").strip()
+        callback_secret = (call_back_secret or SUNO_CALLBACK_SECRET or "").strip()
+        if not callback_url or not callback_secret:
+            raise SunoClientError("Suno callback configuration missing", status=422)
+        title_text = str(title or "").strip()
+        prompt_text = str(prompt or "").strip()
+        if not title_text:
+            title_text = prompt_text or "Untitled track"
+        if not prompt_text:
+            prompt_text = title_text or "Untitled track"
+        try:
+            prompt_length = max(1, int(prompt_len))
+        except (TypeError, ValueError):
+            prompt_length = 16
+        normalized_model = str(model or SUNO_MODEL or "V5").strip()
+        if normalized_model.lower() in {"v5", "suno-v5"}:
+            normalized_model = "V5"
+        custom_mode = "instrumental" if instrumental and not has_lyrics else "vocals"
+        payload: dict[str, Any] = {
+            "model": normalized_model or "V5",
+            "title": title_text,
+            "prompt": prompt_text,
+            "instrumental": bool(instrumental),
+            "has_lyrics": bool(has_lyrics),
+            "prompt_len": prompt_length,
+            "userId": str(user_id),
+            "callBackUrl": callback_url,
+            "callBackSecret": callback_secret,
+            "customMode": custom_mode,
         }
-        context["instrumental"] = is_instrumental
-        context["has_lyrics"] = has_lyrics
-        path = self._primary_gen_path
-        if has_lyrics and self._vocal_path:
-            path = self._vocal_path
-        elif is_instrumental and self._instrumental_path:
-            path = self._instrumental_path
-        context["path"] = path
+        if has_lyrics:
+            payload["lyrics"] = str(lyrics or "")
+        path = self._instrumental_path if instrumental and not has_lyrics else self._vocal_path
+        if not path:
+            path = self._primary_gen_path
+        context = {
+            "phase": "enqueue",
+            "path": path,
+            "custom_mode": custom_mode,
+            "instrumental": bool(instrumental),
+            "has_lyrics": bool(has_lyrics),
+            "prompt_len": prompt_length,
+            "model": payload["model"],
+        }
         try:
             response = self._request(
                 "POST",
                 path,
-                json_payload=body_v5,
+                json_payload=payload,
                 req_id=req_id,
                 op="enqueue",
                 log_context=context,
@@ -552,8 +595,53 @@ class SunoClient:
         except SunoAPIError as exc:
             exc.api_version = _API_V5
             raise
+        req_identifier = req_id or self._extract_identifier(
+            response, ("req_id", "requestId", "request_id")
+        )
+        task_identifier = self._extract_identifier(response, ("task_id", "taskId"))
+        status_label = response.get("status") or response.get("code")
         self._raise_if_not_found(response)
-        return response, _API_V5
+        return EnqueueResult(
+            body=response,
+            req_id=req_identifier,
+            task_id=task_identifier,
+            status=str(status_label) if status_label is not None else None,
+            path=path,
+            custom_mode=custom_mode,
+        )
+
+    def create_music(
+        self, payload: Mapping[str, Any], *, req_id: Optional[str] = None
+    ) -> tuple[Mapping[str, Any], str]:
+        user_identifier = payload.get("userId") or payload.get("user_id")
+        if user_identifier is None:
+            raise SunoClientError("userId is required", status=422)
+        title = str(payload.get("title") or "").strip()
+        style = str(payload.get("style") or "").strip()
+        base_prompt = payload.get("prompt") or style or payload.get("input_text") or payload.get("lyrics")
+        prompt = str(base_prompt or title or "").strip() or "Untitled track"
+        if not title:
+            title = prompt
+        has_lyrics = bool(payload.get("has_lyrics") or payload.get("lyrics"))
+        instrumental = bool(payload.get("instrumental"))
+        lyrics_value = payload.get("lyrics") if has_lyrics else None
+        try:
+            prompt_length = int(payload.get("prompt_len") or 16)
+        except (TypeError, ValueError):
+            prompt_length = 16
+        model_value = payload.get("model") or SUNO_MODEL
+        result = self.enqueue_music(
+            user_id=user_identifier,
+            title=title,
+            prompt=prompt,
+            instrumental=instrumental,
+            has_lyrics=has_lyrics,
+            lyrics=str(lyrics_value) if lyrics_value is not None else None,
+            prompt_len=prompt_length,
+            model=str(model_value) if model_value is not None else None,
+            req_id=req_id,
+        )
+        return result.body, _API_V5
 
     def get_task_status(
         self,
@@ -569,7 +657,7 @@ class SunoClient:
             params_v5["req_id"] = str(req_id)
         if user_id is not None:
             params_v5["userId"] = str(user_id)
-        if not params_v5.get("req_id") and task_id:
+        if task_id:
             params_v5["taskId"] = str(task_id)
         try:
             response = self._request(
@@ -783,6 +871,7 @@ class SunoClient:
 
 
 __all__ = [
+    "EnqueueResult",
     "SunoClient",
     "SunoAPIError",
     "SunoClientError",
