@@ -40,6 +40,8 @@ from utils.suno_state import (
     set_title,
 )
 
+import utils.api_client as api_client_utils
+
 bot_module = importlib.import_module("bot")
 
 
@@ -551,6 +553,7 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
     bot._SUNO_PENDING_MEMORY.clear()
     bot._SUNO_REFUND_PENDING_MEMORY.clear()
     bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_REFUND_REQ_MEMORY.clear()
     bot._SUNO_COOLDOWN_MEMORY.clear()
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
@@ -601,6 +604,14 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
 
     monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
 
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(api_client_utils.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(api_client_utils.random, "uniform", lambda a, b: 0.0)
+
     attempts = {"count": 0}
 
     class DummyTask:
@@ -648,6 +659,7 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
     bot._SUNO_PENDING_MEMORY.clear()
     bot._SUNO_REFUND_PENDING_MEMORY.clear()
     bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_REFUND_REQ_MEMORY.clear()
     bot._SUNO_COOLDOWN_MEMORY.clear()
     monkeypatch.setattr(bot, "_suno_configured", lambda: True)
     monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
@@ -695,6 +707,14 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
 
     monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
 
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(api_client_utils.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(api_client_utils.random, "uniform", lambda a, b: 0.0)
+
     attempts = {"count": 0}
 
     def failing_start_music(*args, **kwargs):
@@ -719,6 +739,89 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
     asyncio.run(_run())
 
     assert attempts["count"] == bot._SUNO_ENQUEUE_MAX_ATTEMPTS
+    assert sum(sleeps) <= bot._SUNO_ENQUEUE_MAX_DELAY + 1e-6
     assert status_texts and status_texts[0] == "⏳ Sending request…"
     assert edited_messages and edited_messages[-1].startswith("⚠️ Generation failed")
     assert refunds and refunds[-1]["user_message"].startswith("⚠️ Generation failed")
+
+
+def test_suno_enqueue_dedupes_failed_req(monkeypatch) -> None:
+    bot = bot_module
+    bot.rds = None
+    bot._SUNO_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_REFUND_REQ_MEMORY.clear()
+    bot._SUNO_COOLDOWN_MEMORY.clear()
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    debit_calls = []
+
+    def fake_debit(user_id, price, reason, meta):
+        debit_calls.append((user_id, price))
+        return True, 77
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit)
+
+    start_calls = []
+
+    def fake_start_music(*args, **kwargs):
+        start_calls.append(args)
+        raise AssertionError("start_music should not be called for deduped req")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
+
+    notifications: list[str] = []
+
+    async def fake_notify(ctx_param, chat_id_param, text, **kwargs):
+        notifications.append(text)
+        return SimpleNamespace(message_id=222)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+    monkeypatch.setattr(bot, "_suno_issue_refund", async_noop)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    state_dict = bot.state(ctx)
+    req_id = "suno:test-dedup"
+    ctx.user_data.setdefault("state", state_dict)
+    ctx.user_data["state"]["suno_current_req_id"] = req_id
+    state_dict["suno_current_req_id"] = req_id
+    bot._suno_pending_store(
+        req_id,
+        {
+            "status": "api_error",
+            "task_id": None,
+            "charged": True,
+        },
+    )
+
+    assert bot._suno_pending_load(req_id) is not None
+
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run() -> None:
+        await bot._launch_suno_generation(
+            chat_id=303,
+            ctx=ctx,
+            params=params,
+            user_id=55,
+            reply_to=None,
+            trigger="retry",
+        )
+
+    asyncio.run(_run())
+
+    assert not start_calls
+    assert not notifications
+    assert debit_calls == []
