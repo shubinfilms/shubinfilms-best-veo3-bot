@@ -890,7 +890,7 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     assert notify_total_after == notify_total_before + 1
     assert enqueue_total_after == enqueue_total_before + 1
     assert notify_calls["count"] == 1
-    assert edited_payloads and edited_payloads[-1].startswith("✅ Списано")
+    assert edited_payloads and edited_payloads[-1].startswith("✅ Task created")
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
 

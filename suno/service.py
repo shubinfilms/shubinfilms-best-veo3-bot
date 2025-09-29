@@ -746,12 +746,59 @@ class SunoService:
             schedule_unlink(path)
         return success
 
+    def _send_audio_url(self, chat_id: int, url: str, *, title: str, reply_to: Optional[int]) -> bool:
+        if not url:
+            return False
+        payload: Dict[str, Any] = {"chat_id": chat_id, "audio": url}
+        if title:
+            payload["caption"] = f"🎵 {title}"
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+        method = "sendAudio"
+        try:
+            resp = self._bot_session.post(self._bot_url(method), json=payload, timeout=60)
+        except Exception:
+            bot_telegram_send_fail_total.labels(method=method).inc()
+            log.warning("Telegram sendAudio network error (url)", exc_info=True)
+            return False
+        if not resp.ok:
+            bot_telegram_send_fail_total.labels(method=method).inc()
+            log.warning(
+                "Telegram sendAudio failed | status=%s text=%s", resp.status_code, _mask_tokens(resp.text)
+            )
+            return False
+        return True
+
     def _send_image(self, chat_id: int, path: Path, *, title: str, reply_to: Optional[int]) -> bool:
         caption = f"🖼️ {title} (обложка)" if title else "🖼️ Обложка"
         success = self._send_file("sendPhoto", "photo", chat_id, path, caption=caption, reply_to=reply_to)
         if success:
             schedule_unlink(path)
         return success
+
+    def _send_image_url(self, chat_id: int, url: str, *, title: str, reply_to: Optional[int]) -> bool:
+        if not url:
+            return False
+        payload: Dict[str, Any] = {"chat_id": chat_id, "photo": url}
+        caption = f"🖼️ {title} (обложка)" if title else "🖼️ Обложка"
+        if caption:
+            payload["caption"] = caption
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+        method = "sendPhoto"
+        try:
+            resp = self._bot_session.post(self._bot_url(method), json=payload, timeout=60)
+        except Exception:
+            bot_telegram_send_fail_total.labels(method=method).inc()
+            log.warning("Telegram sendPhoto network error (url)", exc_info=True)
+            return False
+        if not resp.ok:
+            bot_telegram_send_fail_total.labels(method=method).inc()
+            log.warning(
+                "Telegram sendPhoto failed | status=%s text=%s", resp.status_code, _mask_tokens(resp.text)
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------ helpers
     def _notify_admins(self, text: str) -> None:
@@ -1033,13 +1080,29 @@ class SunoService:
         if not self.telegram_token:
             log.warning("TELEGRAM_TOKEN missing; skip delivery for task %s", task.task_id)
             return
+        existing_record = self._load_task_record(task.task_id) or {}
+        incoming_status = (task.callback_type or "").lower()
+        existing_status = str(existing_record.get("status") or "").lower()
+        final_states = {"complete", "error", "failed"}
+        if incoming_status in final_states and existing_status in final_states and existing_record.get("tracks"):
+            log.info(
+                "Suno callback duplicate final state",
+                extra={
+                    "meta": {
+                        "task_id": task.task_id,
+                        "status": incoming_status,
+                        "existing_status": existing_status,
+                    }
+                },
+            )
+            return
+
         try:
             header = self._stage_header(task)
             reply_to = meta.msg_id if meta else None
             self._send_text(chat_id, header, reply_to=reply_to)
             if not task.items:
-                existing = self._load_task_record(task.task_id) or {}
-                record = dict(existing)
+                record = dict(existing_record)
                 record.update(
                     {
                         "task_id": task.task_id,
@@ -1056,7 +1119,9 @@ class SunoService:
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-                record.setdefault("created_at", existing.get("created_at") or datetime.now(timezone.utc).isoformat())
+                record.setdefault(
+                    "created_at", existing_record.get("created_at") or datetime.now(timezone.utc).isoformat()
+                )
                 self._save_task_record(task.task_id, record)
                 return
             base_dir = self._base_dir(task.task_id)
@@ -1065,15 +1130,35 @@ class SunoService:
                 track_id = track.id or str(idx)
                 title = track.title or (meta.title if meta else None) or f"Track {idx}"
                 audio_path = self._find_local_file(base_dir, track_id)
+                audio_sent = False
                 if audio_path and self._send_audio(chat_id, audio_path, title=title, reply_to=None):
+                    audio_sent = True
                     log.info("Suno audio sent | task=%s track=%s path=%s", task.task_id, track_id, audio_path)
-                elif track.audio_url:
+                elif track.audio_url and self._send_audio_url(chat_id, track.audio_url, title=title, reply_to=None):
+                    audio_sent = True
+                    log.info(
+                        "Suno audio url sent | task=%s track=%s url=%s",
+                        task.task_id,
+                        track_id,
+                        _mask_tokens(track.audio_url),
+                    )
+                if not audio_sent and track.audio_url:
                     text = f"🔗 Аудио ({title}): {track.audio_url}"
                     self._send_text(chat_id, text)
                 image_path = self._find_local_file(base_dir, f"{track_id}_cover")
+                image_sent = False
                 if image_path and self._send_image(chat_id, image_path, title=title, reply_to=None):
+                    image_sent = True
                     log.info("Suno cover sent | task=%s track=%s path=%s", task.task_id, track_id, image_path)
-                elif track.image_url:
+                elif track.image_url and self._send_image_url(chat_id, track.image_url, title=title, reply_to=None):
+                    image_sent = True
+                    log.info(
+                        "Suno cover url sent | task=%s track=%s url=%s",
+                        task.task_id,
+                        track_id,
+                        _mask_tokens(track.image_url),
+                    )
+                if not image_sent and track.image_url:
                     self._send_text(chat_id, f"🖼️ Обложка ({title}): {track.image_url}")
                 track_records.append(
                     {
@@ -1083,8 +1168,7 @@ class SunoService:
                         "image_url": track.image_url,
                     }
                 )
-            existing = self._load_task_record(task.task_id) or {}
-            record = dict(existing)
+            record = dict(existing_record)
             record.update(
                 {
                     "task_id": task.task_id,
@@ -1100,7 +1184,9 @@ class SunoService:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            record.setdefault("created_at", existing.get("created_at") or datetime.now(timezone.utc).isoformat())
+            record.setdefault(
+                "created_at", existing_record.get("created_at") or datetime.now(timezone.utc).isoformat()
+            )
             self._save_task_record(task.task_id, record)
             if self._should_log_once(task.task_id, task.callback_type):
                 log.info(
