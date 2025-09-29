@@ -22,7 +22,7 @@ import atexit
 from pathlib import Path
 # main
 from collections.abc import Mapping
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, Iterable
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode
@@ -4835,6 +4835,13 @@ def _suno_error_message(status: Optional[int], reason: Optional[str]) -> str:
         return "⚠️ Please provide tags. I used defaults."
     if status in {401, 403}:
         return "⚠️ Suno service unavailable. Try again later."
+    if status == 400 and reason:
+        lowered = reason.lower()
+        if any(phrase in lowered for phrase in ("artist name", "living artist", "brand")):
+            return (
+                "⚠️ Your description includes a living artist/brand. "
+                "Please remove explicit names and try: '80s dark R&B, neon city mood, falsetto vocals, cinematic builds'."
+            )
     if reason:
         return f"⚠️ Generation failed: {md2_escape(reason)}"
     return "⚠️ Generation failed, please try later."
@@ -5656,265 +5663,112 @@ async def _poll_suno_and_send(
         )
 
     try:
-        delay_iter = _iter_poll_delays()
-        while True:
-            delay = next(delay_iter)
-            await asyncio.sleep(delay)
-
-            now = time.monotonic()
-            elapsed = now - start_time
-
-            if elapsed >= SUNO_POLL_TIMEOUT:
-                if not notified_timeout:
-                    log.warning(
-                        "[SUNO] poll timeout | task_id=%s elapsed=%.1f attempts=%s",
-                        task_id,
-                        elapsed,
-                        attempt,
-                    )
-                    await _notify_timeout_once()
-                return
-
-            if elapsed > SUNO_POLL_BACKGROUND_LIMIT:
-                log.warning(
-                    "[SUNO] poll background limit reached | task_id=%s elapsed=%.1f",
-                    task_id,
-                    elapsed,
-                )
-                return
-
-            try:
-                existing_record = await asyncio.to_thread(SUNO_SERVICE.get_task_record, task_id)
-            except Exception:
-                existing_record = None
-            if existing_record:
-                existing_status = str(existing_record.get("status") or "").lower()
-                if existing_status in {"complete", "error", "failed"} and existing_record.get("tracks"):
-                    log.info(
-                        "[SUNO] poll already delivered | task_id=%s status=%s",
-                        task_id,
-                        existing_status,
-                    )
-                    return
-
-            attempt += 1
-            http_status = 200
-            details: Dict[str, Any] = {}
-            error_code_value: Optional[str] = None
-            status_upper: Optional[str] = None
-            mapped_state = "pending"
-
-            should_retry = False
-            retry_reason: Optional[str] = None
-
-            try:
-                response_payload = await suno_poll_task(task_id, user_id=user_id)
-                if isinstance(response_payload, Mapping):
-                    details = response_payload
-                status_upper = _poll_status(details)
-                error_code_value = _poll_error_code(details)
-            except SunoApiError as exc:
-                http_status = exc.status or 0
-                payload = exc.payload if isinstance(exc.payload, Mapping) else {}
-                if isinstance(payload, Mapping):
-                    details = payload
-                status_upper = _poll_status(details)
-                error_code_value = _poll_error_code(details)
-                if http_status == 404:
-                    mapped_state = "pending"
-                elif 400 <= http_status < 500 or error_code_value:
-                    mapped_state = "failed"
-                    reason_text = _clean_reason(
-                        details.get("message")
-                        or details.get("error")
-                        or details.get("detail")
-                        or f"status_{http_status}"
-                    )
-                    log.error(
-                        "[SUNO] poll final failure",
-                        extra={
-                            "meta": {
-                                "taskId": task_id,
-                                "attempt": attempt,
-                                "http_status": http_status,
-                                "error_code": error_code_value,
-                                "reason": reason_text,
-                                "snippet": _suno_sanitize_log_payload(details) if isinstance(details, Mapping) else None,
-                            }
-                        },
-                    )
-                    message = _suno_error_message(http_status, reason_text)
-                    try:
-                        await _suno_notify(
-                            ctx,
-                            chat_id,
-                            message,
-                            req_id=req_id_value,
-                            reply_to=reply_to,
-                        )
-                    except Exception as notify_exc:
-                        log.warning(
-                            "[SUNO] poll failure notify fail | task_id=%s err=%s",
-                            task_id,
-                            notify_exc,
-                        )
-                    await _issue_refund(message, reason="suno:refund:status_err")
-                    return
-                else:
-                    mapped_state = "retry"
-                    should_retry = True
-                    retry_reason = f"status_{http_status}" if http_status else "status_unknown"
-                    log.warning(
-                        "[SUNO] poll retry | task_id=%s status=%s attempt=%s",
-                        task_id,
-                        http_status,
-                        attempt,
-                    )
-            except Exception as exc:
-                http_status = 0
-                mapped_state = "retry"
-                should_retry = True
-                retry_reason = str(exc)
-                log.warning("[SUNO] poll unexpected error | task_id=%s err=%s", task_id, exc)
-
-            if status_upper:
-                status_upper = status_upper.upper()
-            else:
-                status_upper = None
-
-            if error_code_value and mapped_state != "failed":
-                mapped_state = "failed"
-                should_retry = False
-                reason_text = _clean_reason(
-                    details.get("message")
-                    or details.get("error")
-                    or str(error_code_value)
-                ) or f"error_code:{error_code_value}"
-                log.error(
-                    "[SUNO] poll error code",
-                    extra={
-                        "meta": {
-                            "taskId": task_id,
-                            "attempt": attempt,
-                            "http_status": http_status,
-                            "error_code": error_code_value,
-                            "reason": reason_text,
-                        }
-                    },
-                )
-                message = _suno_error_message(http_status, reason_text)
-                try:
-                    await _suno_notify(
-                        ctx,
-                        chat_id,
-                        message,
-                        req_id=req_id_value,
-                        reply_to=reply_to,
-                    )
-                except Exception as notify_exc:
-                    log.warning(
-                        "[SUNO] poll error-code notify fail | task_id=%s err=%s",
-                        task_id,
-                        notify_exc,
-                    )
-                await _issue_refund(message, reason="suno:refund:error_code")
-                return
-
-            if status_upper in {"SUCCESS", "SUCCEEDED", "COMPLETE", "COMPLETED", "READY"}:
-                mapped_state = "success"
-            elif status_upper in {"FAILED", "ERROR", "TIMEOUT", "CANCELLED", "CANCELED"}:
-                mapped_state = "failed"
-            else:
-                mapped_state = "pending"
-
-            log.info(
-                "[SUNO] poll step",
-                extra={
-                    "meta": {
-                        "taskId": task_id,
-                        "attempt": attempt,
-                        "http_status": http_status,
-                        "mapped_state": mapped_state,
-                        "retry_reason": retry_reason,
-                    }
-                },
-            )
-
-            if should_retry:
-                continue
-
-            if mapped_state == "failed":
-                reason_text = _clean_reason(
-                    details.get("message")
-                    or details.get("error")
-                    or details.get("detail")
-                    or status_upper
-                )
-                message = _suno_error_message(None, reason_text)
-                try:
-                    await _suno_notify(
-                        ctx,
-                        chat_id,
-                        message,
-                        req_id=req_id_value,
-                        reply_to=reply_to,
-                    )
-                except Exception as notify_exc:
-                    log.warning(
-                        "[SUNO] poll failure notify fail | task_id=%s err=%s",
-                        task_id,
-                        notify_exc,
-                    )
-                await _issue_refund(message, reason="suno:refund:status_err")
-                return
-
-            if mapped_state != "success":
-                continue
-
-            tracks_payload = _poll_tracks(details)
-            if not tracks_payload:
+        try:
+            existing_record = await asyncio.to_thread(SUNO_SERVICE.get_task_record, task_id)
+        except Exception:
+            existing_record = None
+        if existing_record:
+            existing_status = str(existing_record.get("status") or "").lower()
+            if existing_status in {"complete", "error", "failed"} and existing_record.get("tracks"):
                 log.info(
-                    "[SUNO] poll success without tracks | task_id=%s attempt=%s",
+                    "[SUNO] poll already delivered | task_id=%s status=%s",
                     task_id,
-                    attempt,
+                    existing_status,
                 )
-                continue
+                return
 
-            envelope_payload = {
-                "code": details.get("code") or 200,
-                "msg": details.get("message") or details.get("msg"),
-                "data": {
-                    "taskId": task_id,
-                    "callbackType": "complete",
-                    "response": {"tracks": tracks_payload},
-                },
-            }
+        poll_result = await asyncio.to_thread(
+            SUNO_SERVICE.wait_for_record_info,
+            task_id,
+            user_id=user_id,
+        )
 
-            duration_value = _poll_duration(details)
-            audio_url_preview = None
-            if tracks_payload:
-                audio_url_preview = tracks_payload[0].get("audioUrl") or tracks_payload[0].get("audio_url")
-            log.info(
-                "[SUNO] poll success",
-                extra={
-                    "meta": {
-                        "taskId": task_id,
-                        "duration": duration_value,
-                        "audioUrl": _mask_tokens(str(audio_url_preview)) if audio_url_preview else None,
-                        "tags": _poll_tags(details),
-                    }
-                },
+        details = dict(poll_result.payload) if isinstance(poll_result.payload, Mapping) else {}
+        http_status = poll_result.status_code
+        state_value = poll_result.state
+
+        if state_value == "timeout":
+            log.warning(
+                "[SUNO] poll timeout | task_id=%s attempts=%s elapsed=%.1f",
+                task_id,
+                poll_result.attempts,
+                poll_result.elapsed,
             )
-
-            try:
-                callback_task = SunoTask.from_envelope(CallbackEnvelope.model_validate(envelope_payload))
-                callback_task = callback_task.model_copy(
-                    update={"code": envelope_payload["code"], "msg": envelope_payload.get("msg")}
-                )
-                await asyncio.to_thread(SUNO_SERVICE.handle_callback, callback_task, req_id=req_id_value)
-            except Exception as exc:
-                log.exception("[SUNO] poll delivery failed | task_id=%s err=%s", task_id, exc)
+            await _notify_timeout_once()
             return
+
+        if state_value == "hard_error":
+            reason_text = _clean_reason(poll_result.message or poll_result.error)
+            message = _suno_error_message(http_status, reason_text)
+            try:
+                await _suno_notify(
+                    ctx,
+                    chat_id,
+                    message,
+                    req_id=req_id_value,
+                    reply_to=reply_to,
+                )
+            except Exception as notify_exc:
+                log.warning(
+                    "[SUNO] poll failure notify fail | task_id=%s err=%s",
+                    task_id,
+                    notify_exc,
+                )
+            await _issue_refund(message, reason="suno:refund:status_err")
+            return
+
+        if state_value != "ready":
+            log.info(
+                "[SUNO] poll finished without ready state | task_id=%s state=%s",
+                task_id,
+                state_value,
+            )
+            return
+
+        tracks_payload = _poll_tracks(details)
+        if not tracks_payload:
+            log.info(
+                "[SUNO] poll success without tracks | task_id=%s",
+                task_id,
+            )
+            await _notify_timeout_once()
+            return
+
+        envelope_payload = {
+            "code": details.get("code") or 200,
+            "msg": details.get("message") or details.get("msg"),
+            "data": {
+                "taskId": task_id,
+                "callbackType": "complete",
+                "response": {"tracks": tracks_payload},
+            },
+        }
+
+        duration_value = _poll_duration(details)
+        audio_url_preview = None
+        if tracks_payload:
+            audio_url_preview = tracks_payload[0].get("audioUrl") or tracks_payload[0].get("audio_url")
+        log.info(
+            "[SUNO] poll success",
+            extra={
+                "meta": {
+                    "taskId": task_id,
+                    "duration": duration_value,
+                    "audioUrl": _mask_tokens(str(audio_url_preview)) if audio_url_preview else None,
+                    "tags": _poll_tags(details),
+                }
+            },
+        )
+
+        try:
+            callback_task = SunoTask.from_envelope(CallbackEnvelope.model_validate(envelope_payload))
+            callback_task = callback_task.model_copy(
+                update={"code": envelope_payload["code"], "msg": envelope_payload.get("msg")}
+            )
+            await asyncio.to_thread(SUNO_SERVICE.handle_callback, callback_task, req_id=req_id_value)
+        except Exception as exc:
+            log.exception("[SUNO] poll delivery failed | task_id=%s err=%s", task_id, exc)
+        return
 
     except asyncio.CancelledError:
         log.info("[SUNO] poll cancelled | task_id=%s", task_id)
@@ -6030,19 +5884,6 @@ def _is_not_found_response(status: int, payload: Dict[str, Any]) -> bool:
     return False
 
 
-def _iter_poll_delays() -> Iterable[float]:
-    base = [delay for delay in [SUNO_POLL_FIRST_DELAY, *SUNO_POLL_BACKOFF_SERIES] if delay > 0]
-    if not base:
-        base = [5.0]
-    index = 0
-    while True:
-        if index < len(base):
-            yield base[index]
-        else:
-            yield base[-1]
-        index += 1
-
-
 def _poll_section(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = payload.get(key)
     if isinstance(value, Mapping):
@@ -6050,37 +5891,15 @@ def _poll_section(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return {}
 
 
-def _poll_status(payload: Mapping[str, Any]) -> Optional[str]:
-    for key in ("status", "taskStatus", "callbackType", "callback_type", "state"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().upper()
-    data_section = _poll_section(payload, "data")
-    for key in ("status", "taskStatus", "callbackType", "callback_type", "state"):
-        value = data_section.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().upper()
-    response_section = _poll_section(data_section, "response")
-    for key in ("status", "taskStatus", "state"):
-        value = response_section.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().upper()
-    return None
-
-
-def _poll_error_code(payload: Mapping[str, Any]) -> Optional[str]:
-    for section in (payload, _poll_section(payload, "data"), _poll_section(_poll_section(payload, "data"), "response")):
-        for key in ("errorCode", "error_code"):
-            value = section.get(key)
-            if value not in (None, ""):
-                return str(value)
-    return None
-
-
 def _poll_tracks(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
     data_section = _poll_section(payload, "data")
     response_section = _poll_section(data_section, "response")
-    tracks_candidate = response_section.get("tracks") or data_section.get("tracks")
+    tracks_candidate = (
+        response_section.get("sunoData")
+        or response_section.get("tracks")
+        or data_section.get("sunoData")
+        or data_section.get("tracks")
+    )
     if isinstance(tracks_candidate, list):
         normalized: List[Dict[str, Any]] = []
         for item in tracks_candidate:

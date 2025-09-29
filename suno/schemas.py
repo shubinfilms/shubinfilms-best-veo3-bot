@@ -58,6 +58,8 @@ class SunoTrack(BaseModel):
     image_url: str | None = None
     tags: str | None = None
     duration: float | None = None
+    source_audio_url: str | None = None
+    source_image_url: str | None = None
 
 
 class SunoTask(BaseModel):
@@ -116,7 +118,7 @@ def _ensure_iterable(value: Any) -> Iterable[Any]:
 
 
 def _extract_items(data: dict[str, Any]) -> Iterable[Any]:
-    for key in ("tracks", "items", "results", "data"):
+    for key in ("sunoData", "tracks", "items", "results", "data"):
         maybe = data.get(key)
         if maybe:
             return _ensure_iterable(maybe)
@@ -144,8 +146,10 @@ def _build_track(raw: Any, index: int) -> SunoTrack | None:
         return None
     track_id = _first(raw, "id", "trackId", "audioId", "songId") or str(index)
     title = _first(raw, "title", "name")
-    audio_url = _first(raw, "audio_url", "audioUrl", "url", "fileUrl", "mp3Url")
-    image_url = _first(raw, "image_url", "imageUrl", "coverUrl", "imgUrl")
+    source_audio_url = _first(raw, "sourceAudioUrl", "audio_url", "audioUrl", "url", "fileUrl", "mp3Url")
+    source_image_url = _first(raw, "sourceImageUrl", "image_url", "imageUrl", "coverUrl", "imgUrl")
+    audio_url = _first(raw, "audio_url", "audioUrl", "url", "fileUrl", "mp3Url") or source_audio_url
+    image_url = _first(raw, "image_url", "imageUrl", "coverUrl", "imgUrl") or source_image_url
     tags_value = _first(raw, "tags", "tag", "style", "styles")
     if isinstance(tags_value, list):
         tags = ", ".join(str(item) for item in tags_value if item not in (None, "")) or None
@@ -171,6 +175,8 @@ def _build_track(raw: Any, index: int) -> SunoTrack | None:
         image_url=str(image_url) if image_url else None,
         tags=tags,
         duration=duration,
+        source_audio_url=str(source_audio_url) if source_audio_url else None,
+        source_image_url=str(source_image_url) if source_image_url else None,
     )
 
 
