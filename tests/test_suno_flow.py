@@ -80,6 +80,27 @@ class FakeMessage:
         return SimpleNamespace(message_id=self._next_message_id)
 
 
+class MiniRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    def setex(self, key: str, ttl: int, value: str) -> bool:
+        self.store[key] = value
+        return True
+
+    def get(self, key: str):
+        return self.store.get(key)
+
+    def delete(self, key: str) -> None:
+        self.store.pop(key, None)
+
+    def set(self, key: str, value: str, nx: bool = False, ex: int | None = None):
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        return True
+
+
 def _setup_suno_context() -> tuple[SimpleNamespace, dict[str, object], FakeBot, int]:
     bot = FakeBot()
     ctx = SimpleNamespace(bot=bot, user_data={})
@@ -96,6 +117,7 @@ def _render(state: SunoState, *, price: int = 30, balance: int | None = None):
         price=price,
         balance=balance,
         generating=False,
+        waiting_enqueue=False,
     )
     return text, markup
 
@@ -520,3 +542,183 @@ def test_suno_card_resend_on_not_modified() -> None:
         assert len(fake_bot.sent) == initial_sent + 1
         assert fake_bot.sent[-1]["text"].startswith("🎵") or "Новый трек" in fake_bot.sent[-1]["text"]
     assert load(ctx).title == "Новый трек"
+
+
+def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
+    bot = bot_module
+    fake_redis = MiniRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    bot._SUNO_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_COOLDOWN_MEMORY.clear()
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    debit_calls = {"count": 0}
+
+    def fake_debit(user_id, price, reason, meta):
+        debit_calls["count"] += 1
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit)
+
+    status_texts: list[str] = []
+
+    async def fake_notify(ctx_param, chat_id_param, text, **kwargs):
+        status_texts.append(text)
+        return SimpleNamespace(message_id=321)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    edited_messages: list[str] = []
+
+    async def fake_safe_edit_message(ctx_param, chat_id_param, message_id_param, new_text, **kwargs):
+        edited_messages.append(new_text)
+        return True
+
+    monkeypatch.setattr(bot, "safe_edit_message", fake_safe_edit_message)
+
+    refunds: list[dict[str, object]] = []
+
+    async def fake_refund(*args, **kwargs):
+        refunds.append(kwargs)
+
+    monkeypatch.setattr(bot, "_suno_issue_refund", fake_refund)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    attempts = {"count": 0}
+
+    class DummyTask:
+        def __init__(self, task_id: str) -> None:
+            self.task_id = task_id
+            self.items = []
+            self.callback_type = "start"
+            self.msg = None
+            self.code = None
+
+    def fake_start_music(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise bot.SunoAPIError("temporary", status=500)
+        return DummyTask("task-success")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run() -> None:
+        await bot._launch_suno_generation(
+            chat_id=111,
+            ctx=ctx,
+            params=params,
+            user_id=42,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    assert attempts["count"] == 3
+    assert debit_calls["count"] == 1
+    assert status_texts and status_texts[0] == "⏳ Sending request…"
+    assert edited_messages and edited_messages[-1].startswith("✅ Списано")
+    assert not refunds
+
+
+def test_suno_enqueue_all_failures(monkeypatch) -> None:
+    bot = bot_module
+    fake_redis = MiniRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    bot._SUNO_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_COOLDOWN_MEMORY.clear()
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    def fake_debit(user_id, price, reason, meta):
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit)
+
+    status_texts: list[str] = []
+
+    async def fake_notify(ctx_param, chat_id_param, text, **kwargs):
+        status_texts.append(text)
+        return SimpleNamespace(message_id=654)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    edited_messages: list[str] = []
+
+    async def fake_safe_edit_message(ctx_param, chat_id_param, message_id_param, new_text, **kwargs):
+        edited_messages.append(new_text)
+        return True
+
+    monkeypatch.setattr(bot, "safe_edit_message", fake_safe_edit_message)
+
+    refunds: list[dict[str, object]] = []
+
+    async def fake_refund(*args, **kwargs):
+        refunds.append(kwargs)
+
+    monkeypatch.setattr(bot, "_suno_issue_refund", fake_refund)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    attempts = {"count": 0}
+
+    def failing_start_music(*args, **kwargs):
+        attempts["count"] += 1
+        raise bot.SunoAPIError("boom", status=500)
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", failing_start_music)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run() -> None:
+        await bot._launch_suno_generation(
+            chat_id=222,
+            ctx=ctx,
+            params=params,
+            user_id=99,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    assert attempts["count"] == bot._SUNO_ENQUEUE_MAX_ATTEMPTS
+    assert status_texts and status_texts[0] == "⏳ Sending request…"
+    assert edited_messages and edited_messages[-1].startswith("⚠️ Generation failed")
+    assert refunds and refunds[-1]["user_message"].startswith("⚠️ Generation failed")

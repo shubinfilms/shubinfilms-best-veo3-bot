@@ -207,6 +207,8 @@ from telegram_utils import (
     run_ffmpeg,
     md2_escape,
 )
+from utils.api_client import request_with_retries
+from utils.telegram_safe import safe_edit_message
 from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
@@ -2593,6 +2595,7 @@ DEFAULT_STATE = {
     "suno_state": None,
     "suno_waiting_state": IDLE_SUNO,
     "suno_generating": False,
+    "suno_waiting_enqueue": False,
     "suno_last_task_id": None,
     "suno_last_params": None,
     "suno_balance": None,
@@ -4051,8 +4054,10 @@ def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
         'Введите промпт сообщением. После этого нажмите «Подтвердить».',
         f"Текущий формат: <b>{aspect}</b>",
     ]
-    snippet = _short_prompt(prompt) or "—"
-    lines.extend(["", f"Промпт: <i>{html.escape(snippet)}</i>"])
+    snippet = _short_prompt(prompt)
+    snippet_html = html.escape(snippet) if snippet else ""
+    display = snippet_html if snippet_html else " "
+    lines.extend(["", f"Промпт: <i>{display}</i>"])
     return "\n".join(lines)
 
 def _mj_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -5033,6 +5038,7 @@ async def _launch_suno_generation(
     }
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
+    s["suno_waiting_enqueue"] = True
     _reset_suno_card_cache(s)
     s["suno_waiting_state"] = IDLE_SUNO
     s["suno_current_req_id"] = req_id
@@ -5053,10 +5059,12 @@ async def _launch_suno_generation(
                 "req_id": req_id,
                 "req_short": req_label,
                 "charged": True,
+                "status": "enqueueing",
             }
         )
 
-        notify_text = (
+        waiting_text = "⏳ Sending request…"
+        success_text = (
             f"✅ Списано {PRICE_SUNO}💎 (req {req_label}).\n"
             "Задача создана, ждём результат…\n"
             "Как только получим коллбек — пришлю аудио/ссылки."
@@ -5064,12 +5072,12 @@ async def _launch_suno_generation(
         notify_exc: Optional[Exception] = None
         notify_started = time.monotonic()
         notify_ok = False
-        ack_message: Optional["telegram.Message"] = None
+        status_message: Optional["telegram.Message"] = None
         try:
-            ack_message = await _suno_notify(
+            status_message = await _suno_notify(
                 ctx,
                 chat_id,
-                notify_text,
+                waiting_text,
                 req_id=req_id,
                 reply_to=reply_to,
             )
@@ -5103,7 +5111,6 @@ async def _launch_suno_generation(
                 "ts": _utcnow_iso(),
                 "updated_ts": _utcnow_iso(),
                 "notify_ok": notify_ok,
-                "status": "pending",
             }
         )
         if isinstance(new_balance, int):
@@ -5112,49 +5119,90 @@ async def _launch_suno_generation(
         _suno_refund_pending_clear(req_id)
 
         reply_message_id = 0
-        if ack_message is not None and getattr(ack_message, "message_id", None):
-            reply_message_id = int(getattr(ack_message, "message_id"))
+        if status_message is not None and getattr(status_message, "message_id", None):
+            reply_message_id = int(getattr(status_message, "message_id"))
         elif reply_to is not None:
             reply_message_id = int(reply_to.message_id)
 
+        status_holder: dict[str, Optional["telegram.Message"]] = {"message": status_message}
+
+        async def _update_status_message(new_text: str, *, fallback: bool = False) -> None:
+            message_obj = status_holder.get("message")
+            msg_id = getattr(message_obj, "message_id", None)
+            edited = False
+            if isinstance(msg_id, int):
+                try:
+                    edited = await safe_edit_message(
+                        ctx,
+                        chat_id,
+                        msg_id,
+                        new_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[SUNO] status edit failed | req_id=%s err=%s",
+                        req_id,
+                        exc,
+                    )
+            if fallback and not edited:
+                try:
+                    status_holder["message"] = await _suno_notify(
+                        ctx,
+                        chat_id,
+                        new_text,
+                        req_id=req_id,
+                        reply_to=reply_to,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[SUNO] status fallback send failed | req_id=%s err=%s",
+                        req_id,
+                        exc,
+                    )
+
         enqueue_started = time.monotonic()
         prompt_text = payload.get("prompt") or ""
+        failure_text = "⚠️ Generation failed, please try later."
+        refund_message = (
+            f"{failure_text}\n"
+            f"💎 Токены возвращены (+{PRICE_SUNO}💎)."
+        )
 
-        task = None
+        def _start_music_call() -> Awaitable[Any]:
+            return asyncio.to_thread(
+                SUNO_SERVICE.start_music,
+                chat_id,
+                reply_message_id,
+                title=payload.get("title"),
+                style=payload.get("style"),
+                lyrics=(payload.get("lyrics") if (payload.get("lyrics") and not instrumental) else None),
+                model=payload.get("model", model),
+                instrumental=payload.get("instrumental", instrumental),
+                user_id=user_id,
+                prompt=prompt_text,
+                req_id=req_id,
+                lang=payload.get("lang"),
+                has_lyrics=payload.get("has_lyrics", False),
+            )
+
+        def _retry_filter(exc: BaseException) -> bool:
+            if isinstance(exc, SunoAPIError):
+                status = exc.status
+                return status is None or (isinstance(status, int) and status >= 500)
+            return isinstance(exc, Exception)
+
         try:
-            for attempt in range(1, _SUNO_ENQUEUE_MAX_ATTEMPTS + 1):
-                try:
-                    task = await asyncio.to_thread(
-                        SUNO_SERVICE.start_music,
-                        chat_id,
-                        reply_message_id,
-                        title=payload.get("title"),
-                        style=payload.get("style"),
-                        lyrics=(payload.get("lyrics") if (payload.get("lyrics") and not instrumental) else None),
-                        model=payload.get("model", model),
-                        instrumental=payload.get("instrumental", instrumental),
-                        user_id=user_id,
-                        prompt=prompt_text,
-                        req_id=req_id,
-                        lang=payload.get("lang"),
-                        has_lyrics=payload.get("has_lyrics", False),
-                    )
-                    break
-                except SunoAPIError as exc:
-                    status = exc.status
-                    retryable = status is None or (isinstance(status, int) and status >= 500)
-                    if retryable and attempt < _SUNO_ENQUEUE_MAX_ATTEMPTS:
-                        wait_for = min(5.0, attempt * 2.0)
-                        log.warning(
-                            "[SUNO] enqueue retry | req_id=%s attempt=%s status=%s wait=%.1f",
-                            req_id,
-                            attempt,
-                            status,
-                            wait_for,
-                        )
-                        await asyncio.sleep(wait_for)
-                        continue
-                    raise
+            task = await request_with_retries(
+                _start_music_call,
+                attempts=_SUNO_ENQUEUE_MAX_ATTEMPTS,
+                base_delay=1.0,
+                max_delay=6.0,
+                backoff_factor=2.0,
+                logger=log,
+                log_context={"req_id": req_id, "stage": "suno.enqueue"},
+                retry_filter=_retry_filter,
+            )
             if task is None:
                 raise RuntimeError("Suno start_music returned no task")
         except SunoAPIError as exc:
@@ -5176,6 +5224,7 @@ async def _launch_suno_generation(
                 duration,
                 exc.status,
             )
+            await _update_status_message(failure_text, fallback=True)
             await _suno_issue_refund(
                 ctx,
                 chat_id,
@@ -5186,6 +5235,7 @@ async def _launch_suno_generation(
                 reason="suno:refund:create_err",
                 req_id=req_id,
                 reply_to=reply_to,
+                user_message=refund_message,
             )
             return
         except Exception as exc:
@@ -5206,6 +5256,7 @@ async def _launch_suno_generation(
                 req_id,
                 duration,
             )
+            await _update_status_message(failure_text, fallback=True)
             await _suno_issue_refund(
                 ctx,
                 chat_id,
@@ -5216,6 +5267,7 @@ async def _launch_suno_generation(
                 reason="suno:refund:create_err",
                 req_id=req_id,
                 reply_to=reply_to,
+                user_message=refund_message,
             )
             return
 
@@ -5255,6 +5307,8 @@ async def _launch_suno_generation(
 
         log.info("[SUNO] enqueue ok | req_id=%s task_id=%s duration=%.3f", req_id, task_id, duration)
 
+        await _update_status_message(success_text, fallback=True)
+
         _suno_set_cooldown(int(user_id))
         meta["task_id"] = task_id
         _suno_update_last_debit_meta(user_id, {"task_id": task_id})
@@ -5277,9 +5331,11 @@ async def _launch_suno_generation(
             "instrumental": instrumental,
         }
         s["suno_generating"] = False
+        s["suno_waiting_enqueue"] = False
         s["suno_current_req_id"] = None
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
     finally:
+        s["suno_waiting_enqueue"] = False
         if s.get("suno_generating"):
             s["suno_generating"] = False
             s["suno_current_req_id"] = None
@@ -5495,8 +5551,7 @@ async def _poll_suno_and_send(
 # --------- VEO Card ----------
 def veo_card_text(s: Dict[str, Any]) -> str:
     prompt_raw = (s.get("last_prompt") or "").strip()
-    prompt_display = prompt_raw or "—"
-    prompt_html = html.escape(prompt_display)
+    prompt_html = html.escape(prompt_raw) if prompt_raw else ""
     aspect = html.escape(s.get("aspect") or "16:9")
     model = "Veo Quality" if s.get("model") == "veo3" else "Veo Fast"
     img = "есть" if s.get("last_image_url") else "нет"
@@ -5512,13 +5567,12 @@ def veo_card_text(s: Dict[str, Any]) -> str:
         lines.append(f"• Длительность: <b>{html.escape(str(duration_hint))}</b>")
     if lip_sync:
         lines.append("• <b>lip-sync required</b>")
-    lines.extend(
-        [
-            "",
-            "🖊️ <b>Промпт:</b>",
-            f"<code>{prompt_html}</code>",
-        ]
-    )
+    code_line = f"<code>{prompt_html}</code>" if prompt_html else "<code> </code>"
+    lines.extend([
+        "",
+        "🖊️ <b>Промпт:</b>",
+        code_line,
+    ])
     return "\n".join(lines)
 
 def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:

@@ -197,6 +197,7 @@ def render_suno_card(
     price: int,
     balance: Optional[int] = None,
     generating: bool = False,
+    waiting_enqueue: bool = False,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     safe_title = html.escape(suno_state.title) if suno_state.title else "—"
     style_display = suno_style_preview(suno_state.style, limit=200)
@@ -216,7 +217,9 @@ def render_suno_card(
     lines.append(f"• Текст: <i>{safe_lyrics}</i>")
     lines.append("")
     lines.append(f"💎 Цена: {price} 💎 за попытку")
-    if generating:
+    if waiting_enqueue:
+        lines.append("⏳ Отправляем запрос в Suno…")
+    elif generating:
         lines.append("⏳ Генерация запущена — ожидайте результат.")
 
     text = "\n".join(lines)
@@ -236,6 +239,7 @@ async def refresh_suno_card(
     suno_state_obj = load_suno_state(ctx)
     state_dict["suno_state"] = suno_state_obj.to_dict()
     generating = bool(state_dict.get("suno_generating"))
+    waiting_enqueue = bool(state_dict.get("suno_waiting_enqueue"))
     balance_val = state_dict.get("suno_balance")
     try:
         balance_num = int(balance_val) if balance_val is not None else None
@@ -246,6 +250,7 @@ async def refresh_suno_card(
         price=price,
         balance=balance_num,
         generating=generating,
+        waiting_enqueue=waiting_enqueue,
     )
     card_state_raw = state_dict.get("suno_card")
     card_state: MutableMapping[str, Any]
