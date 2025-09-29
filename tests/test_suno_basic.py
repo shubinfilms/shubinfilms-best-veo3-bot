@@ -6,7 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import pytest
 import requests
@@ -34,7 +34,7 @@ os.environ.setdefault("SUNO_CALLBACK_URL", "https://callback.local/suno-callback
 import suno_web
 from suno_web import app
 import suno.tempfiles as tempfiles
-from suno.client import EnqueueResult, SunoAPIError, SunoClient, SunoClientError
+from suno.client import SunoAPIError, SunoClient, SunoClientError
 from suno.service import SunoService
 from suno.schemas import CallbackEnvelope, SunoTask
 
@@ -166,7 +166,7 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
     assert sent["callBackUrl"] == "https://callback.local/suno-callback"
     assert sent["userId"] == "777"
     assert sent["negativeTags"] == []
-    assert sent["tags"] == []
+    assert sent["tags"] == ["pop"]
     assert "callBackSecret" not in sent
 
 
@@ -192,7 +192,7 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
     assert body["instrumental"] is True
     assert body["customMode"] is False
     assert body["negativeTags"] == []
-    assert body["tags"] == []
+    assert body["tags"] == ["lyrics"]
 
 
 def test_payload_uses_default_prompt(monkeypatch, requests_mock):
@@ -207,6 +207,7 @@ def test_payload_uses_default_prompt(monkeypatch, requests_mock):
     assert body["prompt"] == "Untitled track"
     assert body["instrumental"] is False
     assert body["customMode"] is False
+    assert body["tags"] == ["untitled", "track"]
 
 
 def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
@@ -262,32 +263,23 @@ def test_status_uses_task_id_query(monkeypatch, requests_mock):
         "https://api.example.com/api/v1/generate/record-info",
         json={"status": "queued"},
     )
-    client.get_task_status("req-1", task_id="abc", user_id="42")
+    client.get_task_status("abc", req_id="req-1")
     request = requests_mock.last_request
     qs = {k.lower(): v for k, v in request.qs.items()}
     assert qs.get("taskid") == ["abc"]
-    assert qs.get("userid") == ["42"]
-    assert "req_id" not in qs and "reqid" not in qs
+    assert "userid" not in qs
 
 
-def test_status_retries_without_user_id(monkeypatch, requests_mock):
+def test_status_returns_payload(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.get(
         "https://api.example.com/api/v1/generate/record-info",
-        [
-            {"status_code": 422, "json": {"message": "userId cannot be empty"}},
-            {"json": {"status": "ready", "taskId": "abc"}},
-        ],
+        json={"status": "ready", "taskId": "abc"},
     )
-    response = client.get_task_status("abc", user_id="42")
+    response = client.get_task_status("abc")
     assert response["status"] == "ready"
-    assert requests_mock.call_count == 2
-    first, second = requests_mock.request_history
-    first_qs = {k.lower(): v for k, v in first.qs.items()}
-    second_qs = {k.lower(): v for k, v in second.qs.items()}
-    assert first_qs.get("userid") == ["42"]
-    assert "userid" not in second_qs
+    assert requests_mock.call_count == 1
 
 
 def test_suno_wav_helpers(monkeypatch, requests_mock):
@@ -490,21 +482,39 @@ def test_suno_service_records_request_id(monkeypatch):
         def __init__(self):
             self.captured_req_id = None
 
-        def enqueue_music(self, **kwargs):
-            self.captured_req_id = kwargs.get("req_id")
-            body = {"task_id": "task-req", "req_id": self.captured_req_id}
-            return EnqueueResult(
-                body=body,
-                req_id=self.captured_req_id,
-                task_id="task-req",
-                status="ok",
-                path="/api/v1/generate",
-                custom_mode=False,
-            )
+        def build_payload(
+            self,
+            *,
+            user_id: str,
+            title: Optional[str],
+            prompt: Optional[str],
+            instrumental: bool,
+            has_lyrics: bool,
+            lyrics: Optional[str],
+            prompt_len: int = 16,
+            model: Optional[str] = None,
+            call_back_url: Optional[str] = None,
+            call_back_secret: Optional[str] = None,
+            tags: Optional[Sequence[Any]] = None,
+        ) -> Mapping[str, Any]:
+            return {
+                "model": model or "V5",
+                "title": title or "Demo",
+                "prompt": prompt or "Demo",
+                "instrumental": instrumental,
+                "has_lyrics": has_lyrics,
+                "lyrics": lyrics or "",
+                "tags": list(tags or ["demo"]),
+                "negativeTags": [],
+                "prompt_len": prompt_len,
+                "customMode": False,
+                "userId": user_id,
+                "callBackUrl": call_back_url or "https://callback.example/suno",
+            }
 
-        def create_music(self, payload, *, req_id=None):
-            result = self.enqueue_music(req_id=req_id)
-            return result.body, "v5"
+        def enqueue(self, payload: Mapping[str, Any], *, req_id: Optional[str] = None) -> str:
+            self.captured_req_id = req_id
+            return "task-req"
 
     service = SunoService(client=FakeClient(), redis=None, telegram_token="dummy")
     task = service.start_music(
@@ -520,54 +530,63 @@ def test_suno_service_records_request_id(monkeypatch):
     )
     assert task.task_id == "task-req"
     assert service.client.captured_req_id == "req-123"
-    assert service.get_request_id(task.task_id) == task.task_id
+    assert service.get_request_id(task.task_id) == "req-123"
     assert service.get_task_id_by_request("req-123") == task.task_id
     ts = service.get_start_timestamp(task.task_id)
     assert ts is not None
 
 
-@pytest.mark.parametrize(
-    "response, expected_req, expected_task",
-    [
-        ({"req_id": "req-1", "task_id": "task-1"}, "req-1", "task-1"),
-        ({"data": {"req_id": "req-2", "task_id": "task-2"}}, "req-2", "task-2"),
-        ({"requestId": "req-3", "taskId": "task-3"}, "req-3", "task-3"),
-    ],
-)
-def test_suno_service_extracts_enqueue_ids(response, expected_req, expected_task):
+def test_suno_service_assigns_task_id_when_request_missing():
     class FakeClient:
-        def enqueue_music(self, **kwargs):
-            req_id = kwargs.get("req_id")
-            task_id = response.get("task_id") or response.get("taskId")
-            return EnqueueResult(
-                body=response,
-                req_id=response.get("req_id") or response.get("requestId") or req_id,
-                task_id=task_id,
-                status=str(response.get("status") or response.get("code") or "ok"),
-                path="/api/v1/generate",
-                custom_mode=False,
-            )
+        def build_payload(
+            self,
+            *,
+            user_id: str,
+            title: Optional[str],
+            prompt: Optional[str],
+            instrumental: bool,
+            has_lyrics: bool,
+            lyrics: Optional[str],
+            prompt_len: int = 16,
+            model: Optional[str] = None,
+            call_back_url: Optional[str] = None,
+            call_back_secret: Optional[str] = None,
+            tags: Optional[Sequence[Any]] = None,
+        ) -> Mapping[str, Any]:
+            return {
+                "model": model or "V5",
+                "title": title or "Demo",
+                "prompt": prompt or "Prompt",
+                "instrumental": instrumental,
+                "has_lyrics": has_lyrics,
+                "lyrics": lyrics or "",
+                "tags": list(tags or ["demo"]),
+                "negativeTags": [],
+                "prompt_len": prompt_len,
+                "customMode": False,
+                "userId": user_id,
+                "callBackUrl": call_back_url or "https://callback.example/suno",
+            }
 
-        def create_music(self, payload, *, req_id=None):
-            result = self.enqueue_music(req_id=req_id)
-            return result.body, "v5"
+        def enqueue(self, payload: Mapping[str, Any], *, req_id: Optional[str] = None) -> str:
+            assert req_id is None
+            return "task-generated"
 
     service = SunoService(client=FakeClient(), redis=None, telegram_token="dummy")
     task = service.start_music(
         10,
         20,
         title="Demo",
-        style=None,
-        lyrics=None,
+        style="Pop",
+        lyrics="Lyrics",
         instrumental=False,
         user_id=1,
         prompt="Prompt",
         req_id=None,
     )
-    assert task.task_id == expected_task
-    assert service.get_request_id(expected_task) == expected_task
-    assert service.get_task_id_by_request(expected_req) == expected_task
-    assert service.get_task_id_by_request(expected_req) == expected_task
+    assert task.task_id == "task-generated"
+    assert service.get_request_id("task-generated") == "task-generated"
+    assert service.get_task_id_by_request("task-generated") == "task-generated"
 
 
 def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock):
@@ -606,7 +625,7 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
     assert sent_body["instrumental"] is True
     assert sent_body["customMode"] is False
     assert sent_body["negativeTags"] == []
-    assert sent_body["tags"] == []
+    assert sent_body["tags"] == ["ambient"]
 
     envelope = CallbackEnvelope(
         code=200,
@@ -637,21 +656,38 @@ def test_callback_restores_missing_req_id(monkeypatch):
         def __init__(self, task_id: str):
             self.task_id = task_id
 
-        def enqueue_music(self, **kwargs):
-            req_id = kwargs.get("req_id")
-            body = {"task_id": self.task_id, "req_id": req_id}
-            return EnqueueResult(
-                body=body,
-                req_id=req_id,
-                task_id=self.task_id,
-                status="ok",
-                path="/api/v1/generate",
-                custom_mode=False,
-            )
+        def build_payload(
+            self,
+            *,
+            user_id: str,
+            title: Optional[str],
+            prompt: Optional[str],
+            instrumental: bool,
+            has_lyrics: bool,
+            lyrics: Optional[str],
+            prompt_len: int = 16,
+            model: Optional[str] = None,
+            call_back_url: Optional[str] = None,
+            call_back_secret: Optional[str] = None,
+            tags: Optional[Sequence[Any]] = None,
+        ) -> Mapping[str, Any]:
+            return {
+                "model": model or "V5",
+                "title": title or "Demo",
+                "prompt": prompt or "Prompt",
+                "instrumental": instrumental,
+                "has_lyrics": has_lyrics,
+                "lyrics": lyrics or "",
+                "tags": list(tags or ["demo"]),
+                "negativeTags": [],
+                "prompt_len": prompt_len,
+                "customMode": False,
+                "userId": user_id,
+                "callBackUrl": call_back_url or "https://callback.example/suno",
+            }
 
-        def create_music(self, payload, *, req_id=None):
-            result = self.enqueue_music(req_id=req_id)
-            return result.body, "legacy"
+        def enqueue(self, payload: Mapping[str, Any], *, req_id: Optional[str] = None) -> str:
+            return self.task_id
 
     fake_client = FakeClient("restore-task")
     service = SunoService(client=fake_client, redis=None, telegram_token="dummy")
@@ -675,7 +711,7 @@ def test_callback_restores_missing_req_id(monkeypatch):
     )
     assert response.status_code == 200
     assert captured["task"].task_id == "restore-task"
-    assert captured["req_id"] == "restore-task"
+    assert captured["req_id"] == "req-restore"
     assert service.get_task_id_by_request("req-restore") == "restore-task"
 
 

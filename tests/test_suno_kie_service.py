@@ -45,7 +45,7 @@ def test_enqueue_music_builds_instrumental_payload():
             additional_matcher=_capture,
         )
 
-        result = client.enqueue_music(
+        task_id = client.enqueue_music(
             user_id=878622103,
             title="Ping",
             prompt="ambient",
@@ -65,11 +65,9 @@ def test_enqueue_music_builds_instrumental_payload():
     assert payload["instrumental"] is True
     assert payload["has_lyrics"] is False
     assert payload["negativeTags"] == []
-    assert payload["tags"] == []
-    assert "lyrics" not in payload
-    assert result.task_id == "task-1"
-    assert result.req_id == "task-1"
-    assert result.custom_mode is False
+    assert payload["tags"] == ["ambient"]
+    assert payload["lyrics"] == ""
+    assert task_id == "task-1"
 
 
 def test_enqueue_music_builds_vocal_payload():
@@ -87,7 +85,7 @@ def test_enqueue_music_builds_vocal_payload():
             additional_matcher=_capture,
         )
 
-        result = client.enqueue_music(
+        task_id = client.enqueue_music(
             user_id=111,
             title="Song",
             prompt="pop ballad",
@@ -103,9 +101,8 @@ def test_enqueue_music_builds_vocal_payload():
     assert payload["has_lyrics"] is True
     assert payload["instrumental"] is False
     assert payload["lyrics"] == "hello world"
-    assert result.task_id == "task-2"
-    assert result.req_id == "task-2"
-    assert result.custom_mode is False
+    assert payload["tags"] == ["pop", "ballad"]
+    assert task_id == "task-2"
 
 
 def test_enqueue_music_returns_422_without_retry(monkeypatch):
@@ -155,7 +152,7 @@ def test_enqueue_music_retries_on_server_error():
             ],
         )
 
-        result = client.enqueue_music(
+        task_id = client.enqueue_music(
             user_id=2,
             title="Retry",
             prompt="ambient",
@@ -164,7 +161,5 @@ def test_enqueue_music_retries_on_server_error():
             lyrics=None,
         )
 
-    assert result.task_id == "ok"
-    assert result.req_id == "ok"
-    assert result.custom_mode is False
+    assert task_id == "ok"
     assert len(mocker.request_history) == 3

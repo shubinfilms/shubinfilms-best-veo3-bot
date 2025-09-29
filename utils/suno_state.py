@@ -238,6 +238,16 @@ def build_generation_payload(
         "instrumental": not state.has_lyrics,
         "has_lyrics": state.has_lyrics,
     }
+    tags: list[str] = []
+    if state.style:
+        for raw in re.split(r"[\s,]+", state.style):
+            tag = raw.strip().strip("#")
+            if not tag:
+                continue
+            lowered = tag.lower()
+            if lowered not in tags:
+                tags.append(lowered)
+    payload["tags"] = tags
     if state.has_lyrics:
         payload["lyrics"] = state.lyrics or ""
     if lang:
