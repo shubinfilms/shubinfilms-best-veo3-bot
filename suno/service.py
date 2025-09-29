@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import re
-from typing import Any, Dict, Literal, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Iterable, Literal, Mapping, MutableMapping, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -44,6 +44,44 @@ log = logging.getLogger("suno.service")
 API_BASE = SUNO_API_BASE
 API_KEY = SUNO_API_TOKEN
 CALLBACK_URL = SUNO_CALLBACK_URL
+
+
+_POLL_DEFAULT_TIMEOUT = 420.0
+_POLL_DELIVERED_TTL = 15 * 60
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_backoff_series(raw: str) -> list[float]:
+    parts = (raw or "").split(",")
+    values: list[float] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return values
+
+
+@dataclass(slots=True)
+class RecordInfoPollResult:
+    state: Literal["pending", "ready", "hard_error", "retry", "timeout"]
+    status_code: int
+    payload: Mapping[str, Any]
+    attempts: int = 0
+    elapsed: float = 0.0
+    message: Optional[str] = None
+    error: Optional[str] = None
 
 
 class SunoError(Exception):
@@ -298,8 +336,22 @@ class SunoService:
         adapter = HTTPAdapter(pool_connections=HTTP_POOL_CONNECTIONS, pool_maxsize=HTTP_POOL_PER_HOST)
         self._bot_session.mount("https://", adapter)
         self._bot_session.mount("http://", adapter)
+        self._api_session = requests.Session()
+        self._api_session.mount("https://", adapter)
+        self._api_session.mount("http://", adapter)
         self._admin_ids = self._parse_admins(os.getenv("ADMIN_IDS"))
         self._log_once_memory: MutableMapping[str, float] = {}
+        self._delivered_cache: MutableMapping[str, float] = {}
+        self._poll_first_delay = max(0.1, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 5.0))
+        backoff_raw = os.getenv("SUNO_POLL_BACKOFF_SERIES", "5,8,13,21,34") or ""
+        parsed_backoff = _parse_backoff_series(backoff_raw)
+        if parsed_backoff and abs(parsed_backoff[0] - self._poll_first_delay) < 1e-3:
+            parsed_backoff = parsed_backoff[1:]
+        self._poll_backoff_series = parsed_backoff or [8.0, 13.0, 21.0, 34.0]
+        self._poll_timeout = max(
+            self._poll_first_delay,
+            _env_float("SUNO_POLL_TIMEOUT_SEC", _POLL_DEFAULT_TIMEOUT),
+        )
         summary = {
             "suno_enabled": bool(SUNO_ENABLED),
             "api_base": SUNO_API_BASE,
@@ -349,6 +401,253 @@ class SunoService:
             return False
         self._log_once_memory[key] = expires_at
         return True
+
+    def _cleanup_delivered_cache(self) -> None:
+        now = time.time()
+        stale = [key for key, expires in self._delivered_cache.items() if expires <= now]
+        for key in stale:
+            del self._delivered_cache[key]
+
+    def _mark_delivered(self, task_id: str) -> None:
+        if not task_id:
+            return
+        self._cleanup_delivered_cache()
+        self._delivered_cache[task_id] = time.time() + _POLL_DELIVERED_TTL
+
+    def _recently_delivered(self, task_id: Optional[str]) -> bool:
+        if not task_id:
+            return False
+        self._cleanup_delivered_cache()
+        expires = self._delivered_cache.get(task_id)
+        return bool(expires and expires > time.time())
+
+    def _iter_poll_delays(self) -> Iterable[float]:
+        base = [delay for delay in [self._poll_first_delay, *self._poll_backoff_series] if delay > 0]
+        if not base:
+            base = [5.0]
+        index = 0
+        while True:
+            if index < len(base):
+                yield base[index]
+            else:
+                yield base[-1]
+            index += 1
+
+    @staticmethod
+    def _poll_section(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return value
+        return {}
+
+    @classmethod
+    def _status_from_payload(cls, payload: Mapping[str, Any]) -> Optional[str]:
+        for key in ("status", "taskStatus", "callbackType", "callback_type", "state"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        data_section = cls._poll_section(payload, "data")
+        for key in ("status", "taskStatus", "callbackType", "callback_type", "state"):
+            value = data_section.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        response_section = cls._poll_section(data_section, "response")
+        for key in ("status", "taskStatus", "state"):
+            value = response_section.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        return None
+
+    @classmethod
+    def _error_code_from_payload(cls, payload: Mapping[str, Any]) -> Optional[str]:
+        data_section = cls._poll_section(payload, "data")
+        response_section = cls._poll_section(data_section, "response")
+        for section in (payload, data_section, response_section):
+            for key in ("errorCode", "error_code"):
+                value = section.get(key)
+                if value not in (None, ""):
+                    return str(value)
+        return None
+
+    @classmethod
+    def _tracks_from_payload(cls, payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        data_section = cls._poll_section(payload, "data")
+        response_section = cls._poll_section(data_section, "response")
+        tracks_candidate = response_section.get("sunoData") or response_section.get("tracks")
+        if not isinstance(tracks_candidate, list):
+            tracks_candidate = data_section.get("sunoData") or data_section.get("tracks")
+        tracks: list[Mapping[str, Any]] = []
+        if isinstance(tracks_candidate, list):
+            for item in tracks_candidate:
+                if isinstance(item, Mapping):
+                    tracks.append(item)
+        return tracks
+
+    @staticmethod
+    def _durations_from_tracks(tracks: Iterable[Mapping[str, Any]]) -> list[float]:
+        durations: list[float] = []
+        for track in tracks:
+            value = track.get("duration")
+            if isinstance(value, (int, float)):
+                durations.append(float(value))
+            elif isinstance(value, str):
+                try:
+                    durations.append(float(value))
+                except ValueError:
+                    continue
+        return durations
+
+    def poll_record_info_once(
+        self,
+        task_id: str,
+        *,
+        user_id: Optional[int] = None,
+    ) -> RecordInfoPollResult:
+        params: Dict[str, Any] = {"taskId": task_id}
+        if user_id is not None:
+            params["userId"] = str(user_id)
+        headers: Dict[str, str] = {}
+        if API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+        url = f"{API_BASE}/api/v1/generate/record-info"
+        try:
+            response = self._api_session.get(url, params=params, headers=headers or None, timeout=20)
+        except requests.RequestException as exc:
+            log.warning(
+                "Suno record-info network error",
+                extra={"meta": {"taskId": task_id, "error": str(exc)}},
+            )
+            return RecordInfoPollResult(state="retry", status_code=0, payload={}, error=str(exc))
+        try:
+            payload_raw = response.json()
+        except ValueError:
+            payload_raw = {}
+        payload = payload_raw if isinstance(payload_raw, Mapping) else {}
+        message = payload.get("message") or payload.get("msg") if isinstance(payload, Mapping) else None
+        status_code = response.status_code
+        if status_code == 404:
+            return RecordInfoPollResult(state="pending", status_code=status_code, payload=payload, message=message)
+        if status_code == 429 or 500 <= status_code < 600:
+            return RecordInfoPollResult(state="retry", status_code=status_code, payload=payload, message=message)
+        if 400 <= status_code < 500:
+            return RecordInfoPollResult(state="hard_error", status_code=status_code, payload=payload, message=message)
+        data_section = payload.get("data") if isinstance(payload, Mapping) else None
+        if not data_section:
+            return RecordInfoPollResult(state="pending", status_code=status_code, payload=payload, message=message)
+        status_value = self._status_from_payload(payload)
+        error_code = self._error_code_from_payload(payload)
+        tracks = self._tracks_from_payload(payload)
+        if error_code:
+            return RecordInfoPollResult(
+                state="hard_error",
+                status_code=status_code,
+                payload=payload,
+                message=message,
+                error=error_code,
+            )
+        success_states = {"SUCCESS", "SUCCEEDED", "COMPLETE", "COMPLETED", "READY"}
+        failure_states = {"FAILED", "ERROR", "TIMEOUT", "CANCELLED", "CANCELED"}
+        if tracks and (status_value is None or status_value in success_states):
+            return RecordInfoPollResult(state="ready", status_code=status_code, payload=payload, message=message)
+        if status_value in failure_states:
+            return RecordInfoPollResult(state="hard_error", status_code=status_code, payload=payload, message=message)
+        return RecordInfoPollResult(state="pending", status_code=status_code, payload=payload, message=message)
+
+    def wait_for_record_info(
+        self,
+        task_id: str,
+        *,
+        user_id: Optional[int] = None,
+    ) -> RecordInfoPollResult:
+        start = time.monotonic()
+        attempts = 0
+        for delay in self._iter_poll_delays():
+            now = time.monotonic()
+            if attempts > 0 and now - start >= self._poll_timeout:
+                break
+            time.sleep(delay)
+            attempts += 1
+            result = self.poll_record_info_once(task_id, user_id=user_id)
+            result.attempts = attempts
+            result.elapsed = time.monotonic() - start
+            meta = {
+                "taskId": task_id,
+                "attempt": attempts,
+                "http_status": result.status_code,
+                "mapped_state": result.state,
+            }
+            if result.error:
+                meta["error_code"] = result.error
+            if result.state == "retry":
+                log.warning("Suno poll retry", extra={"meta": meta})
+            else:
+                log.info("Suno poll step", extra={"meta": meta})
+            if result.state == "ready":
+                tracks = self._tracks_from_payload(result.payload)
+                durations = self._durations_from_tracks(tracks)
+                log.info(
+                    "Suno poll ready",
+                    extra={
+                        "meta": {
+                            "taskId": task_id,
+                            "takes": len(tracks),
+                            "durations": durations,
+                            "http_status": result.status_code,
+                        }
+                    },
+                )
+                return result
+            if result.state == "hard_error":
+                log.error(
+                    "Suno poll hard failure",
+                    extra={"meta": {**meta, "message": result.message}},
+                )
+                return result
+            if result.elapsed >= self._poll_timeout:
+                break
+        final_attempt = self.poll_record_info_once(task_id, user_id=user_id)
+        final_attempt.attempts = attempts + 1
+        final_attempt.elapsed = time.monotonic() - start
+        if final_attempt.state == "ready":
+            tracks = self._tracks_from_payload(final_attempt.payload)
+            durations = self._durations_from_tracks(tracks)
+            log.info(
+                "Suno poll ready",
+                extra={
+                    "meta": {
+                        "taskId": task_id,
+                        "takes": len(tracks),
+                        "durations": durations,
+                        "http_status": final_attempt.status_code,
+                    }
+                },
+            )
+            return final_attempt
+        if final_attempt.state == "hard_error":
+            log.error(
+                "Suno poll hard failure",
+                extra={
+                    "meta": {
+                        "taskId": task_id,
+                        "attempt": final_attempt.attempts,
+                        "http_status": final_attempt.status_code,
+                        "message": final_attempt.message,
+                    }
+                },
+            )
+            return final_attempt
+        log.warning(
+            "Suno poll timeout",
+            extra={
+                "meta": {
+                    "taskId": task_id,
+                    "attempts": final_attempt.attempts,
+                    "elapsed": final_attempt.elapsed,
+                }
+            },
+        )
+        final_attempt.state = "timeout"
+        return final_attempt
 
     @staticmethod
     def _parse_admins(raw: Optional[str]) -> set[int]:
@@ -676,21 +975,36 @@ class SunoService:
         tracks_data = record.get("tracks") or []
         if not isinstance(tracks_data, list):
             tracks_data = []
+        total_tracks = len(tracks_data)
         for idx, item in enumerate(tracks_data, start=1):
             if not isinstance(item, Mapping):
                 continue
             title = item.get("title") or record.get("title") or f"Track {idx}"
-            audio = item.get("audio_url")
-            image = item.get("image_url")
+            audio = item.get("source_audio_url") or item.get("audio_url")
+            image = item.get("source_image_url") or item.get("image_url")
             tags = item.get("tags") if isinstance(item.get("tags"), str) else None
             duration_value = item.get("duration")
             try:
                 duration = float(duration_value) if duration_value is not None else None
             except (TypeError, ValueError):
                 duration = None
-            caption = self._build_audio_caption(title=title, tags=tags, duration=duration)
+            take_label = f"Take {idx}" if total_tracks > 1 else None
+            caption = self._build_audio_caption(
+                title=title,
+                tags=tags,
+                duration=duration,
+                take_label=take_label,
+            )
             if audio:
-                audio_sent = self._send_audio_url(int(chat_id), audio, caption=caption, reply_to=None)
+                send_title = f"{title} ({take_label})" if take_label else title
+                audio_sent = self._send_audio_url(
+                    int(chat_id),
+                    audio,
+                    caption=caption,
+                    reply_to=None,
+                    title=send_title,
+                    thumb=image,
+                )
                 if not audio_sent:
                     path = Path(audio)
                     if path.exists():
@@ -775,19 +1089,32 @@ class SunoService:
         title: Optional[str],
         tags: Optional[str],
         duration: Optional[float],
+        take_label: Optional[str],
     ) -> Optional[str]:
-        lines: list[str] = []
-        if title:
-            lines.append(f"🎵 {title}")
+        base_title = title or "Suno track"
+        if take_label:
+            base_title = f"{base_title} ({take_label})"
+        duration_seconds: Optional[int] = None
+        if duration is not None:
+            try:
+                duration_seconds = int(round(float(duration)))
+            except (TypeError, ValueError):
+                duration_seconds = None
+        first_line = base_title
+        if duration_seconds and duration_seconds > 0:
+            first_line = f"{first_line} • {duration_seconds}s"
+        lines: list[str] = [first_line.strip()]
         if tags:
-            lines.append(f"🏷️ {tags}")
-        duration_label = self._format_duration_label(duration)
-        if duration_label:
-            lines.append(f"⏱️ {duration_label}")
-        return "\n".join(lines) if lines else None
+            lines.append(tags)
+        caption = "\n".join(part for part in lines if part)
+        if not caption:
+            return None
+        if len(caption) > 1024:
+            return f"{caption[:1021]}…"
+        return caption
 
     def _send_audio(self, chat_id: int, path: Path, *, title: str, reply_to: Optional[int]) -> bool:
-        caption = self._build_audio_caption(title=title, tags=None, duration=None)
+        caption = self._build_audio_caption(title=title, tags=None, duration=None, take_label=None)
         success = self._send_file("sendAudio", "audio", chat_id, path, caption=caption, reply_to=reply_to)
         if success:
             schedule_unlink(path)
@@ -800,6 +1127,8 @@ class SunoService:
         *,
         caption: Optional[str],
         reply_to: Optional[int],
+        title: Optional[str],
+        thumb: Optional[str],
     ) -> bool:
         if not url:
             return False
@@ -808,6 +1137,10 @@ class SunoService:
             payload["caption"] = caption
         if reply_to:
             payload["reply_to_message_id"] = reply_to
+        if title:
+            payload["title"] = title
+        if thumb:
+            payload["thumb"] = thumb
         method = "sendAudio"
         try:
             resp = self._bot_session.post(self._bot_url(method), json=payload, timeout=60)
@@ -1143,7 +1476,19 @@ class SunoService:
         existing_record = self._load_task_record(task.task_id) or {}
         incoming_status = (task.callback_type or "").lower()
         existing_status = str(existing_record.get("status") or "").lower()
-        final_states = {"complete", "error", "failed"}
+        final_states = {"complete", "error", "failed", "success"}
+        if incoming_status in final_states and self._recently_delivered(task.task_id):
+            log.info(
+                "Suno callback duplicate final",
+                extra={
+                    "meta": {
+                        "task_id": task.task_id,
+                        "status": incoming_status,
+                        "reason": "delivered_cache",
+                    }
+                },
+            )
+            return
         if incoming_status in final_states and existing_status in final_states and existing_record.get("tracks"):
             log.info(
                 "Suno callback duplicate final state",
@@ -1186,23 +1531,35 @@ class SunoService:
                 return
             base_dir = self._base_dir(task.task_id)
             track_records: list[Dict[str, Any]] = []
+            durations: list[float] = []
             for idx, track in enumerate(task.items, start=1):
                 track_id = track.id or str(idx)
                 title = track.title or (meta.title if meta else None) or f"Track {idx}"
-                caption = self._build_audio_caption(title=title, tags=track.tags, duration=track.duration)
+                take_label = f"Take {idx}" if len(task.items) > 1 else None
+                caption = self._build_audio_caption(
+                    title=title,
+                    tags=track.tags,
+                    duration=track.duration,
+                    take_label=take_label,
+                )
+                resolved_audio = track.source_audio_url or track.audio_url
+                thumb_url = track.source_image_url or track.image_url
+                send_title = f"{title} ({take_label})" if take_label else title
                 audio_sent = False
-                if track.audio_url and self._send_audio_url(
+                if resolved_audio and self._send_audio_url(
                     chat_id,
-                    track.audio_url,
+                    resolved_audio,
                     caption=caption,
                     reply_to=None,
+                    title=send_title,
+                    thumb=thumb_url,
                 ):
                     audio_sent = True
                     log.info(
                         "Suno audio url sent | task=%s track=%s url=%s",
                         task.task_id,
                         track_id,
-                        _mask_tokens(track.audio_url),
+                        _mask_tokens(resolved_audio),
                     )
                 else:
                     audio_path = self._find_local_file(base_dir, track_id)
@@ -1255,10 +1612,14 @@ class SunoService:
                         "title": title,
                         "audio_url": track.audio_url,
                         "image_url": track.image_url,
+                        "source_audio_url": track.source_audio_url,
+                        "source_image_url": track.source_image_url,
                         "tags": track.tags,
                         "duration": track.duration,
                     }
                 )
+                if isinstance(track.duration, (int, float)):
+                    durations.append(float(track.duration))
             record = dict(existing_record)
             record.update(
                 {
@@ -1279,6 +1640,18 @@ class SunoService:
                 "created_at", existing_record.get("created_at") or datetime.now(timezone.utc).isoformat()
             )
             self._save_task_record(task.task_id, record)
+            if incoming_status in final_states:
+                self._mark_delivered(task.task_id)
+            log.info(
+                "Suno ready",
+                extra={
+                    "meta": {
+                        "task_id": task.task_id,
+                        "takes": len(task.items),
+                        "durations": durations,
+                    }
+                },
+            )
             if self._should_log_once(task.task_id, task.callback_type):
                 log.info(
                     "processed | suno.callback",

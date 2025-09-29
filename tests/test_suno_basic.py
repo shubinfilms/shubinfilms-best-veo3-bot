@@ -35,8 +35,8 @@ import suno_web
 from suno_web import app
 import suno.tempfiles as tempfiles
 from suno.client import SunoAPIError, SunoClient, SunoClientError
-from suno.service import SunoService
-from suno.schemas import CallbackEnvelope, SunoTask
+from suno.service import SunoService, TelegramMeta, TaskLink
+from suno.schemas import CallbackEnvelope, SunoTask, SunoTrack
 
 
 def _build_payload(task_id: str = "task-1", callback_type: str = "complete") -> dict:
@@ -193,6 +193,36 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
     assert body["customMode"] is False
     assert body["negativeTags"] == []
     assert body["tags"] == ["lyrics"]
+
+
+def test_webhook_accepts_without_secret(monkeypatch):
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "")
+    monkeypatch.setattr(suno_web, "SUNO_CALLBACK_SECRET", "", raising=False)
+    stub = StubService()
+    monkeypatch.setattr(suno_web, "service", stub, raising=False)
+    client = _client()
+    payload = {"req_id": "req-1", "status": "SUCCESS", "payload": {"sunoData": []}}
+    response = client.post("/suno-callback", json=payload)
+    assert response.status_code == 200
+    assert stub.captured["task"].task_id == "req-1"
+
+
+def test_webhook_secret_enforced(monkeypatch):
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "expected")
+    monkeypatch.setattr(suno_web, "SUNO_CALLBACK_SECRET", "expected", raising=False)
+    stub = StubService()
+    monkeypatch.setattr(suno_web, "service", stub, raising=False)
+    client = _client()
+    payload = {"task_id": "task-42", "status": "complete", "payload": {"sunoData": []}}
+    forbidden = client.post("/suno-callback", json=payload)
+    assert forbidden.status_code == 403
+    allowed = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Secret": "expected"},
+        json=payload,
+    )
+    assert allowed.status_code == 200
+    assert stub.captured["task"].task_id == "task-42"
 
 
 def test_payload_uses_default_prompt(monkeypatch, requests_mock):
@@ -1171,3 +1201,128 @@ def test_launch_suno_duplicate_req_id_no_double_charge(monkeypatch, bot_module):
     assert start_calls["count"] == 1
     pending_key = f"{bot.REDIS_PREFIX}:suno:pending:suno:999:{str(fixed_uuid)}"
     assert pending_key in fake_redis.store
+
+
+def _make_poll_service(monkeypatch, *, timeout: str = "0.3") -> SunoService:
+    monkeypatch.setenv("SUNO_API_BASE", "https://api.example.com")
+    monkeypatch.setenv("SUNO_API_TOKEN", "token")
+    monkeypatch.setenv("SUNO_POLL_FIRST_DELAY_SEC", "0.1")
+    monkeypatch.setenv("SUNO_POLL_BACKOFF_SERIES", "0.1")
+    monkeypatch.setenv("SUNO_POLL_TIMEOUT_SEC", timeout)
+    monkeypatch.setattr("suno.service.API_BASE", "https://api.example.com", raising=False)
+    monkeypatch.setattr("suno.service.API_KEY", "token", raising=False)
+    return SunoService(redis=None, telegram_token="dummy-token")
+
+
+def test_poll_wait_handles_404(monkeypatch, requests_mock):
+    service = _make_poll_service(monkeypatch, timeout="0.4")
+    requests_mock.get(
+        "https://api.example.com/api/v1/generate/record-info",
+        [
+            {"status_code": 404, "json": {"code": 404, "msg": "pending"}},
+            {
+                "status_code": 200,
+                "json": {
+                    "code": 200,
+                    "data": {
+                        "status": "SUCCESS",
+                        "response": {
+                            "sunoData": [
+                                {
+                                    "id": "track-1",
+                                    "sourceAudioUrl": "https://cdn/audio1.mp3",
+                                    "sourceImageUrl": "https://cdn/image1.jpg",
+                                    "duration": 42,
+                                }
+                            ]
+                        },
+                    },
+                },
+            },
+        ],
+    )
+
+    result = service.wait_for_record_info("task-404", user_id=7)
+    assert result.state == "ready"
+    assert result.attempts >= 2
+    assert requests_mock.call_count == 2
+
+
+def test_poll_timeout_reports_timeout(monkeypatch, requests_mock):
+    service = _make_poll_service(monkeypatch, timeout="0.12")
+    requests_mock.get(
+        "https://api.example.com/api/v1/generate/record-info",
+        status_code=404,
+        json={"code": 404, "msg": "not ready"},
+    )
+
+    result = service.wait_for_record_info("task-timeout", user_id=None)
+    assert result.state == "timeout"
+    assert result.status_code == 404
+
+
+def test_policy_error_message_text(bot_module):
+    message = bot_module._suno_error_message(
+        400, "The description contains artist name: The Weeknd"
+    )
+    assert "living artist/brand" in message
+
+
+def test_delivery_uses_remote_urls(monkeypatch):
+    service = SunoService(redis=None, telegram_token="test-token")
+
+    meta = TelegramMeta(chat_id=123, msg_id=77, title="Demo", ts="now", req_id="req-1")
+    link = TaskLink(user_id=555, prompt="Prompt", ts="now")
+
+    monkeypatch.setattr(service, "_load_mapping", lambda task_id: meta)
+    monkeypatch.setattr(service, "_load_user_link", lambda task_id: link)
+    monkeypatch.setattr(service, "_save_task_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_send_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_send_image_url", lambda *args, **kwargs: False)
+    monkeypatch.setattr(service, "_send_audio", lambda *args, **kwargs: False)
+    monkeypatch.setattr(service, "_send_image", lambda *args, **kwargs: False)
+
+    sent_audio: list[dict[str, object]] = []
+
+    def _fake_send_audio_url(chat_id, url, *, caption, reply_to, title, thumb):
+        sent_audio.append(
+            {
+                "chat_id": chat_id,
+                "url": url,
+                "caption": caption,
+                "title": title,
+                "thumb": thumb,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(service, "_send_audio_url", _fake_send_audio_url)
+
+    tracks = [
+        SunoTrack(
+            id="1",
+            title="First",
+            source_audio_url="https://cdn/audio1.mp3",
+            source_image_url="https://cdn/image1.jpg",
+            duration=41.5,
+            tags="tag-one",
+        ),
+        SunoTrack(
+            id="2",
+            title="Second",
+            source_audio_url="https://cdn/audio2.mp3",
+            source_image_url="https://cdn/image2.jpg",
+            duration=38.0,
+            tags="tag-two",
+        ),
+    ]
+
+    task = SunoTask(task_id="task-demo", callback_type="complete", items=tracks, msg="ok", code=200)
+
+    service.handle_callback(task, req_id="req-1")
+
+    assert len(sent_audio) == 2
+    assert sent_audio[0]["url"] == "https://cdn/audio1.mp3"
+    assert sent_audio[0]["thumb"] == "https://cdn/image1.jpg"
+    assert "Take 1" in str(sent_audio[0]["caption"])
+    assert sent_audio[1]["title"].endswith("(Take 2)")
