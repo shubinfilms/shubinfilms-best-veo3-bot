@@ -56,6 +56,8 @@ class SunoTrack(BaseModel):
     title: str | None = None
     audio_url: str | None = None
     image_url: str | None = None
+    tags: str | None = None
+    duration: float | None = None
 
 
 class SunoTask(BaseModel):
@@ -144,11 +146,31 @@ def _build_track(raw: Any, index: int) -> SunoTrack | None:
     title = _first(raw, "title", "name")
     audio_url = _first(raw, "audio_url", "audioUrl", "url", "fileUrl", "mp3Url")
     image_url = _first(raw, "image_url", "imageUrl", "coverUrl", "imgUrl")
+    tags_value = _first(raw, "tags", "tag", "style", "styles")
+    if isinstance(tags_value, list):
+        tags = ", ".join(str(item) for item in tags_value if item not in (None, "")) or None
+    elif isinstance(tags_value, str):
+        tags = tags_value
+    else:
+        tags = None
+    duration_value = _first(raw, "duration", "durationSec", "duration_seconds")
+    duration: float | None
+    if isinstance(duration_value, (int, float)):
+        duration = float(duration_value)
+    elif isinstance(duration_value, str):
+        try:
+            duration = float(duration_value)
+        except ValueError:
+            duration = None
+    else:
+        duration = None
     return SunoTrack(
         id=str(track_id),
         title=str(title) if title is not None else None,
         audio_url=str(audio_url) if audio_url else None,
         image_url=str(image_url) if image_url else None,
+        tags=tags,
+        duration=duration,
     )
 
 

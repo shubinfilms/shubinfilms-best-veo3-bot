@@ -141,6 +141,14 @@ def _normalize_callback_payload(raw: Any) -> tuple[dict[str, Any], Dict[str, Any
             base_data.setdefault(key, value)
     if "results" in base_data and "items" not in base_data:
         base_data["items"] = base_data["results"]
+    suno_data = base_data.get("sunoData")
+    if isinstance(suno_data, list) and "items" not in base_data:
+        base_data["items"] = suno_data
+    if isinstance(suno_data, list):
+        response_block = base_data.get("response")
+        response_payload = dict(response_block) if isinstance(response_block, Mapping) else {}
+        response_payload.setdefault("tracks", suno_data)
+        base_data["response"] = response_payload
     if "type" in base_data and "callbackType" not in base_data:
         base_data.setdefault("callbackType", base_data["type"])
     if "status" in base_data and "callbackType" not in base_data:
@@ -387,9 +395,6 @@ def _prepare_assets(task: SunoTask) -> None:
     base_dir = task_directory(task.task_id)
     for index, track in enumerate(task.items, start=1):
         track_id = track.id or str(index)
-        if track.audio_url:
-            target = _apply_extension(base_dir / track_id, track.audio_url)
-            track.audio_url = _download(track.audio_url, target)
         if track.image_url:
             target = _apply_extension(base_dir / f"{track_id}_cover", track.image_url)
             track.image_url = _download(track.image_url, target)
@@ -406,7 +411,7 @@ async def suno_callback(
     x_callback_secret: Optional[str] = Header(default=None, alias="X-Callback-Secret"),
 ):
     expected_secret = (SUNO_CALLBACK_SECRET or "").strip()
-    provided = x_callback_secret or request.headers.get("X-Callback-Token")
+    provided = (x_callback_secret or "").strip() or None
     if expected_secret:
         if provided != expected_secret:
             log.warning(
@@ -415,6 +420,11 @@ async def suno_callback(
             )
             suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
             return Response(status_code=403)
+    elif provided:
+        log.warning(
+            "unexpected callback secret provided",
+            extra={"meta": {"provided": True, "has_secret": False}},
+        )
 
     body = await request.body()
     if len(body) > _MAX_JSON_BYTES:

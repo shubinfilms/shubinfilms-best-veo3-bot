@@ -682,13 +682,31 @@ class SunoService:
             title = item.get("title") or record.get("title") or f"Track {idx}"
             audio = item.get("audio_url")
             image = item.get("image_url")
+            tags = item.get("tags") if isinstance(item.get("tags"), str) else None
+            duration_value = item.get("duration")
+            try:
+                duration = float(duration_value) if duration_value is not None else None
+            except (TypeError, ValueError):
+                duration = None
+            caption = self._build_audio_caption(title=title, tags=tags, duration=duration)
             if audio:
-                path = Path(audio)
-                if path.exists():
-                    self._send_audio(int(chat_id), path, title=title, reply_to=None)
-                else:
-                    self._send_text(int(chat_id), f"🔗 Аудио ({title}): {audio}")
+                audio_sent = self._send_audio_url(int(chat_id), audio, caption=caption, reply_to=None)
+                if not audio_sent:
+                    path = Path(audio)
+                    if path.exists():
+                        self._send_audio(int(chat_id), path, title=title, reply_to=None)
+                    else:
+                        fallback_lines = [f"🔗 Аудио ({title}): {audio}"]
+                        if tags:
+                            fallback_lines.append(f"🏷️ {tags}")
+                        duration_label = self._format_duration_label(duration)
+                        if duration_label:
+                            fallback_lines.append(f"⏱️ {duration_label}")
+                        self._send_text(int(chat_id), "\n".join(fallback_lines))
             if image:
+                image_caption = f"🖼️ {title} (обложка)"
+                if self._send_image_url(int(chat_id), image, caption=image_caption, reply_to=None):
+                    continue
                 img_path = Path(image)
                 if img_path.exists():
                     self._send_image(int(chat_id), img_path, title=title, reply_to=None)
@@ -739,19 +757,55 @@ class SunoService:
             bot_telegram_send_fail_total.labels(method=method).inc()
             return False
 
+    def _format_duration_label(self, duration: Optional[float]) -> Optional[str]:
+        if duration is None:
+            return None
+        try:
+            total_seconds = int(round(float(duration)))
+        except (TypeError, ValueError):
+            return None
+        if total_seconds <= 0:
+            return None
+        minutes, seconds = divmod(total_seconds, 60)
+        return f"{minutes}:{seconds:02d}"
+
+    def _build_audio_caption(
+        self,
+        *,
+        title: Optional[str],
+        tags: Optional[str],
+        duration: Optional[float],
+    ) -> Optional[str]:
+        lines: list[str] = []
+        if title:
+            lines.append(f"🎵 {title}")
+        if tags:
+            lines.append(f"🏷️ {tags}")
+        duration_label = self._format_duration_label(duration)
+        if duration_label:
+            lines.append(f"⏱️ {duration_label}")
+        return "\n".join(lines) if lines else None
+
     def _send_audio(self, chat_id: int, path: Path, *, title: str, reply_to: Optional[int]) -> bool:
-        caption = f"🎵 {title}" if title else None
+        caption = self._build_audio_caption(title=title, tags=None, duration=None)
         success = self._send_file("sendAudio", "audio", chat_id, path, caption=caption, reply_to=reply_to)
         if success:
             schedule_unlink(path)
         return success
 
-    def _send_audio_url(self, chat_id: int, url: str, *, title: str, reply_to: Optional[int]) -> bool:
+    def _send_audio_url(
+        self,
+        chat_id: int,
+        url: str,
+        *,
+        caption: Optional[str],
+        reply_to: Optional[int],
+    ) -> bool:
         if not url:
             return False
         payload: Dict[str, Any] = {"chat_id": chat_id, "audio": url}
-        if title:
-            payload["caption"] = f"🎵 {title}"
+        if caption:
+            payload["caption"] = caption
         if reply_to:
             payload["reply_to_message_id"] = reply_to
         method = "sendAudio"
@@ -776,11 +830,17 @@ class SunoService:
             schedule_unlink(path)
         return success
 
-    def _send_image_url(self, chat_id: int, url: str, *, title: str, reply_to: Optional[int]) -> bool:
+    def _send_image_url(
+        self,
+        chat_id: int,
+        url: str,
+        *,
+        caption: Optional[str],
+        reply_to: Optional[int],
+    ) -> bool:
         if not url:
             return False
         payload: Dict[str, Any] = {"chat_id": chat_id, "photo": url}
-        caption = f"🖼️ {title} (обложка)" if title else "🖼️ Обложка"
         if caption:
             payload["caption"] = caption
         if reply_to:
@@ -1129,12 +1189,14 @@ class SunoService:
             for idx, track in enumerate(task.items, start=1):
                 track_id = track.id or str(idx)
                 title = track.title or (meta.title if meta else None) or f"Track {idx}"
-                audio_path = self._find_local_file(base_dir, track_id)
+                caption = self._build_audio_caption(title=title, tags=track.tags, duration=track.duration)
                 audio_sent = False
-                if audio_path and self._send_audio(chat_id, audio_path, title=title, reply_to=None):
-                    audio_sent = True
-                    log.info("Suno audio sent | task=%s track=%s path=%s", task.task_id, track_id, audio_path)
-                elif track.audio_url and self._send_audio_url(chat_id, track.audio_url, title=title, reply_to=None):
+                if track.audio_url and self._send_audio_url(
+                    chat_id,
+                    track.audio_url,
+                    caption=caption,
+                    reply_to=None,
+                ):
                     audio_sent = True
                     log.info(
                         "Suno audio url sent | task=%s track=%s url=%s",
@@ -1142,15 +1204,32 @@ class SunoService:
                         track_id,
                         _mask_tokens(track.audio_url),
                     )
+                else:
+                    audio_path = self._find_local_file(base_dir, track_id)
+                    if audio_path and self._send_audio(chat_id, audio_path, title=title, reply_to=None):
+                        audio_sent = True
+                        log.info(
+                            "Suno audio sent | task=%s track=%s path=%s",
+                            task.task_id,
+                            track_id,
+                            audio_path,
+                        )
                 if not audio_sent and track.audio_url:
-                    text = f"🔗 Аудио ({title}): {track.audio_url}"
-                    self._send_text(chat_id, text)
-                image_path = self._find_local_file(base_dir, f"{track_id}_cover")
+                    text_lines = [f"🔗 Аудио ({title}): {track.audio_url}"]
+                    if track.tags:
+                        text_lines.append(f"🏷️ {track.tags}")
+                    duration_label = self._format_duration_label(track.duration)
+                    if duration_label:
+                        text_lines.append(f"⏱️ {duration_label}")
+                    self._send_text(chat_id, "\n".join(text_lines))
+                image_caption = f"🖼️ {title} (обложка)"
                 image_sent = False
-                if image_path and self._send_image(chat_id, image_path, title=title, reply_to=None):
-                    image_sent = True
-                    log.info("Suno cover sent | task=%s track=%s path=%s", task.task_id, track_id, image_path)
-                elif track.image_url and self._send_image_url(chat_id, track.image_url, title=title, reply_to=None):
+                if track.image_url and self._send_image_url(
+                    chat_id,
+                    track.image_url,
+                    caption=image_caption,
+                    reply_to=None,
+                ):
                     image_sent = True
                     log.info(
                         "Suno cover url sent | task=%s track=%s url=%s",
@@ -1158,6 +1237,16 @@ class SunoService:
                         track_id,
                         _mask_tokens(track.image_url),
                     )
+                else:
+                    image_path = self._find_local_file(base_dir, f"{track_id}_cover")
+                    if image_path and self._send_image(chat_id, image_path, title=title, reply_to=None):
+                        image_sent = True
+                        log.info(
+                            "Suno cover sent | task=%s track=%s path=%s",
+                            task.task_id,
+                            track_id,
+                            image_path,
+                        )
                 if not image_sent and track.image_url:
                     self._send_text(chat_id, f"🖼️ Обложка ({title}): {track.image_url}")
                 track_records.append(
@@ -1166,6 +1255,8 @@ class SunoService:
                         "title": title,
                         "audio_url": track.audio_url,
                         "image_url": track.image_url,
+                        "tags": track.tags,
+                        "duration": track.duration,
                     }
                 )
             record = dict(existing_record)
