@@ -25,20 +25,41 @@ def _casefold(text: str) -> str:
     return _normalize_button_text(text).casefold()
 
 
+def normalize_ui_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    normalized = _normalize_button_text(text)
+    stripped = "".join(
+        ch for ch in normalized if unicodedata.category(ch) not in {"So", "Sk"}
+    )
+    stripped = _SPACE_RE.sub(" ", stripped).strip()
+    if not stripped:
+        return ""
+    return stripped.casefold()
+
+
 LABEL_ALIASES: dict[str, str] = {}
 _EXACT_LABELS: Set[str] = set()
 _PREFIX_LABELS: Set[str] = set()
 _MENU_LABELS: Set[str] = set()
+_LABEL_COMMANDS: dict[str, str] = {}
 
 
-def _register_label(canonical: str, *aliases: str, prefix: bool = False) -> None:
+def _register_label(
+    canonical: str,
+    *aliases: str,
+    prefix: bool = False,
+    command: Optional[str] = None,
+) -> None:
     if not canonical:
         return
-    _MENU_LABELS.add(_normalize_button_text(canonical))
     all_variants = (canonical, *aliases)
     for variant in all_variants:
         if not variant:
             continue
+        normalized_variant = _normalize_button_text(variant)
+        if normalized_variant:
+            _MENU_LABELS.add(normalized_variant)
         folded = _casefold(variant)
         if not folded:
             continue
@@ -47,13 +68,39 @@ def _register_label(canonical: str, *aliases: str, prefix: bool = False) -> None
             _PREFIX_LABELS.add(folded)
         else:
             _EXACT_LABELS.add(folded)
+        if command:
+            normalized_ui = normalize_ui_text(variant)
+            if normalized_ui:
+                _LABEL_COMMANDS[normalized_ui] = command
 
 
-_register_label("🎬 ГЕНЕРАЦИЯ ВИДЕО", "🎬 Генерация видео", "🎬 Видео", "🎬 Видео (VEO)", "🎬 Video", "🎬 Video prompt (VEO)", prefix=True)
-_register_label("🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ", "🎨 Генерация изображений", "🎨 Изображения", "🎨 Изображения (MJ)", "🎨 Midjourney", "🎨 Image prompt (MJ)", prefix=True)
+_register_label(
+    "🎬 ГЕНЕРАЦИЯ ВИДЕО",
+    "🎬 Генерация видео",
+    "ГЕНЕРАЦИЯ ВИДЕО",
+    "Генерация видео",
+    "🎬 Видео",
+    "🎬 Видео (VEO)",
+    "🎬 Video",
+    "🎬 Video prompt (VEO)",
+    prefix=True,
+    command="veo.card",
+)
+_register_label(
+    "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ",
+    "🎨 Генерация изображений",
+    "ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ",
+    "Генерация изображений",
+    "🎨 Изображения",
+    "🎨 Изображения (MJ)",
+    "🎨 Midjourney",
+    "🎨 Image prompt (MJ)",
+    prefix=True,
+    command="mj.card",
+)
 _register_label("🎵 Генерация музыки", "🎵 Музыка", "🎵 Музыка (Suno)", "🎵 Track (Suno)", "🎵 Suno", prefix=True)
 _register_label("🧠 Prompt-Master", "🧠", prefix=True)
-_register_label("💎 Баланс", "💎", prefix=True)
+_register_label("💎 Баланс", "Баланс", "💎", prefix=True, command="balance.show")
 _register_label("💬 Обычный чат", "💬", prefix=True)
 _register_label("🏠 В меню", "⬅️ В меню")
 _register_label("ℹ️ FAQ", "ℹ️ Общие вопросы", "⚡ Токены и возвраты")
@@ -122,6 +169,7 @@ _PLACEHOLDER_PROMPTS = {
     "⏳ sending request…",
     "⚠️ generation failed, please try later.",
     "⚠️ generation failed, please try later. 💎 токены возвращены.",
+    "введите промпт…",
 }
 
 
@@ -139,6 +187,9 @@ def is_button_label(text: Optional[str]) -> bool:
     for prefix in _PREFIX_LABELS:
         if normalized.startswith(prefix):
             return True
+    normalized_ui = normalize_ui_text(text)
+    if normalized_ui and normalized_ui in _LABEL_COMMANDS:
+        return True
     return False
 
 
@@ -156,9 +207,21 @@ def is_command_text(text: Optional[str]) -> bool:
     for prefix in _PREFIX_LABELS:
         if normalized.startswith(prefix):
             return True
+    normalized_ui = normalize_ui_text(stripped)
+    if normalized_ui and normalized_ui in _LABEL_COMMANDS:
+        return True
     if COMMAND_OR_BUTTON_REGEX.search(normalized):
         return True
     return False
+
+
+def label_to_command(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    normalized = normalize_ui_text(text)
+    if not normalized:
+        return None
+    return _LABEL_COMMANDS.get(normalized)
 
 
 def should_capture_to_prompt(text: Optional[str]) -> bool:
@@ -207,6 +270,8 @@ __all__ = [
     "LABEL_ALIASES",
     "COMMAND_OR_BUTTON_REGEX",
     "BUTTON_LABELS",
+    "normalize_ui_text",
+    "label_to_command",
     "is_command_text",
     "is_button_label",
     "should_capture_to_prompt",

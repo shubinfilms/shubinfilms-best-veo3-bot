@@ -328,6 +328,126 @@ def test_wait_state_filters_button_labels_during_wait() -> None:
     assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
 
 
+def test_big_balance_button_routes_balance_no_chat() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    calls: list[str] = []
+    chat_calls: list[object] = []
+
+    async def fake_balance(update, context):  # type: ignore[override]
+        calls.append(update.effective_message.text)  # type: ignore[attr-defined]
+
+    async def fake_chat_handler(**kwargs):  # type: ignore[override]
+        chat_calls.append(kwargs)
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_route = bot_module.LABEL_COMMAND_ROUTES["balance.show"]
+    original_chat = bot_module._handle_chat_message
+    original_ensure = bot_module.ensure_user_record
+
+    try:
+        bot_module.LABEL_COMMAND_ROUTES["balance.show"] = fake_balance
+        bot_module._handle_chat_message = fake_chat_handler  # type: ignore[assignment]
+        bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+        for sample in ("💎 Баланс", "Баланс"):
+            message = DummyMessage(chat_id=202, text=sample)
+            update = SimpleNamespace(
+                message=message,
+                effective_message=message,
+                effective_user=SimpleNamespace(id=202),
+                effective_chat=SimpleNamespace(id=202),
+            )
+            _run(bot_module.on_text(update, ctx))
+    finally:
+        bot_module.LABEL_COMMAND_ROUTES["balance.show"] = original_route
+        bot_module._handle_chat_message = original_chat  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert calls == ["💎 Баланс", "Баланс"]
+    assert chat_calls == []
+
+
+def test_video_button_routes_veo_card() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    calls: list[str] = []
+    chat_calls: list[object] = []
+
+    async def fake_video(update, context):  # type: ignore[override]
+        calls.append(update.effective_message.text)  # type: ignore[attr-defined]
+
+    async def fake_chat_handler(**kwargs):  # type: ignore[override]
+        chat_calls.append(kwargs)
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_route = bot_module.LABEL_COMMAND_ROUTES["veo.card"]
+    original_chat = bot_module._handle_chat_message
+    original_ensure = bot_module.ensure_user_record
+
+    try:
+        bot_module.LABEL_COMMAND_ROUTES["veo.card"] = fake_video
+        bot_module._handle_chat_message = fake_chat_handler  # type: ignore[assignment]
+        bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+        for sample in ("🎬 Генерация видео", "ГЕНЕРАЦИЯ ВИДЕО"):
+            message = DummyMessage(chat_id=303, text=sample)
+            update = SimpleNamespace(
+                message=message,
+                effective_message=message,
+                effective_user=SimpleNamespace(id=303),
+                effective_chat=SimpleNamespace(id=303),
+            )
+            _run(bot_module.on_text(update, ctx))
+    finally:
+        bot_module.LABEL_COMMAND_ROUTES["veo.card"] = original_route
+        bot_module._handle_chat_message = original_chat  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert calls == ["🎬 Генерация видео", "ГЕНЕРАЦИЯ ВИДЕО"]
+    assert chat_calls == []
+
+
+def test_image_button_routes_mj_card() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    calls: list[str] = []
+    chat_calls: list[object] = []
+
+    async def fake_image(update, context):  # type: ignore[override]
+        calls.append(update.effective_message.text)  # type: ignore[attr-defined]
+
+    async def fake_chat_handler(**kwargs):  # type: ignore[override]
+        chat_calls.append(kwargs)
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_route = bot_module.LABEL_COMMAND_ROUTES["mj.card"]
+    original_chat = bot_module._handle_chat_message
+    original_ensure = bot_module.ensure_user_record
+
+    try:
+        bot_module.LABEL_COMMAND_ROUTES["mj.card"] = fake_image
+        bot_module._handle_chat_message = fake_chat_handler  # type: ignore[assignment]
+        bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+        for sample in ("🎨 Генерация изображений", "ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"):
+            message = DummyMessage(chat_id=404, text=sample)
+            update = SimpleNamespace(
+                message=message,
+                effective_message=message,
+                effective_user=SimpleNamespace(id=404),
+                effective_chat=SimpleNamespace(id=404),
+            )
+            _run(bot_module.on_text(update, ctx))
+    finally:
+        bot_module.LABEL_COMMAND_ROUTES["mj.card"] = original_route
+        bot_module._handle_chat_message = original_chat  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert calls == ["🎨 Генерация изображений", "ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"]
+    assert chat_calls == []
+
+
 def test_wait_state_blocks_prompt_master() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
     message = DummyMessage(chat_id=111, text="Prompt text")
