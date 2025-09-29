@@ -26,12 +26,8 @@ def _suno_defaults(monkeypatch):
     yield
 
 
-def _instrumental_url() -> str:
-    return "https://api.kie.ai/api/v1/generate/add-instrumental"
-
-
-def _vocal_url() -> str:
-    return "https://api.kie.ai/api/v1/generate/add-vocals"
+def _generate_url() -> str:
+    return "https://api.kie.ai/api/v1/generate"
 
 
 def test_enqueue_music_builds_instrumental_payload():
@@ -44,8 +40,8 @@ def test_enqueue_music_builds_instrumental_payload():
             return True
 
         mocker.post(
-            _instrumental_url(),
-            json={"code": 200, "data": {"taskId": "task-1", "req_id": "req-1"}},
+            _generate_url(),
+            json={"code": 200, "data": {"taskId": "task-1", "msg": "ok"}},
             additional_matcher=_capture,
         )
 
@@ -63,14 +59,17 @@ def test_enqueue_music_builds_instrumental_payload():
     assert payload["model"] == "V5"
     assert payload["userId"] == "878622103"
     assert payload["callBackUrl"] == "https://bot.example.com/suno-callback"
-    assert payload["callBackSecret"] == "super-secret"
-    assert payload["customMode"] == "instrumental"
+    assert "callBackSecret" not in payload
+    assert payload["customMode"] is False
     assert payload["prompt_len"] == 16
     assert payload["instrumental"] is True
     assert payload["has_lyrics"] is False
+    assert payload["negativeTags"] == []
+    assert payload["tags"] == []
     assert "lyrics" not in payload
     assert result.task_id == "task-1"
-    assert result.req_id == "req-1"
+    assert result.req_id == "task-1"
+    assert result.custom_mode is False
 
 
 def test_enqueue_music_builds_vocal_payload():
@@ -83,8 +82,8 @@ def test_enqueue_music_builds_vocal_payload():
             return True
 
         mocker.post(
-            _vocal_url(),
-            json={"code": 200, "data": {"taskId": "task-2", "req_id": "req-2"}},
+            _generate_url(),
+            json={"code": 200, "data": {"taskId": "task-2", "msg": "ok"}},
             additional_matcher=_capture,
         )
 
@@ -100,12 +99,13 @@ def test_enqueue_music_builds_vocal_payload():
     payload = captured.get("json")
     assert isinstance(payload, dict)
     assert payload["model"] == "V5"
-    assert payload["customMode"] == "vocals"
+    assert payload["customMode"] is False
     assert payload["has_lyrics"] is True
     assert payload["instrumental"] is False
     assert payload["lyrics"] == "hello world"
     assert result.task_id == "task-2"
-    assert result.req_id == "req-2"
+    assert result.req_id == "task-2"
+    assert result.custom_mode is False
 
 
 def test_enqueue_music_returns_422_without_retry(monkeypatch):
@@ -118,7 +118,7 @@ def test_enqueue_music_returns_422_without_retry(monkeypatch):
 
     with requests_mock.Mocker() as mocker:
         mocker.post(
-            _vocal_url(),
+            _generate_url(),
             status_code=422,
             json={
                 "detail": [
@@ -147,11 +147,11 @@ def test_enqueue_music_retries_on_server_error():
     client = SunoClient()
     with requests_mock.Mocker() as mocker:
         mocker.post(
-            _instrumental_url(),
+            _generate_url(),
             response_list=[
                 {"status_code": 500, "json": {"message": "fail"}},
                 {"status_code": 502, "json": {"message": "still failing"}},
-                {"status_code": 200, "json": {"data": {"taskId": "ok", "req_id": "req-5"}}},
+                {"status_code": 200, "json": {"data": {"taskId": "ok"}}},
             ],
         )
 
@@ -165,4 +165,6 @@ def test_enqueue_music_retries_on_server_error():
         )
 
     assert result.task_id == "ok"
+    assert result.req_id == "ok"
+    assert result.custom_mode is False
     assert len(mocker.request_history) == 3

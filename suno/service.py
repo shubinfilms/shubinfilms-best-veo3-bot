@@ -851,11 +851,11 @@ class SunoService:
             parsed_req_id = fallback_req_id
         if not parsed_task_id:
             parsed_task_id = fallback_task_id
+        provided_req_id = req_id or parsed_req_id
         if parsed_req_id and req_id and parsed_req_id != req_id:
             log.warning(
                 "Suno enqueue req_id mismatch", extra={"meta": {"provided": req_id, "received": parsed_req_id}}
             )
-        req_id = req_id or parsed_req_id
         data_section = result.get("data") if isinstance(result.get("data"), Mapping) else {}
         task_id = (
             parsed_task_id
@@ -868,14 +868,13 @@ class SunoService:
         log.info(
             "SUNO[enqueue] status=%s req_id=%s task_id=%s body_start=%s",
             status_label,
-            req_id or "—",
+            task_id or "—",
             task_id or "",
             _json_preview(result),
         )
-        if not req_id:
-            log.warning("Suno enqueue response missing request id")
         if not task_id:
             raise SunoAPIError("Suno did not return task_id", payload=result)
+        req_id = task_id or provided_req_id
         task = SunoTask(task_id=task_id, callback_type="start", items=[], msg=result.get("msg"), code=result.get("code"))
         meta = {
             "chat_id": int(chat_id),
@@ -884,7 +883,11 @@ class SunoService:
             "ts": datetime.now(timezone.utc).isoformat(),
             "req_id": req_id,
         }
+        if provided_req_id and provided_req_id != req_id:
+            meta["enqueue_req_id"] = provided_req_id
         self._store_mapping(task.task_id, meta)
+        if provided_req_id and provided_req_id != req_id:
+            self._store_req_id(task.task_id, provided_req_id)
         self._store_req_id(task.task_id, req_id)
         if user_id is not None:
             self._store_user_link(
@@ -908,6 +911,8 @@ class SunoService:
             "lang": str(lang).strip().lower() if lang else None,
             "has_lyrics": bool(has_lyrics),
         }
+        if provided_req_id and provided_req_id != req_id:
+            record["enqueue_req_id"] = provided_req_id
         self._save_task_record(task.task_id, record)
         log.info(
             "Suno task stored",

@@ -58,7 +58,7 @@ class EnqueueResult:
     task_id: Optional[str]
     status: Optional[str]
     path: str
-    custom_mode: str
+    custom_mode: bool
 
 
 class SunoAPIError(RuntimeError):
@@ -208,6 +208,61 @@ class SunoClient:
         if isinstance(field_list, (list, tuple)):
             missing.extend(str(value) for value in field_list)
         return missing
+
+    @staticmethod
+    def _payload_message(payload: Mapping[str, Any]) -> Optional[str]:
+        for key in ("msg", "message"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        if isinstance(detail, Mapping):
+            nested_message = SunoClient._payload_message(detail)
+            if nested_message:
+                return nested_message
+        if isinstance(detail, Sequence) and not isinstance(detail, (str, bytes, bytearray)):
+            for item in detail:
+                if isinstance(item, Mapping):
+                    nested_message = SunoClient._payload_message(item)
+                    if nested_message:
+                        return nested_message
+                elif isinstance(item, str) and item.strip():
+                    return item.strip()
+        data = payload.get("data")
+        if isinstance(data, Mapping):
+            nested_message = SunoClient._payload_message(data)
+            if nested_message:
+                return nested_message
+        return None
+
+    @staticmethod
+    def _is_user_id_empty_error(payload: Any) -> bool:
+        if not isinstance(payload, Mapping):
+            return False
+        texts: list[str] = []
+        for key in ("message", "msg"):
+            value = payload.get(key)
+            if value:
+                texts.append(str(value))
+        detail = payload.get("detail")
+        if isinstance(detail, str):
+            texts.append(detail)
+        elif isinstance(detail, Mapping):
+            nested = SunoClient._payload_message(detail)
+            if nested:
+                texts.append(nested)
+        elif isinstance(detail, Sequence) and not isinstance(detail, (str, bytes, bytearray)):
+            for item in detail:
+                if isinstance(item, Mapping):
+                    nested = SunoClient._payload_message(item)
+                    if nested:
+                        texts.append(nested)
+                elif isinstance(item, str):
+                    texts.append(item)
+        combined = " ".join(text.lower() for text in texts if text)
+        return "userid" in combined and "empty" in combined
 
     @staticmethod
     def _format_422_error(payload: Mapping[str, Any]) -> str:
@@ -443,10 +498,16 @@ class SunoClient:
                     continue
 
             payload = self._parse_json(response)
+            task_hint = self._extract_identifier(payload, ("task_id", "taskId"))
+            payload_message = self._payload_message(payload)
             if status >= 400:
                 message = payload.get("message") or payload.get("msg") or f"HTTP {status}"
                 context = dict(log_context or {})
                 path_hint = context.get("path", path)
+                if task_hint and "taskId" not in context:
+                    context["taskId"] = task_hint
+                if payload_message and "msg" not in context:
+                    context["msg"] = payload_message
                 if status == 401:
                     outbound_ip = resolve_outbound_ip() or "unknown"
                     context["outbound_ip"] = outbound_ip
@@ -493,6 +554,10 @@ class SunoClient:
                 raise error
 
             context = dict(log_context or {})
+            if task_hint and "taskId" not in context:
+                context["taskId"] = task_hint
+            if payload_message and "msg" not in context:
+                context["msg"] = payload_message
             self._log_request(
                 op,
                 level=logging.INFO,
@@ -556,7 +621,6 @@ class SunoClient:
         normalized_model = str(model or SUNO_MODEL or "V5").strip()
         if normalized_model.lower() in {"v5", "suno-v5"}:
             normalized_model = "V5"
-        custom_mode = "instrumental" if instrumental and not has_lyrics else "vocals"
         payload: dict[str, Any] = {
             "model": normalized_model or "V5",
             "title": title_text,
@@ -566,18 +630,17 @@ class SunoClient:
             "prompt_len": prompt_length,
             "userId": str(user_id),
             "callBackUrl": callback_url,
-            "callBackSecret": callback_secret,
-            "customMode": custom_mode,
+            "tags": [],
+            "negativeTags": [],
+            "customMode": False,
         }
         if has_lyrics:
             payload["lyrics"] = str(lyrics or "")
-        path = self._instrumental_path if instrumental and not has_lyrics else self._vocal_path
-        if not path:
-            path = self._primary_gen_path
+        path = self._primary_gen_path
         context = {
             "phase": "enqueue",
             "path": path,
-            "custom_mode": custom_mode,
+            "custom_mode": False,
             "instrumental": bool(instrumental),
             "has_lyrics": bool(has_lyrics),
             "prompt_len": prompt_length,
@@ -595,10 +658,10 @@ class SunoClient:
         except SunoAPIError as exc:
             exc.api_version = _API_V5
             raise
-        req_identifier = req_id or self._extract_identifier(
+        task_identifier = self._extract_identifier(response, ("task_id", "taskId"))
+        req_identifier = task_identifier or req_id or self._extract_identifier(
             response, ("req_id", "requestId", "request_id")
         )
-        task_identifier = self._extract_identifier(response, ("task_id", "taskId"))
         status_label = response.get("status") or response.get("code")
         self._raise_if_not_found(response)
         return EnqueueResult(
@@ -607,7 +670,7 @@ class SunoClient:
             task_id=task_identifier,
             status=str(status_label) if status_label is not None else None,
             path=path,
-            custom_mode=custom_mode,
+            custom_mode=False,
         )
 
     def create_music(
@@ -650,24 +713,46 @@ class SunoClient:
         user_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Mapping[str, Any]:
-        if not req_id and not task_id:
+        lookup_id = task_id or req_id
+        if not lookup_id:
             raise SunoClientError("req_id is required for status check", status=422)
-        params_v5: dict[str, Any] = {}
-        if req_id:
-            params_v5["req_id"] = str(req_id)
-        if user_id is not None:
-            params_v5["userId"] = str(user_id)
-        if task_id:
-            params_v5["taskId"] = str(task_id)
+        params: dict[str, Any] = {"taskId": str(lookup_id)}
+        user_param = str(user_id).strip() if user_id is not None else None
+        if user_param:
+            params["userId"] = user_param
+        context = {
+            "req_id": req_id or lookup_id,
+            "userId": user_param,
+            "taskId": str(lookup_id),
+            "path": self._primary_status_path,
+        }
+        identifier = req_id or task_id or str(lookup_id)
         try:
             response = self._request(
                 "GET",
                 self._primary_status_path,
-                params=params_v5,
-                req_id=req_id or task_id,
+                params=params,
+                req_id=identifier,
                 op="status",
-                log_context={"req_id": req_id or task_id, "userId": user_id, "path": self._primary_status_path},
+                log_context=context,
             )
+        except SunoClientError as exc:
+            if user_param and exc.status == 422 and self._is_user_id_empty_error(exc.payload):
+                trimmed_context = dict(context)
+                trimmed_context["userId"] = None
+                trimmed_context["hint"] = "retry_without_userId"
+                retry_params = {"taskId": str(lookup_id)}
+                response = self._request(
+                    "GET",
+                    self._primary_status_path,
+                    params=retry_params,
+                    req_id=identifier,
+                    op="status",
+                    log_context=trimmed_context,
+                )
+            else:
+                exc.api_version = _API_V5
+                raise
         except SunoAPIError as exc:
             exc.api_version = _API_V5
             raise

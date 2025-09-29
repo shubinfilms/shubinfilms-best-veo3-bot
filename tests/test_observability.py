@@ -102,7 +102,7 @@ def test_suno_client_retries(monkeypatch, requests_mock, status_codes, expected_
         else:
             response_list.append({"status_code": status, "json": {"message": "err"}})
     requests_mock.post(
-        "https://example.com/api/v1/generate/add-vocals",
+        "https://example.com/api/v1/generate",
         response_list=response_list,
     )
     suno_client = SunoClient(base_url="https://example.com", token="tkn", max_retries=3)

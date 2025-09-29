@@ -125,7 +125,7 @@ def _setup_client_env(monkeypatch) -> None:
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_URL", "https://callback.local/suno-callback", raising=False)
     monkeypatch.setattr("suno.client.SUNO_CALLBACK_SECRET", "secret-token", raising=False)
     monkeypatch.setattr("suno.client.SUNO_MODEL", "suno-v5", raising=False)
-    monkeypatch.setattr("suno.client.SUNO_GEN_PATH", "/api/v1/generate/add-vocals", raising=False)
+    monkeypatch.setattr("suno.client.SUNO_GEN_PATH", "/api/v1/generate", raising=False)
     monkeypatch.setattr("suno.client.SUNO_TASK_STATUS_PATH", "/api/v1/generate/record-info", raising=False)
     monkeypatch.setattr("suno.client.SUNO_WAV_PATH", "/api/v1/wav/generate", raising=False)
     monkeypatch.setattr("suno.client.SUNO_WAV_INFO_PATH", "/api/v1/wav/record-info", raising=False)
@@ -143,8 +143,8 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/generate/add-vocals",
-        json={"task_id": "task-new"},
+        "https://api.example.com/api/v1/generate",
+        json={"taskId": "task-new", "msg": "queued"},
     )
     payload, version = client.create_music(
         {
@@ -156,23 +156,26 @@ def test_suno_v5_enqueue_success(monkeypatch, requests_mock):
         }
     )
     assert version == "v5"
-    assert payload["task_id"] == "task-new"
+    assert payload["taskId"] == "task-new"
     assert requests_mock.call_count == 1
     sent = requests_mock.last_request.json()
     assert sent["model"] == "V5"
     assert sent["prompt"] == "hello"
     assert sent["instrumental"] is False
-    assert sent["customMode"] == "vocals"
+    assert sent["customMode"] is False
     assert sent["callBackUrl"] == "https://callback.local/suno-callback"
     assert sent["userId"] == "777"
+    assert sent["negativeTags"] == []
+    assert sent["tags"] == []
+    assert "callBackSecret" not in sent
 
 
 def test_payload_shape_v5(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/generate/add-instrumental",
-        json={"task_id": "task-shape"},
+        "https://api.example.com/api/v1/generate",
+        json={"taskId": "task-shape"},
     )
     client.create_music(
         {
@@ -187,28 +190,30 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
     assert body["prompt"] == "lyrics"
     assert body["title"] == "Title"
     assert body["instrumental"] is True
-    assert body["customMode"] == "instrumental"
+    assert body["customMode"] is False
+    assert body["negativeTags"] == []
+    assert body["tags"] == []
 
 
 def test_payload_uses_default_prompt(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/generate/add-vocals",
-        json={"task_id": "task-default"},
+        "https://api.example.com/api/v1/generate",
+        json={"taskId": "task-default"},
     )
     client.create_music({"instrumental": False, "userId": 100})
     body = requests_mock.last_request.json()
     assert body["prompt"] == "Untitled track"
     assert body["instrumental"] is False
-    assert body["customMode"] == "vocals"
+    assert body["customMode"] is False
 
 
 def test_suno_v5_enqueue_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/generate/add-vocals",
+        "https://api.example.com/api/v1/generate",
         status_code=404,
         json={"message": "not found"},
     )
@@ -224,7 +229,7 @@ def test_suno_v5_enqueue_code_404_raises(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.post(
-        "https://api.example.com/api/v1/generate/add-vocals",
+        "https://api.example.com/api/v1/generate",
         json={"code": 404, "message": "not found"},
     )
     with pytest.raises(SunoAPIError) as exc:
@@ -250,17 +255,39 @@ def test_suno_status_v5_404_raises(monkeypatch, requests_mock):
     assert requests_mock.call_count == 1
 
 
-def test_status_includes_request_id(monkeypatch, requests_mock):
+def test_status_uses_task_id_query(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     client = SunoClient(base_url="https://api.example.com", token="token")
     requests_mock.get(
         "https://api.example.com/api/v1/generate/record-info",
         json={"status": "queued"},
     )
-    client.get_task_status("req-1", task_id="abc")
-    qs = {k.lower(): v for k, v in requests_mock.last_request.qs.items()}
+    client.get_task_status("req-1", task_id="abc", user_id="42")
+    request = requests_mock.last_request
+    qs = {k.lower(): v for k, v in request.qs.items()}
     assert qs.get("taskid") == ["abc"]
-    assert qs.get("req_id") == ["req-1"]
+    assert qs.get("userid") == ["42"]
+    assert "req_id" not in qs and "reqid" not in qs
+
+
+def test_status_retries_without_user_id(monkeypatch, requests_mock):
+    _setup_client_env(monkeypatch)
+    client = SunoClient(base_url="https://api.example.com", token="token")
+    requests_mock.get(
+        "https://api.example.com/api/v1/generate/record-info",
+        [
+            {"status_code": 422, "json": {"message": "userId cannot be empty"}},
+            {"json": {"status": "ready", "taskId": "abc"}},
+        ],
+    )
+    response = client.get_task_status("abc", user_id="42")
+    assert response["status"] == "ready"
+    assert requests_mock.call_count == 2
+    first, second = requests_mock.request_history
+    first_qs = {k.lower(): v for k, v in first.qs.items()}
+    second_qs = {k.lower(): v for k, v in second.qs.items()}
+    assert first_qs.get("userid") == ["42"]
+    assert "userid" not in second_qs
 
 
 def test_suno_wav_helpers(monkeypatch, requests_mock):
@@ -471,8 +498,8 @@ def test_suno_service_records_request_id(monkeypatch):
                 req_id=self.captured_req_id,
                 task_id="task-req",
                 status="ok",
-                path="/api/v1/generate/add-vocals",
-                custom_mode="vocals",
+                path="/api/v1/generate",
+                custom_mode=False,
             )
 
         def create_music(self, payload, *, req_id=None):
@@ -493,7 +520,8 @@ def test_suno_service_records_request_id(monkeypatch):
     )
     assert task.task_id == "task-req"
     assert service.client.captured_req_id == "req-123"
-    assert service.get_request_id(task.task_id) == "req-123"
+    assert service.get_request_id(task.task_id) == task.task_id
+    assert service.get_task_id_by_request("req-123") == task.task_id
     ts = service.get_start_timestamp(task.task_id)
     assert ts is not None
 
@@ -516,8 +544,8 @@ def test_suno_service_extracts_enqueue_ids(response, expected_req, expected_task
                 req_id=response.get("req_id") or response.get("requestId") or req_id,
                 task_id=task_id,
                 status=str(response.get("status") or response.get("code") or "ok"),
-                path="/api/v1/generate/add-vocals",
-                custom_mode="vocals",
+                path="/api/v1/generate",
+                custom_mode=False,
             )
 
         def create_music(self, payload, *, req_id=None):
@@ -537,15 +565,16 @@ def test_suno_service_extracts_enqueue_ids(response, expected_req, expected_task
         req_id=None,
     )
     assert task.task_id == expected_task
-    assert service.get_request_id(expected_task) == expected_req
+    assert service.get_request_id(expected_task) == expected_task
+    assert service.get_task_id_by_request(expected_req) == expected_task
     assert service.get_task_id_by_request(expected_req) == expected_task
 
 
 def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock):
     _setup_client_env(monkeypatch)
     requests_mock.post(
-        "https://api.example.com/api/v1/generate/add-instrumental",
-        json={"task_id": "task-flow"},
+        "https://api.example.com/api/v1/generate",
+        json={"taskId": "task-flow"},
     )
     service = SunoService(client=SunoClient(base_url="https://api.example.com", token="token"), redis=None, telegram_token="dummy")
 
@@ -575,7 +604,9 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
     sent_body = requests_mock.last_request.json()
     assert sent_body["prompt"] == "Test instrumental track"
     assert sent_body["instrumental"] is True
-    assert sent_body["customMode"] == "instrumental"
+    assert sent_body["customMode"] is False
+    assert sent_body["negativeTags"] == []
+    assert sent_body["tags"] == []
 
     envelope = CallbackEnvelope(
         code=200,
@@ -614,8 +645,8 @@ def test_callback_restores_missing_req_id(monkeypatch):
                 req_id=req_id,
                 task_id=self.task_id,
                 status="ok",
-                path="/api/v1/generate/add-vocals",
-                custom_mode="vocals",
+                path="/api/v1/generate",
+                custom_mode=False,
             )
 
         def create_music(self, payload, *, req_id=None):
@@ -644,7 +675,8 @@ def test_callback_restores_missing_req_id(monkeypatch):
     )
     assert response.status_code == 200
     assert captured["task"].task_id == "restore-task"
-    assert captured["req_id"] == "req-restore"
+    assert captured["req_id"] == "restore-task"
+    assert service.get_task_id_by_request("req-restore") == "restore-task"
 
 
 @pytest.mark.parametrize(
