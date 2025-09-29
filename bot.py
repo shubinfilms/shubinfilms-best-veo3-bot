@@ -110,11 +110,12 @@ from utils.input_state import (
     clear_wait_state,
     clear_wait,
     get_wait,
+    input_state,
     refresh_card_pointer,
     set_wait,
     touch_wait,
 )
-from utils.telegram_utils import should_capture_to_prompt
+from utils.telegram_utils import label_to_command, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
@@ -4056,7 +4057,7 @@ def _mj_prompt_card_text(aspect: str, prompt: Optional[str]) -> str:
     ]
     snippet = _short_prompt(prompt)
     snippet_html = html.escape(snippet) if snippet else ""
-    display = snippet_html if snippet_html else " "
+    display = snippet_html if snippet_html else html.escape(_PROMPT_PLACEHOLDER)
     lines.extend(["", f"Промпт: <i>{display}</i>"])
     return "\n".join(lines)
 
@@ -5549,6 +5550,9 @@ async def _poll_suno_and_send(
 
 
 # --------- VEO Card ----------
+_PROMPT_PLACEHOLDER = "Введите промпт…"
+
+
 def veo_card_text(s: Dict[str, Any]) -> str:
     prompt_raw = (s.get("last_prompt") or "").strip()
     prompt_html = html.escape(prompt_raw) if prompt_raw else ""
@@ -5567,7 +5571,10 @@ def veo_card_text(s: Dict[str, Any]) -> str:
         lines.append(f"• Длительность: <b>{html.escape(str(duration_hint))}</b>")
     if lip_sync:
         lines.append("• <b>lip-sync required</b>")
-    code_line = f"<code>{prompt_html}</code>" if prompt_html else "<code> </code>"
+    if prompt_html:
+        code_line = f"<code>{prompt_html}</code>"
+    else:
+        code_line = f"<code>{html.escape(_PROMPT_PLACEHOLDER)}</code>"
     lines.extend([
         "",
         "🖊️ <b>Промпт:</b>",
@@ -7078,6 +7085,7 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id if user else None
     if user_id:
+        input_state.clear(user_id, reason="card_opened")
         set_mode(user_id, False)
         clear_wait(user_id)
 
@@ -7110,6 +7118,7 @@ async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id if user else None
     if user_id:
+        input_state.clear(user_id, reason="card_opened")
         set_mode(user_id, False)
         clear_wait(user_id)
 
@@ -8633,6 +8642,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ):
         chat_autoswitch_total.labels(outcome="skip_active").inc()
 
+    mapped_command = label_to_command(text)
+    if mapped_command:
+        handler = LABEL_COMMAND_ROUTES.get(mapped_command)
+        if handler is not None:
+            await handler(update, ctx)
+            return
+
     lowered = text.lower()
     if lowered in {"меню", "menu", "главное меню"}:
         await handle_menu(update, ctx)
@@ -9761,6 +9777,13 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
     (MENU_BTN_CHAT, handle_chat_entry),
     (MENU_BTN_BALANCE, handle_balance_entry),
 ]
+
+
+LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]] = {
+    "veo.card": handle_video_entry,
+    "mj.card": handle_image_entry,
+    "balance.show": handle_balance_entry,
+}
 
 
 def register_handlers(application: Any) -> None:
