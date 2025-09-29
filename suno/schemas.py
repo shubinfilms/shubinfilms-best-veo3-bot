@@ -1,9 +1,50 @@
 """Pydantic models shared between the Suno bot and callback worker."""
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, List, Literal, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class EnqueueData(BaseModel):
+    """Minimal payload returned when a generation request is accepted."""
+
+    taskId: str = Field(..., alias="taskId")
+
+
+class ApiEnvelope(BaseModel):
+    """Common KIE API envelope used by the lightweight Suno endpoints."""
+
+    code: int
+    msg: Optional[str] = None
+    data: Optional[Any] = None
+
+
+class Track(BaseModel):
+    """Single track description delivered via the callback."""
+
+    audio_url: Optional[str] = None
+    stream_audio_url: Optional[str] = None
+    image_url: Optional[str] = None
+    title: Optional[str] = None
+    tags: Optional[str] = None
+    duration: Optional[float] = None
+
+
+class CallbackData(BaseModel):
+    """Callback payload published by the KIE webhook."""
+
+    callbackType: Literal["text", "first", "complete", "error"]
+    task_id: Optional[str] = None
+    data: List[Track] = Field(default_factory=list)
+
+
+class SunoCallback(BaseModel):
+    """Top-level callback wrapper."""
+
+    code: int
+    msg: Optional[str] = None
+    data: CallbackData
 
 
 class SunoTrack(BaseModel):
@@ -111,4 +152,13 @@ def _build_track(raw: Any, index: int) -> SunoTrack | None:
     )
 
 
-__all__ = ["CallbackEnvelope", "SunoTask", "SunoTrack"]
+__all__ = [
+    "CallbackEnvelope",
+    "SunoTask",
+    "SunoTrack",
+    "EnqueueData",
+    "ApiEnvelope",
+    "Track",
+    "CallbackData",
+    "SunoCallback",
+]
