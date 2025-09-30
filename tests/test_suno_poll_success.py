@@ -15,6 +15,36 @@ import bot
 from suno.service import RecordInfoPollResult
 
 
+def _prepare_suno_params(
+    ctx: SimpleNamespace,
+    *,
+    title: str = "",
+    style: str = "",
+    lyrics: str = "",
+    mode: str = "instrumental",
+    lyrics_source=None,
+):
+    suno_state = bot.load_suno_state(ctx)
+    suno_state.mode = mode  # type: ignore[assignment]
+    bot.set_suno_title(suno_state, title)
+    bot.set_suno_style(suno_state, style)
+    if lyrics:
+        bot.set_suno_lyrics(suno_state, lyrics)
+    else:
+        bot.clear_suno_lyrics(suno_state)
+    if lyrics_source is None:
+        if lyrics and mode == "lyrics":
+            lyrics_source = bot.LyricsSource.USER
+        else:
+            lyrics_source = bot.LyricsSource.AI
+    bot.set_suno_lyrics_source(suno_state, lyrics_source)
+    bot.save_suno_state(ctx, suno_state)
+    state_dict = bot.state(ctx)
+    params = bot._suno_collect_params(state_dict, suno_state)
+    ctx.user_data["suno_state"] = suno_state.to_dict()
+    return params
+
+
 def test_suno_poll_success(monkeypatch):
     monkeypatch.setattr(bot, "SUNO_POLL_FIRST_DELAY", 0.0, raising=False)
     monkeypatch.setattr(bot, "SUNO_POLL_BACKOFF_SERIES", [0.0], raising=False)
@@ -98,7 +128,12 @@ def test_suno_poll_success(monkeypatch):
     monkeypatch.setattr(bot, "_reset_suno_card_cache", lambda _: None, raising=False)
 
     ctx = SimpleNamespace(bot=SimpleNamespace(), user_data={})
-    params = {"title": "Demo", "style": "Chill", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        ctx,
+        title="Demo",
+        style="Chill",
+        mode="instrumental",
+    )
     meta = {"req_id": "req-123"}
 
     asyncio.run(

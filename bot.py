@@ -5890,6 +5890,27 @@ async def _launch_suno_generation(
         )
         return
 
+    try:
+        suno_state_obj = load_suno_state(ctx)
+    except Exception as exc:
+        log.exception("suno.load_state_failed | chat_id=%s err=%s", chat_id, exc)
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "⚠️ Ошибка: не удалось загрузить состояние Suno. Попробуйте ещё раз.",
+            reply_to=reply_to,
+        )
+        return
+
+    if not isinstance(suno_state_obj, SunoState):
+        await _suno_notify(
+            ctx,
+            chat_id,
+            "⚠️ Ошибка: не удалось загрузить состояние Suno. Попробуйте ещё раз.",
+            reply_to=reply_to,
+        )
+        return
+
     if SUNO_PER_USER_COOLDOWN_SEC > 0:
         remaining = _suno_cooldown_remaining(int(user_id))
         if remaining > 0:
@@ -5914,14 +5935,14 @@ async def _launch_suno_generation(
         return
 
     instrumental = bool(params.get("instrumental", True))
-    title = (params.get("title") or "").strip()
-    style = (params.get("style") or "").strip()
+    title = suno_state_obj.title or "Без названия"
+    style = suno_state_obj.style or "Без стиля"
     raw_source = str(params.get("lyrics_source") or suno_state_obj.lyrics_source.value or "ai").strip().lower()
     try:
         lyrics_source = LyricsSource(raw_source)
     except ValueError:
         lyrics_source = LyricsSource.AI
-    lyrics_from_state = suno_state_obj.lyrics or ""
+    lyrics_from_state = suno_state_obj.lyrics or "\n"
     lyrics = lyrics_from_state.strip()
     providing_lyrics = (lyrics_source == LyricsSource.USER) and not instrumental
     if providing_lyrics:
