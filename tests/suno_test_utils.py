@@ -39,6 +39,14 @@ class FakeBot:
         self._next_message_id += 1
         return SimpleNamespace(message_id=message_id)
 
+    async def send_sticker(self, **kwargs):  # type: ignore[override]
+        payload = dict(kwargs)
+        payload.setdefault("_method", "send_sticker")
+        self.sent.append(payload)
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        return SimpleNamespace(message_id=message_id)
+
     async def edit_message_text(self, **kwargs):  # type: ignore[override]
         self.edited.append(kwargs)
         return SimpleNamespace(message_id=kwargs.get("message_id"))

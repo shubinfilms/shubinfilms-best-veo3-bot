@@ -317,6 +317,8 @@ async def sync_suno_start_message(
     else:
         text = SUNO_START_READY_MESSAGE
         markup = suno_start_keyboard()
+        suno_state.start_clicked = False
+        suno_state.start_emoji_msg_id = None
         if isinstance(start_msg_id, int):
             try:
                 await safe_edit_message(
@@ -360,6 +362,7 @@ async def sync_suno_start_message(
             msg_ids.pop("suno_start", None)
 
     suno_state.start_msg_id = start_msg_id
+    state_dict["suno_state"] = suno_state.to_dict()
     return start_msg_id
 
 

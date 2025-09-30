@@ -716,6 +716,27 @@ async def safe_send_placeholder(bot: Any, chat_id: int, text: str) -> Optional[M
     )
 
 
+async def safe_send_sticker(
+    bot: Any,
+    chat_id: int,
+    sticker: str,
+    *,
+    req_id: Optional[str] = None,
+    max_attempts: int = 4,
+    **kwargs: Any,
+) -> Optional[Any]:
+    return await safe_send(
+        bot.send_sticker,
+        method_name="send_sticker",
+        kind="sticker",
+        req_id=req_id,
+        max_attempts=max_attempts,
+        chat_id=chat_id,
+        sticker=sticker,
+        **kwargs,
+    )
+
+
 async def run_ffmpeg(input_bytes: bytes, args: list[str], timeout: float = 40.0) -> bytes:
     ffmpeg_bin = (os.getenv("FFMPEG_BIN") or "ffmpeg").strip() or "ffmpeg"
     cmd = [ffmpeg_bin, *args]
@@ -839,6 +860,7 @@ __all__ = [
     "safe_send",
     "safe_send_text",
     "safe_send_placeholder",
+    "safe_send_sticker",
     "safe_edit_text",
     "safe_edit_markdown_v2",
     "run_ffmpeg",

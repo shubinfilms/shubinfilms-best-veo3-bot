@@ -168,6 +168,17 @@ async def safe_send(
     return last_message
 
 
+async def safe_send_sticker(
+    bot: Bot,
+    chat_id: int,
+    sticker: str,
+    **kwargs,
+) -> Optional[Message]:
+    """Send a sticker with best-effort error propagation."""
+
+    return await bot.send_sticker(chat_id=chat_id, sticker=sticker, **kwargs)
+
+
 async def safe_delete_message(bot: Bot, chat_id: int, message_id: int) -> bool:
     """Delete a message while suppressing common Telegram errors."""
 
@@ -232,4 +243,10 @@ async def send_html_with_fallback(
         )
 
 
-__all__ = ["safe_send", "send_html_with_fallback", "sanitize_html", "safe_delete_message"]
+__all__ = [
+    "safe_send",
+    "safe_send_sticker",
+    "send_html_with_fallback",
+    "sanitize_html",
+    "safe_delete_message",
+]

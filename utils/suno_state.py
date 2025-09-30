@@ -120,6 +120,8 @@ class SunoState:
     source_url: Optional[str] = None
     kie_file_id: Optional[str] = None
     start_msg_id: Optional[int] = None
+    start_clicked: bool = False
+    start_emoji_msg_id: Optional[int] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -145,6 +147,8 @@ class SunoState:
             "source_url": self.source_url,
             "kie_file_id": self.kie_file_id,
             "start_msg_id": self.start_msg_id,
+            "start_clicked": self.start_clicked,
+            "start_emoji_msg_id": self.start_emoji_msg_id,
         }
 
 
@@ -213,6 +217,14 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     raw_start_msg_id = payload.get("start_msg_id")
     if isinstance(raw_start_msg_id, int):
         state.start_msg_id = raw_start_msg_id
+    raw_start_clicked = payload.get("start_clicked")
+    if isinstance(raw_start_clicked, bool):
+        state.start_clicked = raw_start_clicked
+    elif isinstance(raw_start_clicked, (int, float)):
+        state.start_clicked = bool(raw_start_clicked)
+    raw_start_emoji = payload.get("start_emoji_msg_id")
+    if isinstance(raw_start_emoji, int):
+        state.start_emoji_msg_id = raw_start_emoji
     return state
 
 
@@ -315,6 +327,8 @@ def reset_suno_card_state(
     state.card_chat_id = card_chat_id
     state.last_card_hash = None
     state.start_msg_id = None
+    state.start_clicked = False
+    state.start_emoji_msg_id = None
     return state
 
 
