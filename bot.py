@@ -5346,6 +5346,24 @@ async def _launch_suno_generation(
                 return _sanitize_reason_text(str(exc))
             return _sanitize_reason_text(str(exc))
 
+        def _is_policy_block_error(status: Optional[int], reason: Optional[str]) -> bool:
+            if status != 400:
+                return False
+            if not reason:
+                return False
+            lowered = reason.lower()
+            return any(token in lowered for token in ("artist", "brand", "copyright"))
+
+        def _policy_block_message(lang: Optional[str]) -> str:
+            lang_value = (lang or "").strip().lower()
+            if lang_value.startswith("en"):
+                return (
+                    "❗️Error: your description mentions an artist/brand. Remove the reference and try again."
+                )
+            return (
+                "❗️Ошибка: в описании упомянут артист/бренд. Удалите упоминания и попробуйте снова."
+            )
+
         def _format_failure(reason: Optional[str], *, status: Optional[int] = None) -> str:
             return _suno_error_message(status, reason)
 
@@ -5398,6 +5416,36 @@ async def _launch_suno_generation(
             suno_enqueue_duration_seconds.labels(**_METRIC_LABELS).observe(max(duration, 0.0))
             suno_enqueue_total.labels(outcome="error", api="v5", **_METRIC_LABELS).inc()
             reason_text = _reason_from_exception(exc)
+            if _is_policy_block_error(exc.status, reason_text):
+                policy_message = _policy_block_message(payload.get("lang"))
+                policy_refund = f"{policy_message}\n💎 Токены возвращены (+{PRICE_SUNO}💎)."
+                pending_meta.update(
+                    {
+                        "status": "policy_block",
+                        "error": reason_text or str(exc.payload or exc),
+                        "updated_ts": _utcnow_iso(),
+                    }
+                )
+                _suno_pending_store(req_id, pending_meta)
+                _suno_refund_pending_mark(req_id, pending_meta)
+                log.info(
+                    "suno.enqueue.blocked_policy",
+                    extra={"meta": {"status": exc.status, "reason": reason_text or ""}},
+                )
+                await _update_status_message(policy_message, fallback=True)
+                await _suno_issue_refund(
+                    ctx,
+                    chat_id,
+                    user_id,
+                    base_meta=meta,
+                    task_id=None,
+                    error_text=str(exc.payload or exc),
+                    reason="suno:refund:policy_block",
+                    req_id=req_id,
+                    reply_to=reply_to,
+                    user_message=policy_refund,
+                )
+                return
             failure_text = _format_failure(reason_text, status=exc.status)
             refund_message = _build_refund_message(reason_text, status=exc.status)
             pending_meta.update(
@@ -5688,6 +5736,10 @@ async def _poll_suno_and_send(
         http_status = poll_result.status_code
         state_value = poll_result.state
 
+        if state_value == "delivered":
+            log.info("[SUNO] poll delivered via webhook | task_id=%s", task_id)
+            return
+
         if state_value == "timeout":
             log.warning(
                 "[SUNO] poll timeout | task_id=%s attempts=%s elapsed=%.1f",
@@ -5772,7 +5824,12 @@ async def _poll_suno_and_send(
             callback_task = callback_task.model_copy(
                 update={"code": envelope_payload["code"], "msg": envelope_payload.get("msg")}
             )
-            await asyncio.to_thread(SUNO_SERVICE.handle_callback, callback_task, req_id=req_id_value)
+            await asyncio.to_thread(
+                SUNO_SERVICE.handle_callback,
+                callback_task,
+                req_id=req_id_value,
+                delivery_via="poll",
+            )
         except Exception as exc:
             log.exception("[SUNO] poll delivery failed | task_id=%s err=%s", task_id, exc)
         return

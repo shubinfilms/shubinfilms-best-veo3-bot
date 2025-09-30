@@ -13,7 +13,10 @@ from asyncio.subprocess import PIPE
 from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Awaitable, Callable, MutableMapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
+
+import requests
+from requests import Response
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.constants import ParseMode
@@ -740,6 +743,98 @@ async def run_ffmpeg(input_bytes: bytes, args: list[str], timeout: float = 40.0)
     return stdout
 
 
+def _telegram_post_json(
+    session: requests.Session,
+    url: str,
+    payload: Mapping[str, Any],
+    *,
+    timeout: float = 60.0,
+) -> tuple[bool, Optional[str], Optional[int]]:
+    try:
+        response = session.post(url, json=payload, timeout=timeout)
+    except requests.RequestException as exc:
+        reason = f"network:{exc.__class__.__name__}"
+        return False, reason, None
+    if response.ok:
+        return True, None, response.status_code
+    return False, _extract_description(response), response.status_code
+
+
+def _extract_description(response: Response) -> Optional[str]:
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, Mapping):
+        for key in ("description", "error", "message"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    text = response.text or response.reason
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None
+
+
+def send_photo_request(
+    session: requests.Session,
+    url: str,
+    *,
+    chat_id: int,
+    photo: str,
+    caption: Optional[str] = None,
+    reply_to: Optional[int] = None,
+    timeout: float = 60.0,
+) -> tuple[bool, Optional[str], Optional[int]]:
+    payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+    if caption:
+        payload["caption"] = caption
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    return _telegram_post_json(session, url, payload, timeout=timeout)
+
+
+def send_audio_request(
+    session: requests.Session,
+    url: str,
+    *,
+    chat_id: int,
+    audio: str,
+    caption: Optional[str] = None,
+    reply_to: Optional[int] = None,
+    title: Optional[str] = None,
+    thumb: Optional[str] = None,
+    timeout: float = 60.0,
+) -> tuple[bool, Optional[str], Optional[int]]:
+    payload: dict[str, Any] = {"chat_id": chat_id, "audio": audio}
+    if caption:
+        payload["caption"] = caption
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    if title:
+        payload["title"] = title
+    if thumb:
+        payload["thumb"] = thumb
+    return _telegram_post_json(session, url, payload, timeout=timeout)
+
+
+def is_remote_file_error(status: Optional[int], reason: Optional[str]) -> bool:
+    if status != 400:
+        return False
+    if not reason:
+        return False
+    lowered = reason.lower()
+    keywords = [
+        "file reference expired",
+        "failed to get http url content",
+        "wrong file identifier",
+        "http url content",
+        "wrong remote file id",
+        "remote url not valid",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
 __all__ = [
     "safe_send",
     "safe_send_text",
@@ -753,4 +848,7 @@ __all__ = [
     "SafeEditResult",
     "sanitize_html",
     "mask_tokens",
+    "send_photo_request",
+    "send_audio_request",
+    "is_remote_file_error",
 ]

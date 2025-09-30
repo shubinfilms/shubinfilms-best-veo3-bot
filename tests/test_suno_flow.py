@@ -828,10 +828,7 @@ def test_suno_enqueue_handles_400_error(monkeypatch) -> None:
 
     asyncio.run(_run())
 
-    expected = (
-        "❌ Ошибка: описание содержит запрещённые слова (например, имя артиста).\n"
-        "Пожалуйста, измените описание и попробуйте снова."
-    )
+    expected = "❗️Error: your description mentions an artist/brand. Remove the reference and try again."
     assert status_texts and status_texts[0] == "⏳ Sending request…"
     assert edited_messages and edited_messages[-1] == expected
     assert refunds and refunds[-1]["user_message"].startswith(expected)
