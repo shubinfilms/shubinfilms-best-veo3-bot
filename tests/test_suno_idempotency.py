@@ -28,6 +28,36 @@ os.environ.setdefault("LOG_LEVEL", "WARNING")
 bot_module = importlib.import_module("bot")
 
 
+def _prepare_suno_params(
+    ctx: SimpleNamespace,
+    *,
+    title: str = "",
+    style: str = "",
+    lyrics: str = "",
+    mode: str = "instrumental",
+    lyrics_source=None,
+):
+    suno_state = bot_module.load_suno_state(ctx)
+    suno_state.mode = mode  # type: ignore[assignment]
+    bot_module.set_suno_title(suno_state, title)
+    bot_module.set_suno_style(suno_state, style)
+    if lyrics:
+        bot_module.set_suno_lyrics(suno_state, lyrics)
+    else:
+        bot_module.clear_suno_lyrics(suno_state)
+    if lyrics_source is None:
+        if lyrics and mode == "lyrics":
+            lyrics_source = bot_module.LyricsSource.USER
+        else:
+            lyrics_source = bot_module.LyricsSource.AI
+    bot_module.set_suno_lyrics_source(suno_state, lyrics_source)
+    bot_module.save_suno_state(ctx, suno_state)
+    state_dict = bot_module.state(ctx)
+    params = bot_module._suno_collect_params(state_dict, suno_state)
+    ctx.user_data["suno_state"] = suno_state.to_dict()
+    return params
+
+
 def test_generate_request_id_includes_user() -> None:
     rid = bot_module._generate_suno_request_id(555)
     assert rid.startswith("suno:555:"), rid
@@ -75,7 +105,7 @@ def test_duplicate_req_id_skips_enqueue(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(bot_module.SUNO_SERVICE, "start_music", fail_start_music)
 
     async def scenario() -> None:
-        params = {"instrumental": True, "title": "", "style": "", "lyrics": "", "has_lyrics": False}
+        params = _prepare_suno_params(ctx, title="", style="", mode="instrumental")
         await bot_module._launch_suno_generation(
             123,
             ctx,

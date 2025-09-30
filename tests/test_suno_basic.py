@@ -121,6 +121,37 @@ def _hist_sum(histogram, **labels) -> float:
     return child._sum.get()
 
 
+def _prepare_suno_params(
+    bot,
+    ctx: SimpleNamespace,
+    *,
+    title: str = "",
+    style: str = "",
+    lyrics: str = "",
+    mode: str = "instrumental",
+    lyrics_source=None,
+):
+    suno_state = bot.load_suno_state(ctx)
+    suno_state.mode = mode  # type: ignore[assignment]
+    bot.set_suno_title(suno_state, title)
+    bot.set_suno_style(suno_state, style)
+    if lyrics:
+        bot.set_suno_lyrics(suno_state, lyrics)
+    else:
+        bot.clear_suno_lyrics(suno_state)
+    if lyrics_source is None:
+        if lyrics and mode == "lyrics":
+            lyrics_source = bot.LyricsSource.USER
+        else:
+            lyrics_source = bot.LyricsSource.AI
+    bot.set_suno_lyrics_source(suno_state, lyrics_source)
+    bot.save_suno_state(ctx, suno_state)
+    state_dict = bot.state(ctx)
+    params = bot._suno_collect_params(state_dict, suno_state)
+    ctx.user_data["suno_state"] = suno_state.to_dict()
+    return params
+
+
 def _setup_client_env(monkeypatch) -> None:
     monkeypatch.setenv("SUNO_API_BASE", "https://api.example.com")
     monkeypatch.setenv("SUNO_API_TOKEN", "token")
@@ -911,7 +942,13 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
     user_id = 888
     user_id = 777
     user_id = 888
@@ -1025,7 +1062,13 @@ def test_launch_suno_notify_fail_continues(monkeypatch, bot_module):
     monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
     user_id = 777
     async def _run():
         await bot._launch_suno_generation(
@@ -1115,7 +1158,13 @@ def test_launch_suno_failure_marks_refund(monkeypatch, bot_module):
     monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
     user_id = 888
     async def _run():
         await bot._launch_suno_generation(
@@ -1201,7 +1250,13 @@ def test_launch_suno_duplicate_req_id_no_double_charge(monkeypatch, bot_module):
     monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
 
     async def _run():
         await bot._launch_suno_generation(
@@ -1227,6 +1282,170 @@ def test_launch_suno_duplicate_req_id_no_double_charge(monkeypatch, bot_module):
     assert start_calls["count"] == 1
     pending_key = f"{bot.REDIS_PREFIX}:suno:pending:suno:999:{str(fixed_uuid)}"
     assert pending_key in fake_redis.store
+
+
+def test_launch_suno_generation_uses_state(monkeypatch, bot_module):
+    bot = bot_module
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    bot._SUNO_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_COOLDOWN_MEMORY.clear()
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    def fake_debit_try(user_id, price, reason, meta):
+        return True, 50
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit_try)
+
+    status_texts: list[str] = []
+
+    async def fake_notify(ctx_param, chat_id_param, text, **kwargs):
+        status_texts.append(text)
+        return SimpleNamespace(message_id=654)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    edited_payloads: list[str] = []
+
+    async def fake_safe_edit(ctx_param, chat_id_param, message_id_param, new_text, **kwargs):
+        edited_payloads.append(new_text)
+        return True
+
+    monkeypatch.setattr(bot, "safe_edit_message", fake_safe_edit)
+
+    def fake_client_build_payload(**kwargs):
+        return {
+            "title": kwargs.get("title"),
+            "prompt": kwargs.get("prompt") or kwargs.get("title"),
+            "tags": kwargs.get("tags") or ["custom-tag"],
+            "negativeTags": kwargs.get("negative_tags") or [],
+            "instrumental": kwargs.get("instrumental", True),
+            "has_lyrics": kwargs.get("has_lyrics", False),
+            "lyrics": kwargs.get("lyrics"),
+        }
+
+    monkeypatch.setattr(bot.SUNO_SERVICE.client, "build_payload", fake_client_build_payload)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    async def fake_request_with_retries(func, *args, **kwargs):
+        result = func()
+        if hasattr(result, "__await__"):
+            return await result  # type: ignore[return-value]
+        return result
+
+    monkeypatch.setattr(bot, "request_with_retries", fake_request_with_retries)
+
+    class DummyTask:
+        def __init__(self, task_id: str) -> None:
+            self.task_id = task_id
+            self.items = []
+            self.callback_type = "start"
+            self.msg = None
+            self.code = None
+
+    start_calls: dict[str, object] = {}
+
+    def fake_start_music(*args, **kwargs):
+        start_calls.update(kwargs)
+        return DummyTask("task-state")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="State Title",
+        style="Dream vibes",
+        lyrics="Hello world",
+        mode="lyrics",
+        lyrics_source=bot.LyricsSource.USER,
+    )
+    stored_state = ctx.user_data.get("suno_state")
+    assert stored_state and stored_state.get("lyrics") == "Hello world"
+    state_before = bot.load_suno_state(ctx)
+    assert state_before.lyrics == "Hello world"
+    assert params.get("lyrics") == "Hello world"
+    assert "suno_state" in ctx.user_data
+
+    asyncio.run(
+        bot._launch_suno_generation(
+            chat_id=456,
+            ctx=ctx,
+            params=params,
+            user_id=99,
+            reply_to=None,
+            trigger="test",
+        )
+    )
+
+    assert status_texts and status_texts[0] == "⏳ Sending request…"
+    assert edited_payloads and edited_payloads[-1].startswith("✅ Task created")
+    assert start_calls.get("title") == "State Title"
+    assert start_calls.get("style") == "Dream vibes"
+    assert start_calls.get("lyrics") == "Hello world"
+    assert start_calls.get("lyrics_source") == bot.LyricsSource.USER.value
+
+
+def test_launch_suno_generation_missing_state(monkeypatch, bot_module):
+    bot = bot_module
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+
+    messages: list[str] = []
+
+    async def fake_notify(ctx_param, chat_id_param, text, **kwargs):
+        messages.append(text)
+        return SimpleNamespace(message_id=111)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+    monkeypatch.setattr(bot, "load_suno_state", lambda ctx: None)
+    monkeypatch.setattr(
+        bot,
+        "state",
+        lambda ctx_param: ctx_param.user_data.setdefault("state", {}) if isinstance(getattr(ctx_param, "user_data", None), dict) else {},
+    )
+
+    def fail_start_music(*args, **kwargs):
+        raise AssertionError("start_music should not be called")
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fail_start_music)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"instrumental": True, "lyrics_source": "ai"}
+
+    asyncio.run(
+        bot._launch_suno_generation(
+            chat_id=123,
+            ctx=ctx,
+            params=params,
+            user_id=777,
+            reply_to=None,
+            trigger="test",
+        )
+    )
+
+    assert messages == ["⚠️ Ошибка: не удалось загрузить состояние Suno. Попробуйте ещё раз."]
 
 
 def _make_poll_service(monkeypatch, *, timeout: str = "0.3") -> SunoService:

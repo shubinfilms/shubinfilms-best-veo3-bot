@@ -114,6 +114,37 @@ def _setup_suno_context() -> tuple[SimpleNamespace, dict[str, object], FakeBot, 
     return ctx, state_dict, bot, chat_id
 
 
+def _prepare_suno_params(
+    bot,
+    ctx: SimpleNamespace,
+    *,
+    title: str = "",
+    style: str = "",
+    lyrics: str = "",
+    mode: str = "instrumental",
+    lyrics_source=None,
+):
+    suno_state = bot.load_suno_state(ctx)
+    suno_state.mode = mode  # type: ignore[assignment]
+    bot.set_suno_title(suno_state, title)
+    bot.set_suno_style(suno_state, style)
+    if lyrics:
+        bot.set_suno_lyrics(suno_state, lyrics)
+    else:
+        bot.clear_suno_lyrics(suno_state)
+    if lyrics_source is None:
+        if lyrics and mode == "lyrics":
+            lyrics_source = bot.LyricsSource.USER
+        else:
+            lyrics_source = bot.LyricsSource.AI
+    bot.set_suno_lyrics_source(suno_state, lyrics_source)
+    bot.save_suno_state(ctx, suno_state)
+    state_dict = bot.state(ctx)
+    params = bot._suno_collect_params(state_dict, suno_state)
+    ctx.user_data["suno_state"] = suno_state.to_dict()
+    return params
+
+
 def _render(state: SunoState, *, price: int = 30, balance: int | None = None):
     text, markup, ready = render_suno_card(
         state,
@@ -659,7 +690,13 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
     monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", fake_start_music)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
 
     async def _run() -> None:
         assert bot.SUNO_MODE_AVAILABLE is True
@@ -754,7 +791,13 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
     monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", failing_start_music)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
 
     async def _run() -> None:
         await bot._launch_suno_generation(
@@ -841,7 +884,13 @@ def test_suno_enqueue_handles_400_error(monkeypatch) -> None:
     monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", failing_start_music)
 
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
-    params = {"title": "Future", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Future",
+        style="Pop",
+        mode="instrumental",
+    )
 
     async def _run() -> None:
         await bot._launch_suno_generation(
@@ -926,7 +975,13 @@ def test_suno_enqueue_dedupes_failed_req(monkeypatch) -> None:
 
     assert bot._suno_pending_load(req_id) is not None
 
-    params = {"title": "Demo", "style": "Pop", "lyrics": "", "instrumental": True}
+    params = _prepare_suno_params(
+        bot,
+        ctx,
+        title="Demo",
+        style="Pop",
+        mode="instrumental",
+    )
 
     async def _run() -> None:
         assert bot.SUNO_MODE_AVAILABLE is True
