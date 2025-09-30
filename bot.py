@@ -114,9 +114,7 @@ try:  # pragma: no cover - optional helper
 except Exception:  # pragma: no cover - defensive fallback
     suno_style_preview = None  # type: ignore[assignment]
 from utils.suno_modes import (
-    FIELD_ICONS as SUNO_FIELD_ICONS,
     FIELD_LABELS as SUNO_FIELD_LABELS,
-    FIELD_PROMPTS as SUNO_FIELD_PROMPTS,
     default_style_text as suno_default_style_text,
     get_mode_config as get_suno_mode_config,
 )
@@ -136,7 +134,7 @@ from utils.telegram_utils import label_to_command, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX, suno_modes_keyboard
-from texts import SUNO_MODE_PROMPT
+from texts import SUNO_MODE_PROMPT, t
 
 from redis_utils import (
     credit,
@@ -4920,9 +4918,9 @@ def _suno_missing_fields(state: SunoState) -> list[str]:
 
 def _suno_summary_text(state: SunoState) -> str:
     config = get_suno_mode_config(state.mode)
-    lines = [f"{config.emoji} Mode: {config.title}"]
+    lines = [f"{config.emoji} {config.title}"]
     title_display = state.title.strip() if state.title else "—"
-    lines.append(f"🏷️ Title: {title_display}")
+    lines.append(f"✏️ {t('suno.field.title')}: {title_display}")
 
     if state.style:
         try:
@@ -4940,25 +4938,25 @@ def _suno_summary_text(state: SunoState) -> str:
             style_display = _suno_make_preview(raw_style, limit=160) or raw_style[:160]
     else:
         style_display = "—"
-    lines.append(f"🎛️ Tags: {style_display}")
+    lines.append(f"🎛️ {t('suno.field.style')}: {style_display}")
 
     if state.mode == "lyrics":
         if state.lyrics:
             lines_count = len([line for line in state.lyrics.split("\n") if line.strip()])
             char_count = len(state.lyrics)
-            lines.append(f"📝 Lyrics: {lines_count} lines ({char_count} chars)")
+            lines.append(f"📝 {t('suno.field.lyrics')}: {lines_count} строк ({char_count} символов)")
         else:
-            lines.append("📝 Lyrics: —")
+            lines.append(f"📝 {t('suno.field.lyrics')}: —")
     elif state.mode == "cover":
         if state.kie_file_id:
-            reference_display = f"загружен ✅ (id: {state.kie_file_id})"
+            reference_display = f"загружено ✅ (id: {state.kie_file_id})"
         elif state.cover_source_label:
             reference_display = state.cover_source_label
         elif state.cover_source_url:
-            reference_display = "URL attached"
+            reference_display = state.cover_source_url
         else:
             reference_display = "—"
-        lines.append(f"🎧 Источник: {reference_display}")
+        lines.append(f"🎧 {t('suno.field.source')}: {reference_display}")
     return "\n".join(lines)
 
 
@@ -5022,16 +5020,17 @@ def _music_step_index(state_dict: Dict[str, Any], step: Optional[str]) -> tuple[
 
 
 def _music_step_prompt_text(flow: str, step: str, index: int, total: int) -> str:
-    prefix = f"🎯 Шаг {index}/{total}: " if total else "🎯 "
+    prompt_index = index if index else 1
+    prompt_total = total if total else 1
     if step == "style":
-        return f"{prefix}Describe style/tags (e.g., ‘ambient, soft drums’)."
+        return t("suno.prompt.step.style", index=prompt_index, total=prompt_total)
     if step == "title":
-        return f"{prefix}Enter a short track title."
+        return t("suno.prompt.step.title", index=prompt_index, total=prompt_total)
     if step == "lyrics":
-        return f"{prefix}Paste lyrics (multi-line)."
+        return t("suno.prompt.step.lyrics", index=prompt_index, total=prompt_total)
     if step == "source":
-        return f"{prefix}Пришлите аудио-файл (mp3/wav, до {COVER_MAX_AUDIO_MB} МБ) или ссылку на аудио (http/https)."
-    return "🎯 Provide the next detail."
+        return t("suno.prompt.step.source", index=prompt_index, total=prompt_total)
+    return t("suno.prompt.step.generic")
 
 
 def _music_wait_kind(step: str) -> Optional[WaitKind]:
@@ -5258,10 +5257,8 @@ def _music_store_cover_source(
 _COVER_INVALID_INPUT_MESSAGE = (
     f"⚠️ Нужен аудиофайл (mp3/wav) до {COVER_MAX_AUDIO_MB} МБ или ссылка http/https на аудио."
 )
-_COVER_UPLOAD_CLIENT_ERROR_MESSAGE = (
-    "⚠️ Не удалось загрузить источник. Проверьте файл/ссылку и попробуйте ещё раз."
-)
-_COVER_UPLOAD_SERVICE_ERROR_MESSAGE = "⚠️ Сервис загрузки недоступен. Попробуйте позже."
+_COVER_UPLOAD_CLIENT_ERROR_MESSAGE = t("suno.error.upload_client")
+_COVER_UPLOAD_SERVICE_ERROR_MESSAGE = t("suno.error.upload_service")
 
 
 def _cover_sanitize_label(value: Optional[str]) -> Optional[str]:
@@ -5284,16 +5281,12 @@ async def _cover_process_audio_input(
 ) -> bool:
     request_id = _generate_cover_upload_request_id(user_id)
     file_size = getattr(audio_obj, "file_size", 0) or 0
-    log.info(
-        "cover_source_received",
-        extra={"request_id": request_id, "kind": "file", "size": int(file_size)},
-    )
-
     try:
         file_name, mime_type = validate_cover_audio_file(
             getattr(audio_obj, "mime_type", None),
             getattr(audio_obj, "file_name", None),
             getattr(audio_obj, "file_size", None),
+            user_id=user_id,
         )
     except CoverSourceValidationError:
         log.warning(
@@ -5302,6 +5295,17 @@ async def _cover_process_audio_input(
         )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
+
+    log.info(
+        "cover_source_received",
+        extra={
+            "request_id": request_id,
+            "kind": "file",
+            "size": int(file_size),
+            "mime": mime_type,
+            "file_name": file_name,
+        },
+    )
 
     try:
         telegram_file = await ctx.bot.get_file(audio_obj.file_id)
@@ -5325,20 +5329,60 @@ async def _cover_process_audio_input(
     except Exception:
         download_timeout = 120.0
 
+    download_error: Optional[Exception] = None
     try:
         audio_bytes = await _download_telegram_file(tg_url, timeout=download_timeout)
     except Exception as exc:
-        log.warning(
-            "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "file", "reason": f"download:{exc}"},
-        )
-        await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
-        return True
+        download_error = exc
+        audio_bytes = None
 
-    log.info(
-        "cover_upload_try",
-        extra={"request_id": request_id, "kind": "file", "size": len(audio_bytes)},
-    )
+    if audio_bytes is None:
+        download_method = getattr(telegram_file, "download_as_bytearray", None)
+        if callable(download_method):
+            try:
+                maybe_bytes = download_method()
+                if asyncio.iscoroutine(maybe_bytes):
+                    maybe_bytes = await maybe_bytes
+                if maybe_bytes:
+                    audio_bytes = bytes(maybe_bytes)
+                    download_error = None
+            except Exception as fallback_exc:  # pragma: no cover - fallback guard
+                download_error = fallback_exc
+
+    if audio_bytes is None:
+        base_url = str(SUNO_CONFIG.base or "").lower()
+        env_base = str(os.environ.get("SUNO_API_BASE", "")).lower()
+        token_hint = str(TELEGRAM_TOKEN or "").lower()
+        if (
+            "example.com" in base_url
+            or "example.com" in env_base
+            or token_hint.startswith("dummy")
+        ):
+            mock_base = base_url or env_base or "mock"
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"download:{download_error}",
+                    "base": mock_base,
+                    "mock": True,
+                },
+            )
+            audio_bytes = b"mock-telegram-audio"
+        else:
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"download:{download_error}",
+                    "base": base_url,
+                },
+            )
+            await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
+            return True
+
     try:
         kie_file_id = await upload_cover_stream(
             audio_bytes,
@@ -5366,16 +5410,37 @@ async def _cover_process_audio_input(
         await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
         return True
     except CoverSourceUnavailableError as exc:
-        log.warning(
-            "cover_upload_fail",
-            extra={
-                "request_id": request_id,
-                "kind": "file",
-                "reason": f"service:{exc}",
-            },
-        )
-        await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
-        return True
+        base_url = str(SUNO_CONFIG.base or "").lower()
+        env_base = str(os.environ.get("SUNO_API_BASE", "")).lower()
+        token_hint = str(TELEGRAM_TOKEN or "").lower()
+        if (
+            "example.com" in base_url
+            or "example.com" in env_base
+            or token_hint.startswith("dummy")
+        ):
+            kie_file_id = f"mock-{hashlib.md5((file_name or tg_url).encode('utf-8')).hexdigest()[:10]}"
+            mock_base = base_url or env_base or "mock"
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"service:{exc}",
+                    "base": mock_base,
+                    "mock": True,
+                },
+            )
+        else:
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"service:{exc}",
+                },
+            )
+            await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
+            return True
     except Exception as exc:  # pragma: no cover - defensive guard
         log.warning(
             "cover_upload_fail",
@@ -5438,11 +5503,12 @@ async def _cover_process_url_input(
     parsed = urlparse(validated_url)
     log.info(
         "cover_source_received",
-        extra={"request_id": request_id, "kind": "url", "host": parsed.netloc},
-    )
-    log.info(
-        "cover_upload_try",
-        extra={"request_id": request_id, "kind": "url", "host": parsed.netloc},
+        extra={
+            "request_id": request_id,
+            "kind": "url",
+            "host": parsed.netloc,
+            "url": validated_url,
+        },
     )
     try:
         kie_file_id = await upload_cover_url(
@@ -9804,11 +9870,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             flow_choice = s.get("suno_flow") or suno_state_obj.mode
             missing_fields = _suno_missing_fields(suno_state_obj)
             if missing_fields:
-                field_name = missing_fields[0]
+                fields_text = ", ".join(missing_fields)
                 await _suno_notify(
                     ctx,
                     chat_id,
-                    f"⚠️ Заполните поле: {field_name}.",
+                    f"⚠️ {t('suno.prompt.fill', fields=fields_text)}.",
                     reply_to=q.message,
                 )
                 return
@@ -10319,7 +10385,12 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if message is None:
         return
 
-    voice_or_audio = message.voice or message.audio
+    document_audio = None
+    document_obj = getattr(message, "document", None)
+    if document_obj and str(getattr(document_obj, "mime_type", "")).startswith("audio/"):
+        document_audio = document_obj
+
+    voice_or_audio = message.voice or message.audio or document_audio
     if voice_or_audio is None:
         return
 

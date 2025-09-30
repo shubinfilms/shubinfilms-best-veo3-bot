@@ -57,7 +57,13 @@ class FakeBot:
         return None
 
     async def get_file(self, file_id: str):  # type: ignore[override]
-        return SimpleNamespace(file_path=f"audio/{file_id}.mp3")
+        async def _download_as_bytearray() -> bytes:
+            return b"telegram-audio"
+
+        return SimpleNamespace(
+            file_path=f"audio/{file_id}.mp3",
+            download_as_bytearray=_download_as_bytearray,
+        )
 
 
 class DummyMessage:

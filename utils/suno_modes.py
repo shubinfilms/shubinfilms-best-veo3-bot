@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
 
+from texts import t
+
+
 @dataclass(frozen=True)
 class SunoModeConfig:
     key: str
@@ -19,24 +22,24 @@ _MODE_CONFIGS: Dict[str, SunoModeConfig] = {
     "instrumental": SunoModeConfig(
         key="instrumental",
         emoji="🎼",
-        title="Instrumental",
-        button_label="🎼 Instrumental",
+        title=t("suno.mode.instrumental"),
+        button_label=f"🎼 {t('suno.mode.instrumental')}",
         required_fields=("title", "style"),
         default_tags=("ambient", "cinematic pads", "soft drums"),
     ),
     "lyrics": SunoModeConfig(
         key="lyrics",
         emoji="🎤",
-        title="Vocal (with lyrics)",
-        button_label="🎤 Vocal",
+        title=t("suno.mode.vocal"),
+        button_label=f"🎤 {t('suno.mode.vocal')}",
         required_fields=("title", "style", "lyrics"),
         default_tags=("pop", "ballad", "modern mix"),
     ),
     "cover": SunoModeConfig(
         key="cover",
-        emoji="🎛️",
-        title="Cover",
-        button_label="🎛️ Cover",
+        emoji="🎚️",
+        title=t("suno.mode.cover"),
+        button_label=f"🎚️ {t('suno.mode.cover')}",
         required_fields=("title", "reference"),
         optional_fields=("style",),
         default_tags=("cover", "remake", "modern mix"),
@@ -45,15 +48,15 @@ _MODE_CONFIGS: Dict[str, SunoModeConfig] = {
 
 
 FIELD_LABELS: Dict[str, str] = {
-    "title": "Title",
-    "style": "Style / tags",
-    "lyrics": "Lyrics",
-    "reference": "Reference",
+    "title": t("suno.field.title"),
+    "style": t("suno.field.style"),
+    "lyrics": t("suno.field.lyrics"),
+    "reference": t("suno.field.source"),
 }
 
 
 FIELD_ICONS: Dict[str, str] = {
-    "title": "🏷️",
+    "title": "✏️",
     "style": "🎛️",
     "lyrics": "📝",
     "reference": "🎧",
@@ -61,10 +64,10 @@ FIELD_ICONS: Dict[str, str] = {
 
 
 FIELD_PROMPTS: Dict[str, str] = {
-    "title": "Enter a short track title.",
-    "style": "Describe style/tags (e.g., ‘ambient, soft drums’).",
-    "lyrics": "Paste lyrics (multi-line).",
-    "reference": "Send an audio file or URL to the reference track.",
+    "title": t("suno.prompt.step.title", index=1, total=1),
+    "style": t("suno.prompt.step.style", index=1, total=1),
+    "lyrics": t("suno.prompt.step.lyrics", index=1, total=1),
+    "reference": t("suno.prompt.step.source", index=1, total=1),
 }
 
 
