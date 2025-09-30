@@ -103,6 +103,8 @@ from utils.suno_state import (
     set_lyrics as set_suno_lyrics,
     set_style as set_suno_style,
     set_title as set_suno_title,
+    set_cover_source as set_suno_cover_source,
+    clear_cover_source as clear_suno_cover_source,
 )
 from utils.input_state import (
     WaitInputState,
@@ -1879,6 +1881,26 @@ TOKEN_COSTS = {
     "suno": PRICE_SUNO,
     "chat": 0,
 }
+
+_INSTRUMENTAL_DEFAULT_STYLE = "ambient, cinematic, synthwave"
+_INSTRUMENTAL_TITLES = [
+    "Oceanic Dreams",
+    "Neon Horizon",
+    "Aurora Echoes",
+    "Celestial Drift",
+    "Nocturnal Pulse",
+    "Azure Haze",
+    "Starlit Voyage",
+    "Crystal Bloom",
+    "Midnight Currents",
+    "Luminous Trails",
+]
+
+
+def _pick_instrumental_title() -> str:
+    if not _INSTRUMENTAL_TITLES:
+        return "Luminous Trails"
+    return random.choice(_INSTRUMENTAL_TITLES)
 CHAT_UNLOCK_PRICE = 0
 
 # ==========================
@@ -2666,6 +2688,13 @@ DEFAULT_STATE = {
     "suno_last_task_id": None,
     "suno_last_params": None,
     "suno_balance": None,
+    "suno_flow": None,
+    "suno_step": None,
+    "suno_auto_lyrics_pending": False,
+    "suno_lyrics_confirmed": False,
+    "suno_cover_source_label": None,
+    "suno_step_order": None,
+    "suno_auto_lyrics_generated": False,
     "chat_hint_sent": False,
     "image_engine": None,
     "suno_card": {
@@ -3008,23 +3037,42 @@ async def _handle_suno_waiting_input(
     is_clear = stripped in {"-", "—"}
 
     suno_state_obj = load_suno_state(ctx)
+    flow = state_dict.get("suno_flow")
+    current_step = state_dict.get("suno_step")
+    custom_reply: Optional[str] = None
 
     before_value = getattr(suno_state_obj, field, None)
     if field == "title":
         if is_clear or not cleaned_value:
-            clear_suno_title(suno_state_obj)
+            if flow == "instrumental":
+                generated_title = _pick_instrumental_title()
+                set_suno_title(suno_state_obj, generated_title)
+                custom_reply = f"🏷️ Название сгенерировано автоматически: {generated_title}"
+            else:
+                clear_suno_title(suno_state_obj)
         else:
             set_suno_title(suno_state_obj, cleaned_value)
     elif field == "style":
         if is_clear or not cleaned_value:
-            clear_suno_style(suno_state_obj)
+            if flow == "instrumental":
+                set_suno_style(suno_state_obj, _INSTRUMENTAL_DEFAULT_STYLE)
+                custom_reply = "🎛️ Использую стиль по умолчанию: ambient, cinematic, synthwave"
+            else:
+                clear_suno_style(suno_state_obj)
         else:
             set_suno_style(suno_state_obj, cleaned_value)
     elif field == "lyrics":
         if is_clear or not cleaned_value:
             clear_suno_lyrics(suno_state_obj)
+            state_dict["suno_auto_lyrics_pending"] = True
+            state_dict["suno_auto_lyrics_generated"] = False
+            state_dict["suno_lyrics_confirmed"] = False
+            custom_reply = "🤖 Сгенерирую короткий текст через Prompt-Master."
         else:
             set_suno_lyrics(suno_state_obj, cleaned_value)
+            state_dict["suno_auto_lyrics_pending"] = False
+            state_dict["suno_auto_lyrics_generated"] = False
+            state_dict["suno_lyrics_confirmed"] = True
 
     after_value = getattr(suno_state_obj, field, None)
     changed = (before_value or "") != (after_value or "")
@@ -3047,14 +3095,33 @@ async def _handle_suno_waiting_input(
         user_id=user_id,
     )
 
+    if field == "style" and flow == "lyrics" and state_dict.get("suno_auto_lyrics_pending"):
+        _music_apply_auto_lyrics(
+            ctx,
+            state_dict,
+            style=suno_state_obj.style,
+            title=suno_state_obj.title,
+        )
+        custom_reply = "🤖 Добавил автогенерируемые куплеты."
+
     if changed:
         await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
 
     success_messages = _SUNO_SUCCESS_MESSAGES.get(field, ("✅ Обновлено.", "✅ Очищено."))
-    reply_text = success_messages[1] if cleared else success_messages[0]
-    if not changed:
+    reply_text = custom_reply or (success_messages[1] if cleared else success_messages[0])
+    if not custom_reply and not changed:
         reply_text = f"{reply_text} (без изменений)"
     await _send_with_retry(lambda: message.reply_text(reply_text))
+    if flow in {"instrumental", "lyrics", "cover"} and field == current_step:
+        next_step = _music_next_step(state_dict)
+        await _music_prompt_step(
+            chat_id,
+            ctx,
+            state_dict,
+            flow=flow,
+            step=next_step,
+            user_id=user_id,
+        )
     return True
 
 
@@ -4746,7 +4813,7 @@ async def _run_suno_probe() -> None:
 
 def _suno_collect_params(state_obj: Dict[str, Any], suno_state: SunoState) -> Dict[str, Any]:
     state_obj["suno_state"] = suno_state.to_dict()
-    return {
+    payload = {
         "title": suno_state.title or "",
         "style": suno_state.style or "",
         "lyrics": suno_state.lyrics or "",
@@ -4754,6 +4821,11 @@ def _suno_collect_params(state_obj: Dict[str, Any], suno_state: SunoState) -> Di
         "has_lyrics": suno_state.has_lyrics,
         "preset": suno_state.preset,
     }
+    if suno_state.mode == "cover":
+        payload["instrumental"] = False
+        payload["operationType"] = "upload-and-cover-audio"
+        payload["cover_source_url"] = suno_state.cover_source_url
+    return payload
 
 
 def _suno_make_preview(text: str, limit: int = 160) -> str:
@@ -4773,6 +4845,280 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
         ]
     )
+
+
+def _music_flow_steps(flow: str) -> list[str]:
+    mapping = {
+        "instrumental": ["style", "title"],
+        "lyrics": ["lyrics", "style", "title"],
+        "cover": ["source", "style", "title"],
+    }
+    return mapping.get(flow, [])
+
+
+def _music_flow_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎹 Инструментал", callback_data="suno:mode:instrumental")],
+            [InlineKeyboardButton("🎤 Со словами", callback_data="suno:mode:lyrics")],
+            [InlineKeyboardButton("🎶 Кавер", callback_data="suno:mode:cover")],
+        ]
+    )
+
+
+async def _music_show_main_menu(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    state_dict: Dict[str, Any],
+) -> None:
+    state_dict["suno_flow"] = None
+    state_dict["suno_step"] = None
+    state_dict["suno_step_order"] = None
+    state_dict["suno_auto_lyrics_pending"] = False
+    state_dict["suno_lyrics_confirmed"] = False
+    state_dict["suno_cover_source_label"] = None
+    state_dict["suno_auto_lyrics_generated"] = False
+    text = (
+        "🎵 <b>Музыкальный режим</b>\n"
+        "Выберите формат, а затем следуйте подсказкам по шагам."
+    )
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_music_flow_keyboard(),
+    )
+
+
+def _music_step_index(state_dict: Dict[str, Any], step: Optional[str]) -> tuple[int, int]:
+    order_raw = state_dict.get("suno_step_order")
+    order = order_raw if isinstance(order_raw, list) else []
+    total = len(order)
+    if not step or step not in order:
+        return (0, total)
+    try:
+        idx = order.index(step)
+    except ValueError:
+        return (0, total)
+    return (idx + 1, total)
+
+
+def _music_step_prompt_text(flow: str, step: str, index: int, total: int) -> str:
+    prefix = f"🎯 Шаг {index}/{total}: " if total else "🎯 "
+    if step == "style":
+        if flow == "instrumental":
+            return (
+                f"{prefix}опишите настроение и инструменты.\n"
+                "Например: ambient, cinematic, ocean waves.\n"
+                f"Если пропустите — применю пресет {_INSTRUMENTAL_DEFAULT_STYLE}."
+            )
+        return (
+            f"{prefix}опишите жанр и атмосферу трека.\n"
+            "Добавьте пару ключевых слов для Suno."
+        )
+    if step == "title":
+        return (
+            f"{prefix}придумайте название трека.\n"
+            "Можно отправить пустое сообщение — я подберу название автоматически."
+        )
+    if step == "lyrics":
+        return (
+            f"{prefix}пришлите текст песни (8–16 строк).\n"
+            "Если оставите пусто — Prompt-Master сочинит короткие куплеты."
+        )
+    if step == "source":
+        return (
+            f"{prefix}загрузите исходную дорожку.\n"
+            "Пришлите аудио-файл или публичную ссылку (YouTube, SoundCloud)."
+        )
+    return "🎯 Заполните следующий шаг."
+
+
+def _music_wait_kind(step: str) -> Optional[WaitKind]:
+    mapping = {
+        "style": WaitKind.SUNO_STYLE,
+        "title": WaitKind.SUNO_TITLE,
+        "lyrics": WaitKind.SUNO_LYRICS,
+    }
+    return mapping.get(step)
+
+
+def _music_card_message_id(state_dict: Dict[str, Any]) -> Optional[int]:
+    card_state = state_dict.get("suno_card")
+    if isinstance(card_state, dict):
+        msg_id = card_state.get("msg_id")
+        if isinstance(msg_id, int):
+            return msg_id
+    msg_id = state_dict.get("last_ui_msg_id_suno")
+    if isinstance(msg_id, int):
+        return msg_id
+    return None
+
+
+async def _music_prompt_step(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    state_dict: Dict[str, Any],
+    *,
+    flow: str,
+    step: Optional[str],
+    user_id: Optional[int],
+) -> None:
+    if not step:
+        await tg_safe_send(
+            ctx.bot.send_message,
+            method_name="sendMessage",
+            kind="message",
+            chat_id=chat_id,
+            text="✅ Все шаги заполнены. Проверьте карточку и нажмите «Сгенерировать».",
+        )
+        return
+
+    index, total = _music_step_index(state_dict, step)
+    text = _music_step_prompt_text(flow, step, index, total)
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=text,
+    )
+
+    wait_kind = _music_wait_kind(step)
+    if wait_kind is not None:
+        if wait_kind == WaitKind.SUNO_STYLE:
+            waiting_value = WAIT_SUNO_STYLE
+        elif wait_kind == WaitKind.SUNO_TITLE:
+            waiting_value = WAIT_SUNO_TITLE
+        else:
+            waiting_value = WAIT_SUNO_LYRICS
+        state_dict["suno_waiting_state"] = waiting_value
+        _activate_wait_state(
+            user_id=user_id,
+            chat_id=chat_id,
+            card_msg_id=_music_card_message_id(state_dict),
+            kind=wait_kind,
+            meta={"flow": flow, "step": step},
+        )
+    else:
+        state_dict["suno_waiting_state"] = IDLE_SUNO
+
+
+def _music_next_step(state_dict: Dict[str, Any]) -> Optional[str]:
+    order_raw = state_dict.get("suno_step_order")
+    order = order_raw if isinstance(order_raw, list) else []
+    current = state_dict.get("suno_step")
+    if not order:
+        state_dict["suno_step"] = None
+        return None
+    if current not in order:
+        state_dict["suno_step"] = order[0]
+        return order[0]
+    idx = order.index(current)
+    if idx + 1 < len(order):
+        state_dict["suno_step"] = order[idx + 1]
+        return order[idx + 1]
+    state_dict["suno_step"] = None
+    return None
+
+
+async def _music_begin_flow(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    state_dict: Dict[str, Any],
+    *,
+    flow: str,
+    user_id: Optional[int],
+) -> None:
+    suno_state_obj = load_suno_state(ctx)
+    suno_state_obj.mode = flow  # type: ignore[assignment]
+    clear_suno_style(suno_state_obj)
+    clear_suno_title(suno_state_obj)
+    clear_suno_lyrics(suno_state_obj)
+    clear_suno_cover_source(suno_state_obj)
+    state_dict["suno_cover_source_label"] = None
+    if flow == "instrumental":
+        suno_state_obj.mode = "instrumental"  # type: ignore[assignment]
+    elif flow == "lyrics":
+        suno_state_obj.mode = "lyrics"  # type: ignore[assignment]
+    else:
+        suno_state_obj.mode = "cover"  # type: ignore[assignment]
+    save_suno_state(ctx, suno_state_obj)
+    state_dict["suno_state"] = suno_state_obj.to_dict()
+    state_dict["suno_flow"] = flow
+    order = _music_flow_steps(flow)
+    state_dict["suno_step_order"] = order
+    state_dict["suno_step"] = order[0] if order else None
+    state_dict["suno_auto_lyrics_pending"] = False
+    state_dict["suno_auto_lyrics_generated"] = False
+    state_dict["suno_lyrics_confirmed"] = False
+    _reset_suno_card_cache(state_dict)
+    await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
+    await _music_prompt_step(
+        chat_id,
+        ctx,
+        state_dict,
+        flow=flow,
+        step=state_dict.get("suno_step"),
+        user_id=user_id,
+    )
+
+
+def _music_generate_auto_lyrics(style: Optional[str], title: Optional[str]) -> str:
+    keywords = []
+    if style:
+        for token in re.split(r"[,/]+", style):
+            item = token.strip()
+            if item:
+                keywords.append(item)
+    base_title = (title or "Midnight Echo").strip()
+    prompt = build_suno_prompt(base_title, style=style or "dream pop")
+    mood = keywords[0] if keywords else "dreamwave"
+    vibe = keywords[1] if len(keywords) > 1 else "city lights"
+    chorus = keywords[2] if len(keywords) > 2 else "endless glow"
+    lines = [
+        f"{base_title} in the {mood}",
+        f"Hearts align with {vibe}",
+        f"Hold me close through static nights",
+        f"Chorus of {chorus} in our eyes",
+    ]
+    if prompt:
+        pass
+    return "\n".join(lines)
+
+
+def _music_apply_auto_lyrics(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    state_dict: Dict[str, Any],
+    *,
+    style: Optional[str],
+    title: Optional[str],
+) -> None:
+    suno_state_obj = load_suno_state(ctx)
+    lyrics = _music_generate_auto_lyrics(style, title)
+    set_suno_lyrics(suno_state_obj, lyrics)
+    save_suno_state(ctx, suno_state_obj)
+    state_dict["suno_state"] = suno_state_obj.to_dict()
+    state_dict["suno_auto_lyrics_pending"] = False
+    state_dict["suno_auto_lyrics_generated"] = True
+    state_dict["suno_lyrics_confirmed"] = False
+
+
+def _music_store_cover_source(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    state_dict: Dict[str, Any],
+    *,
+    url: str,
+    label: Optional[str] = None,
+) -> None:
+    suno_state_obj = load_suno_state(ctx)
+    set_suno_cover_source(suno_state_obj, url, label)
+    save_suno_state(ctx, suno_state_obj)
+    state_dict["suno_state"] = suno_state_obj.to_dict()
+    state_dict["suno_cover_source_label"] = label or url
 
 
 async def suno_entry(
@@ -4803,6 +5149,7 @@ async def suno_entry(
     s["suno_state"] = suno_state_obj.to_dict()
     _reset_suno_card_cache(s)
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO, force_new=force_new)
+    await _music_show_main_menu(chat_id, ctx, s)
 
 
 async def _suno_notify(
@@ -4846,8 +5193,8 @@ def _suno_error_message(status: Optional[int], reason: Optional[str]) -> str:
         lowered = reason.lower()
         if any(phrase in lowered for phrase in ("artist name", "living artist", "brand")):
             return (
-                "❌ Ошибка: описание содержит запрещённые слова (например, имя артиста).\n"
-                "Пожалуйста, измените описание и попробуйте снова."
+                "⚠️ Please remove artist names or copyrighted references.\n"
+                "Try describing the *style* instead (e.g., “80s synthwave with dark mood”)."
             )
     if reason:
         return f"⚠️ Generation failed: {md2_escape(reason)}"
@@ -8707,10 +9054,41 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         suno_state_obj = load_suno_state(ctx)
         s["suno_state"] = suno_state_obj.to_dict()
 
+        if action == "menu":
+            await q.answer()
+            await _music_show_main_menu(chat_id, ctx, s)
+            return
+
+        if action == "mode":
+            if argument not in {"instrumental", "lyrics", "cover"}:
+                await q.answer("Неизвестный режим", show_alert=True)
+                return
+            await q.answer()
+            await _music_begin_flow(
+                chat_id,
+                ctx,
+                s,
+                flow=argument,
+                user_id=uid,
+            )
+            return
+
         if action == "edit":
             field = argument
-            if field not in {"title", "style", "lyrics"}:
+            if field not in {"title", "style", "lyrics", "cover"}:
                 await q.answer("Недоступное поле", show_alert=True)
+                return
+            if field == "cover":
+                s["suno_step"] = "source"
+                await q.answer()
+                await _music_prompt_step(
+                    chat_id,
+                    ctx,
+                    s,
+                    flow="cover",
+                    step="source",
+                    user_id=uid,
+                )
                 return
             if field == "title":
                 waiting_state = WAIT_SUNO_TITLE
@@ -8765,6 +9143,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if action == "confirm" and argument == "auto_lyrics":
+            s["suno_lyrics_confirmed"] = True
+            await q.answer("Текст подтверждён")
+            target_chat = chat_id
+            if target_chat is None and q.message is not None:
+                target_chat = q.message.chat_id
+            if target_chat is not None:
+                await _suno_notify(
+                    ctx,
+                    target_chat,
+                    "✅ Текст принят. Можно запускать генерацию.",
+                    reply_to=q.message,
+                )
+            return
+
         if action == "preset":
             if argument != "ambient":
                 await q.answer("Неизвестный пресет", show_alert=True)
@@ -8783,6 +9176,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_suno_state(ctx, suno_state_obj)
             s["suno_state"] = suno_state_obj.to_dict()
             s["suno_waiting_state"] = IDLE_SUNO
+            s["suno_flow"] = "instrumental"
+            s["suno_step_order"] = _music_flow_steps("instrumental")
+            s["suno_step"] = None
+            s["suno_auto_lyrics_pending"] = False
+            s["suno_auto_lyrics_generated"] = False
+            s["suno_lyrics_confirmed"] = False
             _reset_suno_card_cache(s)
             await q.answer()
             target_chat = chat_id
@@ -8820,6 +9219,65 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Нет чата", show_alert=True)
                 return
             await q.answer()
+            flow_choice = s.get("suno_flow") or suno_state_obj.mode
+            if flow_choice == "instrumental":
+                if not suno_state_obj.style or not suno_state_obj.title:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⚠️ Заполните стиль и название перед генерацией.",
+                        reply_to=q.message,
+                    )
+                    return
+            elif flow_choice == "lyrics":
+                if not suno_state_obj.style or not suno_state_obj.title:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⚠️ Добавьте стиль и название трека.",
+                        reply_to=q.message,
+                    )
+                    return
+                if not suno_state_obj.lyrics:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⚠️ Текст песни ещё не готов. Пришлите строки или попросите автогенерацию.",
+                        reply_to=q.message,
+                    )
+                    return
+                if s.get("suno_auto_lyrics_generated") and not s.get("suno_lyrics_confirmed"):
+                    keyboard = InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("✅ Подтвердить", callback_data="suno:confirm:auto_lyrics")],
+                            [InlineKeyboardButton("📝 Изменить текст", callback_data="suno:edit:lyrics")],
+                        ]
+                    )
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⚠️ Проверьте сгенерированный текст и подтвердите запуск.",
+                        reply_to=q.message,
+                        reply_markup=keyboard,
+                    )
+                    return
+            elif flow_choice == "cover":
+                if not suno_state_obj.cover_source_url:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⚠️ Прикрепите исходное аудио или ссылку для кавера.",
+                        reply_to=q.message,
+                    )
+                    return
+                if not suno_state_obj.style or not suno_state_obj.title:
+                    await _suno_notify(
+                        ctx,
+                        chat_id,
+                        "⚠️ Укажите стиль и название для кавер-трека.",
+                        reply_to=q.message,
+                    )
+                    return
             params = _suno_collect_params(s, suno_state_obj)
             lock_acquired = False
             if uid is not None:
@@ -9085,6 +9543,32 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Название и стиль очищены.")
         return
 
+    if (
+        state_mode == "suno"
+        and s.get("suno_flow") == "cover"
+        and s.get("suno_step") == "source"
+    ):
+        if text.lower().startswith(("http://", "https://")):
+            url = text.strip()
+            _music_store_cover_source(ctx, s, url=url, label=url)
+            _reset_suno_card_cache(s)
+            await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+            await msg.reply_text("🎧 Ссылка принята.")
+            next_step = _music_next_step(s)
+            await _music_prompt_step(
+                chat_id,
+                ctx,
+                s,
+                flow="cover",
+                step=next_step,
+                user_id=user_id,
+            )
+        else:
+            await msg.reply_text(
+                "⚠️ Пришлите ссылку на аудио (YouTube или SoundCloud) или загрузите файл."
+            )
+        return
+
     if user_mode == MODE_PM:
         await prompt_master_process(update, ctx)
         return
@@ -9309,6 +9793,40 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id if user else None
     start_time = time.time()
+
+    s = state(ctx)
+    if (
+        s.get("mode") == "suno"
+        and s.get("suno_flow") == "cover"
+        and s.get("suno_step") == "source"
+    ):
+        try:
+            file = await ctx.bot.get_file(voice_or_audio.file_id)
+            file_path = getattr(file, "file_path", None)
+            if not file_path:
+                raise RuntimeError("telegram file path missing")
+            url = tg_direct_file_url(TELEGRAM_TOKEN, file_path)
+            filename = getattr(voice_or_audio, "file_name", None)
+            label = filename or "Загруженное аудио"
+            _music_store_cover_source(ctx, s, url=url, label=label)
+            _reset_suno_card_cache(s)
+            await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+            await message.reply_text("🎧 Аудио принято для кавера.")
+            next_step = _music_next_step(s)
+            await _music_prompt_step(
+                chat_id,
+                ctx,
+                s,
+                flow="cover",
+                step=next_step,
+                user_id=user_id,
+            )
+        except Exception as exc:
+            log.warning("cover.audio_store_failed | chat=%s err=%s", chat_id, exc)
+            await message.reply_text(
+                "⚠️ Не удалось сохранить файл. Пришлите ссылку на аудио или попробуйте ещё раз."
+            )
+        return
 
     file_size = getattr(voice_or_audio, "file_size", None) or 0
     duration = getattr(voice_or_audio, "duration", None) or 0
