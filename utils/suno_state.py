@@ -268,6 +268,32 @@ def clear_cover_source(state: SunoState) -> SunoState:
     return state
 
 
+def reset_suno_card_state(
+    state: SunoState,
+    mode: Literal["instrumental", "lyrics", "cover"],
+    *,
+    card_message_id: Optional[int] = None,
+    card_chat_id: Optional[int] = None,
+) -> SunoState:
+    state.mode = mode
+    state.title = None
+    state.style = None
+    state.lyrics = None
+    state.preset = None
+    state.cover_source_url = None
+    state.cover_source_label = None
+    state.source_file_id = None
+    state.source_url = None
+    state.kie_file_id = None
+    state.card_message_id = card_message_id
+    state.card_text_hash = None
+    state.card_markup_hash = None
+    state.card_chat_id = card_chat_id
+    state.last_card_hash = None
+    state.start_msg_id = None
+    return state
+
+
 def set_lyrics(state: SunoState, value: Optional[str]) -> SunoState:
     state.lyrics = _clean_lyrics(value)
     return state
@@ -422,4 +448,5 @@ __all__ = [
     "set_title",
     "style_preview",
     "clear_cover_source",
+    "reset_suno_card_state",
 ]
