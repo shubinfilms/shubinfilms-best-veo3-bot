@@ -17,13 +17,19 @@ from redis_utils import get_balance
 
 import html
 
-from suno.client import AMBIENT_NATURE_PRESET_ID, get_preset_config
 from utils.suno_state import (
     SunoState,
     lyrics_preview as suno_lyrics_preview,
     load as load_suno_state,
     save as save_suno_state,
     style_preview as suno_style_preview,
+)
+from utils.suno_modes import (
+    FIELD_ICONS as SUNO_FIELD_ICONS,
+    FIELD_LABELS as SUNO_FIELD_LABELS,
+    FIELD_PROMPTS as SUNO_FIELD_PROMPTS,
+    default_style_text as suno_default_style_text,
+    get_mode_config as get_suno_mode_config,
 )
 from telegram_utils import safe_edit, SafeEditResult
 from utils.telegram_safe import safe_edit_message
@@ -173,32 +179,24 @@ def _suno_keyboard(
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
-    if flow == "instrumental":
-        rows.append([InlineKeyboardButton("🎨 Изменить стиль", callback_data="suno:edit:style")])
-        rows.append([InlineKeyboardButton("✏️ Изменить название", callback_data="suno:edit:title")])
-    elif flow == "lyrics":
-        rows.append([InlineKeyboardButton("📝 Правка текста", callback_data="suno:edit:lyrics")])
-        rows.append([InlineKeyboardButton("🎨 Правка стиля", callback_data="suno:edit:style")])
-        rows.append([InlineKeyboardButton("✏️ Правка названия", callback_data="suno:edit:title")])
-    elif flow == "cover":
-        rows.append([InlineKeyboardButton("🎧 Сменить источник", callback_data="suno:edit:cover")])
-        rows.append([InlineKeyboardButton("🎨 Правка стиля", callback_data="suno:edit:style")])
-        rows.append([InlineKeyboardButton("✏️ Правка названия", callback_data="suno:edit:title")])
-    else:
-        rows.append([InlineKeyboardButton("🎵 Выбрать режим", callback_data="suno:menu")])
+    mode = flow or suno_state.mode
+    if mode == "instrumental":
+        rows.append([InlineKeyboardButton("✏️ Title", callback_data="suno:edit:title")])
+        rows.append([InlineKeyboardButton("🎛️ Style", callback_data="suno:edit:style")])
+    elif mode == "lyrics":
+        rows.append([InlineKeyboardButton("✏️ Title", callback_data="suno:edit:title")])
+        rows.append([InlineKeyboardButton("🎛️ Style", callback_data="suno:edit:style")])
+        rows.append([InlineKeyboardButton("📝 Lyrics", callback_data="suno:edit:lyrics")])
+    elif mode == "cover":
+        rows.append([InlineKeyboardButton("✏️ Title", callback_data="suno:edit:title")])
+        rows.append([InlineKeyboardButton("🎧 Reference", callback_data="suno:edit:cover")])
+        rows.append([InlineKeyboardButton("🎛️ Style", callback_data="suno:edit:style")])
 
-    preset_active = suno_state.preset == AMBIENT_NATURE_PRESET_ID
-    preset_label = "🌊 Ambient Preset" + (" ✅" if preset_active else "")
-    rows.append([InlineKeyboardButton(preset_label, callback_data="suno:preset:ambient")])
-
-    if generating:
-        generate_caption = "⏳ Генерация…"
-    elif ready:
-        generate_caption = f"✅ Сгенерировать — {price}💎"
-    else:
-        generate_caption = "⚠️ Заполните шаги"
-    rows.append([InlineKeyboardButton(generate_caption, callback_data="suno:start")])
-    rows.append([InlineKeyboardButton("⬅️ В меню музыки", callback_data="suno:menu")])
+    start_label = "⏳ Generating…" if generating else "▶️ Start generation"
+    bottom_row = [InlineKeyboardButton(start_label, callback_data="suno:start")]
+    bottom_row.append(InlineKeyboardButton("🔙 Back", callback_data="suno:menu"))
+    bottom_row.append(InlineKeyboardButton("❌ Cancel", callback_data="suno:cancel"))
+    rows.append(bottom_row)
     return InlineKeyboardMarkup(rows)
 
 
@@ -210,63 +208,102 @@ def render_suno_card(
     generating: bool = False,
     waiting_enqueue: bool = False,
 ) -> Tuple[str, InlineKeyboardMarkup]:
-    safe_title = html.escape(suno_state.title) if suno_state.title else "—"
-    style_display = suno_style_preview(suno_state.style, limit=200)
-    safe_style = html.escape(style_display) if style_display else "—"
     mode = suno_state.mode
-    flow_label_map = {
-        "instrumental": "🎹 Instrumental Music",
-        "lyrics": "🎤 Music with Lyrics",
-        "cover": "🎶 Cover Music",
-    }
-    flow_label = flow_label_map.get(mode, "🎵 Music")
-    lyrics_source = suno_state.lyrics if suno_state.has_lyrics else None
-    lyrics_preview = suno_lyrics_preview(lyrics_source)
-    safe_lyrics = html.escape(lyrics_preview) if lyrics_preview else "—"
-    cover_display_raw = suno_state.cover_source_label or suno_state.cover_source_url or "—"
-    safe_cover = html.escape(cover_display_raw) if cover_display_raw else "—"
+    config = get_suno_mode_config(mode)
 
-    preset_line: Optional[str] = None
-    if suno_state.preset:
-        cfg = get_preset_config(suno_state.preset)
-        if cfg:
-            label = str(cfg.get("label") or "Preset").strip()
+    def _field_value(field: str) -> str:
+        if field == "title":
+            return html.escape(suno_state.title) if suno_state.title else "—"
+        if field == "style":
+            preview = suno_style_preview(suno_state.style, limit=160)
+            return html.escape(preview) if preview else "—"
+        if field == "lyrics":
+            if not suno_state.lyrics:
+                return "—"
+            lines_count = len([line for line in suno_state.lyrics.split("\n") if line.strip()])
+            chars = len(suno_state.lyrics)
+            return f"{lines_count} lines, {chars} chars"
+        if field == "reference":
+            label = suno_state.cover_source_label
             if label:
-                safe_label = html.escape(label)
-                preset_line = f"• Пресет: <i>{safe_label}</i>"
+                return html.escape(label)
+            if suno_state.cover_source_url:
+                return html.escape(suno_state.cover_source_url)
+            return "—"
+        return "—"
 
-    lines = ["🎶 Track Preview", flow_label]
+    legacy_labels = {
+        "title": "🏷️ Название",
+        "style": "🎹 Стиль",
+        "lyrics": "📜 Текст",
+        "reference": "🎧 Источник",
+    }
+
+    def _legacy_value(field: str) -> str:
+        if field == "title":
+            return html.escape(suno_state.title) if suno_state.title else "—"
+        if field == "style":
+            preview = suno_style_preview(suno_state.style, limit=200)
+            return html.escape(preview) if preview else "—"
+        if field == "lyrics":
+            preview = suno_lyrics_preview(suno_state.lyrics)
+            return html.escape(preview) if preview else "—"
+        if field == "reference":
+            label = suno_state.cover_source_label or suno_state.cover_source_url
+            return html.escape(label) if label else "—"
+        return "—"
+
+    def _field_block(field: str) -> list[str]:
+        icon = SUNO_FIELD_ICONS.get(field, "•")
+        label = SUNO_FIELD_LABELS.get(field, field.title())
+        prompt = SUNO_FIELD_PROMPTS.get(field, "Provide a value.")
+        value = _field_value(field)
+        lines = [f"{icon} <b>{html.escape(label)}</b>", prompt, f"Current: <i>{value}</i>"]
+        legacy_label = legacy_labels.get(field)
+        if legacy_label:
+            legacy_value = _legacy_value(field)
+            lines.append(f"{legacy_label}: <i>{legacy_value}</i>")
+        return lines
+
+    lines: list[str] = [f"{config.emoji} <b>{config.title}</b>"]
+    lines.append(f"Model: {html.escape(_SUNO_MODEL_LABEL)}")
     if balance is not None:
-        lines.append(f"Баланс: {int(balance)}")
-    lines.append(f"Модель: {html.escape(_SUNO_MODEL_LABEL)}")
+        lines.append(f"Balance: {int(balance)}💎")
     lines.append("")
-    lines.append(f"🎹 Стиль: <i>{safe_style}</i>")
-    if mode == "lyrics":
-        lines.append(f"📜 Текст: <i>{safe_lyrics}</i>")
-    if mode == "cover":
-        lines.append(f"🎧 Источник: <i>{safe_cover}</i>")
-    lines.append(f"🏷️ Название: <i>{safe_title}</i>")
-    if preset_line:
-        lines.append(preset_line)
+
+    if mode == "instrumental":
+        fields = ["title", "style"]
+    elif mode == "lyrics":
+        fields = ["title", "style", "lyrics"]
+    else:
+        fields = ["title", "reference", "style"]
+
+    for idx, field in enumerate(fields):
+        lines.extend(_field_block(field))
+        if idx < len(fields) - 1:
+            lines.append("")
+
     lines.append("")
-    lines.append(f"💎 Цена: {price} 💎 за попытку")
+    lines.append(f"💎 Price: {price}💎")
     if waiting_enqueue:
-        lines.append("⏳ Отправляем запрос в Suno…")
+        lines.append("⏳ Sending request to Suno…")
     elif generating:
-        lines.append("⏳ Генерация запущена — ожидайте результат.")
+        lines.append("⏳ Generation started. Waiting for audio…")
 
     text = "\n".join(lines)
+
     ready = True
     if mode == "instrumental":
         ready = bool(suno_state.style and suno_state.title)
     elif mode == "lyrics":
         ready = bool(suno_state.style and suno_state.title and suno_state.lyrics)
     elif mode == "cover":
-        ready = bool(suno_state.cover_source_url and suno_state.style and suno_state.title)
+        ready = bool(suno_state.cover_source_url and suno_state.title)
+
     keyboard = _suno_keyboard(
         suno_state,
         price=price,
-        generating=generating,
+        generating=generating or waiting_enqueue,
         flow=mode,
         ready=ready,
     )

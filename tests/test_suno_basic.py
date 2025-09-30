@@ -1291,9 +1291,10 @@ def test_policy_error_message_text(bot_module):
     message = bot_module._suno_error_message(
         400, "The description contains artist name: The Weeknd"
     )
-    assert message == (
-        "❌ Ошибка: описание содержит запрещённые слова (например, имя артиста).\n"
-        "Пожалуйста, измените описание и попробуйте снова."
+    assert (
+        message
+        == "❗Your description contains a protected name (artist or work). "
+        "Please remove artist names or references to real titles and try again."
     )
 
 
