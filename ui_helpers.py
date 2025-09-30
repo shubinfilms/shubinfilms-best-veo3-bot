@@ -17,6 +17,7 @@ from redis_utils import get_balance
 
 import html
 
+from suno.client import AMBIENT_NATURE_PRESET_ID, get_preset_config
 from utils.suno_state import (
     SunoState,
     lyrics_preview as suno_lyrics_preview,
@@ -170,6 +171,10 @@ def _suno_keyboard(
     rows.append([InlineKeyboardButton("✏️ Название", callback_data="suno:edit:title")])
     rows.append([InlineKeyboardButton("🎨 Стиль", callback_data="suno:edit:style")])
 
+    preset_active = suno_state.preset == AMBIENT_NATURE_PRESET_ID
+    preset_label = "🌊 Ambient Preset" + (" ✅" if preset_active else "")
+    rows.append([InlineKeyboardButton(preset_label, callback_data="suno:preset:ambient")])
+
     mode_label = "Со словами" if suno_state.has_lyrics else "Инструментал"
     rows.append([
         InlineKeyboardButton(
@@ -207,6 +212,15 @@ def render_suno_card(
     lyrics_preview = suno_lyrics_preview(lyrics_source)
     safe_lyrics = html.escape(lyrics_preview) if lyrics_preview else "—"
 
+    preset_line: Optional[str] = None
+    if suno_state.preset:
+        cfg = get_preset_config(suno_state.preset)
+        if cfg:
+            label = str(cfg.get("label") or "Preset").strip()
+            if label:
+                safe_label = html.escape(label)
+                preset_line = f"• Пресет: <i>{safe_label}</i>"
+
     lines = ["🎵 Генерация музыки"]
     if balance is not None:
         lines.append(f"Баланс: {int(balance)}")
@@ -215,6 +229,8 @@ def render_suno_card(
     lines.append(f"• Название: <i>{safe_title}</i>")
     lines.append(f"• Стиль: <i>{safe_style}</i>")
     lines.append(f"• Текст: <i>{safe_lyrics}</i>")
+    if preset_line:
+        lines.append(preset_line)
     lines.append("")
     lines.append(f"💎 Цена: {price} 💎 за попытку")
     if waiting_enqueue:

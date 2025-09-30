@@ -46,6 +46,50 @@ log = logging.getLogger("suno.client")
 
 _API_V5 = "v5"
 
+AMBIENT_NATURE_PRESET_ID = "ambient_nature"
+AMBIENT_NATURE_PRESET: Mapping[str, Any] = {
+    "id": AMBIENT_NATURE_PRESET_ID,
+    "label": "Ambient Preset",
+    "emoji": "\U0001F30A",  # 🌊
+    "title_suggestions": ["Oceanic Dreams", "Sky Birds", "Wavescape"],
+    "tags": [
+        "ambient",
+        "cinematic",
+        "soundscape",
+        "ethereal textures",
+        "ocean waves",
+        "wind noise",
+        "forest birds",
+        "deep drones",
+        "experimental instruments",
+        "soothing pads",
+    ],
+    "negative_tags": [
+        "distorted vocals",
+        "screaming",
+        "harsh noise",
+        "rock guitars",
+        "low quality",
+    ],
+    "instrumental": True,
+    "cover_keywords": "surreal ocean horizon, glowing moon, misty atmosphere, soft gradients, abstract art",
+    "caption_primary": "experimental ambient",
+    "caption_secondary": ["ocean waves", "wind", "birds", "deep drones"],
+}
+
+_PRESET_REGISTRY: dict[str, Mapping[str, Any]] = {
+    AMBIENT_NATURE_PRESET_ID: AMBIENT_NATURE_PRESET,
+}
+
+
+def get_preset_config(preset: Optional[str]) -> Optional[Mapping[str, Any]]:
+    if not preset:
+        return None
+    key = str(preset).strip().lower()
+    if not key:
+        return None
+    return _PRESET_REGISTRY.get(key)
+
 
 class SunoAPIError(RuntimeError):
     """Raised when the Suno API responds with an error."""
@@ -557,15 +601,22 @@ class SunoClient:
         if tags is None:
             return normalized
         seen: set[str] = set()
+        preserve_phrases = isinstance(tags, Sequence) and not isinstance(tags, (str, bytes, bytearray))
         for value in tags:
             if value is None:
                 continue
             if isinstance(value, str):
-                parts = re.split(r"[\s,;/\\|]+", value)
+                raw = value.strip()
+                if not raw:
+                    continue
+                if preserve_phrases:
+                    parts = [raw]
+                else:
+                    parts = re.split(r"[\s,;/\\|]+", raw)
             else:
                 parts = [str(value)]
             for part in parts:
-                text = part.strip().strip("#")
+                text = str(part).strip().strip("#")
                 if not text:
                     continue
                 lowered = text.lower()
@@ -607,6 +658,8 @@ class SunoClient:
         call_back_url: Optional[str] = None,
         call_back_secret: Optional[str] = None,
         tags: Optional[Iterable[Any]] = None,
+        negative_tags: Optional[Iterable[Any]] = None,
+        preset: Optional[str] = None,
     ) -> dict[str, Any]:
         if not self.token:
             raise SunoClientError("SUNO_API_TOKEN is not configured", status=401)
@@ -625,6 +678,25 @@ class SunoClient:
         except (TypeError, ValueError):
             prompt_length = 16
         normalized_tags = self._normalize_tags(tags)
+        normalized_negative_tags = self._normalize_tags(negative_tags)
+        preset_cfg = get_preset_config(preset)
+        if preset_cfg:
+            if not normalized_tags:
+                normalized_tags = self._normalize_tags(preset_cfg.get("tags"))
+            if not normalized_negative_tags:
+                normalized_negative_tags = self._normalize_tags(preset_cfg.get("negative_tags"))
+            if preset_cfg.get("instrumental"):
+                instrumental = True
+                has_lyrics = False
+            if not title_text:
+                suggestions = list(preset_cfg.get("title_suggestions") or [])
+                if suggestions:
+                    title_text = random.choice(suggestions)
+            if not prompt_text:
+                prompt_source = preset_cfg.get("prompt")
+                if not prompt_source:
+                    prompt_source = ", ".join(preset_cfg.get("tags", []))
+                prompt_text = str(prompt_source or title_text or "Ambient track").strip()
         if not normalized_tags:
             normalized_tags = self._derive_tags_from_prompt(prompt_text, instrumental=instrumental)
         model_name = self._normalize_model(model)
@@ -636,7 +708,7 @@ class SunoClient:
             "has_lyrics": bool(has_lyrics),
             "lyrics": str(lyrics or "") if has_lyrics else "",
             "tags": normalized_tags,
-            "negativeTags": [],
+            "negativeTags": normalized_negative_tags,
             "prompt_len": prompt_length,
             "customMode": False,
             "userId": str(user_id),
@@ -703,6 +775,8 @@ class SunoClient:
         call_back_url: Optional[str] = None,
         call_back_secret: Optional[str] = None,
         tags: Optional[Iterable[Any]] = None,
+        negative_tags: Optional[Iterable[Any]] = None,
+        preset: Optional[str] = None,
     ) -> str:
         payload = self.build_payload(
             user_id=user_id,
@@ -716,6 +790,8 @@ class SunoClient:
             call_back_url=call_back_url,
             call_back_secret=call_back_secret,
             tags=tags,
+            negative_tags=negative_tags,
+            preset=preset,
         )
         return self.enqueue(payload, req_id=req_id)
 
@@ -740,6 +816,16 @@ class SunoClient:
             prompt_length = 16
         model_value = payload.get("model") or SUNO_MODEL
         tags_value = payload.get("tags") if isinstance(payload, Mapping) else None
+        negative_tags_value = None
+        if isinstance(payload, Mapping):
+            negative_tags_value = payload.get("negativeTags") or payload.get("negative_tags")
+        preset_value = None
+        if isinstance(payload, Mapping):
+            for key in ("preset", "preset_id", "presetId"):
+                value = payload.get(key)
+                if value:
+                    preset_value = str(value)
+                    break
         if tags_value is None and style:
             tags_value = [style]
         if isinstance(tags_value, str):
@@ -750,6 +836,14 @@ class SunoClient:
             normalized_tags_value = [tags_value]
         else:
             normalized_tags_value = None
+        if isinstance(negative_tags_value, str):
+            normalized_negative_tags: Optional[Iterable[Any]] = [negative_tags_value]
+        elif isinstance(negative_tags_value, Iterable):
+            normalized_negative_tags = negative_tags_value
+        elif negative_tags_value is not None:
+            normalized_negative_tags = [negative_tags_value]
+        else:
+            normalized_negative_tags = None
         built_payload = self.build_payload(
             user_id=user_identifier,
             title=title,
@@ -760,6 +854,8 @@ class SunoClient:
             prompt_len=prompt_length,
             model=str(model_value) if model_value is not None else None,
             tags=normalized_tags_value,
+            negative_tags=normalized_negative_tags,
+            preset=preset_value,
         )
         task_identifier = self.enqueue(built_payload, req_id=req_id)
         return {"taskId": task_identifier}, _API_V5
@@ -973,8 +1069,11 @@ class SunoClient:
 
 
 __all__ = [
+    "AMBIENT_NATURE_PRESET",
+    "AMBIENT_NATURE_PRESET_ID",
     "SunoClient",
     "SunoAPIError",
     "SunoClientError",
     "SunoServerError",
+    "get_preset_config",
 ]

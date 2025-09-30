@@ -16,7 +16,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random
 import threading
 import atexit
 from pathlib import Path
@@ -167,7 +167,12 @@ from settings import (
 )
 from suno.service import SunoService, SunoAPIError
 from suno.schemas import CallbackEnvelope, SunoTask
-from suno.client import SunoServerError
+from suno.client import (
+    AMBIENT_NATURE_PRESET_ID,
+    AMBIENT_NATURE_PRESET,
+    SunoServerError,
+    get_preset_config,
+)
 from chat_service import (
     append_ctx,
     build_messages,
@@ -4747,6 +4752,7 @@ def _suno_collect_params(state_obj: Dict[str, Any], suno_state: SunoState) -> Di
         "lyrics": suno_state.lyrics or "",
         "instrumental": not suno_state.has_lyrics,
         "has_lyrics": suno_state.has_lyrics,
+        "preset": suno_state.preset,
     }
 
 
@@ -5032,6 +5038,7 @@ async def _launch_suno_generation(
     style = (params.get("style") or "").strip()
     lyrics = (params.get("lyrics") or "").strip()
     has_lyrics = bool(params.get("has_lyrics")) if not instrumental else False
+    preset_value_raw = params.get("preset")
     model = SUNO_MODEL or "V5"
     existing_req_id = s.get("suno_current_req_id")
     if isinstance(existing_req_id, str) and existing_req_id.strip():
@@ -5042,6 +5049,10 @@ async def _launch_suno_generation(
     lang_source = style or lyrics or title
     lang = detect_lang(lang_source or title or "")
     suno_payload_state = SunoState(mode="lyrics" if has_lyrics else "instrumental")
+    if isinstance(preset_value_raw, str) and preset_value_raw.strip():
+        suno_payload_state.preset = preset_value_raw.strip().lower()
+    elif preset_value_raw == AMBIENT_NATURE_PRESET_ID:
+        suno_payload_state.preset = AMBIENT_NATURE_PRESET_ID
     set_suno_title(suno_payload_state, title)
     set_suno_style(suno_payload_state, style)
     if has_lyrics:
@@ -5093,6 +5104,8 @@ async def _launch_suno_generation(
             prompt_len=payload.get("prompt_len", 16),
             model=model,
             tags=payload.get("tags"),
+            negative_tags=payload.get("negative_tags"),
+            preset=payload.get("preset"),
         )
     except SunoAPIError as exc:
         log.warning(
@@ -5133,6 +5146,7 @@ async def _launch_suno_generation(
             "title": prepared_payload.get("title"),
             "prompt": prepared_payload.get("prompt"),
             "tags": prepared_payload.get("tags"),
+            "negative_tags": prepared_payload.get("negativeTags"),
         }
     )
 
@@ -5146,6 +5160,7 @@ async def _launch_suno_generation(
         "style": payload.get("style"),
         "trigger": trigger,
         "req_id": req_id,
+        "preset": payload.get("preset"),
     }
 
     log.info(
@@ -5191,6 +5206,7 @@ async def _launch_suno_generation(
         "prompt": payload.get("prompt"),
         "lang": payload.get("lang"),
         "has_lyrics": suno_payload_state.has_lyrics,
+        "preset": suno_payload_state.preset,
     }
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
@@ -5386,6 +5402,8 @@ async def _launch_suno_generation(
                 lang=payload.get("lang"),
                 has_lyrics=payload.get("has_lyrics", False),
                 prepared_payload=prepared_payload,
+                negative_tags=payload.get("negative_tags"),
+                preset=payload.get("preset"),
             )
 
         def _retry_filter(exc: BaseException) -> bool:
@@ -8744,6 +8762,44 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     card_msg_id=card_msg_id,
                     kind=wait_kind,
                     meta={"field": field},
+            )
+            return
+
+        if action == "preset":
+            if argument != "ambient":
+                await q.answer("Неизвестный пресет", show_alert=True)
+                return
+            cfg = get_preset_config(AMBIENT_NATURE_PRESET_ID) or AMBIENT_NATURE_PRESET
+            suggestions = list(cfg.get("title_suggestions") or [])
+            if suggestions:
+                suggestion = random.choice(suggestions)
+            else:
+                suggestion = "Oceanic Dreams"
+            set_suno_title(suno_state_obj, suggestion)
+            clear_suno_style(suno_state_obj)
+            clear_suno_lyrics(suno_state_obj)
+            suno_state_obj.mode = "instrumental"
+            suno_state_obj.preset = AMBIENT_NATURE_PRESET_ID
+            save_suno_state(ctx, suno_state_obj)
+            s["suno_state"] = suno_state_obj.to_dict()
+            s["suno_waiting_state"] = IDLE_SUNO
+            _reset_suno_card_cache(s)
+            await q.answer()
+            target_chat = chat_id
+            if target_chat is None and q.message is not None:
+                target_chat = q.message.chat_id
+            if target_chat is not None:
+                await refresh_suno_card(ctx, target_chat, s, price=PRICE_SUNO)
+                description = "ocean waves, birds, wind, and experimental instruments"
+                message_text = (
+                    f"✅ Ambient preset selected ({suggestion})\n"
+                    f"🎶 Generating track with {description}..."
+                )
+                await _suno_notify(
+                    ctx,
+                    target_chat,
+                    message_text,
+                    reply_to=q.message,
                 )
             return
 
