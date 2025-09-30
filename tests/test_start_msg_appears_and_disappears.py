@@ -35,6 +35,8 @@ def test_start_msg_appears_and_disappears():
     )
     assert result_initial is None
     assert not bot.sent
+    assert state_dict["suno_can_start"] is False
+    assert state_dict.get("suno_start_button_sent_ts") is None
 
     # Ready state should trigger a new message.
     result_ready = asyncio.run(
@@ -52,6 +54,9 @@ def test_start_msg_appears_and_disappears():
     assert bot.sent[-1]["text"] == SUNO_START_READY_MESSAGE
     assert state_dict["suno_start_msg_id"] == result_ready
     assert suno_state.start_msg_id == result_ready
+    assert state_dict["suno_can_start"] is True
+    button_ts = state_dict.get("suno_start_button_sent_ts")
+    assert isinstance(button_ts, int) and button_ts > 0
 
     # Losing readiness should remove the message.
     result_hidden = asyncio.run(
@@ -69,3 +74,5 @@ def test_start_msg_appears_and_disappears():
     assert bot.deleted[-1]["message_id"] == result_ready
     assert state_dict.get("suno_start_msg_id") is None
     assert suno_state.start_msg_id is None
+    assert state_dict["suno_can_start"] is False
+    assert state_dict.get("suno_start_button_sent_ts") is None

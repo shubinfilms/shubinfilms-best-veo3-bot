@@ -798,6 +798,8 @@ class SunoService:
                 context[key] = extras[key]
         if "enabled" not in context and "strict_enabled" in extras:
             context["enabled"] = extras["strict_enabled"]
+        if "lyrics_source" not in context and extras.get("lyrics_source"):
+            context["lyrics_source"] = extras["lyrics_source"]
         if "original" not in context and "original_lyrics" in extras and extras["original_lyrics"]:
             context["original"] = extras["original_lyrics"]
         if "payload" not in context and "strict_payload" in extras and extras["strict_payload"]:
@@ -920,8 +922,12 @@ class SunoService:
         normalized_generated = self._strict_normalize_text(generated_text)
         similarity = self._strict_similarity(normalized_original, normalized_generated)
         strict_context["similarity"] = similarity
+        source_label = str(strict_context.get("lyrics_source") or "").strip().lower()
+        skip_retry = source_label == "user"
         if similarity >= threshold and generated_text:
             return {"lyrics": generated_text, "similarity": similarity, "attempts": attempts}
+        if skip_retry:
+            return {"lyrics": generated_text or "", "similarity": similarity, "attempts": attempts}
         if attempts < 1 and self._strict_retry_enqueue(
             task=task,
             meta=meta,
@@ -1728,56 +1734,77 @@ class SunoService:
 
         last_reason: Optional[str] = None
         tags_enabled = os.getenv("AUDIO_TAGS_ENABLED", "false").strip().lower() == "true"
-        if tags_enabled:
-            default_artist = os.getenv("AUDIO_DEFAULT_ARTIST", "Best VEO3")
-            embed_cover_enabled = (
-                os.getenv("AUDIO_EMBED_COVER_ENABLED", "false").strip().lower() == "true"
+        embed_cover_enabled = os.getenv("AUDIO_EMBED_COVER_ENABLED", "false").strip().lower() == "true"
+        default_artist = os.getenv("AUDIO_DEFAULT_ARTIST", "Best VEO3")
+        transliterate_env = os.getenv("AUDIO_FILENAME_TRANSLITERATE")
+        if transliterate_env is None:
+            transliterate = True
+        else:
+            transliterate = transliterate_env.strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            max_name = int(os.getenv("AUDIO_FILENAME_MAX", "60"))
+        except (TypeError, ValueError):
+            max_name = 60
+
+        prepared_meta: Dict[str, Optional[str]] = {}
+        prepared_path: Optional[Path] = None
+        try:
+            local_path_str, prepared_meta = prepare_audio_file_sync(
+                audio_url,
+                title=title,
+                cover_url=thumb,
+                default_artist=default_artist,
+                max_name=max_name,
+                tags_enabled=tags_enabled,
+                embed_cover_enabled=embed_cover_enabled,
+                transliterate=transliterate,
             )
-            transliterate = (
-                os.getenv("AUDIO_FILENAME_TRANSLITERATE", "false").strip().lower() == "true"
+        except Exception:
+            log.warning(
+                "suno.audio.postprocess_failed",
+                extra={"meta": {"url": mask_tokens(audio_url), "take": take_id}},
+                exc_info=True,
             )
+        else:
+            prepared_path = Path(local_path_str)
+
+        remote_title = prepared_meta.get("title") or title
+
+        if prepared_path and prepared_path.exists():
             try:
-                max_name = int(os.getenv("AUDIO_FILENAME_MAX", "60"))
-            except (TypeError, ValueError):
-                max_name = 60
-            try:
-                local_path_str, meta = prepare_audio_file_sync(
-                    audio_url,
-                    title=title,
-                    cover_url=thumb,
-                    default_artist=default_artist,
-                    max_name=max_name,
-                    tags_enabled=True,
-                    embed_cover_enabled=embed_cover_enabled,
-                    transliterate=transliterate,
+                audio_extra: Dict[str, Optional[str]] = {}
+                if remote_title:
+                    audio_extra["title"] = remote_title
+                performer = prepared_meta.get("performer")
+                if performer:
+                    audio_extra["performer"] = performer
+                file_name = prepared_meta.get("file_name") or prepared_path.name
+
+                audio_sent = self._send_file(
+                    "sendAudio",
+                    "audio",
+                    chat_id,
+                    prepared_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    extra=audio_extra,
+                    file_name=file_name,
                 )
-            except Exception:
-                log.warning(
-                    "suno.audio.postprocess_failed",
-                    extra={"meta": {"url": mask_tokens(audio_url), "take": take_id}},
-                    exc_info=True,
+                document_sent = self._send_file(
+                    "sendDocument",
+                    "document",
+                    chat_id,
+                    prepared_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    extra=None,
+                    file_name=file_name,
                 )
-            else:
-                local_path = Path(local_path_str)
-                try:
-                    success = self._send_file(
-                        "sendAudio",
-                        "audio",
-                        chat_id,
-                        local_path,
-                        caption=caption,
-                        reply_to=reply_to,
-                        extra={
-                            "title": meta.get("title"),
-                            "performer": meta.get("performer"),
-                        },
-                        file_name=meta.get("file_name"),
-                    )
-                finally:
-                    schedule_unlink(local_path)
-                if success:
+                if audio_sent or document_sent:
                     return True, None
                 last_reason = "upload_failed"
+            finally:
+                schedule_unlink(prepared_path)
 
         attempt = 1
         success, reason, status = send_audio_request(
@@ -1787,7 +1814,7 @@ class SunoService:
             audio=audio_url,
             caption=caption,
             reply_to=reply_to,
-            title=title,
+            title=remote_title,
             thumb=thumb,
         )
         if success:
@@ -1808,7 +1835,7 @@ class SunoService:
                 audio=audio_url,
                 caption=caption,
                 reply_to=reply_to,
-                title=title,
+                title=remote_title,
                 thumb=thumb,
             )
             if success:
@@ -1825,20 +1852,33 @@ class SunoService:
         local_path = self._download_audio(audio_url, base_dir, take_id)
         if not local_path:
             return False, last_reason
-        extra: Dict[str, Any] = {"title": title}
-        sent = self._send_file(
-            "sendAudio",
-            "audio",
-            chat_id,
-            local_path,
-            caption=caption,
-            reply_to=reply_to,
-            extra=extra,
-        )
-        if sent:
+        extra: Dict[str, Any] = {"title": remote_title} if remote_title else {}
+        file_name = prepared_meta.get("file_name") or local_path.name
+        try:
+            audio_sent = self._send_file(
+                "sendAudio",
+                "audio",
+                chat_id,
+                local_path,
+                caption=caption,
+                reply_to=reply_to,
+                extra=extra,
+                file_name=file_name,
+            )
+            document_sent = self._send_file(
+                "sendDocument",
+                "document",
+                chat_id,
+                local_path,
+                caption=caption,
+                reply_to=reply_to,
+                extra=None,
+                file_name=file_name,
+            )
+        finally:
             schedule_unlink(local_path)
+        if audio_sent or document_sent:
             return True, None
-        schedule_unlink(local_path)
         return False, last_reason
 
     def _download_audio(self, url: str, base_dir: Path, take_id: str) -> Optional[Path]:

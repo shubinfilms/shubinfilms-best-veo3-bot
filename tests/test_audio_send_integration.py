@@ -23,7 +23,7 @@ def test_send_audio_uses_prepared_file(monkeypatch, tmp_path):
             "performer": "Tester",
         }
 
-    calls: dict[str, object] = {}
+    calls: list[dict[str, object]] = []
 
     def fake_send_file(
         method: str,
@@ -36,11 +36,17 @@ def test_send_audio_uses_prepared_file(monkeypatch, tmp_path):
         extra,
         file_name,
     ) -> bool:
-        calls["method"] = method
-        calls["file_name"] = file_name
-        calls["extra"] = extra
-        calls["chat_id"] = chat_id
-        calls["path"] = local_path
+        calls.append(
+            {
+                "method": method,
+                "field": field,
+                "chat_id": chat_id,
+                "path": local_path,
+                "file_name": file_name,
+                "extra": extra,
+                "caption": caption,
+            }
+        )
         return True
 
     def fail_send_audio_request(*args, **kwargs):  # pragma: no cover - defensive
@@ -65,7 +71,12 @@ def test_send_audio_uses_prepared_file(monkeypatch, tmp_path):
 
     assert success is True
     assert reason is None
-    assert calls["method"] == "sendAudio"
-    assert calls["file_name"] == "Prepared.mp3"
-    assert calls["extra"] == {"title": "Song", "performer": "Tester"}
-    assert calls["path"] == prepared_path
+    assert len(calls) == 2
+    first_call, second_call = calls
+    assert first_call["method"] == "sendAudio"
+    assert first_call["file_name"] == "Prepared.mp3"
+    assert first_call["extra"] == {"title": "Song", "performer": "Tester"}
+    assert first_call["path"] == prepared_path
+    assert second_call["method"] == "sendDocument"
+    assert second_call["file_name"] == "Prepared.mp3"
+    assert second_call["extra"] is None

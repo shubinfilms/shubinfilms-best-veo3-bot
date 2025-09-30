@@ -5,6 +5,7 @@ import json
 import hashlib
 import logging
 import os
+import time
 from typing import Any, Optional, Tuple, MutableMapping
 
 from urllib.parse import quote_plus
@@ -298,12 +299,29 @@ async def sync_suno_start_message(
     generating: bool,
     waiting_enqueue: bool,
 ) -> Optional[int]:
+    previous_can_start = bool(state_dict.get("suno_can_start"))
+    if ready and not previous_can_start:
+        state_dict["suno_start_button_sent_ts"] = None
+        state_dict["suno_start_clicked"] = False
+    state_dict["suno_can_start"] = ready
+
     should_show = ready and not generating and not waiting_enqueue
 
     raw_id = state_dict.get("suno_start_msg_id")
     start_msg_id = raw_id if isinstance(raw_id, int) else None
     if start_msg_id is None and isinstance(suno_state.start_msg_id, int):
         start_msg_id = suno_state.start_msg_id
+
+    start_clicked_flag = bool(state_dict.get("suno_start_clicked"))
+    button_sent_ts = state_dict.get("suno_start_button_sent_ts")
+    if should_show:
+        if start_clicked_flag:
+            should_show = False
+        elif isinstance(button_sent_ts, (int, float)) and button_sent_ts > 0:
+            should_show = False
+    else:
+        if not ready and not generating and not waiting_enqueue and not start_clicked_flag:
+            state_dict["suno_start_button_sent_ts"] = None
 
     if not should_show:
         if isinstance(start_msg_id, int):
@@ -319,6 +337,7 @@ async def sync_suno_start_message(
         markup = suno_start_keyboard()
         suno_state.start_clicked = False
         suno_state.start_emoji_msg_id = None
+        state_dict["suno_start_clicked"] = False
         if isinstance(start_msg_id, int):
             try:
                 await safe_edit_message(
@@ -346,9 +365,12 @@ async def sync_suno_start_message(
                     disable_web_page_preview=True,
                 )
                 start_msg_id = msg.message_id
+                state_dict["suno_start_button_sent_ts"] = int(time.time())
             except Exception as exc:  # pragma: no cover - network issues
                 logger.error("send suno start failed: %s", exc)
                 start_msg_id = None
+        else:
+            state_dict["suno_start_button_sent_ts"] = int(time.time())
 
     if isinstance(start_msg_id, int):
         state_dict["suno_start_msg_id"] = start_msg_id
@@ -362,6 +384,8 @@ async def sync_suno_start_message(
             msg_ids.pop("suno_start", None)
 
     suno_state.start_msg_id = start_msg_id
+    if state_dict.get("suno_start_clicked") is not None:
+        suno_state.start_clicked = bool(state_dict.get("suno_start_clicked"))
     state_dict["suno_state"] = suno_state.to_dict()
     return start_msg_id
 
