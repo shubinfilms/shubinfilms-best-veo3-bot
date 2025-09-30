@@ -64,6 +64,10 @@ DATABASE_URL=postgresql://user:password@host:5432/database
 pytest -q
 ```
 
+> **Note:** Python 3.13 удалил модуль `imghdr` (PEP 594). Проект использует
+> Pillow для определения типа обложек и совместим как с Python 3.12, так и с
+> 3.13+.
+
 Проверка callback вручную:
 
 ```bash

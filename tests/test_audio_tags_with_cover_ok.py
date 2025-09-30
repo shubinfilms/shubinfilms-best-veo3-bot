@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import importlib
 from pathlib import Path
 import sys
@@ -9,11 +10,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 audio_post = importlib.import_module("utils.audio_post")
 
 MP3_BYTES = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 16
-PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n"
-    b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
-    b"\x00\x00\x00\x0bIDATx\x9cc`\x00\x00\x00\x02\x00\x01\xe2!\xbc3"
-    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 )
 
 
