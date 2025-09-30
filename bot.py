@@ -2645,6 +2645,7 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
 WAIT_SUNO_TITLE = "WAIT_SUNO_TITLE"
 WAIT_SUNO_STYLE = "WAIT_SUNO_STYLE"
 WAIT_SUNO_LYRICS = "WAIT_SUNO_LYRICS"
+WAIT_SUNO_REFERENCE = "WAIT_SUNO_REFERENCE"
 IDLE_SUNO = "IDLE_SUNO"
 
 
@@ -2791,12 +2792,14 @@ _SUNO_WAIT_TO_FIELD = {
     WAIT_SUNO_TITLE: "title",
     WAIT_SUNO_STYLE: "style",
     WAIT_SUNO_LYRICS: "lyrics",
+    WAIT_SUNO_REFERENCE: "cover",
 }
 
 _SUNO_PROMPTS = {
     "title": "Enter a short track title. Send /cancel to stop.",
     "style": "Describe style/tags (e.g., ‘ambient, soft drums’). Send /cancel to stop.",
     "lyrics": "Paste lyrics (multi-line). Send /cancel to stop.",
+    "cover": f"Пришлите аудиофайл (mp3/wav, до {COVER_MAX_AUDIO_MB} МБ) или ссылку на аудио (http/https).",
 }
 
 _SUNO_SUCCESS_MESSAGES = {
@@ -2824,6 +2827,8 @@ def _suno_prompt_text(field: str, suno_state_obj: SunoState) -> str:
         current_value = suno_state_obj.title
     elif field == "style":
         current_value = suno_state_obj.style
+    elif field == "cover":
+        current_value = suno_state_obj.cover_source_label or suno_state_obj.cover_source_url
     else:
         current_value = suno_state_obj.lyrics
     preview = _suno_inline_preview(current_value, limit=50)
@@ -3050,6 +3055,27 @@ async def _handle_suno_waiting_input(
         return False
 
     raw_text = message.text
+    if field == "cover":
+        if raw_text is None:
+            await _send_with_retry(lambda: message.reply_text(_COVER_INVALID_INPUT_MESSAGE))
+            return True
+        stripped_cover = raw_text.strip()
+        if stripped_cover.lower() == "/cancel":
+            state_dict["suno_waiting_state"] = IDLE_SUNO
+            await _send_with_retry(lambda: message.reply_text("✏️ Изменение отменено."))
+            return True
+        if not stripped_cover:
+            await _send_with_retry(lambda: message.reply_text(_COVER_INVALID_INPUT_MESSAGE))
+            return True
+        return await _cover_process_url_input(
+            ctx,
+            chat_id,
+            message,
+            state_dict,
+            stripped_cover,
+            user_id=user_id,
+        )
+
     if raw_text is None:
         await _send_with_retry(lambda: message.reply_text("⚠️ Отправьте текстовое сообщение."))
         return True
@@ -3169,7 +3195,7 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
             suno_state_obj = SunoState()
         state_dict["suno_state"] = suno_state_obj.to_dict()
     waiting = state_dict.get("suno_waiting_state")
-    if waiting not in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS}:
+    if waiting not in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS, WAIT_SUNO_REFERENCE}:
         state_dict["suno_waiting_state"] = IDLE_SUNO
     card_meta = state_dict.get("suno_card")
     if not isinstance(card_meta, dict):
@@ -3196,7 +3222,7 @@ def _chat_state_waiting_input(state_dict: Dict[str, Any]) -> bool:
     if mode and str(mode) not in {"", "chat", "none", "null"}:
         return True
     waiting = state_dict.get("suno_waiting_state")
-    if waiting in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS}:
+    if waiting in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS, WAIT_SUNO_REFERENCE}:
         return True
     if state_dict.get("banana_active_op_key"):
         return True
@@ -4899,13 +4925,19 @@ def _suno_summary_text(state: SunoState) -> str:
     lines.append(f"🏷️ Title: {title_display}")
 
     if state.style:
-        if callable(suno_style_preview):
+        try:
+            preview_func = suno_style_preview  # type: ignore[name-defined]
+        except NameError:
+            preview_func = None
+        style_display: Optional[str] = None
+        if callable(preview_func):
             try:
-                style_display = suno_style_preview(state.style, limit=160) or "—"
+                style_display = preview_func(state.style, limit=160) or "—"
             except Exception:
-                style_display = _suno_make_preview(state.style, limit=160) or "—"
-        else:
-            style_display = _suno_make_preview(state.style, limit=160) or "—"
+                style_display = None
+        if not style_display:
+            raw_style = state.style or "—"
+            style_display = _suno_make_preview(raw_style, limit=160) or raw_style[:160]
     else:
         style_display = "—"
     lines.append(f"🎛️ Tags: {style_display}")
@@ -5051,6 +5083,10 @@ async def _music_prompt_step(
         chat_id=chat_id,
         text=text,
     )
+
+    if flow == "cover" and step == "source":
+        state_dict["suno_waiting_state"] = WAIT_SUNO_REFERENCE
+        return
 
     wait_kind = _music_wait_kind(step)
     if wait_kind is not None:
@@ -10048,10 +10084,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Название и стиль очищены.")
         return
 
+    waiting_cover = s.get("suno_waiting_state") == WAIT_SUNO_REFERENCE
     if (
         state_mode == "suno"
         and s.get("suno_flow") == "cover"
-        and s.get("suno_step") == "source"
+        and (waiting_cover or s.get("suno_step") == "source")
     ):
         if not text:
             await msg.reply_text(_COVER_INVALID_INPUT_MESSAGE)
@@ -10292,10 +10329,11 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
 
     s = state(ctx)
+    waiting_cover = s.get("suno_waiting_state") == WAIT_SUNO_REFERENCE
     if (
         s.get("mode") == "suno"
         and s.get("suno_flow") == "cover"
-        and s.get("suno_step") == "source"
+        and (waiting_cover or s.get("suno_step") == "source")
     ):
         await _cover_process_audio_input(
             ctx,
