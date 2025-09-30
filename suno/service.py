@@ -12,13 +12,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Literal, Mapping, MutableMapping, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import requests
 from requests.adapters import HTTPAdapter
 
 from metrics import bot_telegram_send_fail_total, suno_requests_total, suno_task_store_total
-from suno.client import SunoClient, SunoAPIError
+from suno.client import (
+    AMBIENT_NATURE_PRESET_ID,
+    SunoClient,
+    SunoAPIError,
+    get_preset_config,
+)
 from suno.schemas import ApiEnvelope, CallbackEnvelope, SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
 from settings import (
@@ -1326,7 +1331,7 @@ class SunoService:
         return "Untitled"
 
     @staticmethod
-    def _collect_tags(tags_value: Any) -> list[str]:
+    def _collect_tags(tags_value: Any, *, limit: int = 3) -> list[str]:
         if tags_value in (None, ""):
             return []
         tokens: list[str] = []
@@ -1338,7 +1343,9 @@ class SunoService:
             cleaned = raw.strip().lower()
             if cleaned and cleaned not in tokens:
                 tokens.append(cleaned)
-        return tokens[:3]
+        if limit <= 0:
+            return tokens
+        return tokens[:limit]
 
     def _build_take_caption(
         self,
@@ -1347,6 +1354,8 @@ class SunoService:
         take_index: int,
         duration: Optional[float],
         tags: list[str],
+        preset: Optional[str] = None,
+        total_takes: int = 1,
     ) -> str:
         duration_seconds: Optional[int] = None
         if duration is not None:
@@ -1354,6 +1363,40 @@ class SunoService:
                 duration_seconds = int(round(float(duration)))
             except (TypeError, ValueError):
                 duration_seconds = None
+        normalized_preset = (preset or "").strip().lower()
+        if normalized_preset == AMBIENT_NATURE_PRESET_ID:
+            cfg = get_preset_config(AMBIENT_NATURE_PRESET_ID) or {}
+            emoji = str(cfg.get("emoji") or "🌊").strip() or "🌊"
+            label = str(cfg.get("label") or "Ambient Preset").strip() or "Ambient Preset"
+            if total_takes > 1:
+                first_line = f"{emoji} {title} ({label} • Take {take_index})"
+            else:
+                first_line = f"{emoji} {title} ({label})"
+            primary = str(cfg.get("caption_primary") or "cinematic ambient").strip()
+            secondary_values = cfg.get("caption_secondary") or []
+            if isinstance(secondary_values, (list, tuple)):
+                secondary = ", ".join(
+                    str(item).strip() for item in secondary_values if str(item).strip()
+                )
+            else:
+                secondary = ""
+            if not secondary:
+                secondary = ", ".join(tags[1:5]) if len(tags) > 1 else ", ".join(tags[:4])
+            if not primary and tags:
+                primary = tags[0]
+            parts: list[str] = []
+            if duration_seconds and duration_seconds > 0:
+                parts.append(f"{duration_seconds}s")
+            if primary:
+                parts.append(primary)
+            if secondary:
+                parts.append(secondary)
+            second_line = " • ".join(part for part in parts if part)
+            caption = first_line if not second_line else f"{first_line}\n{second_line}"
+            if len(caption) <= 1024:
+                return caption
+            return caption[:1021] + "…"
+
         first_line = f"{title} (Take {take_index})"
         if duration_seconds and duration_seconds > 0:
             first_line = f"{first_line} • {duration_seconds}s"
@@ -1372,6 +1415,17 @@ class SunoService:
                 return f"{first_line}\n{truncated_tags}"
             return first_line[:1021] + "…"
         return caption[:1021] + "…"
+
+    @staticmethod
+    def _preset_cover_url(preset: Optional[str]) -> Optional[str]:
+        preset_id = (preset or "").strip().lower()
+        if preset_id != AMBIENT_NATURE_PRESET_ID:
+            return None
+        cfg = get_preset_config(AMBIENT_NATURE_PRESET_ID) or {}
+        keywords = str(cfg.get("cover_keywords") or "").strip()
+        if not keywords:
+            return None
+        return f"https://image.pollinations.ai/prompt/{quote_plus(keywords)}"
 
     def _send_cover_url(
         self,
@@ -1526,6 +1580,8 @@ class SunoService:
         lang: Optional[str] = None,
         has_lyrics: bool = False,
         prepared_payload: Optional[Mapping[str, Any]] = None,
+        negative_tags: Optional[Iterable[str]] = None,
+        preset: Optional[str] = None,
     ) -> SunoTask:
         prompt_text = str(
             (prompt if prompt is not None else "")
@@ -1558,6 +1614,8 @@ class SunoService:
                 prompt_len=prompt_len,
                 model=model_name,
                 tags=derived_tags,
+                negative_tags=negative_tags,
+                preset=preset,
             )
         resolved_title = str(final_payload.get("title") or title or prompt_text)
         prompt_text = str(final_payload.get("prompt") or prompt_text)
@@ -1635,6 +1693,7 @@ class SunoService:
             "req_id": req_id,
             "lang": str(lang).strip().lower() if lang else None,
             "has_lyrics": bool(has_lyrics),
+            "preset": (str(preset).strip().lower() if preset else None),
         }
         self._save_task_record(task.task_id, record)
         log.info(
@@ -1772,6 +1831,7 @@ class SunoService:
             log.warning("TELEGRAM_TOKEN missing; skip delivery for task %s", task.task_id)
             return
         existing_record = self._load_task_record(task.task_id) or {}
+        preset_id = str(existing_record.get("preset") or "").strip().lower()
         incoming_status = (task.callback_type or "").lower()
         existing_status = str(existing_record.get("status") or "").lower()
         final_states = {"complete", "error", "failed", "success"}
@@ -1848,6 +1908,7 @@ class SunoService:
                 via=delivery_via,
             )
 
+            total_takes = len(task.items)
             for idx, track in enumerate(task.items, start=1):
                 take_id = track.id or str(idx)
                 meta_title_value = str(meta.title).strip() if meta and meta.title else None
@@ -1856,15 +1917,28 @@ class SunoService:
                     meta_title=meta_title_value,
                     user_title=meta_user_title,
                 )
-                tags_list = self._collect_tags(track.tags)
+                tag_limit = 5 if preset_id == AMBIENT_NATURE_PRESET_ID else 3
+                tags_list = self._collect_tags(track.tags, limit=tag_limit)
+                if preset_id == AMBIENT_NATURE_PRESET_ID and not tags_list:
+                    cfg = get_preset_config(AMBIENT_NATURE_PRESET_ID) or {}
+                    fallback_tags: list[str] = []
+                    for tag in cfg.get("tags", []):
+                        text = str(tag).strip().lower()
+                        if text and text not in fallback_tags:
+                            fallback_tags.append(text)
+                    tags_list = fallback_tags[:tag_limit]
                 caption = self._build_take_caption(
                     title=normalized_title,
                     take_index=idx,
                     duration=track.duration,
                     tags=tags_list,
+                    preset=preset_id,
+                    total_takes=total_takes,
                 )
                 take_title = f"{normalized_title} (Take {idx})" if len(task.items) > 1 else normalized_title
                 cover_url = track.source_image_url or track.image_url
+                if not cover_url:
+                    cover_url = self._preset_cover_url(preset_id)
                 audio_url = track.source_audio_url or track.audio_url
 
                 if not self._delivery_register(task.task_id, take_id):

@@ -533,6 +533,8 @@ def test_suno_service_records_request_id(monkeypatch):
             call_back_url: Optional[str] = None,
             call_back_secret: Optional[str] = None,
             tags: Optional[Sequence[Any]] = None,
+            negative_tags: Optional[Sequence[Any]] = None,
+            preset: Optional[str] = None,
         ) -> Mapping[str, Any]:
             return {
                 "model": model or "V5",
@@ -542,7 +544,7 @@ def test_suno_service_records_request_id(monkeypatch):
                 "has_lyrics": has_lyrics,
                 "lyrics": lyrics or "",
                 "tags": list(tags or ["demo"]),
-                "negativeTags": [],
+                "negativeTags": list(negative_tags or []),
                 "prompt_len": prompt_len,
                 "customMode": False,
                 "userId": user_id,
@@ -589,6 +591,8 @@ def test_suno_service_assigns_task_id_when_request_missing():
             call_back_url: Optional[str] = None,
             call_back_secret: Optional[str] = None,
             tags: Optional[Sequence[Any]] = None,
+            negative_tags: Optional[Sequence[Any]] = None,
+            preset: Optional[str] = None,
         ) -> Mapping[str, Any]:
             return {
                 "model": model or "V5",
@@ -598,7 +602,7 @@ def test_suno_service_assigns_task_id_when_request_missing():
                 "has_lyrics": has_lyrics,
                 "lyrics": lyrics or "",
                 "tags": list(tags or ["demo"]),
-                "negativeTags": [],
+                "negativeTags": list(negative_tags or []),
                 "prompt_len": prompt_len,
                 "customMode": False,
                 "userId": user_id,
@@ -720,6 +724,8 @@ def test_callback_restores_missing_req_id(monkeypatch):
             call_back_url: Optional[str] = None,
             call_back_secret: Optional[str] = None,
             tags: Optional[Sequence[Any]] = None,
+            negative_tags: Optional[Sequence[Any]] = None,
+            preset: Optional[str] = None,
         ) -> Mapping[str, Any]:
             return {
                 "model": model or "V5",
@@ -729,7 +735,7 @@ def test_callback_restores_missing_req_id(monkeypatch):
                 "has_lyrics": has_lyrics,
                 "lyrics": lyrics or "",
                 "tags": list(tags or ["demo"]),
-                "negativeTags": [],
+                "negativeTags": list(negative_tags or []),
                 "prompt_len": prompt_len,
                 "customMode": False,
                 "userId": user_id,

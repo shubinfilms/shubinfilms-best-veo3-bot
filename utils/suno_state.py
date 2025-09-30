@@ -6,6 +6,8 @@ from typing import Any, Literal, Mapping, MutableMapping, Optional
 import html
 import re
 
+from suno.client import get_preset_config
+
 
 TITLE_MAX_LENGTH = 300
 STYLE_MAX_LENGTH = 500
@@ -102,6 +104,7 @@ class SunoState:
     card_markup_hash: Optional[str] = None
     card_chat_id: Optional[int] = None
     last_card_hash: Optional[str] = None
+    preset: Optional[str] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -119,6 +122,7 @@ class SunoState:
             "card_markup_hash": self.card_markup_hash,
             "card_chat_id": self.card_chat_id,
             "last_card_hash": self.last_card_hash,
+            "preset": self.preset,
         }
 
 
@@ -148,6 +152,11 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     raw_last_hash = payload.get("last_card_hash")
     if isinstance(raw_last_hash, str):
         state.last_card_hash = raw_last_hash
+    raw_preset = payload.get("preset")
+    if isinstance(raw_preset, str):
+        text = raw_preset.strip().lower()
+        if text:
+            state.preset = text
     return state
 
 
@@ -182,6 +191,8 @@ def clear_title(state: SunoState) -> SunoState:
 
 def set_style(state: SunoState, value: Optional[str]) -> SunoState:
     state.style = _clean_style(value)
+    if state.style:
+        state.preset = None
     return state
 
 
@@ -248,6 +259,8 @@ def build_generation_payload(
             if lowered not in tags:
                 tags.append(lowered)
     payload["tags"] = tags
+    if state.preset:
+        payload["preset"] = state.preset
     if state.has_lyrics:
         payload["lyrics"] = state.lyrics or ""
     if lang:
@@ -258,6 +271,33 @@ def build_generation_payload(
         payload["prompt"] = state.lyrics
     elif state.title:
         payload["prompt"] = state.title
+    if state.preset:
+        cfg = get_preset_config(state.preset)
+        if cfg:
+            preset_tags: list[str] = []
+            for tag in cfg.get("tags", []):
+                text = str(tag).strip().lower()
+                if text and text not in preset_tags:
+                    preset_tags.append(text)
+            if not payload.get("tags"):
+                payload["tags"] = preset_tags
+            preset_negative: list[str] = []
+            for tag in cfg.get("negative_tags", []):
+                text = str(tag).strip().lower()
+                if text and text not in preset_negative:
+                    preset_negative.append(text)
+            if preset_negative:
+                payload["negative_tags"] = preset_negative
+            if cfg.get("instrumental"):
+                payload["instrumental"] = True
+                payload["has_lyrics"] = False
+            if not payload.get("prompt"):
+                prompt_source = cfg.get("prompt") or ", ".join(cfg.get("tags", []))
+                payload["prompt"] = str(prompt_source or "").strip()
+            if not payload.get("title") and cfg.get("title_suggestions"):
+                payload["title"] = cfg.get("title_suggestions")[0]
+    if not payload.get("prompt"):
+        payload["prompt"] = payload.get("title", "")
     return payload
 
 
