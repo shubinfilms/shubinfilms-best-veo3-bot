@@ -16,7 +16,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random, copy
 import threading
 import atexit
 from pathlib import Path
@@ -93,6 +93,7 @@ from ui_helpers import (
 )
 
 from utils.suno_state import (
+    LyricsSource,
     SunoState,
     build_generation_payload as build_suno_generation_payload,
     clear_lyrics as clear_suno_lyrics,
@@ -102,11 +103,13 @@ from utils.suno_state import (
     sanitize_payload_for_log,
     save as save_suno_state,
     set_lyrics as set_suno_lyrics,
+    set_lyrics_source as set_suno_lyrics_source,
     set_style as set_suno_style,
     set_title as set_suno_title,
     set_cover_source as set_suno_cover_source,
     clear_cover_source as clear_suno_cover_source,
     reset_suno_card_state,
+    suno_is_ready_to_start,
 )
 
 try:  # pragma: no cover - optional helper
@@ -597,6 +600,17 @@ SUNO_PER_USER_COOLDOWN_SEC = max(0, _env_int("SUNO_PER_USER_COOLDOWN_SEC", 0))
 _SUNO_COOLDOWN_MEMORY: Dict[int, float] = {}
 _SUNO_REFUND_TTL = 24 * 60 * 60
 _SUNO_REFUND_MEMORY: Dict[str, float] = {}
+
+_SUNO_STRICT_ENABLED = bool(_env_bool("SUNO_STRICT_LYRICS_ENABLED", True))
+_SUNO_LYRICS_RETRY_THRESHOLD = max(0.0, min(1.0, _env_float("SUNO_LYRICS_RETRY_THRESHOLD", 0.75)))
+_SUNO_LYRICS_MAXLEN = max(1, _env_int("SUNO_LYRICS_MAXLEN", 2000))
+_SUNO_LYRICS_STRICT_TEMPERATURE = max(0.0, _env_float("SUNO_LYRICS_STRICT_TEMPERATURE", 0.3))
+_SUNO_LYRICS_STRICT_FLAG = _env("SUNO_LYRICS_STRICT_FLAG", "").strip()
+_SUNO_LYRICS_SEED_RAW = _env("SUNO_LYRICS_SEED", "").strip()
+try:
+    _SUNO_LYRICS_SEED: Optional[int] = int(_SUNO_LYRICS_SEED_RAW) if _SUNO_LYRICS_SEED_RAW else None
+except ValueError:
+    _SUNO_LYRICS_SEED = None
 
 def _normalize_endpoint_values(*values: Any) -> List[str]:
     """Collect endpoint path candidates from strings / iterables."""
@@ -4874,11 +4888,12 @@ def _suno_collect_params(state_obj: Dict[str, Any], suno_state: SunoState) -> Di
     payload = {
         "title": suno_state.title or "",
         "style": suno_state.style or "",
-        "lyrics": suno_state.lyrics or "",
-        "instrumental": not suno_state.has_lyrics,
-        "has_lyrics": suno_state.has_lyrics,
+        "lyrics": suno_state.lyrics if suno_state.lyrics_source == LyricsSource.USER else None,
+        "instrumental": suno_state.mode != "lyrics",
+        "has_lyrics": suno_state.mode == "lyrics" and suno_state.lyrics_source == LyricsSource.USER,
         "preset": suno_state.preset,
         "mode": suno_state.mode,
+        "lyrics_source": suno_state.lyrics_source.value,
     }
     if suno_state.mode == "cover":
         payload["instrumental"] = False
@@ -4888,6 +4903,10 @@ def _suno_collect_params(state_obj: Dict[str, Any], suno_state: SunoState) -> Di
         payload["source_file_id"] = suno_state.source_file_id
         payload["source_url"] = suno_state.source_url
         payload["kie_file_id"] = suno_state.kie_file_id
+    elif suno_state.mode == "lyrics" and suno_state.lyrics_source == LyricsSource.USER:
+        payload["lyrics"] = suno_state.lyrics or ""
+    else:
+        payload.pop("lyrics", None)
     return payload
 
 
@@ -4909,8 +4928,9 @@ def _suno_missing_fields(state: SunoState) -> list[str]:
             missing.append(SUNO_FIELD_LABELS.get("title", "Title"))
         elif field == "style" and not state.style:
             missing.append(SUNO_FIELD_LABELS.get("style", "Style"))
-        elif field == "lyrics" and not state.lyrics:
-            missing.append(SUNO_FIELD_LABELS.get("lyrics", "Lyrics"))
+        elif field == "lyrics":
+            if state.mode == "lyrics" and state.lyrics_source == LyricsSource.USER and not state.lyrics:
+                missing.append(SUNO_FIELD_LABELS.get("lyrics", "Lyrics"))
         elif field == "reference" and not state.kie_file_id:
             missing.append(SUNO_FIELD_LABELS.get("reference", "Reference"))
     return missing
@@ -4941,12 +4961,15 @@ def _suno_summary_text(state: SunoState) -> str:
     lines.append(f"🎛️ {t('suno.field.style')}: {style_display}")
 
     if state.mode == "lyrics":
-        if state.lyrics:
-            lines_count = len([line for line in state.lyrics.split("\n") if line.strip()])
-            char_count = len(state.lyrics)
-            lines.append(f"📝 {t('suno.field.lyrics')}: {lines_count} строк ({char_count} символов)")
-        else:
-            lines.append(f"📝 {t('suno.field.lyrics')}: —")
+        source_text = t("suno.lyrics_source.user") if state.lyrics_source == LyricsSource.USER else t("suno.lyrics_source.ai")
+        lines.append(f"📥 {t('suno.field.lyrics_source')}: {source_text}")
+        if state.lyrics_source == LyricsSource.USER:
+            if state.lyrics:
+                lines_count = len([line for line in state.lyrics.split("\n") if line.strip()])
+                char_count = len(state.lyrics)
+                lines.append(f"📝 {t('suno.field.lyrics')}: {lines_count} строк ({char_count} символов)")
+            else:
+                lines.append(f"📝 {t('suno.field.lyrics')}: —")
     elif state.mode == "cover":
         if state.kie_file_id:
             reference_display = f"загружено ✅ (id: {state.kie_file_id})"
@@ -5870,8 +5893,37 @@ async def _launch_suno_generation(
     instrumental = bool(params.get("instrumental", True))
     title = (params.get("title") or "").strip()
     style = (params.get("style") or "").strip()
-    lyrics = (params.get("lyrics") or "").strip()
-    has_lyrics = bool(params.get("has_lyrics")) if not instrumental else False
+    raw_source = str(params.get("lyrics_source") or suno_state_obj.lyrics_source.value or "ai").strip().lower()
+    try:
+        lyrics_source = LyricsSource(raw_source)
+    except ValueError:
+        lyrics_source = LyricsSource.AI
+    lyrics_from_state = suno_state_obj.lyrics or ""
+    lyrics = lyrics_from_state.strip()
+    providing_lyrics = (lyrics_source == LyricsSource.USER) and not instrumental
+    if providing_lyrics:
+        if not lyrics:
+            await _suno_notify(
+                ctx,
+                chat_id,
+                "⚠️ Добавьте текст песни или переключитесь на генерацию ИИ.",
+                reply_to=reply_to,
+            )
+            return
+        if len(lyrics) > _SUNO_LYRICS_MAXLEN:
+            await _suno_notify(
+                ctx,
+                chat_id,
+                f"⚠️ Текст слишком длинный ({len(lyrics)}). Максимум — {_SUNO_LYRICS_MAXLEN} символов.",
+                reply_to=reply_to,
+            )
+            return
+    else:
+        lyrics = ""
+        params["lyrics"] = None
+    params["lyrics"] = lyrics
+    params["has_lyrics"] = providing_lyrics
+    params["lyrics_source"] = lyrics_source.value
     preset_value_raw = params.get("preset")
     model = SUNO_MODEL or "V5"
     existing_req_id = s.get("suno_current_req_id")
@@ -5882,14 +5934,18 @@ async def _launch_suno_generation(
 
     lang_source = style or lyrics or title
     lang = detect_lang(lang_source or title or "")
-    suno_payload_state = SunoState(mode="lyrics" if has_lyrics else "instrumental")
+    mode_value = params.get("mode") or ("lyrics" if not instrumental else "instrumental")
+    if mode_value not in {"instrumental", "lyrics", "cover"}:
+        mode_value = "instrumental"
+    suno_payload_state = SunoState(mode=mode_value)
+    set_suno_lyrics_source(suno_payload_state, lyrics_source)
     if isinstance(preset_value_raw, str) and preset_value_raw.strip():
         suno_payload_state.preset = preset_value_raw.strip().lower()
     elif preset_value_raw == AMBIENT_NATURE_PRESET_ID:
         suno_payload_state.preset = AMBIENT_NATURE_PRESET_ID
     set_suno_title(suno_payload_state, title)
     set_suno_style(suno_payload_state, style)
-    if has_lyrics:
+    if providing_lyrics:
         set_suno_lyrics(suno_payload_state, lyrics)
     else:
         clear_suno_lyrics(suno_payload_state)
@@ -5963,6 +6019,8 @@ async def _launch_suno_generation(
             )
             return
 
+    strict_payload_snapshot: Optional[Dict[str, Any]] = None
+
     try:
         prepared_payload = SUNO_SERVICE.client.build_payload(
             user_id=str(user_id),
@@ -5999,6 +6057,23 @@ async def _launch_suno_generation(
         )
         return
 
+    if providing_lyrics and _SUNO_STRICT_ENABLED:
+        if _SUNO_LYRICS_STRICT_FLAG:
+            flag_key = _SUNO_LYRICS_STRICT_FLAG
+            if flag_key.lower() in {"true", "1", "yes", "on"}:
+                flag_key = "force_lyrics"
+            prepared_payload.setdefault(flag_key, True)
+        current_temp = prepared_payload.get("temperature")
+        try:
+            current_temp_value = float(current_temp)
+        except (TypeError, ValueError):
+            current_temp_value = None
+        if current_temp_value is None or current_temp_value > _SUNO_LYRICS_STRICT_TEMPERATURE:
+            prepared_payload["temperature"] = _SUNO_LYRICS_STRICT_TEMPERATURE
+        if _SUNO_LYRICS_SEED is not None:
+            prepared_payload.setdefault("seed", _SUNO_LYRICS_SEED)
+        strict_payload_snapshot = copy.deepcopy(prepared_payload)
+
     required_title = str(prepared_payload.get("title") or "").strip()
     required_prompt = str(prepared_payload.get("prompt") or "").strip()
     required_tags = [tag for tag in prepared_payload.get("tags", []) if str(tag).strip()]
@@ -6024,14 +6099,20 @@ async def _launch_suno_generation(
         "task_id": None,
         "model": model,
         "instrumental": not suno_payload_state.has_lyrics,
-        "has_lyrics": suno_payload_state.has_lyrics,
+        "has_lyrics": providing_lyrics,
         "prompt_len": len(str(prepared_payload.get("prompt") or "")),
         "title": payload.get("title"),
         "style": payload.get("style"),
         "trigger": trigger,
         "req_id": req_id,
         "preset": payload.get("preset"),
+        "lyrics_source": lyrics_source.value,
+        "original_lyrics": lyrics if providing_lyrics else None,
+        "strict_enabled": providing_lyrics and _SUNO_STRICT_ENABLED,
+        "strict_threshold": _SUNO_LYRICS_RETRY_THRESHOLD if providing_lyrics else None,
     }
+    if strict_payload_snapshot:
+        meta["strict_payload"] = strict_payload_snapshot
 
     log.info(
         "suno launch meta",
@@ -6071,11 +6152,12 @@ async def _launch_suno_generation(
     s["suno_last_params"] = {
         "title": suno_payload_state.title,
         "style": suno_payload_state.style,
-        "lyrics": suno_payload_state.lyrics if suno_payload_state.has_lyrics else None,
-        "instrumental": not suno_payload_state.has_lyrics,
+        "lyrics": lyrics if providing_lyrics else None,
+        "instrumental": bool(params.get("instrumental", True)),
         "prompt": payload.get("prompt"),
-        "lang": payload.get("lang"),
-        "has_lyrics": suno_payload_state.has_lyrics,
+        "lang": lang,
+        "has_lyrics": providing_lyrics,
+        "lyrics_source": lyrics_source.value,
         "preset": suno_payload_state.preset,
     }
     if isinstance(new_balance, int):
@@ -6102,6 +6184,11 @@ async def _launch_suno_generation(
                 "req_short": req_label,
                 "charged": True,
                 "status": "new",
+                "lyrics_source": lyrics_source.value,
+                "strict_enabled": providing_lyrics and _SUNO_STRICT_ENABLED,
+                "original_lyrics": lyrics if providing_lyrics else None,
+                "strict_threshold": _SUNO_LYRICS_RETRY_THRESHOLD if providing_lyrics else None,
+                "strict_payload": strict_payload_snapshot,
             }
         )
 
@@ -6274,6 +6361,11 @@ async def _launch_suno_generation(
                 prepared_payload=prepared_payload,
                 negative_tags=payload.get("negative_tags"),
                 preset=payload.get("preset"),
+                lyrics_source=lyrics_source.value,
+                strict_enabled=providing_lyrics and _SUNO_STRICT_ENABLED,
+                strict_original_lyrics=lyrics if providing_lyrics else None,
+                strict_payload=strict_payload_snapshot,
+                strict_threshold=_SUNO_LYRICS_RETRY_THRESHOLD,
             )
 
         def _retry_filter(exc: BaseException) -> bool:
@@ -9719,6 +9811,50 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
                 await _music_show_main_menu(chat_id, ctx, s)
                 await _suno_notify(ctx, chat_id, "❌ Cancelled. Card reset.", reply_to=q.message)
+            return
+
+        if action == "card":
+            sub_action, _, sub_argument = argument.partition(":")
+            if sub_action == "lyrics_source" and (sub_argument in {"", "toggle"}):
+                await q.answer()
+                current_source = suno_state_obj.lyrics_source
+                new_source = LyricsSource.USER if current_source != LyricsSource.USER else LyricsSource.AI
+                set_suno_lyrics_source(suno_state_obj, new_source)
+                save_suno_state(ctx, suno_state_obj)
+                s["suno_state"] = suno_state_obj.to_dict()
+                s["suno_waiting_state"] = IDLE_SUNO
+                _reset_suno_card_cache(s)
+                target_chat = chat_id
+                if target_chat is None and q.message is not None:
+                    target_chat = q.message.chat_id
+                if target_chat is not None:
+                    await refresh_suno_card(ctx, target_chat, s, price=PRICE_SUNO)
+                    ready_flag = suno_is_ready_to_start(suno_state_obj)
+                    generating = bool(s.get("suno_generating"))
+                    waiting_enqueue = bool(s.get("suno_waiting_enqueue"))
+                    await sync_suno_start_message(
+                        ctx,
+                        target_chat,
+                        s,
+                        suno_state=suno_state_obj,
+                        ready=ready_flag,
+                        generating=generating,
+                        waiting_enqueue=waiting_enqueue,
+                    )
+                if target_chat is not None:
+                    source_label = (
+                        t("suno.lyrics_source.user")
+                        if new_source == LyricsSource.USER
+                        else t("suno.lyrics_source.ai")
+                    )
+                    await _suno_notify(
+                        ctx,
+                        target_chat,
+                        f"🔁 {t('suno.field.lyrics_source')}: {source_label}",
+                        reply_to=q.message,
+                    )
+                return
+            await q.answer()
             return
 
         if action == "edit":

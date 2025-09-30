@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import difflib
 import logging
 import os
 import time
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -64,6 +65,25 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = raw.strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+_STRICT_LYRICS_ENABLED = _env_bool("SUNO_STRICT_LYRICS_ENABLED", True)
+_STRICT_LYRICS_THRESHOLD = max(0.0, min(1.0, _env_float("SUNO_LYRICS_RETRY_THRESHOLD", 0.75)))
+_STRICT_LYRICS_TEMPERATURE = max(0.0, _env_float("SUNO_LYRICS_STRICT_TEMPERATURE", 0.3))
 
 
 def _parse_backoff_series(raw: str) -> list[float]:
@@ -298,6 +318,7 @@ class TelegramMeta:
     ts: str
     req_id: Optional[str]
     user_title: Optional[str] = None
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -692,6 +713,233 @@ class SunoService:
                 log.warning("SunoService admin id invalid: %s", part)
         return result
 
+    @staticmethod
+    def _strict_normalize_text(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        text = re.sub(r"[\s]+", " ", value.strip().lower())
+        text = re.sub(r"[^\w\s]", " ", text)
+        return " ".join(text.split())
+
+    @staticmethod
+    def _strict_similarity(a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    @staticmethod
+    def _strict_extract_lyrics(payload: Mapping[str, Any]) -> Optional[str]:
+        lines: list[str] = []
+
+        def _collect(value: Any, hint: Optional[str] = None) -> None:
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    lines.append(text)
+                return
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    lowered = str(key).lower()
+                    if lowered in {"lyrics", "text", "content", "words", "lines"}:
+                        _collect(nested, lowered)
+                    elif isinstance(nested, (Mapping, list, tuple, set)):
+                        _collect(nested, lowered)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect(item, hint)
+
+        _collect(payload)
+        if lines:
+            unique_lines = []
+            seen = set()
+            for line in lines:
+                if line not in seen:
+                    seen.add(line)
+                    unique_lines.append(line)
+            return "\n".join(unique_lines)
+        return None
+
+    def _strict_fetch_lyrics(
+        self,
+        task_id: str,
+        *,
+        req_id: Optional[str],
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[str]:
+        try:
+            response = self.client.get_lyrics(task_id, req_id=req_id, payload=payload)
+        except SunoAPIError as exc:
+            log.warning(
+                "Suno strict lyrics fetch failed",
+                extra={"meta": {"task_id": task_id, "status": exc.status, "message": str(exc)}},
+            )
+            return None
+        except Exception:
+            log.warning("Suno strict lyrics fetch crashed", exc_info=True)
+            return None
+        if isinstance(response, Mapping):
+            return self._strict_extract_lyrics(response)
+        return None
+
+    def _strict_context_from_meta(self, meta: Optional[TelegramMeta]) -> Optional[Dict[str, Any]]:
+        if meta is None:
+            return None
+        extras = meta.extras or {}
+        strict_info = extras.get("strict_lyrics")
+        context: Dict[str, Any]
+        if isinstance(strict_info, Mapping):
+            context = dict(strict_info)
+        else:
+            context = {}
+        for key in ("original", "payload", "threshold", "attempts"):
+            if key not in context and key in extras and extras[key] is not None:
+                context[key] = extras[key]
+        if "enabled" not in context and "strict_enabled" in extras:
+            context["enabled"] = extras["strict_enabled"]
+        if "original" not in context and "original_lyrics" in extras and extras["original_lyrics"]:
+            context["original"] = extras["original_lyrics"]
+        if "payload" not in context and "strict_payload" in extras and extras["strict_payload"]:
+            context["payload"] = extras["strict_payload"]
+        if "threshold" not in context and "strict_threshold" in extras and extras["strict_threshold"] is not None:
+            context["threshold"] = extras["strict_threshold"]
+        if context:
+            context.setdefault("attempts", 0)
+        return context or None
+
+    def _strict_retry_enqueue(
+        self,
+        *,
+        task: SunoTask,
+        meta: TelegramMeta,
+        link: Optional[TaskLink],
+        strict_context: Dict[str, Any],
+        req_id: Optional[str],
+        threshold: float,
+    ) -> bool:
+        payload = strict_context.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        retry_payload = dict(payload)
+        current_temp = retry_payload.get("temperature")
+        try:
+            current_temp_value = float(current_temp) if current_temp is not None else None
+        except (TypeError, ValueError):
+            current_temp_value = None
+        base_temp = current_temp_value if current_temp_value is not None else _STRICT_LYRICS_TEMPERATURE
+        retry_payload["temperature"] = max(0.0, min(base_temp, _STRICT_LYRICS_TEMPERATURE) * 0.7)
+        new_req_id = f"{req_id or task.task_id}-retry"
+        try:
+            new_task_id = self.client.enqueue(retry_payload, req_id=new_req_id)
+        except SunoAPIError as exc:
+            log.warning(
+                "Suno strict retry enqueue failed",
+                extra={"meta": {"task_id": task.task_id, "status": exc.status, "message": str(exc)}},
+            )
+            return False
+        except Exception:
+            log.warning("Suno strict retry enqueue crashed", exc_info=True)
+            return False
+        if not new_task_id:
+            return False
+        strict_meta = {
+            "attempts": int(strict_context.get("attempts") or 0) + 1,
+            "threshold": threshold,
+            "original": strict_context.get("original"),
+            "payload": retry_payload,
+        }
+        new_meta: Dict[str, Any] = {
+            "chat_id": meta.chat_id,
+            "msg_id": meta.msg_id,
+            "title": meta.title,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "req_id": new_req_id,
+            "user_title": meta.user_title,
+            "strict_enabled": True,
+            "strict_threshold": threshold,
+            "strict_lyrics": strict_meta,
+            "lyrics_source": meta.extras.get("lyrics_source"),
+        }
+        if strict_context.get("original"):
+            new_meta["original_lyrics"] = strict_context.get("original")
+        if strict_context.get("payload"):
+            new_meta["strict_payload"] = retry_payload
+        self._store_mapping(str(new_task_id), new_meta)
+        self._store_req_id(str(new_task_id), new_req_id)
+        if link is not None:
+            self._store_user_link(
+                str(new_task_id),
+                {
+                    "user_id": link.user_id,
+                    "prompt": link.prompt,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        self._log_delivery(
+            "suno.strict.retry.enqueued",
+            task_id=task.task_id,
+            retry_task_id=str(new_task_id),
+            req_id=req_id,
+            retry_req_id=new_req_id,
+        )
+        try:
+            self._send_text(
+                meta.chat_id,
+                "🔁 Перезапускаем генерацию, чтобы сохранить ваш текст.",
+                reply_to=meta.msg_id,
+            )
+        except Exception:
+            log.debug("Suno strict retry notify failed", exc_info=True)
+        return True
+
+    def _process_strict_delivery(
+        self,
+        *,
+        task: SunoTask,
+        meta: TelegramMeta,
+        link: Optional[TaskLink],
+        strict_context: Dict[str, Any],
+        req_id: Optional[str],
+    ) -> Optional[Dict[str, Any] | str]:
+        if not strict_context.get("enabled") or not _STRICT_LYRICS_ENABLED:
+            return None
+        original = str(strict_context.get("original") or "").strip()
+        if not original:
+            return None
+        threshold_raw = strict_context.get("threshold")
+        try:
+            threshold = float(threshold_raw)
+        except (TypeError, ValueError):
+            threshold = _STRICT_LYRICS_THRESHOLD
+        threshold = max(0.0, min(1.0, threshold))
+        attempts = int(strict_context.get("attempts") or 0)
+        lyrics_payload = strict_context.get("payload") if isinstance(strict_context.get("payload"), Mapping) else None
+        generated_text = self._strict_fetch_lyrics(task.task_id, req_id=req_id, payload=lyrics_payload)
+        normalized_original = self._strict_normalize_text(original)
+        normalized_generated = self._strict_normalize_text(generated_text)
+        similarity = self._strict_similarity(normalized_original, normalized_generated)
+        strict_context["similarity"] = similarity
+        if similarity >= threshold and generated_text:
+            return {"lyrics": generated_text, "similarity": similarity, "attempts": attempts}
+        if attempts < 1 and self._strict_retry_enqueue(
+            task=task,
+            meta=meta,
+            link=link,
+            strict_context=strict_context,
+            req_id=req_id,
+            threshold=threshold,
+        ):
+            return "retry"
+        warning_text = None
+        if generated_text:
+            warning_text = "⚠️ Модель частично перефразировала текст. Ниже — фактические слова."
+        return {
+            "lyrics": generated_text or "",
+            "warning": warning_text,
+            "similarity": similarity,
+            "attempts": attempts,
+        }
+
     def _store_mapping(self, task_id: str, payload: Mapping[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False)
         key = self._redis_key(task_id)
@@ -802,6 +1050,19 @@ class SunoService:
         user_title = data.get("user_title")
         ts = data.get("ts") or datetime.now(timezone.utc).isoformat()
         req_id = data.get("req_id") or self._load_req_id(task_id)
+        extras = {
+            key: value
+            for key, value in data.items()
+            if key
+            not in {
+                "chat_id",
+                "msg_id",
+                "title",
+                "ts",
+                "req_id",
+                "user_title",
+            }
+        }
         return TelegramMeta(
             chat_id=chat_id,
             msg_id=msg_id,
@@ -809,6 +1070,7 @@ class SunoService:
             ts=ts,
             req_id=req_id,
             user_title=user_title,
+            extras=extras,
         )
 
     def _delete_mapping(self, task_id: str) -> None:
@@ -1582,6 +1844,11 @@ class SunoService:
         prepared_payload: Optional[Mapping[str, Any]] = None,
         negative_tags: Optional[Iterable[str]] = None,
         preset: Optional[str] = None,
+        lyrics_source: Optional[str] = None,
+        strict_enabled: bool = False,
+        strict_original_lyrics: Optional[str] = None,
+        strict_payload: Optional[Mapping[str, Any]] = None,
+        strict_threshold: Optional[float] = None,
     ) -> SunoTask:
         prompt_text = str(
             (prompt if prompt is not None else "")
@@ -1617,6 +1884,8 @@ class SunoService:
                 negative_tags=negative_tags,
                 preset=preset,
             )
+        if lyrics_source:
+            final_payload.setdefault("lyrics_source", lyrics_source)
         resolved_title = str(final_payload.get("title") or title or prompt_text)
         prompt_text = str(final_payload.get("prompt") or prompt_text)
         try:
@@ -1666,7 +1935,22 @@ class SunoService:
             "ts": datetime.now(timezone.utc).isoformat(),
             "req_id": req_id,
             "user_title": user_title,
+            "lyrics_source": lyrics_source,
+            "strict_enabled": bool(strict_enabled),
         }
+        if strict_enabled:
+            strict_meta: Dict[str, Any] = {
+                "attempts": 0,
+                "threshold": float(strict_threshold) if strict_threshold is not None else _STRICT_LYRICS_THRESHOLD,
+            }
+            if strict_original_lyrics:
+                strict_meta["original"] = str(strict_original_lyrics)
+            elif lyrics_text:
+                strict_meta["original"] = str(lyrics_text)
+            payload_snapshot = strict_payload or prepared_payload
+            if payload_snapshot is not None:
+                strict_meta["payload"] = dict(payload_snapshot)
+            meta["strict_lyrics"] = strict_meta
         self._store_mapping(task.task_id, meta)
         self._store_req_id(task.task_id, task_id)
         if req_id != task_id:
@@ -1860,12 +2144,13 @@ class SunoService:
             )
             return
 
+        meta_user_title: Optional[str] = None
+
         try:
             header = self._stage_header(task)
             reply_to = meta.msg_id if meta else None
             self._send_text(chat_id, header, reply_to=reply_to)
             stored_user_title = existing_record.get("user_title")
-            meta_user_title: Optional[str] = None
             if meta and isinstance(meta.user_title, str) and meta.user_title.strip():
                 meta_user_title = meta.user_title.strip()
             elif isinstance(stored_user_title, str) and stored_user_title.strip():
@@ -1897,6 +2182,31 @@ class SunoService:
                 )
                 self._save_task_record(task.task_id, record)
                 return
+        except Exception:
+            log.warning("Suno callback stage header failed", exc_info=True)
+
+        try:
+            strict_context = self._strict_context_from_meta(meta)
+            strict_warning: Optional[str] = None
+            strict_actual_lyrics: Optional[str] = None
+            strict_similarity: Optional[float] = None
+            if strict_context and incoming_status in final_states:
+                strict_decision = self._process_strict_delivery(
+                    task=task,
+                    meta=meta,
+                    link=link,
+                    strict_context=strict_context,
+                    req_id=req_id,
+                )
+                if strict_decision == "retry":
+                    return
+                if isinstance(strict_decision, dict):
+                    strict_warning = strict_decision.get("warning")
+                    strict_actual_lyrics = strict_decision.get("lyrics")
+                    strict_similarity = strict_decision.get("similarity")
+                    strict_context["attempts"] = strict_decision.get(
+                        "attempts", strict_context.get("attempts", 0)
+                    )
 
             base_dir = self._base_dir(task.task_id)
             track_records: list[Dict[str, Any]] = []
@@ -2068,31 +2378,47 @@ class SunoService:
             record.setdefault(
                 "created_at", existing_record.get("created_at") or datetime.now(timezone.utc).isoformat()
             )
+            if strict_context:
+                record["strict_lyrics"] = {
+                    "original": strict_context.get("original"),
+                    "actual": strict_actual_lyrics,
+                    "similarity": strict_similarity,
+                    "attempts": strict_context.get("attempts"),
+                    "threshold": strict_context.get("threshold", _STRICT_LYRICS_THRESHOLD),
+                }
             self._save_task_record(task.task_id, record)
             if incoming_status in final_states:
                 self._mark_delivered(task.task_id)
-            log.info(
-                "Suno ready",
-                extra={
-                    "meta": {
-                        "task_id": task.task_id,
-                        "takes": len(task.items),
-                        "durations": durations,
-                    }
-                },
-            )
-            if self._should_log_once(task.task_id, task.callback_type):
                 log.info(
-                    "processed | suno.callback",
+                    "Suno ready",
                     extra={
                         "meta": {
                             "task_id": task.task_id,
-                            "type": task.callback_type,
-                            "code": task.code,
-                            "tracks": len(task.items),
+                            "takes": len(task.items),
+                            "durations": durations,
                         }
                     },
                 )
+                if strict_warning:
+                    try:
+                        message_text = strict_warning
+                        if strict_actual_lyrics:
+                            message_text = f"{strict_warning}\n\n{strict_actual_lyrics}"
+                        self._send_text(chat_id, message_text, reply_to=reply_to)
+                    except Exception:
+                        log.debug("Suno strict warning notify failed", exc_info=True)
+                if self._should_log_once(task.task_id, task.callback_type):
+                    log.info(
+                        "processed | suno.callback",
+                        extra={
+                            "meta": {
+                                "task_id": task.task_id,
+                                "type": task.callback_type,
+                                "code": task.code,
+                                "tracks": len(task.items),
+                            }
+                        },
+                    )
         finally:
             if (task.callback_type or "").lower() == "complete":
                 self._delete_mapping(task.task_id)

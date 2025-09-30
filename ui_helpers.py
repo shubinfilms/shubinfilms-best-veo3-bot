@@ -18,6 +18,7 @@ from redis_utils import get_balance
 import html
 
 from utils.suno_state import (
+    LyricsSource,
     SunoState,
     lyrics_preview as suno_lyrics_preview,
     load as load_suno_state,
@@ -185,7 +186,14 @@ def _suno_keyboard(
     elif mode == "lyrics":
         rows.append([InlineKeyboardButton("✏️ Название", callback_data="suno:edit:title")])
         rows.append([InlineKeyboardButton("🎛️ Стиль", callback_data="suno:edit:style")])
-        rows.append([InlineKeyboardButton("📝 Текст", callback_data="suno:edit:lyrics")])
+        rows.append([
+            InlineKeyboardButton(
+                "🧾/✨ Источник текста",
+                callback_data="suno:card:lyrics_source:toggle",
+            )
+        ])
+        if suno_state.lyrics_source == LyricsSource.USER:
+            rows.append([InlineKeyboardButton("📝 Текст", callback_data="suno:edit:lyrics")])
     elif mode == "cover":
         rows.append([InlineKeyboardButton("✏️ Название", callback_data="suno:edit:title")])
         rows.append([InlineKeyboardButton("🎧 Источник", callback_data="suno:edit:cover")])
@@ -251,7 +259,11 @@ def render_suno_card(
     elif mode == "lyrics":
         lines.append(f"🏷️ {t('suno.field.title')}: <i>{title_value}</i>")
         lines.append(f"🎹 {t('suno.field.style')}: <i>{style_value}</i>")
-        lines.append(f"📜 {t('suno.field.lyrics')}: <i>{lyrics_value}</i>")
+        if suno_state.lyrics_source == LyricsSource.USER:
+            lines.append(f"📥 {t('suno.field.lyrics_source')}: <i>{html.escape(t('suno.lyrics_source.user'))}</i>")
+            lines.append(f"📜 {t('suno.field.lyrics')}: <i>{lyrics_value}</i>")
+        else:
+            lines.append(f"📥 {t('suno.field.lyrics_source')}: <i>{html.escape(t('suno.lyrics_source.ai'))}</i>")
     else:
         lines.append(f"🏷️ {t('suno.field.title')}: <i>{title_value}</i>")
         lines.append(f"🎧 {t('suno.field.source')}: <i>{source_value}</i>")
