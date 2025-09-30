@@ -78,9 +78,16 @@ class StubService:
     def get_start_timestamp(self, task_id: str) -> Optional[str]:
         return None
 
-    def handle_callback(self, task: SunoTask, req_id: Optional[str] = None) -> None:
+    def handle_callback(
+        self,
+        task: SunoTask,
+        req_id: Optional[str] = None,
+        *,
+        delivery_via: str = "webhook",
+    ) -> None:
         self.captured["task"] = task
         self.captured["req_id"] = req_id
+        self.captured["via"] = delivery_via
 
 
 @pytest.fixture(autouse=True)
@@ -384,7 +391,7 @@ def bot_module(monkeypatch):
 def test_callback_accepts_header_token(monkeypatch):
     received = {}
 
-    def fake_handle(task, req_id=None):
+    def fake_handle(task, req_id=None, **kwargs):
         received["task"] = task
         received["req_id"] = req_id
 
@@ -425,7 +432,7 @@ def test_callback_rejects_wrong_token():
 def test_duplicate_callbacks_processed_once(monkeypatch):
     count = {"calls": 0}
 
-    def fake_handle(task, req_id=None):
+    def fake_handle(task, req_id=None, **kwargs):
         count["calls"] += 1
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
@@ -444,7 +451,7 @@ def test_duplicate_callbacks_processed_once(monkeypatch):
 def test_callback_rejects_payloads_over_limit(monkeypatch):
     invoked = {"called": False}
 
-    def fake_handle(task):  # pragma: no cover - should not be called
+    def fake_handle(task, **kwargs):  # pragma: no cover - should not be called
         invoked["called"] = True
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
@@ -464,7 +471,7 @@ def test_callback_rejects_payloads_over_limit(monkeypatch):
 def test_download_failure_falls_back_to_url(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_handle(task, req_id=None):
+    def fake_handle(task, req_id=None, **kwargs):
         captured["task"] = task
 
     monkeypatch.setattr(suno_web.service, "handle_callback", fake_handle)
@@ -632,9 +639,21 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
     def fake_send_text(chat_id: int, text: str, *, reply_to: Optional[int] = None) -> None:
         sent_messages.append((chat_id, text))
 
+    cover_calls: list[dict[str, Any]] = []
+    audio_calls: list[dict[str, Any]] = []
+
+    def fake_cover(**kwargs):
+        cover_calls.append(kwargs)
+        return True, None
+
+    def fake_audio(**kwargs):
+        audio_calls.append(kwargs)
+        return True, None
+
     monkeypatch.setattr(service, "_send_text", fake_send_text)
-    monkeypatch.setattr(service, "_send_audio", lambda *args, **kwargs: True)
-    monkeypatch.setattr(service, "_send_image", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service, "_send_cover_url", fake_cover)
+    monkeypatch.setattr(service, "_send_audio_url_with_retry", fake_audio)
+    monkeypatch.setattr(service, "_log_delivery", lambda *args, **kwargs: None)
 
     task = service.start_music(
         42,
@@ -678,7 +697,8 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
 
     service.handle_callback(SunoTask.from_envelope(envelope), req_id="req-flow")
     assert any("Suno: этап complete" in text for _, text in sent_messages)
-    assert any("https://cdn.example.com/test.mp3" in text for _, text in sent_messages)
+    assert cover_calls and cover_calls[0]["photo_url"] == "https://cdn.example.com/test.jpg"
+    assert audio_calls and audio_calls[0]["audio_url"] == "https://cdn.example.com/test.mp3"
 
 
 def test_callback_restores_missing_req_id(monkeypatch):
@@ -725,7 +745,7 @@ def test_callback_restores_missing_req_id(monkeypatch):
 
     captured = {}
 
-    def fake_handle(task, req_id=None):
+    def fake_handle(task, req_id=None, **kwargs):
         captured["task"] = task
         captured["req_id"] = req_id
 
@@ -1271,7 +1291,45 @@ def test_policy_error_message_text(bot_module):
     )
 
 
-def test_delivery_uses_remote_urls(monkeypatch):
+def test_webhook_secret_modes(monkeypatch, caplog):
+    client = TestClient(app)
+    payload = {"code": 200, "data": {"taskId": "task", "callbackType": "complete", "sunoData": []}}
+
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "secret-token")
+    monkeypatch.setattr(suno_web, "SUNO_CALLBACK_SECRET", "secret-token", raising=False)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="suno-web"):
+        resp = client.post(
+            "/suno-callback",
+            headers={"X-Callback-Secret": "secret-token"},
+            json=payload,
+        )
+    assert resp.status_code == 200
+    records = [record for record in caplog.records if record.message == "suno.webhook.secret"]
+    assert records and getattr(records[-1], "meta", {}).get("mode") == "accepted"
+
+    caplog.clear()
+    caplog.set_level("INFO", logger="suno-web")
+    resp = client.post(
+        "/suno-callback",
+        headers={"X-Callback-Secret": "wrong"},
+        json=payload,
+    )
+    assert resp.status_code == 403
+    records = [record for record in caplog.records if record.message == "suno.webhook.secret"]
+    assert records and getattr(records[-1], "meta", {}).get("mode") == "rejected"
+
+    monkeypatch.setenv("SUNO_CALLBACK_SECRET", "")
+    monkeypatch.setattr(suno_web, "SUNO_CALLBACK_SECRET", "", raising=False)
+    caplog.clear()
+    caplog.set_level("INFO", logger="suno-web")
+    resp = client.post("/suno-callback", json=payload)
+    assert resp.status_code == 200
+    records = [record for record in caplog.records if record.message == "suno.webhook.secret"]
+    assert records and getattr(records[-1], "meta", {}).get("mode") == "not-required"
+
+
+def test_cover_and_audio_sent_for_each_take(monkeypatch):
     service = SunoService(redis=None, telegram_token="test-token")
 
     meta = TelegramMeta(
@@ -1280,7 +1338,7 @@ def test_delivery_uses_remote_urls(monkeypatch):
         title="Demo",
         ts="now",
         req_id="req-1",
-        user_title="Future",
+        user_title="UserTitle",
     )
     link = TaskLink(user_id=555, prompt="Prompt", ts="now")
 
@@ -1288,60 +1346,162 @@ def test_delivery_uses_remote_urls(monkeypatch):
     monkeypatch.setattr(service, "_load_user_link", lambda task_id: link)
     monkeypatch.setattr(service, "_save_task_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(service, "_send_text", lambda *args, **kwargs: None)
-    image_calls: list[tuple] = []
+    monkeypatch.setattr(service, "_find_local_file", lambda *args, **kwargs: None)
 
-    def _fake_send_image_url(*args, **kwargs):
-        image_calls.append((args, kwargs))
-        return False
+    events: list[tuple[str, tuple[Any, ...]]] = []
 
-    monkeypatch.setattr(service, "_send_image_url", _fake_send_image_url)
-    monkeypatch.setattr(service, "_send_audio", lambda *args, **kwargs: False)
-    monkeypatch.setattr(service, "_send_image", lambda *args, **kwargs: False)
+    def _fake_send_cover_url(*, chat_id, photo_url, caption, reply_to):
+        events.append(("cover", (photo_url, caption)))
+        return True, None
 
-    sent_audio: list[dict[str, object]] = []
+    def _fake_send_audio_url_with_retry(
+        *,
+        chat_id,
+        audio_url,
+        caption,
+        reply_to,
+        title,
+        thumb,
+        base_dir,
+        take_id,
+    ):
+        events.append(("audio", (audio_url, caption, title, thumb, take_id)))
+        return True, None
 
-    def _fake_send_audio_url(chat_id, url, *, caption, reply_to, title, thumb):
-        sent_audio.append(
-            {
-                "chat_id": chat_id,
-                "url": url,
-                "caption": caption,
-                "title": title,
-                "thumb": thumb,
-            }
-        )
-        return True
-
-    monkeypatch.setattr(service, "_send_audio_url", _fake_send_audio_url)
+    monkeypatch.setattr(service, "_send_cover_url", _fake_send_cover_url)
+    monkeypatch.setattr(service, "_send_audio_url_with_retry", _fake_send_audio_url_with_retry)
+    monkeypatch.setattr(service, "_log_delivery", lambda *args, **kwargs: None)
 
     tracks = [
         SunoTrack(
             id="1",
-            title="First",
+            title=None,
             source_audio_url="https://cdn/audio1.mp3",
-            source_image_url="https://cdn/image1.jpg",
-            duration=41.5,
-            tags="tag-one",
+            source_image_url="https://cdn/cover1.jpg",
+            duration=41.6,
+            tags="Pop, Rock, Jazz, Extra",
         ),
         SunoTrack(
             id="2",
-            title="Second",
+            title=None,
             source_audio_url="https://cdn/audio2.mp3",
-            source_image_url="https://cdn/image2.jpg",
-            duration=38.0,
-            tags="tag-two",
+            source_image_url="https://cdn/cover2.jpg",
+            duration=36.7,
+            tags="ambient chill cinematic",
         ),
     ]
 
     task = SunoTask(task_id="task-demo", callback_type="complete", items=tracks, msg="ok", code=200)
 
-    service.handle_callback(task, req_id="req-1")
+    service.handle_callback(task, req_id="req-1", delivery_via="webhook")
 
-    assert len(sent_audio) == 2
-    assert sent_audio[0]["url"] == "https://cdn/audio1.mp3"
-    assert sent_audio[0]["thumb"] == "https://cdn/image1.jpg"
-    assert sent_audio[0]["caption"] == "🎵 Future (Take 1)\n42 sec • tag-one"
-    assert sent_audio[0]["title"] == "Future (Take 1)"
-    assert sent_audio[1]["title"] == "Future (Take 2)"
-    assert sent_audio[1]["caption"] == "🎵 Future (Take 2)\n38 sec • tag-two"
-    assert not image_calls
+    assert [event[0] for event in events] == ["cover", "audio", "cover", "audio"]
+    first_cover = events[0][1]
+    first_audio = events[1][1]
+    assert first_cover == ("https://cdn/cover1.jpg", "UserTitle (Take 1)")
+    assert first_audio[0] == "https://cdn/audio1.mp3"
+    assert first_audio[2] == "UserTitle (Take 1)"
+    assert first_audio[3] == "https://cdn/cover1.jpg"
+    assert first_audio[1] == "UserTitle (Take 1) • 42s\npop, rock, jazz"
+
+    second_cover = events[2][1]
+    second_audio = events[3][1]
+    assert second_cover == ("https://cdn/cover2.jpg", "UserTitle (Take 2)")
+    assert second_audio[0] == "https://cdn/audio2.mp3"
+    assert second_audio[2] == "UserTitle (Take 2)"
+    assert second_audio[1] == "UserTitle (Take 2) • 37s\nambient, chill, cinematic"
+
+
+def test_dedupe_webhook_vs_poll(monkeypatch):
+    service = SunoService(redis=None, telegram_token="test-token")
+
+    meta = TelegramMeta(
+        chat_id=555,
+        msg_id=42,
+        title="Demo",
+        ts="now",
+        req_id="req-2",
+        user_title="Track",
+    )
+    link = TaskLink(user_id=777, prompt="Prompt", ts="now")
+
+    monkeypatch.setattr(service, "_load_mapping", lambda task_id: meta)
+    monkeypatch.setattr(service, "_load_user_link", lambda task_id: link)
+    monkeypatch.setattr(service, "_save_task_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_send_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_find_local_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_log_delivery", lambda *args, **kwargs: None)
+
+    events: list[str] = []
+
+    def _fake_send_cover_url(**kwargs):
+        events.append("cover")
+        return True, None
+
+    def _fake_send_audio_url_with_retry(**kwargs):
+        events.append("audio")
+        return True, None
+
+    monkeypatch.setattr(service, "_send_cover_url", _fake_send_cover_url)
+    monkeypatch.setattr(service, "_send_audio_url_with_retry", _fake_send_audio_url_with_retry)
+
+    track = SunoTrack(
+        id="take-1",
+        title="",
+        source_audio_url="https://cdn/audio.mp3",
+        source_image_url="https://cdn/cover.jpg",
+        duration=30.0,
+        tags="rock",
+    )
+    task = SunoTask(task_id="task-dupe", callback_type="complete", items=[track], msg="ok", code=200)
+
+    service.handle_callback(task, req_id="req-2", delivery_via="poll")
+    assert events == ["cover", "audio"]
+
+    poll_result = service.wait_for_record_info("task-dupe", user_id=None)
+    assert poll_result.state == "delivered"
+
+    service.handle_callback(task, req_id="req-2", delivery_via="webhook")
+    assert events == ["cover", "audio"]
+
+
+def test_telegram_url_retry_then_download(monkeypatch, tmp_path):
+    service = SunoService(redis=None, telegram_token="test-token")
+    events: list[str] = []
+
+    call_counter = {"count": 0}
+
+    def _fake_send_audio_request(session, url, *, chat_id, audio, caption, reply_to, title, thumb, timeout=60.0):
+        call_counter["count"] += 1
+        return False, "failed to get HTTP URL content", 400
+
+    audio_file = tmp_path / "fallback.mp3"
+    audio_file.write_bytes(b"data")
+
+    monkeypatch.setattr("telegram_utils.send_audio_request", _fake_send_audio_request, raising=False)
+    monkeypatch.setattr(service, "_download_audio", lambda *args, **kwargs: audio_file)
+
+    def _fake_send_file(method, field, chat_id, path, *, caption, reply_to, extra=None):
+        events.append("local")
+        assert method == "sendAudio"
+        assert extra == {"title": "Title (Take 1)"}
+        return True
+
+    monkeypatch.setattr(service, "_send_file", _fake_send_file)
+    monkeypatch.setattr(service, "_log_delivery", lambda *args, **kwargs: None)
+
+    success, reason = service._send_audio_url_with_retry(
+        chat_id=999,
+        audio_url="https://cdn/audio.mp3",
+        caption="Title (Take 1) • 12s",
+        reply_to=None,
+        title="Title (Take 1)",
+        thumb="https://cdn/cover.jpg",
+        base_dir=tmp_path,
+        take_id="take-1",
+    )
+
+    assert success is True
+    assert reason is None
+    assert call_counter["count"] == 2
+    assert events == ["local"]

@@ -399,17 +399,14 @@ async def suno_callback(
 ):
     expected_secret = (SUNO_CALLBACK_SECRET or "").strip()
     provided = (x_callback_secret or "").strip() or None
-    secret_meta = {"meta": {"provided": bool(provided), "has_secret": bool(expected_secret)}}
     if expected_secret:
         if provided != expected_secret:
-            log.warning("forbidden callback", extra=secret_meta)
+            log.warning("suno.webhook.secret", extra={"meta": {"mode": "rejected"}})
             suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
             return Response(status_code=403)
-        log.info("callback secret accepted", extra=secret_meta)
-    elif provided:
-        log.warning("unexpected callback secret provided", extra=secret_meta)
+        log.info("suno.webhook.secret", extra={"meta": {"mode": "accepted"}})
     else:
-        log.info("callback secret not required", extra=secret_meta)
+        log.info("suno.webhook.secret", extra={"meta": {"mode": "not-required"}})
 
     body = await request.body()
     if len(body) > _MAX_JSON_BYTES:
@@ -526,7 +523,7 @@ async def suno_callback(
             extra={"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}},
         )
     try:
-        service.handle_callback(task, req_id=req_id)
+        service.handle_callback(task, req_id=req_id, delivery_via="webhook")
     except Exception as exc:  # pragma: no cover - defensive
         process_status = "error"
         log.exception(

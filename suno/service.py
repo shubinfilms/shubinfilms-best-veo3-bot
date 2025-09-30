@@ -5,11 +5,14 @@ import json
 import logging
 import os
 import time
+from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Literal, Mapping, MutableMapping, Optional
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -76,7 +79,7 @@ def _parse_backoff_series(raw: str) -> list[float]:
 
 @dataclass(slots=True)
 class RecordInfoPollResult:
-    state: Literal["pending", "ready", "hard_error", "retry", "timeout"]
+    state: Literal["pending", "ready", "hard_error", "retry", "timeout", "delivered"]
     status_code: int
     payload: Mapping[str, Any]
     attempts: int = 0
@@ -328,6 +331,10 @@ class SunoService:
         self._admin_ids = self._parse_admins(os.getenv("ADMIN_IDS"))
         self._log_once_memory: MutableMapping[str, float] = {}
         self._delivered_cache: MutableMapping[str, float] = {}
+        self._delivery_seen: "OrderedDict[str, float]" = OrderedDict()
+        raw_fallback = (os.getenv("TELEGRAM_DOWNLOAD_FALLBACK") or "true").strip().lower()
+        self._telegram_download_fallback = raw_fallback not in {"0", "false", "no"}
+        self._delivery_seen_limit = 200
         self._poll_first_delay = max(0.1, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 5.0))
         backoff_raw = os.getenv("SUNO_POLL_BACKOFF_SERIES", "5,8,13,21,34") or ""
         parsed_backoff = _parse_backoff_series(backoff_raw)
@@ -547,7 +554,25 @@ class SunoService:
     ) -> RecordInfoPollResult:
         start = time.monotonic()
         attempts = 0
+        if self._recently_delivered(task_id):
+            log.info(
+                "Suno poll delivered via webhook",
+                extra={"meta": {"taskId": task_id, "via": "webhook"}},
+            )
+            return RecordInfoPollResult(state="delivered", status_code=200, payload={}, attempts=0, elapsed=0.0)
         for delay in self._iter_poll_delays():
+            if self._recently_delivered(task_id):
+                log.info(
+                    "Suno poll delivered via webhook",
+                    extra={"meta": {"taskId": task_id, "via": "webhook"}},
+                )
+                return RecordInfoPollResult(
+                    state="delivered",
+                    status_code=200,
+                    payload={},
+                    attempts=attempts,
+                    elapsed=time.monotonic() - start,
+                )
             now = time.monotonic()
             if attempts > 0 and now - start >= self._poll_timeout:
                 break
@@ -591,6 +616,18 @@ class SunoService:
                 return result
             if result.elapsed >= self._poll_timeout:
                 break
+        if self._recently_delivered(task_id):
+            log.info(
+                "Suno poll delivered via webhook",
+                extra={"meta": {"taskId": task_id, "via": "webhook"}},
+            )
+            return RecordInfoPollResult(
+                state="delivered",
+                status_code=200,
+                payload={},
+                attempts=attempts,
+                elapsed=time.monotonic() - start,
+            )
         final_attempt = self.poll_record_info_once(task_id, user_id=user_id)
         final_attempt.attempts = attempts + 1
         final_attempt.elapsed = time.monotonic() - start
@@ -1047,12 +1084,27 @@ class SunoService:
             bot_telegram_send_fail_total.labels(method=method).inc()
             log.warning("Telegram sendMessage network error", exc_info=True)
 
-    def _send_file(self, method: str, field: str, chat_id: int, path: Path, *, caption: Optional[str], reply_to: Optional[int]) -> bool:
+    def _send_file(
+        self,
+        method: str,
+        field: str,
+        chat_id: int,
+        path: Path,
+        *,
+        caption: Optional[str],
+        reply_to: Optional[int],
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
         data: Dict[str, Any] = {"chat_id": chat_id}
         if caption:
             data["caption"] = caption
         if reply_to:
             data["reply_to_message_id"] = reply_to
+        if extra:
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                data[key] = value
         try:
             with path.open("rb") as fh:
                 files = {field: (path.name, fh)}
@@ -1117,7 +1169,15 @@ class SunoService:
 
     def _send_audio(self, chat_id: int, path: Path, *, title: str, reply_to: Optional[int]) -> bool:
         caption = self._build_audio_caption(title=title, tags=None, duration=None, take_label=None)
-        success = self._send_file("sendAudio", "audio", chat_id, path, caption=caption, reply_to=reply_to)
+        success = self._send_file(
+            "sendAudio",
+            "audio",
+            chat_id,
+            path,
+            caption=caption,
+            reply_to=reply_to,
+            extra={"title": title},
+        )
         if success:
             schedule_unlink(path)
         return success
@@ -1225,6 +1285,229 @@ class SunoService:
             if candidate.is_file():
                 return candidate
         return None
+
+    def _delivery_key(self, task_id: str, take_id: str) -> str:
+        return f"{task_id}:{take_id}"
+
+    def _delivery_register(self, task_id: str, take_id: str) -> bool:
+        if not task_id or not take_id:
+            return True
+        key = self._delivery_key(task_id, take_id)
+        seen = self._delivery_seen
+        if key in seen:
+            seen.move_to_end(key)
+            return False
+        seen[key] = time.time()
+        while len(seen) > self._delivery_seen_limit:
+            seen.popitem(last=False)
+        return True
+
+    @staticmethod
+    def _log_delivery(event: str, **meta: Any) -> None:
+        log.info(event, extra={"meta": meta})
+
+    def _normalize_take_title(
+        self,
+        track: SunoTrack,
+        *,
+        meta_title: Optional[str],
+        user_title: Optional[str],
+    ) -> str:
+        for candidate in (
+            track.title,
+            user_title,
+            meta_title,
+            "Untitled",
+        ):
+            if isinstance(candidate, str):
+                cleaned = candidate.strip()
+                if cleaned:
+                    return cleaned
+        return "Untitled"
+
+    @staticmethod
+    def _collect_tags(tags_value: Any) -> list[str]:
+        if tags_value in (None, ""):
+            return []
+        tokens: list[str] = []
+        if isinstance(tags_value, (list, tuple, set)):
+            raw_values = [str(item) for item in tags_value if str(item).strip()]
+        else:
+            raw_values = re.split(r"[\s,;#]+", str(tags_value))
+        for raw in raw_values:
+            cleaned = raw.strip().lower()
+            if cleaned and cleaned not in tokens:
+                tokens.append(cleaned)
+        return tokens[:3]
+
+    def _build_take_caption(
+        self,
+        *,
+        title: str,
+        take_index: int,
+        duration: Optional[float],
+        tags: list[str],
+    ) -> str:
+        duration_seconds: Optional[int] = None
+        if duration is not None:
+            try:
+                duration_seconds = int(round(float(duration)))
+            except (TypeError, ValueError):
+                duration_seconds = None
+        first_line = f"{title} (Take {take_index})"
+        if duration_seconds and duration_seconds > 0:
+            first_line = f"{first_line} • {duration_seconds}s"
+        tags_text = ", ".join(tags)
+        if tags_text:
+            caption = f"{first_line}\n{tags_text}"
+        else:
+            caption = first_line
+        if len(caption) <= 1024:
+            return caption
+        if tags_text and len(first_line) < 1024:
+            remaining = max(0, 1024 - len(first_line) - 1)
+            truncated_tags = (tags_text[: remaining - 1] + "…") if remaining and len(tags_text) > remaining else tags_text[:remaining]
+            truncated_tags = truncated_tags.rstrip()
+            if truncated_tags:
+                return f"{first_line}\n{truncated_tags}"
+            return first_line[:1021] + "…"
+        return caption[:1021] + "…"
+
+    def _send_cover_url(
+        self,
+        *,
+        chat_id: int,
+        photo_url: str,
+        caption: Optional[str],
+        reply_to: Optional[int],
+    ) -> tuple[bool, Optional[str]]:
+        from telegram_utils import send_photo_request
+
+        success, reason, _ = send_photo_request(
+            self._bot_session,
+            self._bot_url("sendPhoto"),
+            chat_id=chat_id,
+            photo=photo_url,
+            caption=caption,
+            reply_to=reply_to,
+        )
+        return success, reason
+
+    def _send_audio_url_with_retry(
+        self,
+        *,
+        chat_id: int,
+        audio_url: str,
+        caption: Optional[str],
+        reply_to: Optional[int],
+        title: str,
+        thumb: Optional[str],
+        base_dir: Path,
+        take_id: str,
+    ) -> tuple[bool, Optional[str]]:
+        from telegram_utils import is_remote_file_error, send_audio_request
+
+        attempt = 1
+        success, reason, status = send_audio_request(
+            self._bot_session,
+            self._bot_url("sendAudio"),
+            chat_id=chat_id,
+            audio=audio_url,
+            caption=caption,
+            reply_to=reply_to,
+            title=title,
+            thumb=thumb,
+        )
+        if success:
+            return True, None
+        last_reason = reason
+        if is_remote_file_error(status, reason):
+            self._log_delivery(
+                "telegram.retry",
+                kind="audio",
+                attempt=attempt + 1,
+                reason=last_reason or "remote_error",
+            )
+            attempt += 1
+            success, reason, status = send_audio_request(
+                self._bot_session,
+                self._bot_url("sendAudio"),
+                chat_id=chat_id,
+                audio=audio_url,
+                caption=caption,
+                reply_to=reply_to,
+                title=title,
+                thumb=thumb,
+            )
+            if success:
+                return True, None
+            last_reason = reason or last_reason
+        if not self._telegram_download_fallback:
+            return False, last_reason
+        self._log_delivery(
+            "telegram.retry",
+            kind="audio",
+            attempt=attempt + 1,
+            reason=last_reason or "remote_error",
+        )
+        local_path = self._download_audio(audio_url, base_dir, take_id)
+        if not local_path:
+            return False, last_reason
+        extra: Dict[str, Any] = {"title": title}
+        sent = self._send_file(
+            "sendAudio",
+            "audio",
+            chat_id,
+            local_path,
+            caption=caption,
+            reply_to=reply_to,
+            extra=extra,
+        )
+        if sent:
+            schedule_unlink(local_path)
+            return True, None
+        schedule_unlink(local_path)
+        return False, last_reason
+
+    def _download_audio(self, url: str, base_dir: Path, take_id: str) -> Optional[Path]:
+        if not url:
+            return None
+        try:
+            response = requests.get(url, stream=True, timeout=60)
+        except requests.RequestException as exc:
+            log.warning(
+                "suno.audio.download.failed",
+                extra={"meta": {"url": mask_tokens(url), "err": str(exc)}},
+            )
+            return None
+        if not response.ok:
+            log.warning(
+                "suno.audio.download.failed",
+                extra={
+                    "meta": {
+                        "url": mask_tokens(url),
+                        "status": response.status_code,
+                    }
+                },
+            )
+            return None
+        suffix = Path(urlparse(url).path).suffix or ".mp3"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        target = base_dir / f"{take_id}_dl{suffix}"
+        try:
+            with target.open("wb") as handle:
+                for chunk in response.iter_content(65536):
+                    if chunk:
+                        handle.write(chunk)
+        except Exception as exc:
+            log.warning(
+                "suno.audio.download.write_failed",
+                extra={"meta": {"path": str(target), "err": str(exc)}},
+            )
+            with suppress(Exception):
+                target.unlink(missing_ok=True)  # type: ignore[arg-type]
+            return None
+        return target
 
     # ----------------------------------------------------------------- public API
     def start_music(
@@ -1447,7 +1730,13 @@ class SunoService:
                 task = task.model_copy(update={"task_id": mapped})
         self.handle_callback(task, req_id=req_id)
 
-    def handle_callback(self, task: SunoTask, req_id: Optional[str] = None) -> None:
+    def handle_callback(
+        self,
+        task: SunoTask,
+        req_id: Optional[str] = None,
+        *,
+        delivery_via: str = "webhook",
+    ) -> None:
         if not task.task_id:
             log.warning("Callback without task_id: %s", task)
             return
@@ -1548,113 +1837,131 @@ class SunoService:
                 )
                 self._save_task_record(task.task_id, record)
                 return
+
             base_dir = self._base_dir(task.task_id)
             track_records: list[Dict[str, Any]] = []
             durations: list[float] = []
+            self._log_delivery(
+                "suno.delivery.start",
+                task_id=task.task_id,
+                takes=len(task.items),
+                via=delivery_via,
+            )
+
             for idx, track in enumerate(task.items, start=1):
-                track_id = track.id or str(idx)
-                track_title = str(track.title).strip() if track.title else None
-                meta_title = str(meta.title).strip() if meta and meta.title else None
-                preferred_title = meta_user_title or track_title or meta_title or f"Track {idx}"
-                take_label = f"Take {idx}" if len(task.items) > 1 else None
-                caption = self._build_audio_caption(
-                    title=preferred_title,
-                    tags=track.tags,
-                    duration=track.duration,
-                    take_label=take_label,
+                take_id = track.id or str(idx)
+                meta_title_value = str(meta.title).strip() if meta and meta.title else None
+                normalized_title = self._normalize_take_title(
+                    track,
+                    meta_title=meta_title_value,
+                    user_title=meta_user_title,
                 )
-                resolved_audio = track.source_audio_url or track.audio_url
-                thumb_url = track.source_image_url or track.image_url
-                send_title = f"{preferred_title} ({take_label})" if take_label else preferred_title
-                duration_label = self._format_duration_label(track.duration)
-                fallback_lines: list[str] = []
-                if track.audio_url:
-                    fallback_lines.append(f"🔗 Аудио ({send_title}): {track.audio_url}")
-                elif resolved_audio:
-                    fallback_lines.append(f"🔗 Аудио ({send_title}): {resolved_audio}")
-                if track.tags:
-                    fallback_lines.append(f"🏷️ {track.tags}")
-                if duration_label:
-                    fallback_lines.append(f"⏱️ {duration_label}")
-                if track.image_url:
-                    fallback_lines.append(f"🖼️ Обложка ({send_title}): {track.image_url}")
-                if not fallback_lines:
-                    fallback_lines.append(f"⚠️ Не удалось отправить трек {send_title}.")
-                fallback_text = "\n".join(fallback_lines)
+                tags_list = self._collect_tags(track.tags)
+                caption = self._build_take_caption(
+                    title=normalized_title,
+                    take_index=idx,
+                    duration=track.duration,
+                    tags=tags_list,
+                )
+                take_title = f"{normalized_title} (Take {idx})" if len(task.items) > 1 else normalized_title
+                cover_url = track.source_image_url or track.image_url
+                audio_url = track.source_audio_url or track.audio_url
+
+                if not self._delivery_register(task.task_id, take_id):
+                    self._log_delivery(
+                        "suno.delivery.take.skipped",
+                        task_id=task.task_id,
+                        take_id=take_id,
+                        reason="duplicate",
+                    )
+                    track_records.append(
+                        {
+                            "id": take_id,
+                            "title": normalized_title,
+                            "original_title": track.title,
+                            "audio_url": track.audio_url,
+                            "image_url": track.image_url,
+                            "source_audio_url": track.source_audio_url,
+                            "source_image_url": track.source_image_url,
+                            "tags": track.tags,
+                            "duration": track.duration,
+                        }
+                    )
+                    if isinstance(track.duration, (int, float)):
+                        durations.append(float(track.duration))
+                    continue
+
+                cover_sent = False
+                cover_reason: Optional[str] = None
+                if cover_url:
+                    cover_sent, cover_reason = self._send_cover_url(
+                        chat_id=chat_id,
+                        photo_url=cover_url,
+                        caption=take_title,
+                        reply_to=None,
+                    )
+                    if not cover_sent:
+                        image_path = self._find_local_file(base_dir, f"{take_id}_cover")
+                        if image_path and self._send_image(chat_id, image_path, title=take_title, reply_to=None):
+                            cover_sent = True
+                            cover_reason = None
+                if cover_url and not cover_sent:
+                    self._log_delivery(
+                        "suno.delivery.cover.failed",
+                        task_id=task.task_id,
+                        take_id=take_id,
+                        err=mask_tokens(cover_reason or "unknown"),
+                    )
+
                 audio_sent = False
-                image_sent = False
-                try:
-                    if resolved_audio and self._send_audio_url(
-                        chat_id,
-                        resolved_audio,
+                if audio_url:
+                    audio_sent, _ = self._send_audio_url_with_retry(
+                        chat_id=chat_id,
+                        audio_url=audio_url,
                         caption=caption,
                         reply_to=None,
-                        title=send_title,
-                        thumb=thumb_url,
-                    ):
-                        audio_sent = True
-                        if thumb_url:
-                            image_sent = True
-                        log.info(
-                            "Suno audio url sent | task=%s track=%s url=%s",
-                            task.task_id,
-                            track_id,
-                            mask_tokens(resolved_audio),
-                        )
-                    else:
-                        audio_path = self._find_local_file(base_dir, track_id)
-                        if audio_path and self._send_audio(chat_id, audio_path, title=preferred_title, reply_to=None):
-                            audio_sent = True
-                            log.info(
-                                "Suno audio sent | task=%s track=%s path=%s",
-                                task.task_id,
-                                track_id,
-                                audio_path,
-                            )
-                    if not image_sent:
-                        image_caption = f"🖼️ {send_title} (обложка)"
-                        if track.image_url and self._send_image_url(
-                            chat_id,
-                            track.image_url,
-                            caption=image_caption,
-                            reply_to=None,
-                        ):
-                            image_sent = True
-                            log.info(
-                                "Suno cover url sent | task=%s track=%s url=%s",
-                                task.task_id,
-                                track_id,
-                                mask_tokens(track.image_url),
-                            )
-                        else:
-                            image_path = self._find_local_file(base_dir, f"{track_id}_cover")
-                            if image_path and self._send_image(chat_id, image_path, title=send_title, reply_to=None):
-                                image_sent = True
-                                log.info(
-                                    "Suno cover sent | task=%s track=%s path=%s",
-                                    task.task_id,
-                                    track_id,
-                                    image_path,
-                                )
-                except Exception as send_exc:
-                    log.error(
-                        "Failed to send audio %s, chat %s, error=%s",
-                        task.task_id,
-                        chat_id,
-                        send_exc,
-                        exc_info=True,
+                        title=take_title,
+                        thumb=cover_url,
+                        base_dir=base_dir,
+                        take_id=take_id,
                     )
-                    audio_sent = False
-                    image_sent = False
-                if not audio_sent:
-                    self._send_text(chat_id, fallback_text)
-                elif not image_sent and track.image_url:
-                    self._send_text(chat_id, f"🖼️ Обложка ({send_title}): {track.image_url}")
-                log.info("Delivered track %s to chat %s", task.task_id, chat_id)
+                else:
+                    local_audio = self._find_local_file(base_dir, take_id)
+                    if local_audio:
+                        audio_sent = self._send_file(
+                            "sendAudio",
+                            "audio",
+                            chat_id,
+                            local_audio,
+                            caption=caption,
+                            reply_to=None,
+                            extra={"title": take_title},
+                        )
+                        schedule_unlink(local_audio)
+
+                if audio_sent:
+                    self._log_delivery(
+                        "suno.delivery.take.sent",
+                        task_id=task.task_id,
+                        take_id=take_id,
+                        audio_url=mask_tokens(audio_url or track.audio_url or ""),
+                        image_url=mask_tokens(cover_url or track.image_url or ""),
+                    )
+                    if not cover_sent and cover_url:
+                        self._send_text(chat_id, f"🖼️ Обложка ({take_title}): {cover_url}")
+                else:
+                    fallback_lines = [f"⚠️ Не удалось отправить трек {take_title}."]
+                    link_candidate = audio_url or track.audio_url
+                    if link_candidate:
+                        fallback_lines.append(f"🔗 {link_candidate}")
+                    if cover_url:
+                        fallback_lines.append(f"🖼️ Обложка: {cover_url}")
+                    self._send_text(chat_id, "\n".join(fallback_lines))
+
                 track_records.append(
                     {
-                        "id": track_id,
-                        "title": preferred_title,
+                        "id": take_id,
+                        "title": normalized_title,
                         "original_title": track.title,
                         "audio_url": track.audio_url,
                         "image_url": track.image_url,
@@ -1666,6 +1973,7 @@ class SunoService:
                 )
                 if isinstance(track.duration, (int, float)):
                     durations.append(float(track.duration))
+
             record = dict(existing_record)
             record.update(
                 {
