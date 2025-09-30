@@ -100,6 +100,9 @@ def test_start_sends_big_emoji_once(monkeypatch):
     assert len(sticker_entries) == 1
     assert sticker_entries[0]["sticker"] == "sticker-file-id"
 
+    deleted_payloads = [item for item in bot.deleted if item.get("message_id") == start_msg_id]
+    assert deleted_payloads, "start button message should be removed"
+
     suno_state_after = load_suno_state(ctx)
     assert suno_state_after.start_clicked is True
     assert suno_state_after.start_emoji_msg_id == 100
@@ -109,7 +112,7 @@ def test_start_sends_big_emoji_once(monkeypatch):
     assert ctx.user_data["suno_state"]["start_msg_id"] is None
 
     assert launch_calls and launch_calls[0]["trigger"] == "start"
-    assert notify_calls, "summary notification should be sent"
+    assert notify_calls == [SUNO_STARTING_MESSAGE]
 
     # Second click should be ignored entirely.
     second_update = SimpleNamespace(
@@ -123,6 +126,7 @@ def test_start_sends_big_emoji_once(monkeypatch):
     sticker_entries_after = [item for item in bot.sent if item.get("_method") == "send_sticker"]
     assert len(sticker_entries_after) == 1
     assert len(launch_calls) == 1
+    assert notify_calls == [SUNO_STARTING_MESSAGE]
 
 
 def test_start_button_disabled_after_click(monkeypatch):
@@ -152,12 +156,9 @@ def test_start_button_disabled_after_click(monkeypatch):
 
     asyncio.run(bot_module.on_callback(update, ctx))
 
-    assert bot.edited, "start message should be edited"
-    edited_payload = bot.edited[-1]
-    assert edited_payload["message_id"] == start_msg_id
-    assert edited_payload["chat_id"] == chat_id
-    assert edited_payload["text"] == SUNO_STARTING_MESSAGE
-    assert edited_payload.get("reply_markup") is None
+    assert not bot.edited, "start message should be removed instead of edited"
+    deleted_payloads = [item for item in bot.deleted if item.get("message_id") == start_msg_id]
+    assert deleted_payloads
 
     state_after = load_suno_state(ctx)
     assert state_after.start_msg_id is None

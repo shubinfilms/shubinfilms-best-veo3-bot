@@ -615,7 +615,7 @@ def _env_int(k: str, default: int) -> int:
         return default
 
 
-START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "")
+START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
 
@@ -2723,6 +2723,12 @@ def _reset_suno_card_cache(state_dict: Dict[str, Any]) -> None:
         card_state["chat_id"] = None
 
 
+def _reset_suno_start_flags(state_dict: Dict[str, Any]) -> None:
+    state_dict["suno_start_clicked"] = False
+    state_dict["suno_start_button_sent_ts"] = None
+    state_dict["suno_can_start"] = False
+
+
 DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
@@ -2752,6 +2758,10 @@ DEFAULT_STATE = {
     "suno_waiting_state": IDLE_SUNO,
     "suno_generating": False,
     "suno_waiting_enqueue": False,
+    "suno_current_req_id": None,
+    "suno_can_start": False,
+    "suno_start_button_sent_ts": None,
+    "suno_start_clicked": False,
     "suno_last_task_id": None,
     "suno_last_params": None,
     "suno_balance": None,
@@ -5824,6 +5834,7 @@ async def _suno_issue_refund(
     s = state(ctx)
     s["suno_generating"] = False
     s["suno_current_req_id"] = None
+    _reset_suno_start_flags(s)
     if task_id and s.get("suno_last_task_id") == task_id:
         s["suno_last_task_id"] = None
     if isinstance(new_balance, int):
@@ -6976,6 +6987,8 @@ async def _poll_suno_and_send(
         if s.get("suno_last_task_id") == task_id:
             s["suno_last_task_id"] = None
         s["suno_generating"] = False
+        s["suno_current_req_id"] = None
+        _reset_suno_start_flags(s)
         _reset_suno_card_cache(s)
         try:
             await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
@@ -10047,7 +10060,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Нет чата", show_alert=True)
                 return
 
-            if suno_state_obj.start_clicked:
+            if suno_state_obj.start_clicked or bool(s.get("suno_start_clicked")):
                 await q.answer()
                 return
 
@@ -10088,18 +10101,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if isinstance(start_msg_id, int):
                 try:
-                    await safe_edit(
-                        ctx.bot,
-                        chat_id,
-                        start_msg_id,
-                        SUNO_STARTING_MESSAGE,
-                        None,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
+                    await ctx.bot.delete_message(chat_id, start_msg_id)
                 except Exception as exc:
                     log.debug(
-                        "suno start message update failed | chat=%s msg=%s err=%s",
+                        "suno start message delete failed | chat=%s msg=%s err=%s",
                         chat_id,
                         start_msg_id,
                         exc,
@@ -10141,13 +10146,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             suno_state_obj.start_emoji_msg_id = emoji_msg_id
             save_suno_state(ctx, suno_state_obj)
             s["suno_state"] = suno_state_obj.to_dict()
+            s["suno_start_clicked"] = True
+            s["suno_can_start"] = False
 
-            summary_text = _suno_summary_text(suno_state_obj)
             await _suno_notify(
                 ctx,
                 chat_id,
-                summary_text,
-                reply_to=q.message,
+                SUNO_STARTING_MESSAGE,
             )
             params = _suno_collect_params(s, suno_state_obj)
             lock_acquired = False
