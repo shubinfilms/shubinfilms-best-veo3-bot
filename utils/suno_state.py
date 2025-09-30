@@ -95,7 +95,7 @@ def _clean_lyrics(value: Optional[str]) -> Optional[str]:
 
 @dataclass
 class SunoState:
-    mode: Literal["instrumental", "lyrics"] = "instrumental"
+    mode: Literal["instrumental", "lyrics", "cover"] = "instrumental"
     title: Optional[str] = None
     style: Optional[str] = None
     lyrics: Optional[str] = None
@@ -105,6 +105,8 @@ class SunoState:
     card_chat_id: Optional[int] = None
     last_card_hash: Optional[str] = None
     preset: Optional[str] = None
+    cover_source_url: Optional[str] = None
+    cover_source_label: Optional[str] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -123,13 +125,15 @@ class SunoState:
             "card_chat_id": self.card_chat_id,
             "last_card_hash": self.last_card_hash,
             "preset": self.preset,
+            "cover_source_url": self.cover_source_url,
+            "cover_source_label": self.cover_source_label,
         }
 
 
 def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     raw_mode = payload.get("mode")
-    mode: Literal["instrumental", "lyrics"]
-    if isinstance(raw_mode, str) and raw_mode in {"instrumental", "lyrics"}:
+    mode: Literal["instrumental", "lyrics", "cover"]
+    if isinstance(raw_mode, str) and raw_mode in {"instrumental", "lyrics", "cover"}:
         mode = raw_mode  # type: ignore[assignment]
     else:
         mode = "lyrics" if bool(payload.get("has_lyrics")) else "instrumental"
@@ -157,6 +161,12 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
         text = raw_preset.strip().lower()
         if text:
             state.preset = text
+    raw_cover_url = payload.get("cover_source_url")
+    if isinstance(raw_cover_url, str):
+        state.cover_source_url = raw_cover_url.strip() or None
+    raw_cover_label = payload.get("cover_source_label")
+    if isinstance(raw_cover_label, str):
+        state.cover_source_label = raw_cover_label.strip() or None
     return state
 
 
@@ -198,6 +208,18 @@ def set_style(state: SunoState, value: Optional[str]) -> SunoState:
 
 def clear_style(state: SunoState) -> SunoState:
     state.style = None
+    return state
+
+
+def set_cover_source(state: SunoState, url: Optional[str], label: Optional[str] = None) -> SunoState:
+    state.cover_source_url = (url or "").strip() or None
+    state.cover_source_label = (label or "").strip() or None
+    return state
+
+
+def clear_cover_source(state: SunoState) -> SunoState:
+    state.cover_source_url = None
+    state.cover_source_label = None
     return state
 
 
@@ -261,7 +283,13 @@ def build_generation_payload(
     payload["tags"] = tags
     if state.preset:
         payload["preset"] = state.preset
-    if state.has_lyrics:
+    if state.mode == "cover":
+        payload["operationType"] = "upload-and-cover-audio"
+        if state.cover_source_url:
+            payload["inputAudioUrl"] = state.cover_source_url
+        payload["instrumental"] = False
+        payload["has_lyrics"] = False
+    elif state.has_lyrics:
         payload["lyrics"] = state.lyrics or ""
     if lang:
         payload["lang"] = lang
@@ -330,6 +358,8 @@ __all__ = [
     "sanitize_payload_for_log",
     "set_lyrics",
     "set_style",
+    "set_cover_source",
     "set_title",
     "style_preview",
+    "clear_cover_source",
 ]

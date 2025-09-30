@@ -130,18 +130,22 @@ def test_render_includes_escaped_fields() -> None:
     set_style(state, "Dream pop <b>lush</b>")
     set_lyrics(state, "Line one\nLine two")
     text, _ = _render(state)
-    assert "• Название: <i>Test</i>" in text
+    assert "🏷️ Название: <i>Test</i>" in text
     assert "<Track" not in text
-    assert "• Стиль: <i>Dream pop lush</i>" in text
-    assert "• Текст: <i>Line one" in text
+    assert "🎹 Стиль: <i>Dream pop lush</i>" in text
+    assert "📜 Текст: <i>Line one" in text
 
 
 def test_render_shows_dash_for_missing_values() -> None:
     state = SunoState()
     text, _ = _render(state)
-    assert "• Название: <i>—</i>" in text
-    assert "• Стиль: <i>—</i>" in text
-    assert "• Текст: <i>—</i>" in text
+    assert "🏷️ Название: <i>—</i>" in text
+    assert "🎹 Стиль: <i>—</i>" in text
+    assert "📜" not in text
+
+    state_lyrics = SunoState(mode="lyrics")
+    text_lyrics, _ = _render(state_lyrics)
+    assert "📜 Текст: <i>—</i>" in text_lyrics
 
 
 def test_render_has_no_br_tags() -> None:
@@ -157,7 +161,7 @@ def test_lyrics_preview_and_payload() -> None:
     state = SunoState(mode="lyrics")
     set_lyrics(state, lyrics)
     text, _ = _render(state)
-    assert "• Текст: <i>First verse" in text
+    assert "📜 Текст: <i>First verse" in text
     payload = build_generation_payload(state, model="V5", lang="ru")
     assert payload["lyrics"] == "First verse\nSecond line\nThird"
 
