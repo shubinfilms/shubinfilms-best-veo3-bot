@@ -40,6 +40,7 @@ SUNO_RU = {
     "suno.prompt.step.generic": "🎯 Уточните следующий параметр.",
     "suno.prompt.fill": "Заполните: {fields}",
     "suno.prompt.ready": "Все обязательные поля заполнены. Можно запускать генерацию.",
+    "suno.prompt.starting": "Запускаю генерацию…",
     "suno.error.upload_client": "⚠️ Не удалось загрузить источник. Проверьте файл/ссылку и попробуйте ещё раз.",
     "suno.error.upload_service": "⚠️ Сервис загрузки недоступен. Попробуйте позже.",
 }
@@ -57,3 +58,4 @@ def t(key: str, /, **kwargs: Any) -> str:
 
 SUNO_MODE_PROMPT = t("suno.prompt.mode_select")
 SUNO_START_READY_MESSAGE = t("suno.prompt.ready")
+SUNO_STARTING_MESSAGE = t("suno.prompt.starting")

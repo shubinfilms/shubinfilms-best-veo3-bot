@@ -137,7 +137,7 @@ from utils.telegram_utils import label_to_command, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX, suno_modes_keyboard
-from texts import SUNO_MODE_PROMPT, t
+from texts import SUNO_MODE_PROMPT, SUNO_STARTING_MESSAGE, t
 
 from redis_utils import (
     credit,
@@ -239,10 +239,12 @@ from telegram_utils import (
     build_hub_keyboard,
     build_hub_text,
     safe_send as tg_safe_send,
+    safe_edit,
     safe_edit_text,
     safe_send_text,
     safe_send_placeholder,
     safe_edit_markdown_v2,
+    safe_send_sticker,
     run_ffmpeg,
     md2_escape,
     mask_tokens,
@@ -283,6 +285,7 @@ def _faq_track_section(section: str) -> None:
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
 _SUNO_LOCK_MEMORY: set[int] = set()
+_SUNO_START_LOCK_TTL = 120
 
 _SUNO_PENDING_TTL = 20 * 60
 _SUNO_PENDING_LOCK = threading.Lock()
@@ -311,6 +314,22 @@ def _acquire_suno_lock(user_id: int) -> bool:
         if user_id in _SUNO_LOCK_MEMORY:
             return False
         _SUNO_LOCK_MEMORY.add(user_id)
+        return True
+
+
+def _suno_start_lock_key(user_id: int) -> str:
+    return f"{REDIS_PREFIX}:suno:start:{int(user_id)}"
+
+
+def _acquire_suno_start_lock(user_id: int) -> bool:
+    if not REDIS_LOCK_ENABLED or not redis_client:
+        return True
+    key = _suno_start_lock_key(user_id)
+    try:
+        stored = redis_client.set(key, "1", nx=True, ex=_SUNO_START_LOCK_TTL)
+        return bool(stored)
+    except Exception as exc:
+        log.warning("Suno start redis lock error | user=%s err=%s", user_id, exc)
         return True
 
 
@@ -594,6 +613,10 @@ def _env_int(k: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "")
+START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
 
 SUNO_PER_USER_COOLDOWN_SEC = max(0, _env_int("SUNO_PER_USER_COOLDOWN_SEC", 0))
@@ -10002,8 +10025,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if chat_id is None:
                 await q.answer("Нет чата", show_alert=True)
                 return
+
+            if suno_state_obj.start_clicked:
+                await q.answer()
+                return
+
+            if uid is not None:
+                start_lock_ok = _acquire_suno_start_lock(int(uid))
+                if not start_lock_ok:
+                    await q.answer()
+                    return
+
             await q.answer()
-            flow_choice = s.get("suno_flow") or suno_state_obj.mode
+
             missing_fields = _suno_missing_fields(suno_state_obj)
             if missing_fields:
                 fields_text = ", ".join(missing_fields)
@@ -10014,6 +10048,79 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_to=q.message,
                 )
                 return
+
+            raw_start_msg = s.get("suno_start_msg_id")
+            start_msg_id = raw_start_msg if isinstance(raw_start_msg, int) else None
+            if start_msg_id is None and isinstance(suno_state_obj.start_msg_id, int):
+                start_msg_id = suno_state_obj.start_msg_id
+
+            msg_ids_map = s.get("msg_ids")
+            if isinstance(msg_ids_map, dict):
+                msg_ids_map.pop("suno_start", None)
+            s.pop("suno_start_msg_id", None)
+
+            suno_state_obj.start_clicked = True
+            suno_state_obj.start_msg_id = None
+            suno_state_obj.start_emoji_msg_id = None
+            save_suno_state(ctx, suno_state_obj)
+            s["suno_state"] = suno_state_obj.to_dict()
+
+            if isinstance(start_msg_id, int):
+                try:
+                    await safe_edit(
+                        ctx.bot,
+                        chat_id,
+                        start_msg_id,
+                        SUNO_STARTING_MESSAGE,
+                        None,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:
+                    log.debug(
+                        "suno start message update failed | chat=%s msg=%s err=%s",
+                        chat_id,
+                        start_msg_id,
+                        exc,
+                    )
+
+            emoji_msg_id: Optional[int] = None
+            sticker_id = START_EMOJI_STICKER_ID.strip()
+            if sticker_id:
+                try:
+                    sticker_message = await safe_send_sticker(ctx.bot, chat_id, sticker_id)
+                    if sticker_message is not None:
+                        emoji_msg_id = getattr(sticker_message, "message_id", None)
+                except Exception as exc:
+                    log.warning(
+                        "suno start sticker failed | user=%s chat=%s err=%s",
+                        uid,
+                        chat_id,
+                        exc,
+                    )
+
+            if emoji_msg_id is None:
+                fallback_emoji = START_EMOJI_FALLBACK or "🎬"
+                try:
+                    fallback_message = await safe_send_placeholder(
+                        ctx.bot,
+                        chat_id,
+                        fallback_emoji,
+                    )
+                    if fallback_message is not None:
+                        emoji_msg_id = getattr(fallback_message, "message_id", None)
+                except Exception as exc:
+                    log.warning(
+                        "suno start fallback emoji failed | user=%s chat=%s err=%s",
+                        uid,
+                        chat_id,
+                        exc,
+                    )
+
+            suno_state_obj.start_emoji_msg_id = emoji_msg_id
+            save_suno_state(ctx, suno_state_obj)
+            s["suno_state"] = suno_state_obj.to_dict()
+
             summary_text = _suno_summary_text(suno_state_obj)
             await _suno_notify(
                 ctx,
