@@ -168,6 +168,33 @@ async def safe_send(
     return last_message
 
 
+async def safe_delete_message(bot: Bot, chat_id: int, message_id: int) -> bool:
+    """Delete a message while suppressing common Telegram errors."""
+
+    try:
+        await bot.delete_message(chat_id, message_id)
+        return True
+    except BadRequest as exc:
+        message = str(exc).lower()
+        if "message to delete not found" in message or "message can't be deleted" in message:
+            logger.debug(
+                "safe_delete.skip",
+                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
+            return False
+        logger.debug(
+            "safe_delete.bad_request",
+            extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+        )
+        return False
+    except Exception as exc:  # pragma: no cover - network issues
+        logger.warning(
+            "safe_delete.error",
+            extra={"chat_id": chat_id, "message_id": message_id, "error": repr(exc)},
+        )
+        return False
+
+
 async def send_html_with_fallback(
     bot: Bot,
     chat_id: int,
@@ -205,4 +232,4 @@ async def send_html_with_fallback(
         )
 
 
-__all__ = ["safe_send", "send_html_with_fallback", "sanitize_html"]
+__all__ = ["safe_send", "send_html_with_fallback", "sanitize_html", "safe_delete_message"]

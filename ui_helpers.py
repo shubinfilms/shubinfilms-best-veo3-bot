@@ -288,7 +288,7 @@ def render_suno_card(
         if suno_state.kie_file_id:
             source_info = f"загружено ✅ (id: {html.escape(suno_state.kie_file_id)})"
         else:
-            source_info = "не загружен"
+            source_info = "—"
         lines = ["🎚️ <b>Ковер</b>"]
         lines.append(f"✏️ Название: {title_display}")
         lines.append(f"🎧 Источник: {source_info}")

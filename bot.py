@@ -22,7 +22,7 @@ import atexit
 from pathlib import Path
 # main
 from collections.abc import Mapping
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode
@@ -106,6 +106,7 @@ from utils.suno_state import (
     set_title as set_suno_title,
     set_cover_source as set_suno_cover_source,
     clear_cover_source as clear_suno_cover_source,
+    reset_suno_card_state,
 )
 
 try:  # pragma: no cover - optional helper
@@ -246,6 +247,7 @@ from telegram_utils import (
     mask_tokens,
 )
 from utils.api_client import request_with_retries
+from utils.safe_send import safe_delete_message
 from utils.telegram_safe import safe_edit_message
 from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
@@ -5097,21 +5099,37 @@ async def _music_begin_flow(
     user_id: Optional[int],
 ) -> None:
     suno_state_obj = load_suno_state(ctx)
-    suno_state_obj.mode = flow  # type: ignore[assignment]
-    clear_suno_style(suno_state_obj)
-    clear_suno_title(suno_state_obj)
-    clear_suno_lyrics(suno_state_obj)
-    clear_suno_cover_source(suno_state_obj)
+    card_state = state_dict.get("suno_card")
+    card_msg_id: Optional[int] = None
+    card_chat_id: Optional[int] = None
+    if isinstance(card_state, Mapping):
+        raw_msg_id = card_state.get("msg_id")
+        raw_chat_id = card_state.get("chat_id")
+        if isinstance(raw_msg_id, int):
+            card_msg_id = raw_msg_id
+        if isinstance(raw_chat_id, int):
+            card_chat_id = raw_chat_id
+    if card_msg_id is None:
+        raw_last_id = state_dict.get("last_ui_msg_id_suno")
+        if isinstance(raw_last_id, int):
+            card_msg_id = raw_last_id
+
+    effective_chat_id = card_chat_id if isinstance(card_chat_id, int) else chat_id
+    start_msg_id = getattr(suno_state_obj, "start_msg_id", None)
+    if isinstance(start_msg_id, int) and isinstance(effective_chat_id, int):
+        await safe_delete_message(ctx.bot, effective_chat_id, start_msg_id)
+    state_dict.pop("suno_start_msg_id", None)
+    msg_ids = state_dict.get("msg_ids")
+    if isinstance(msg_ids, MutableMapping):
+        msg_ids.pop("suno_start", None)
+
+    reset_suno_card_state(
+        suno_state_obj,
+        mode=flow if flow in {"instrumental", "lyrics", "cover"} else "instrumental",  # type: ignore[arg-type]
+        card_message_id=card_msg_id,
+        card_chat_id=effective_chat_id if isinstance(effective_chat_id, int) else None,
+    )
     state_dict["suno_cover_source_label"] = None
-    if flow == "instrumental":
-        suno_state_obj.mode = "instrumental"  # type: ignore[assignment]
-    elif flow == "lyrics":
-        suno_state_obj.mode = "lyrics"  # type: ignore[assignment]
-    else:
-        suno_state_obj.mode = "cover"  # type: ignore[assignment]
-    default_style = suno_default_style_text(flow)
-    if default_style and not suno_state_obj.style:
-        set_suno_style(suno_state_obj, default_style)
     save_suno_state(ctx, suno_state_obj)
     state_dict["suno_state"] = suno_state_obj.to_dict()
     state_dict["suno_flow"] = flow
@@ -5122,6 +5140,7 @@ async def _music_begin_flow(
     state_dict["suno_auto_lyrics_pending"] = False
     state_dict["suno_auto_lyrics_generated"] = False
     state_dict["suno_lyrics_confirmed"] = False
+    state_dict["suno_waiting_state"] = IDLE_SUNO
     _reset_suno_card_cache(state_dict)
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
     await _music_prompt_step(
@@ -5204,9 +5223,9 @@ _COVER_INVALID_INPUT_MESSAGE = (
     f"⚠️ Нужен аудиофайл (mp3/wav) до {COVER_MAX_AUDIO_MB} МБ или ссылка http/https на аудио."
 )
 _COVER_UPLOAD_CLIENT_ERROR_MESSAGE = (
-    "⚠️ Не удалось загрузить источник (ошибка сервиса). Проверьте файл/ссылку и попробуйте ещё раз."
+    "⚠️ Не удалось загрузить источник. Проверьте файл/ссылку и попробуйте ещё раз."
 )
-_COVER_UPLOAD_SERVICE_ERROR_MESSAGE = "⚠️ Сервис загрузки временно недоступен. Попробуйте позже."
+_COVER_UPLOAD_SERVICE_ERROR_MESSAGE = "⚠️ Сервис загрузки недоступен. Попробуйте позже."
 
 
 def _cover_sanitize_label(value: Optional[str]) -> Optional[str]:
@@ -5230,7 +5249,7 @@ async def _cover_process_audio_input(
     request_id = _generate_cover_upload_request_id(user_id)
     file_size = getattr(audio_obj, "file_size", 0) or 0
     log.info(
-        "cover.source_received",
+        "cover_source_received",
         extra={"request_id": request_id, "kind": "file", "size": int(file_size)},
     )
 
@@ -5241,19 +5260,26 @@ async def _cover_process_audio_input(
             getattr(audio_obj, "file_size", None),
         )
     except CoverSourceValidationError:
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "file", "reason": "validation"},
+        )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
 
     try:
         telegram_file = await ctx.bot.get_file(audio_obj.file_id)
     except TelegramError as exc:
-        log.warning("cover.source_get_file_failed | chat=%s err=%s", chat_id, exc)
+        log.warning("cover_upload_fail", extra={"request_id": request_id, "kind": "file", "reason": f"get_file:{exc}"})
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
     file_path = getattr(telegram_file, "file_path", None)
     if not file_path:
-        log.warning("cover.source_file_path_missing | chat=%s", chat_id)
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "file", "reason": "file_path_missing"},
+        )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
@@ -5266,12 +5292,15 @@ async def _cover_process_audio_input(
     try:
         audio_bytes = await _download_telegram_file(tg_url, timeout=download_timeout)
     except Exception as exc:
-        log.warning("cover.source_download_failed | chat=%s err=%s", chat_id, exc)
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "file", "reason": f"download:{exc}"},
+        )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
     log.info(
-        "cover.source_uploading",
+        "cover_upload_try",
         extra={"request_id": request_id, "kind": "file", "size": len(audio_bytes)},
     )
     try:
@@ -5283,21 +5312,44 @@ async def _cover_process_audio_input(
             logger=log,
         )
     except CoverSourceValidationError:
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "file", "reason": "validation"},
+        )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
-    except CoverSourceClientError:
+    except CoverSourceClientError as exc:
+        log.warning(
+            "cover_upload_fail",
+            extra={
+                "request_id": request_id,
+                "kind": "file",
+                "reason": f"client:{exc}",
+            },
+        )
         await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
         return True
-    except CoverSourceUnavailableError:
+    except CoverSourceUnavailableError as exc:
+        log.warning(
+            "cover_upload_fail",
+            extra={
+                "request_id": request_id,
+                "kind": "file",
+                "reason": f"service:{exc}",
+            },
+        )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
     except Exception as exc:  # pragma: no cover - defensive guard
-        log.warning("cover.source_upload_exception | chat=%s err=%s", chat_id, exc)
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "file", "reason": f"exception:{exc}"},
+        )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
     log.info(
-        "cover.source_uploaded",
+        "cover_upload_ok",
         extra={"request_id": request_id, "kie_file_id": kie_file_id},
     )
 
@@ -5305,9 +5357,10 @@ async def _cover_process_audio_input(
     _music_store_cover_source(
         ctx,
         state_dict,
+        url=tg_url,
         label=label,
         source_file_id=getattr(audio_obj, "file_id", None),
-        source_url=None,
+        source_url=tg_url,
         kie_file_id=kie_file_id,
     )
     state_dict["suno_waiting_state"] = IDLE_SUNO
@@ -5339,16 +5392,20 @@ async def _cover_process_url_input(
     try:
         validated_url = await ensure_cover_audio_url(url_text)
     except CoverSourceValidationError:
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "url", "reason": "validation"},
+        )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
 
     parsed = urlparse(validated_url)
     log.info(
-        "cover.source_received",
+        "cover_source_received",
         extra={"request_id": request_id, "kind": "url", "host": parsed.netloc},
     )
     log.info(
-        "cover.source_uploading",
+        "cover_upload_try",
         extra={"request_id": request_id, "kind": "url", "host": parsed.netloc},
     )
     try:
@@ -5357,19 +5414,38 @@ async def _cover_process_url_input(
             request_id=request_id,
             logger=log,
         )
-    except CoverSourceClientError:
+    except CoverSourceClientError as exc:
+        log.warning(
+            "cover_upload_fail",
+            extra={
+                "request_id": request_id,
+                "kind": "url",
+                "reason": f"client:{exc}",
+            },
+        )
         await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
         return True
-    except CoverSourceUnavailableError:
+    except CoverSourceUnavailableError as exc:
+        log.warning(
+            "cover_upload_fail",
+            extra={
+                "request_id": request_id,
+                "kind": "url",
+                "reason": f"service:{exc}",
+            },
+        )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
     except Exception as exc:  # pragma: no cover - defensive guard
-        log.warning("cover.source_upload_exception | chat=%s err=%s", chat_id, exc)
+        log.warning(
+            "cover_upload_fail",
+            extra={"request_id": request_id, "kind": "url", "reason": f"exception:{exc}"},
+        )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
     log.info(
-        "cover.source_uploaded",
+        "cover_upload_ok",
         extra={"request_id": request_id, "kie_file_id": kie_file_id},
     )
 
