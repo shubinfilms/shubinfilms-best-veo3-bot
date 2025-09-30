@@ -299,20 +299,20 @@ async def sync_suno_start_message(
     generating: bool,
     waiting_enqueue: bool,
 ) -> Optional[int]:
-    previous_can_start = bool(state_dict.get("suno_can_start"))
-    if ready and not previous_can_start:
-        state_dict["suno_start_button_sent_ts"] = None
-        state_dict["suno_start_clicked"] = False
-    state_dict["suno_can_start"] = ready
-
-    should_show = ready and not generating and not waiting_enqueue
-
     raw_id = state_dict.get("suno_start_msg_id")
     start_msg_id = raw_id if isinstance(raw_id, int) else None
     if start_msg_id is None and isinstance(suno_state.start_msg_id, int):
         start_msg_id = suno_state.start_msg_id
 
     start_clicked_flag = bool(state_dict.get("suno_start_clicked"))
+    previous_can_start = bool(state_dict.get("suno_can_start"))
+    if ready and not previous_can_start and not start_clicked_flag:
+        state_dict["suno_start_button_sent_ts"] = None
+        state_dict["suno_start_clicked"] = False
+    state_dict["suno_can_start"] = ready
+
+    should_show = ready and not generating and not waiting_enqueue
+
     button_sent_ts = state_dict.get("suno_start_button_sent_ts")
     if should_show:
         if start_clicked_flag:
@@ -324,7 +324,11 @@ async def sync_suno_start_message(
             state_dict["suno_start_button_sent_ts"] = None
 
     if not should_show:
-        if isinstance(start_msg_id, int):
+        if (
+            isinstance(start_msg_id, int)
+            and not start_clicked_flag
+            and (not ready or generating or waiting_enqueue)
+        ):
             try:
                 await ctx.bot.delete_message(chat_id, start_msg_id)
             except BadRequest as exc:

@@ -14,7 +14,7 @@ from utils.suno_state import SunoState
 from tests.suno_test_utils import FakeBot
 
 
-def test_start_msg_appears_and_disappears():
+def test_start_button_shown_once():
     bot = FakeBot()
     ctx = SimpleNamespace(bot=bot)
     suno_state = SunoState(mode="cover")
@@ -38,7 +38,7 @@ def test_start_msg_appears_and_disappears():
     assert state_dict["suno_can_start"] is False
     assert state_dict.get("suno_start_button_sent_ts") is None
 
-    # Ready state should trigger a new message.
+    # Ready state should trigger a new message once.
     result_ready = asyncio.run(
         sync_suno_start_message(
             ctx,
@@ -57,6 +57,23 @@ def test_start_msg_appears_and_disappears():
     assert state_dict["suno_can_start"] is True
     button_ts = state_dict.get("suno_start_button_sent_ts")
     assert isinstance(button_ts, int) and button_ts > 0
+
+    # Second sync with ready=True should not send a new button message.
+    result_second = asyncio.run(
+        sync_suno_start_message(
+            ctx,
+            chat_id,
+            state_dict,
+            suno_state=suno_state,
+            ready=True,
+            generating=False,
+            waiting_enqueue=False,
+        )
+    )
+    assert result_second == result_ready
+    assert len([item for item in bot.sent if item.get("text") == SUNO_START_READY_MESSAGE]) == 1
+    second_ts = state_dict.get("suno_start_button_sent_ts")
+    assert second_ts == button_ts
 
     # Losing readiness should remove the message.
     result_hidden = asyncio.run(

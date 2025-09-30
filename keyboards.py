@@ -110,3 +110,8 @@ def suno_modes_keyboard() -> InlineKeyboardMarkup:
 def suno_start_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="suno:start")]]
     return InlineKeyboardMarkup(rows)
+
+
+def suno_start_disabled_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("⏳ Идёт генерация…", callback_data="suno:busy")]]
+    return InlineKeyboardMarkup(rows)

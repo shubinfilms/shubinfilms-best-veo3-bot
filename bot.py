@@ -136,8 +136,13 @@ from utils.input_state import (
 from utils.telegram_utils import label_to_command, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
-from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX, suno_modes_keyboard
-from texts import SUNO_MODE_PROMPT, SUNO_STARTING_MESSAGE, t
+from keyboards import (
+    CB_FAQ_PREFIX,
+    CB_PM_PREFIX,
+    suno_modes_keyboard,
+    suno_start_disabled_keyboard,
+)
+from texts import SUNO_MODE_PROMPT, SUNO_START_READY_MESSAGE, SUNO_STARTING_MESSAGE, t
 
 from redis_utils import (
     credit,
@@ -3217,16 +3222,23 @@ async def _handle_suno_waiting_input(
     if not custom_reply and not changed:
         reply_text = f"{reply_text} (без изменений)"
     await _send_with_retry(lambda: message.reply_text(reply_text))
-    if flow in {"instrumental", "lyrics", "cover"} and field == current_step:
-        next_step = _music_next_step(state_dict)
-        await _music_prompt_step(
-            chat_id,
-            ctx,
-            state_dict,
-            flow=flow,
-            step=next_step,
-            user_id=user_id,
-        )
+
+    if flow in {"instrumental", "lyrics", "cover"}:
+        pending_step = current_step if isinstance(current_step, str) else None
+        if pending_step and field == pending_step:
+            next_step = _music_next_step(state_dict)
+        else:
+            next_step = state_dict.get("suno_step") if isinstance(state_dict.get("suno_step"), str) else None
+
+        if pending_step == field or next_step is not None:
+            await _music_prompt_step(
+                chat_id,
+                ctx,
+                state_dict,
+                flow=flow,
+                step=next_step,
+                user_id=user_id,
+            )
     return True
 
 
@@ -5028,7 +5040,7 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 def _music_flow_steps(flow: str) -> list[str]:
     mapping = {
         "instrumental": ["style", "title"],
-        "lyrics": ["lyrics", "style", "title"],
+        "lyrics": ["style", "title", "lyrics"],
         "cover": ["source", "style", "title"],
     }
     return mapping.get(flow, [])
@@ -10055,13 +10067,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer(f"Режим: {mode_label}")
             return
 
+        if action == "busy":
+            await q.answer("Уже идёт генерация — дождитесь завершения")
+            return
+
         if action == "start":
             if chat_id is None:
                 await q.answer("Нет чата", show_alert=True)
                 return
 
             if suno_state_obj.start_clicked or bool(s.get("suno_start_clicked")):
-                await q.answer()
+                await q.answer("Уже идёт генерация — дождитесь завершения")
                 return
 
             if uid is not None:
@@ -10089,22 +10105,38 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 start_msg_id = suno_state_obj.start_msg_id
 
             msg_ids_map = s.get("msg_ids")
-            if isinstance(msg_ids_map, dict):
-                msg_ids_map.pop("suno_start", None)
-            s.pop("suno_start_msg_id", None)
+            if isinstance(msg_ids_map, dict) and isinstance(start_msg_id, int):
+                msg_ids_map["suno_start"] = start_msg_id
+            if isinstance(start_msg_id, int):
+                s["suno_start_msg_id"] = start_msg_id
 
             suno_state_obj.start_clicked = True
-            suno_state_obj.start_msg_id = None
+            suno_state_obj.start_msg_id = start_msg_id if isinstance(start_msg_id, int) else None
             suno_state_obj.start_emoji_msg_id = None
             save_suno_state(ctx, suno_state_obj)
             s["suno_state"] = suno_state_obj.to_dict()
 
             if isinstance(start_msg_id, int):
                 try:
-                    await ctx.bot.delete_message(chat_id, start_msg_id)
-                except Exception as exc:
+                    await safe_edit_message(
+                        ctx,
+                        chat_id,
+                        start_msg_id,
+                        SUNO_START_READY_MESSAGE,
+                        suno_start_disabled_keyboard(),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except BadRequest as exc:
                     log.debug(
-                        "suno start message delete failed | chat=%s msg=%s err=%s",
+                        "suno start message edit failed | chat=%s msg=%s err=%s",
+                        chat_id,
+                        start_msg_id,
+                        exc,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "suno start message edit error | chat=%s msg=%s err=%s",
                         chat_id,
                         start_msg_id,
                         exc,
@@ -10148,6 +10180,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["suno_state"] = suno_state_obj.to_dict()
             s["suno_start_clicked"] = True
             s["suno_can_start"] = False
+            if uid is not None:
+                s["suno_current_req_id"] = _generate_suno_request_id(int(uid))
+            else:
+                s["suno_current_req_id"] = f"suno:anon:{uuid.uuid4()}"
 
             await _suno_notify(
                 ctx,

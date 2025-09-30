@@ -32,8 +32,8 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self, chat_id: int) -> None:
-        self.data = "suno:start"
+    def __init__(self, chat_id: int, data: str = "suno:start") -> None:
+        self.data = data
         self.message = FakeMessage(chat_id)
         self._answered: list[tuple[str | None, bool]] = []
 
@@ -60,7 +60,7 @@ def _prepare_ready_context(ctx, chat_id: int, user_id: int) -> int:
     return start_msg_id
 
 
-def test_start_sends_big_emoji_once(monkeypatch):
+def test_click_sends_correct_sticker_and_not_prinyato_again(monkeypatch):
     bot = FakeBot()
     ctx = SimpleNamespace(bot=bot, user_data={})
     chat_id = 999
@@ -89,7 +89,7 @@ def test_start_sends_big_emoji_once(monkeypatch):
     monkeypatch.setattr(bot_module, "_suno_notify", fake_notify)
 
     update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id),
+        callback_query=FakeCallback(chat_id, data="suno:start"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )
@@ -100,23 +100,33 @@ def test_start_sends_big_emoji_once(monkeypatch):
     assert len(sticker_entries) == 1
     assert sticker_entries[0]["sticker"] == "sticker-file-id"
 
-    deleted_payloads = [item for item in bot.deleted if item.get("message_id") == start_msg_id]
-    assert deleted_payloads, "start button message should be removed"
+    assert not bot.deleted
+    assert bot.edited, "start message should be edited to disabled state"
+    edited_payload = bot.edited[-1]
+    assert edited_payload.get("message_id") == start_msg_id
+    markup = edited_payload.get("reply_markup")
+    assert markup is not None
+    button_text = markup.inline_keyboard[0][0].text  # type: ignore[index]
+    assert button_text == "⏳ Идёт генерация…"
 
     suno_state_after = load_suno_state(ctx)
     assert suno_state_after.start_clicked is True
     assert suno_state_after.start_emoji_msg_id == 100
-    assert suno_state_after.start_msg_id is None
+    assert suno_state_after.start_msg_id == start_msg_id
 
     assert ctx.user_data["suno_state"]["start_clicked"] is True
-    assert ctx.user_data["suno_state"]["start_msg_id"] is None
+    assert ctx.user_data["suno_state"]["start_msg_id"] == start_msg_id
+
+    state_after = bot_module.state(ctx)
+    req_id = state_after.get("suno_current_req_id")
+    assert isinstance(req_id, str) and req_id.startswith("suno:")
 
     assert launch_calls and launch_calls[0]["trigger"] == "start"
     assert notify_calls == [SUNO_STARTING_MESSAGE]
 
     # Second click should be ignored entirely.
     second_update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id),
+        callback_query=FakeCallback(chat_id, data="suno:busy"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )
@@ -127,9 +137,14 @@ def test_start_sends_big_emoji_once(monkeypatch):
     assert len(sticker_entries_after) == 1
     assert len(launch_calls) == 1
     assert notify_calls == [SUNO_STARTING_MESSAGE]
+    assert second_update.callback_query._answered[-1][0] == "Уже идёт генерация — дождитесь завершения"
+    assert second_update.callback_query.message.replies == []
+
+    state_after_second = bot_module.state(ctx)
+    assert state_after_second.get("suno_current_req_id") == req_id
 
 
-def test_start_button_disabled_after_click(monkeypatch):
+def test_second_click_blocked(monkeypatch):
     bot = FakeBot()
     ctx = SimpleNamespace(bot=bot, user_data={})
     chat_id = 111
@@ -149,26 +164,29 @@ def test_start_button_disabled_after_click(monkeypatch):
     monkeypatch.setattr(bot_module, "_suno_notify", fake_notify)
 
     update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id),
+        callback_query=FakeCallback(chat_id, data="suno:start"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )
 
     asyncio.run(bot_module.on_callback(update, ctx))
 
-    assert not bot.edited, "start message should be removed instead of edited"
-    deleted_payloads = [item for item in bot.deleted if item.get("message_id") == start_msg_id]
-    assert deleted_payloads
+    assert bot.edited, "start message should be edited to disabled state"
+    assert not bot.deleted
+    edited_payload = bot.edited[-1]
+    assert edited_payload.get("message_id") == start_msg_id
+    button = edited_payload.get("reply_markup").inline_keyboard[0][0]  # type: ignore[index]
+    assert button.text == "⏳ Идёт генерация…"
 
     state_after = load_suno_state(ctx)
-    assert state_after.start_msg_id is None
+    assert state_after.start_msg_id == start_msg_id
     assert state_after.start_clicked is True
 
     state_dict = bot_module.state(ctx)
-    assert state_dict.get("suno_start_msg_id") is None
+    assert state_dict.get("suno_start_msg_id") == start_msg_id
     msg_ids = state_dict.get("msg_ids")
     if isinstance(msg_ids, dict):
-        assert "suno_start" not in msg_ids
+        assert msg_ids.get("suno_start") == start_msg_id
 
 
 def test_start_sticker_fallback_to_emoji(monkeypatch):
@@ -195,7 +213,7 @@ def test_start_sticker_fallback_to_emoji(monkeypatch):
     monkeypatch.setattr(bot_module, "safe_send_sticker", failing_sticker)
 
     update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id),
+        callback_query=FakeCallback(chat_id, data="suno:start"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )
@@ -207,6 +225,8 @@ def test_start_sticker_fallback_to_emoji(monkeypatch):
 
     fallback_messages = [item for item in bot.sent if item.get("text") == "🎬"]
     assert len(fallback_messages) == 1
+
+    assert bot.edited, "start message should still be edited when sticker fails"
 
     suno_state_after = load_suno_state(ctx)
     assert suno_state_after.start_emoji_msg_id == 100
