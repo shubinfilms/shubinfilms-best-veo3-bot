@@ -38,6 +38,7 @@ from settings import (
     SUNO_ENABLED,
 )
 from telegram_utils import mask_tokens
+from utils.audio_post import prepare_audio_file_sync
 
 try:  # pragma: no cover - optional runtime dependency
     from redis import Redis
@@ -1361,6 +1362,7 @@ class SunoService:
         caption: Optional[str],
         reply_to: Optional[int],
         extra: Optional[Mapping[str, Any]] = None,
+        file_name: Optional[str] = None,
     ) -> bool:
         data: Dict[str, Any] = {"chat_id": chat_id}
         if caption:
@@ -1374,7 +1376,8 @@ class SunoService:
                 data[key] = value
         try:
             with path.open("rb") as fh:
-                files = {field: (path.name, fh)}
+                upload_name = file_name or path.name
+                files = {field: (upload_name, fh)}
                 resp = self._bot_session.post(self._bot_url(method), data=data, files=files, timeout=120)
             if not resp.ok:
                 bot_telegram_send_fail_total.labels(method=method).inc()
@@ -1723,6 +1726,59 @@ class SunoService:
     ) -> tuple[bool, Optional[str]]:
         from telegram_utils import is_remote_file_error, send_audio_request
 
+        last_reason: Optional[str] = None
+        tags_enabled = os.getenv("AUDIO_TAGS_ENABLED", "false").strip().lower() == "true"
+        if tags_enabled:
+            default_artist = os.getenv("AUDIO_DEFAULT_ARTIST", "Best VEO3")
+            embed_cover_enabled = (
+                os.getenv("AUDIO_EMBED_COVER_ENABLED", "false").strip().lower() == "true"
+            )
+            transliterate = (
+                os.getenv("AUDIO_FILENAME_TRANSLITERATE", "false").strip().lower() == "true"
+            )
+            try:
+                max_name = int(os.getenv("AUDIO_FILENAME_MAX", "60"))
+            except (TypeError, ValueError):
+                max_name = 60
+            try:
+                local_path_str, meta = prepare_audio_file_sync(
+                    audio_url,
+                    title=title,
+                    cover_url=thumb,
+                    default_artist=default_artist,
+                    max_name=max_name,
+                    tags_enabled=True,
+                    embed_cover_enabled=embed_cover_enabled,
+                    transliterate=transliterate,
+                )
+            except Exception:
+                log.warning(
+                    "suno.audio.postprocess_failed",
+                    extra={"meta": {"url": mask_tokens(audio_url), "take": take_id}},
+                    exc_info=True,
+                )
+            else:
+                local_path = Path(local_path_str)
+                try:
+                    success = self._send_file(
+                        "sendAudio",
+                        "audio",
+                        chat_id,
+                        local_path,
+                        caption=caption,
+                        reply_to=reply_to,
+                        extra={
+                            "title": meta.get("title"),
+                            "performer": meta.get("performer"),
+                        },
+                        file_name=meta.get("file_name"),
+                    )
+                finally:
+                    schedule_unlink(local_path)
+                if success:
+                    return True, None
+                last_reason = "upload_failed"
+
         attempt = 1
         success, reason, status = send_audio_request(
             self._bot_session,
@@ -1736,7 +1792,7 @@ class SunoService:
         )
         if success:
             return True, None
-        last_reason = reason
+        last_reason = reason or last_reason
         if is_remote_file_error(status, reason):
             self._log_delivery(
                 "telegram.retry",
