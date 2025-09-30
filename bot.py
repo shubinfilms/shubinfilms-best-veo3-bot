@@ -106,6 +106,11 @@ from utils.suno_state import (
     set_cover_source as set_suno_cover_source,
     clear_cover_source as clear_suno_cover_source,
 )
+
+try:  # pragma: no cover - optional helper
+    from utils.suno_state import style_preview as suno_style_preview
+except Exception:  # pragma: no cover - defensive fallback
+    suno_style_preview = None  # type: ignore[assignment]
 from utils.suno_modes import (
     FIELD_ICONS as SUNO_FIELD_ICONS,
     FIELD_LABELS as SUNO_FIELD_LABELS,
@@ -175,7 +180,7 @@ from settings import (
     SUNO_LOG_KEY,
     SUNO_READY,
 )
-from suno.service import SunoService, SunoAPIError
+from suno.service import SunoService, SunoAPIError, RecordInfoPollResult
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.client import (
     AMBIENT_NATURE_PRESET_ID,
@@ -4872,8 +4877,17 @@ def _suno_summary_text(state: SunoState) -> str:
     title_display = state.title.strip() if state.title else "—"
     lines.append(f"🏷️ Title: {title_display}")
 
-    style_display = suno_style_preview(state.style, limit=160) if state.style else "—"
-    lines.append(f"🎛️ Tags: {style_display or '—'}")
+    if state.style:
+        if callable(suno_style_preview):
+            try:
+                style_display = suno_style_preview(state.style, limit=160) or "—"
+            except Exception:
+                style_display = _suno_make_preview(state.style, limit=160) or "—"
+        else:
+            style_display = _suno_make_preview(state.style, limit=160) or "—"
+    else:
+        style_display = "—"
+    lines.append(f"🎛️ Tags: {style_display}")
 
     if state.mode == "lyrics":
         if state.lyrics:
@@ -6086,6 +6100,117 @@ async def _launch_suno_generation(
                 log.warning("[SUNO] final balance refresh fail | req_id=%s err=%s", req_id, exc)
 
 
+async def _suno_poll_record_info(
+    task_id: str,
+    *,
+    user_id: Optional[int],
+) -> RecordInfoPollResult:
+    delays = [delay for delay in [SUNO_POLL_FIRST_DELAY, *SUNO_POLL_BACKOFF_SERIES] if delay >= 0]
+    if not delays:
+        delays = [5.0]
+    start_ts = time.monotonic()
+    attempt = 0
+    last_status: Optional[str] = None
+
+    while True:
+        if SUNO_SERVICE._recently_delivered(task_id):  # type: ignore[attr-defined]
+            log.info("[SUNO] poll delivered via webhook | task_id=%s", task_id)
+            return RecordInfoPollResult(
+                state="delivered",
+                status_code=200,
+                payload={},
+                attempts=attempt,
+                elapsed=time.monotonic() - start_ts,
+            )
+
+        delay = delays[min(attempt, len(delays) - 1)]
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        attempt += 1
+        result = await asyncio.to_thread(
+            SUNO_SERVICE.poll_record_info_once,
+            task_id,
+            user_id=user_id,
+        )
+        now = time.monotonic()
+        result.attempts = attempt
+        result.elapsed = now - start_ts
+
+        status_value: Optional[str] = None
+        if isinstance(result.payload, Mapping):
+            status_value = SunoService._status_from_payload(result.payload)
+        normalized_status = status_value.upper() if isinstance(status_value, str) else None
+        if normalized_status and normalized_status != last_status:
+            log.info(
+                "[SUNO] poll status update | task_id=%s status=%s attempt=%s http=%s",
+                task_id,
+                normalized_status,
+                attempt,
+                result.status_code,
+            )
+            last_status = normalized_status
+
+        meta = {
+            "taskId": task_id,
+            "attempt": attempt,
+            "http_status": result.status_code,
+            "mapped_state": result.state,
+        }
+        if normalized_status:
+            meta["status"] = normalized_status
+        if result.error:
+            meta["error_code"] = result.error
+        if result.message:
+            meta["message"] = result.message
+
+        if result.state == "retry":
+            log.warning("[SUNO] poll retry", extra={"meta": meta})
+        elif result.state != "pending":
+            log.info("[SUNO] poll step", extra={"meta": meta})
+
+        if result.state == "ready":
+            tracks = SunoService._tracks_from_payload(result.payload)
+            durations = SunoService._durations_from_tracks(tracks)
+            log.info(
+                "[SUNO] poll ready",
+                extra={
+                    "meta": {
+                        "taskId": task_id,
+                        "takes": len(tracks),
+                        "durations": durations,
+                        "http_status": result.status_code,
+                    }
+                },
+            )
+            return result
+
+        if result.state == "hard_error":
+            log.error(
+                "[SUNO] poll hard failure",
+                extra={"meta": meta},
+            )
+            return result
+
+        if result.state == "delivered":
+            log.info("[SUNO] poll delivered via webhook | task_id=%s", task_id)
+            return result
+
+        if result.elapsed >= SUNO_POLL_TIMEOUT:
+            log.warning(
+                "[SUNO] poll timeout",
+                extra={
+                    "meta": {
+                        "taskId": task_id,
+                        "attempts": attempt,
+                        "elapsed": result.elapsed,
+                    }
+                },
+            )
+            result.state = "timeout"
+            return result
+
+
 async def _poll_suno_and_send(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -6164,8 +6289,7 @@ async def _poll_suno_and_send(
                 )
                 return
 
-        poll_result = await asyncio.to_thread(
-            SUNO_SERVICE.wait_for_record_info,
+        poll_result = await _suno_poll_record_info(
             task_id,
             user_id=user_id,
         )
@@ -6185,7 +6309,11 @@ async def _poll_suno_and_send(
                 poll_result.attempts,
                 poll_result.elapsed,
             )
-            await _notify_timeout_once()
+            timeout_message = "⚠️ Suno не ответил вовремя."
+            await _issue_refund(
+                timeout_message,
+                reason="suno:refund:timeout",
+            )
             return
 
         if state_value == "hard_error":
