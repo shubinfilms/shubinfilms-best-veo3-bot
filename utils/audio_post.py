@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import imghdr
 import logging
 import os
 import re
@@ -16,6 +15,8 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import ClientError, ClientTimeout
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TIT2, TPE1
+
+from utils.image_detect import detect_image_ext, is_image
 
 log = logging.getLogger("audio.post")
 
@@ -105,17 +106,31 @@ def _normalize_filename(
     return f"{base or 'track'}.mp3"
 
 
+_MIME_BY_EXT = {
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+
 def _guess_cover_mime(data: bytes, declared: Optional[str]) -> Optional[str]:
+    ext = detect_image_ext(data)
+    if not ext:
+        log.warning(
+            "audio.cover.detect_failed",
+            extra={"meta": {"declared": declared}},
+        )
+        return None
+
+    mime = _MIME_BY_EXT.get(ext)
     if declared:
         lowered = declared.split(";")[0].strip().lower()
-        if lowered in {"image/jpeg", "image/jpg", "image/png"}:
-            return "image/jpeg" if "jpeg" in lowered or "jpg" in lowered else "image/png"
-    kind = imghdr.what(None, h=data)
-    if kind == "jpeg":
-        return "image/jpeg"
-    if kind == "png":
-        return "image/png"
-    return None
+        if lowered and lowered not in {mime, "image/jpg"}:
+            log.debug(
+                "audio.cover.mime_mismatch",
+                extra={"meta": {"declared": lowered, "detected": mime}},
+            )
+    return mime
 
 
 def _apply_id3_tags(
@@ -134,18 +149,29 @@ def _apply_id3_tags(
     tags.add(TIT2(encoding=3, text=title))
     tags.add(TPE1(encoding=3, text=[artist]))
     if cover and cover[0]:
-        mime = _guess_cover_mime(cover[0], cover[1])
-        if mime:
-            tags.delall("APIC")
-            tags.add(
-                APIC(
-                    encoding=3,
-                    mime=mime,
-                    type=3,
-                    desc="Cover",
-                    data=cover[0],
-                )
+        if not is_image(cover[0]):
+            log.warning(
+                "audio.cover.invalid_image",
+                extra={"meta": {"declared": cover[1]}},
             )
+        else:
+            mime = _guess_cover_mime(cover[0], cover[1])
+            if mime:
+                tags.delall("APIC")
+                tags.add(
+                    APIC(
+                        encoding=3,
+                        mime=mime,
+                        type=3,
+                        desc="Cover",
+                        data=cover[0],
+                    )
+                )
+            else:
+                log.warning(
+                    "audio.cover.unsupported_format",
+                    extra={"meta": {"declared": cover[1]}},
+                )
     tags.save(path, v2_version=3)
 
 
