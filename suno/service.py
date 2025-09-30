@@ -289,6 +289,7 @@ class TelegramMeta:
     title: Optional[str]
     ts: str
     req_id: Optional[str]
+    user_title: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -756,9 +757,17 @@ class SunoService:
         except (TypeError, ValueError):
             return None
         title = data.get("title")
+        user_title = data.get("user_title")
         ts = data.get("ts") or datetime.now(timezone.utc).isoformat()
         req_id = data.get("req_id") or self._load_req_id(task_id)
-        return TelegramMeta(chat_id=chat_id, msg_id=msg_id, title=title, ts=ts, req_id=req_id)
+        return TelegramMeta(
+            chat_id=chat_id,
+            msg_id=msg_id,
+            title=title,
+            ts=ts,
+            req_id=req_id,
+            user_title=user_title,
+        )
 
     def _delete_mapping(self, task_id: str) -> None:
         key = self._redis_key(task_id)
@@ -964,7 +973,12 @@ class SunoService:
         for idx, item in enumerate(tracks_data, start=1):
             if not isinstance(item, Mapping):
                 continue
-            title = item.get("title") or record.get("title") or f"Track {idx}"
+            title = (
+                item.get("title")
+                or record.get("user_title")
+                or record.get("title")
+                or f"Track {idx}"
+            )
             audio = item.get("source_audio_url") or item.get("audio_url")
             image = item.get("source_image_url") or item.get("image_url")
             tags = item.get("tags") if isinstance(item.get("tags"), str) else None
@@ -1076,7 +1090,7 @@ class SunoService:
         duration: Optional[float],
         take_label: Optional[str],
     ) -> Optional[str]:
-        base_title = title or "Suno track"
+        base_title = (title or "Suno track").strip()
         if take_label:
             base_title = f"{base_title} ({take_label})"
         duration_seconds: Optional[int] = None
@@ -1085,12 +1099,15 @@ class SunoService:
                 duration_seconds = int(round(float(duration)))
             except (TypeError, ValueError):
                 duration_seconds = None
-        first_line = base_title
+        lines: list[str] = [f"🎵 {base_title}".strip()]
+        details: list[str] = []
         if duration_seconds and duration_seconds > 0:
-            first_line = f"{first_line} • {duration_seconds}s"
-        lines: list[str] = [first_line.strip()]
-        if tags:
-            lines.append(tags)
+            details.append(f"{duration_seconds} sec")
+        tags_text = (tags or "").strip()
+        if tags_text:
+            details.append(tags_text)
+        if details:
+            lines.append(" • ".join(details))
         caption = "\n".join(part for part in lines if part)
         if not caption:
             return None
@@ -1300,12 +1317,14 @@ class SunoService:
             _json_preview(final_payload),
         )
         task = SunoTask(task_id=task_id, callback_type="start", items=[], msg=None, code=200)
+        user_title = str(title).strip() if title else None
         meta = {
             "chat_id": int(chat_id),
             "msg_id": int(msg_id),
             "title": resolved_title,
             "ts": datetime.now(timezone.utc).isoformat(),
             "req_id": req_id,
+            "user_title": user_title,
         }
         self._store_mapping(task.task_id, meta)
         self._store_req_id(task.task_id, task_id)
@@ -1329,6 +1348,7 @@ class SunoService:
             "user_id": int(user_id) if user_id is not None else None,
             "prompt": prompt_text,
             "title": title,
+            "user_title": user_title,
             "req_id": req_id,
             "lang": str(lang).strip().lower() if lang else None,
             "has_lyrics": bool(has_lyrics),
@@ -1495,6 +1515,15 @@ class SunoService:
             header = self._stage_header(task)
             reply_to = meta.msg_id if meta else None
             self._send_text(chat_id, header, reply_to=reply_to)
+            stored_user_title = existing_record.get("user_title")
+            meta_user_title: Optional[str] = None
+            if meta and isinstance(meta.user_title, str) and meta.user_title.strip():
+                meta_user_title = meta.user_title.strip()
+            elif isinstance(stored_user_title, str) and stored_user_title.strip():
+                meta_user_title = stored_user_title.strip()
+            elif isinstance(existing_record.get("title"), str) and str(existing_record.get("title")).strip():
+                meta_user_title = str(existing_record.get("title")).strip()
+
             if not task.items:
                 record = dict(existing_record)
                 record.update(
@@ -1508,6 +1537,7 @@ class SunoService:
                         "user_id": link.user_id if link else None,
                         "prompt": link.prompt if link else "",
                         "title": meta.title if meta else None,
+                        "user_title": meta_user_title,
                         "req_id": req_id,
                         "tracks": [],
                         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1523,31 +1553,33 @@ class SunoService:
             durations: list[float] = []
             for idx, track in enumerate(task.items, start=1):
                 track_id = track.id or str(idx)
-                title = track.title or (meta.title if meta else None) or f"Track {idx}"
+                track_title = str(track.title).strip() if track.title else None
+                meta_title = str(meta.title).strip() if meta and meta.title else None
+                preferred_title = meta_user_title or track_title or meta_title or f"Track {idx}"
                 take_label = f"Take {idx}" if len(task.items) > 1 else None
                 caption = self._build_audio_caption(
-                    title=title,
+                    title=preferred_title,
                     tags=track.tags,
                     duration=track.duration,
                     take_label=take_label,
                 )
                 resolved_audio = track.source_audio_url or track.audio_url
                 thumb_url = track.source_image_url or track.image_url
-                send_title = f"{title} ({take_label})" if take_label else title
+                send_title = f"{preferred_title} ({take_label})" if take_label else preferred_title
                 duration_label = self._format_duration_label(track.duration)
                 fallback_lines: list[str] = []
                 if track.audio_url:
-                    fallback_lines.append(f"🔗 Аудио ({title}): {track.audio_url}")
+                    fallback_lines.append(f"🔗 Аудио ({send_title}): {track.audio_url}")
                 elif resolved_audio:
-                    fallback_lines.append(f"🔗 Аудио ({title}): {resolved_audio}")
+                    fallback_lines.append(f"🔗 Аудио ({send_title}): {resolved_audio}")
                 if track.tags:
                     fallback_lines.append(f"🏷️ {track.tags}")
                 if duration_label:
                     fallback_lines.append(f"⏱️ {duration_label}")
                 if track.image_url:
-                    fallback_lines.append(f"🖼️ Обложка ({title}): {track.image_url}")
+                    fallback_lines.append(f"🖼️ Обложка ({send_title}): {track.image_url}")
                 if not fallback_lines:
-                    fallback_lines.append(f"⚠️ Не удалось отправить трек {title}.")
+                    fallback_lines.append(f"⚠️ Не удалось отправить трек {send_title}.")
                 fallback_text = "\n".join(fallback_lines)
                 audio_sent = False
                 image_sent = False
@@ -1561,6 +1593,8 @@ class SunoService:
                         thumb=thumb_url,
                     ):
                         audio_sent = True
+                        if thumb_url:
+                            image_sent = True
                         log.info(
                             "Suno audio url sent | task=%s track=%s url=%s",
                             task.task_id,
@@ -1569,7 +1603,7 @@ class SunoService:
                         )
                     else:
                         audio_path = self._find_local_file(base_dir, track_id)
-                        if audio_path and self._send_audio(chat_id, audio_path, title=title, reply_to=None):
+                        if audio_path and self._send_audio(chat_id, audio_path, title=preferred_title, reply_to=None):
                             audio_sent = True
                             log.info(
                                 "Suno audio sent | task=%s track=%s path=%s",
@@ -1577,30 +1611,31 @@ class SunoService:
                                 track_id,
                                 audio_path,
                             )
-                    image_caption = f"🖼️ {title} (обложка)"
-                    if track.image_url and self._send_image_url(
-                        chat_id,
-                        track.image_url,
-                        caption=image_caption,
-                        reply_to=None,
-                    ):
-                        image_sent = True
-                        log.info(
-                            "Suno cover url sent | task=%s track=%s url=%s",
-                            task.task_id,
-                            track_id,
-                            mask_tokens(track.image_url),
-                        )
-                    else:
-                        image_path = self._find_local_file(base_dir, f"{track_id}_cover")
-                        if image_path and self._send_image(chat_id, image_path, title=title, reply_to=None):
+                    if not image_sent:
+                        image_caption = f"🖼️ {send_title} (обложка)"
+                        if track.image_url and self._send_image_url(
+                            chat_id,
+                            track.image_url,
+                            caption=image_caption,
+                            reply_to=None,
+                        ):
                             image_sent = True
                             log.info(
-                                "Suno cover sent | task=%s track=%s path=%s",
+                                "Suno cover url sent | task=%s track=%s url=%s",
                                 task.task_id,
                                 track_id,
-                                image_path,
+                                mask_tokens(track.image_url),
                             )
+                        else:
+                            image_path = self._find_local_file(base_dir, f"{track_id}_cover")
+                            if image_path and self._send_image(chat_id, image_path, title=send_title, reply_to=None):
+                                image_sent = True
+                                log.info(
+                                    "Suno cover sent | task=%s track=%s path=%s",
+                                    task.task_id,
+                                    track_id,
+                                    image_path,
+                                )
                 except Exception as send_exc:
                     log.error(
                         "Failed to send audio %s, chat %s, error=%s",
@@ -1614,12 +1649,13 @@ class SunoService:
                 if not audio_sent:
                     self._send_text(chat_id, fallback_text)
                 elif not image_sent and track.image_url:
-                    self._send_text(chat_id, f"🖼️ Обложка ({title}): {track.image_url}")
+                    self._send_text(chat_id, f"🖼️ Обложка ({send_title}): {track.image_url}")
                 log.info("Delivered track %s to chat %s", task.task_id, chat_id)
                 track_records.append(
                     {
                         "id": track_id,
-                        "title": title,
+                        "title": preferred_title,
+                        "original_title": track.title,
                         "audio_url": track.audio_url,
                         "image_url": track.image_url,
                         "source_audio_url": track.source_audio_url,
@@ -1642,6 +1678,7 @@ class SunoService:
                     "user_id": link.user_id if link else None,
                     "prompt": link.prompt if link else "",
                     "title": meta.title if meta else None,
+                    "user_title": meta_user_title,
                     "tracks": track_records,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }

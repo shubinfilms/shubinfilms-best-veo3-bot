@@ -748,6 +748,96 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
     assert refunds and refunds[-1]["user_message"].startswith("⚠️ Generation failed: boom")
 
 
+def test_suno_enqueue_handles_400_error(monkeypatch) -> None:
+    bot = bot_module
+    fake_redis = MiniRedis()
+    monkeypatch.setattr(bot, "rds", fake_redis)
+    bot._SUNO_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_PENDING_MEMORY.clear()
+    bot._SUNO_REFUND_MEMORY.clear()
+    bot._SUNO_REFUND_REQ_MEMORY.clear()
+    bot._SUNO_COOLDOWN_MEMORY.clear()
+    monkeypatch.setattr(bot, "_suno_configured", lambda: True)
+    monkeypatch.setattr(bot, "ensure_user", lambda uid: None)
+    bot.SUNO_PER_USER_COOLDOWN_SEC = 0
+    monkeypatch.setattr(bot, "SUNO_MODE_AVAILABLE", True, raising=False)
+
+    async def async_noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "refresh_suno_card", async_noop)
+    monkeypatch.setattr(bot, "refresh_balance_card_if_open", async_noop)
+    monkeypatch.setattr(bot, "show_balance_notification", async_noop)
+    monkeypatch.setattr(bot, "_suno_update_last_debit_meta", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "_suno_set_cooldown", lambda *args, **kwargs: None)
+
+    def fake_debit(user_id, price, reason, meta):
+        return True, 90
+
+    monkeypatch.setattr(bot, "debit_try", fake_debit)
+
+    status_texts: list[str] = []
+
+    async def fake_notify(ctx_param, chat_id_param, text, **kwargs):
+        status_texts.append(text)
+        return SimpleNamespace(message_id=333)
+
+    monkeypatch.setattr(bot, "_suno_notify", fake_notify)
+
+    edited_messages: list[str] = []
+
+    async def fake_safe_edit_message(ctx_param, chat_id_param, message_id_param, new_text, **kwargs):
+        edited_messages.append(new_text)
+        return True
+
+    monkeypatch.setattr(bot, "safe_edit_message", fake_safe_edit_message)
+
+    refunds: list[dict[str, object]] = []
+
+    async def fake_refund(*args, **kwargs):
+        refunds.append(kwargs)
+
+    monkeypatch.setattr(bot, "_suno_issue_refund", fake_refund)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot.asyncio, "to_thread", fake_to_thread)
+
+    def failing_start_music(*args, **kwargs):
+        raise bot.SunoAPIError(
+            "artist name",
+            status=400,
+            payload={"message": "The description contains artist name: The Weeknd"},
+        )
+
+    monkeypatch.setattr(bot.SUNO_SERVICE, "start_music", failing_start_music)
+
+    ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+    params = {"title": "Future", "style": "Pop", "lyrics": "", "instrumental": True}
+
+    async def _run() -> None:
+        await bot._launch_suno_generation(
+            chat_id=444,
+            ctx=ctx,
+            params=params,
+            user_id=77,
+            reply_to=None,
+            trigger="test",
+        )
+
+    asyncio.run(_run())
+
+    expected = (
+        "❌ Ошибка: описание содержит запрещённые слова (например, имя артиста).\n"
+        "Пожалуйста, измените описание и попробуйте снова."
+    )
+    assert status_texts and status_texts[0] == "⏳ Sending request…"
+    assert edited_messages and edited_messages[-1] == expected
+    assert refunds and refunds[-1]["user_message"].startswith(expected)
+    assert "Токены возвращены" in refunds[-1]["user_message"]
+
+
 def test_suno_enqueue_dedupes_failed_req(monkeypatch) -> None:
     bot = bot_module
     bot.rds = None
