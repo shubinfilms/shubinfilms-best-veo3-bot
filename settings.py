@@ -67,6 +67,7 @@ class _AppSettings(BaseModel):
     UPLOAD_BASE_URL: Optional[str] = Field(default=None)
     UPLOAD_STREAM_PATH: str = Field(default="/api/v1/upload/stream")
     UPLOAD_URL_PATH: str = Field(default="/api/v1/upload/url")
+    UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
     @field_validator("LOG_LEVEL", mode="before")
     def _normalize_level(cls, value: object) -> str:
@@ -195,6 +196,7 @@ TMP_CLEANUP_HOURS = int(_APP_SETTINGS.TMP_CLEANUP_HOURS)
 
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
+UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
 
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:

@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Mapping, MutableMapping, Optional
-from urllib.parse import urljoin, urlparse
+from typing import IO, Any, Mapping, MutableMapping, Optional, Union
+from urllib.parse import urlparse
 
 import httpx
 
 from settings import (
+    MAX_IN_LOG_BODY,
+    SUNO_API_BASE,
     SUNO_API_TOKEN,
     SUNO_TIMEOUT_SEC,
     UPLOAD_BASE_URL,
+    UPLOAD_FALLBACK_ENABLED,
     UPLOAD_STREAM_PATH,
     UPLOAD_URL_PATH,
 )
 
 MAX_AUDIO_MB = 50
 _ALLOWED_EXTENSIONS = {".mp3", ".wav"}
+_RETRY_DELAYS = (1, 2, 4)
+_CONNECT_TIMEOUT = 10.0
+_MAX_FAIL_BODY = min(1024, int(MAX_IN_LOG_BODY))
 
 
 class CoverSourceError(Exception):
@@ -37,26 +43,44 @@ class CoverSourceUnavailableError(CoverSourceError):
     """Raised when the upload service is temporarily unavailable."""
 
 
-class _RetryableError(Exception):
-    """Internal helper to signal retryable errors."""
+def _normalize_base(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    text = str(url).strip()
+    if not text:
+        return None
+    return text.rstrip("/")
 
-    def __init__(self, message: str, response: Optional[httpx.Response] = None) -> None:
-        super().__init__(message)
-        self.response = response
 
-
-def _compose_upload_url(path: str) -> str:
-    base = (UPLOAD_BASE_URL or "").rstrip("/") + "/"
-    return urljoin(base, path.lstrip("/"))
+def _normalize_path(path: str) -> str:
+    text = str(path or "/").strip()
+    if not text:
+        return "/"
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    if not text.startswith("/"):
+        text = f"/{text}"
+    return text
 
 
 def _auth_header() -> dict[str, str]:
     token = (SUNO_API_TOKEN or "").strip()
     if not token:
         raise CoverSourceUnavailableError("missing-token")
-    if not token.lower().startswith("bearer "):
-        token = f"Bearer {token}"
-    return {"Authorization": token}
+    if token.lower().startswith("bearer "):
+        return {"Authorization": token}
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _timeout() -> httpx.Timeout:
+    read_timeout = max(float(SUNO_TIMEOUT_SEC or 60.0), 1.0)
+    write_timeout = max(read_timeout, 1.0)
+    return httpx.Timeout(
+        connect=_CONNECT_TIMEOUT,
+        read=read_timeout,
+        write=write_timeout,
+        pool=_CONNECT_TIMEOUT,
+    )
 
 
 def _extract_kie_file_id(payload: Mapping[str, Any]) -> Optional[str]:
@@ -70,134 +94,270 @@ def _extract_kie_file_id(payload: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-async def _request_with_retries(
-    operation: str,
-    request_cb,
-    *,
+def _trim_body(response: httpx.Response) -> str:
+    try:
+        body = response.text
+    except Exception:  # pragma: no cover - defensive
+        body = response.content.decode("utf-8", errors="replace")
+    if len(body) > _MAX_FAIL_BODY:
+        return body[:_MAX_FAIL_BODY]
+    return body
+
+
+def _log_try(
     logger: Optional[logging.Logger],
+    *,
     request_id: str,
-) -> httpx.Response:
-    delays = [1, 2, 4]
-    last_exc: Optional[Exception] = None
-    for attempt, delay in enumerate(delays, start=1):
-        try:
-            return await request_cb()
-        except _RetryableError as exc:  # pragma: no cover - simple control flow
-            last_exc = exc
-            if logger:
-                logger.warning(
-                    "cover.upload_retry",
-                    extra={
-                        "request_id": request_id,
-                        "operation": operation,
-                        "attempt": attempt,
-                        "error": str(exc),
-                    },
-                )
-        except httpx.TimeoutException as exc:
-            last_exc = exc
-            if logger:
-                logger.warning(
-                    "cover.upload_timeout",
-                    extra={
-                        "request_id": request_id,
-                        "operation": operation,
-                        "attempt": attempt,
-                        "error": str(exc),
-                    },
-                )
-        except httpx.HTTPError as exc:
-            last_exc = exc
-            if logger:
-                logger.warning(
-                    "cover.upload_http_error",
-                    extra={
-                        "request_id": request_id,
-                        "operation": operation,
-                        "attempt": attempt,
-                        "error": str(exc),
-                    },
-                )
-        if attempt < len(delays):
-            await asyncio.sleep(delay)
-    if isinstance(last_exc, _RetryableError) and getattr(last_exc, "response", None):
-        response = last_exc.response  # type: ignore[assignment]
-        assert response is not None
-        return response
-    raise CoverSourceUnavailableError(operation) from last_exc
+    kind: str,
+    host: str,
+    path: str,
+    attempt: int,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    if not logger:
+        return
+    payload = {"request_id": request_id, "kind": kind, "host": host, "path": path, "attempt": attempt}
+    if extra:
+        payload.update(extra)
+    logger.info("cover_upload_try", extra=payload)
 
 
-def _timeout() -> httpx.Timeout:
-    total = max(float(SUNO_TIMEOUT_SEC or 60), 1.0)
-    return httpx.Timeout(total=total)
+def _log_fail(
+    logger: Optional[logging.Logger],
+    *,
+    request_id: str,
+    kind: str,
+    host: str,
+    path: str,
+    attempt: int,
+    status: Optional[int] = None,
+    reason: Optional[str] = None,
+    body: Optional[str] = None,
+) -> None:
+    if not logger:
+        return
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "kind": kind,
+        "host": host,
+        "path": path,
+        "attempt": attempt,
+    }
+    if status is not None:
+        payload["status"] = int(status)
+    if reason:
+        payload["reason"] = reason
+    if body:
+        payload["body"] = body
+    logger.warning("cover_upload_fail", extra=payload)
+
+
+def _log_ok(
+    logger: Optional[logging.Logger],
+    *,
+    request_id: str,
+    kind: str,
+    host: str,
+    kie_file_id: str,
+) -> None:
+    if not logger:
+        return
+    logger.info(
+        "cover_upload_ok",
+        extra={"request_id": request_id, "kind": kind, "host": host, "kie_file_id": kie_file_id},
+    )
+
+
+async def _perform_upload(
+    *,
+    request_id: str,
+    kind: str,
+    path: str,
+    request_cb,
+    logger: Optional[logging.Logger],
+    try_extra: Optional[dict[str, Any]] = None,
+) -> tuple[httpx.Response, str]:
+    path = _normalize_path(path)
+    primary = _normalize_base(UPLOAD_BASE_URL) or _normalize_base(SUNO_API_BASE)
+    fallback = _normalize_base(SUNO_API_BASE)
+    if fallback == primary:
+        fallback = None
+    if primary is None and fallback is None:
+        raise CoverSourceUnavailableError("missing-host")
+
+    hosts: list[tuple[str, bool]] = []
+    if primary is not None:
+        hosts.append((primary, False))
+    elif fallback is not None:
+        hosts.append((fallback, True))
+        fallback = None
+    if fallback is not None:
+        hosts.append((fallback, True))
+
+    last_error: Optional[BaseException] = None
+    last_status: Optional[int] = None
+    for index, (host, is_fallback) in enumerate(hosts):
+        trigger_fallback = False
+        for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+            if path.startswith("http://") or path.startswith("https://"):
+                target_url = path
+                parsed = urlparse(target_url)
+                log_host = parsed.netloc or host
+                log_path = parsed.path or "/"
+            else:
+                target_url = f"{host}{path}"
+                log_host = host
+                log_path = path
+
+            _log_try(
+                logger,
+                request_id=request_id,
+                kind=kind,
+                host=log_host,
+                path=log_path,
+                attempt=attempt,
+                extra=try_extra,
+            )
+            try:
+                response: httpx.Response = await request_cb(target_url)
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                last_status = None
+                _log_fail(
+                    logger,
+                    request_id=request_id,
+                    kind=kind,
+                    host=log_host,
+                    path=log_path,
+                    attempt=attempt,
+                    reason="timeout",
+                )
+            except httpx.RequestError as exc:
+                last_error = exc
+                last_status = None
+                _log_fail(
+                    logger,
+                    request_id=request_id,
+                    kind=kind,
+                    host=log_host,
+                    path=log_path,
+                    attempt=attempt,
+                    reason=str(exc),
+                )
+            else:
+                status = response.status_code
+                last_status = status
+                if status == 429 or 500 <= status < 600:
+                    body = _trim_body(response)
+                    _log_fail(
+                        logger,
+                        request_id=request_id,
+                        kind=kind,
+                        host=log_host,
+                        path=log_path,
+                        attempt=attempt,
+                        status=status,
+                        body=body,
+                    )
+                    if attempt < len(_RETRY_DELAYS):
+                        await asyncio.sleep(delay)
+                        continue
+                    last_error = CoverSourceUnavailableError(f"status:{status}")
+                elif 400 <= status < 500:
+                    body = _trim_body(response)
+                    _log_fail(
+                        logger,
+                        request_id=request_id,
+                        kind=kind,
+                        host=log_host,
+                        path=log_path,
+                        attempt=attempt,
+                        status=status,
+                        body=body,
+                    )
+                    raise CoverSourceClientError(f"status:{status}")
+                else:
+                    return response, log_host
+
+            if attempt < len(_RETRY_DELAYS):
+                await asyncio.sleep(delay)
+                continue
+
+            trigger_fallback = (
+                index == 0
+                and len(hosts) > 1
+                and not is_fallback
+                and UPLOAD_FALLBACK_ENABLED
+                and (last_status is None or (last_status >= 500))
+            )
+            if trigger_fallback:
+                break
+        else:
+            trigger_fallback = False
+        if trigger_fallback:
+            continue
+        break
+
+    if isinstance(last_error, CoverSourceUnavailableError):
+        raise last_error
+    raise CoverSourceUnavailableError(str(last_error or "upload")) from last_error
 
 
 async def upload_stream(
-    data: bytes,
+    file_stream: Union[bytes, bytearray, memoryview, IO[bytes]],
     filename: str,
     mime_type: Optional[str],
     *,
     request_id: str,
     logger: Optional[logging.Logger] = None,
 ) -> str:
-    """Upload audio bytes and return the KIE file identifier."""
+    """Upload audio data to the Suno cover service."""
 
-    if not data:
+    if isinstance(file_stream, (bytes, bytearray, memoryview)):
+        payload = bytes(file_stream)
+    else:
+        payload = file_stream.read()
+    if not payload:
         raise CoverSourceValidationError("empty-data")
 
     headers = _auth_header()
-    url = _compose_upload_url(UPLOAD_STREAM_PATH)
     timeout = _timeout()
+    safe_filename = filename or "audio.bin"
+    content_type = mime_type or "application/octet-stream"
 
-    async def _do_request() -> httpx.Response:
+    async def _request(url: str) -> httpx.Response:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    files={
-                        "file": (
-                            filename or "audio.mp3",
-                            data,
-                            mime_type or "application/octet-stream",
-                        )
-                    },
-                )
-            except httpx.TimeoutException:
-                raise
-            except httpx.HTTPError as exc:
-                raise _RetryableError(str(exc)) from exc
-        if response.status_code in {429} or 500 <= response.status_code < 600:
-            raise _RetryableError(f"status:{response.status_code}", response=response)
-        if 400 <= response.status_code < 500:
-            raise CoverSourceClientError(f"status:{response.status_code}")
-        return response
+            return await client.post(
+                url,
+                headers=headers,
+                files={"file": (safe_filename, payload, content_type)},
+            )
 
-    response = await _request_with_retries(
-        "stream",
-        _do_request,
-        logger=logger,
+    response, host = await _perform_upload(
         request_id=request_id,
+        kind="stream",
+        path=UPLOAD_STREAM_PATH,
+        request_cb=_request,
+        logger=logger,
+        try_extra={"mime": content_type, "size": len(payload)},
     )
 
-    status = response.status_code
-    if status in {429} or 500 <= status < 600:
-        raise CoverSourceUnavailableError(f"status:{status}")
-
     try:
-        payload = response.json()
-    except ValueError:
-        raise CoverSourceUnavailableError("invalid-json") from None
+        payload_json: Any = response.json()
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise CoverSourceUnavailableError("invalid-json") from exc
 
-    if not isinstance(payload, Mapping):
-        if isinstance(payload, MutableMapping):
-            payload = dict(payload)
+    if not isinstance(payload_json, Mapping):
+        if isinstance(payload_json, MutableMapping):
+            payload_json = dict(payload_json)
         else:
-            payload = {"data": payload}
+            payload_json = {"data": payload_json}
 
-    kie_file_id = _extract_kie_file_id(payload)
+    kie_file_id = _extract_kie_file_id(payload_json)
     if not kie_file_id:
         raise CoverSourceUnavailableError("missing-kie-file-id")
+
+    _log_ok(logger, request_id=request_id, kind="stream", host=host, kie_file_id=kie_file_id)
     return kie_file_id
 
 
@@ -207,53 +367,38 @@ async def upload_url(
     request_id: str,
     logger: Optional[logging.Logger] = None,
 ) -> str:
-    """Upload a remote URL and return the KIE file identifier."""
+    """Upload a remote audio URL to the Suno cover service."""
 
-    headers = {"Content-Type": "application/json"}
-    headers.update(_auth_header())
-    url = _compose_upload_url(UPLOAD_URL_PATH)
+    headers = _auth_header()
+    headers["Content-Type"] = "application/json"
     timeout = _timeout()
 
-    async def _do_request() -> httpx.Response:
+    async def _request(url: str) -> httpx.Response:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json={"url": source_url},
-                )
-            except httpx.TimeoutException:
-                raise
-            except httpx.HTTPError as exc:
-                raise _RetryableError(str(exc)) from exc
-        if response.status_code in {429} or 500 <= response.status_code < 600:
-            raise _RetryableError(f"status:{response.status_code}", response=response)
-        if 400 <= response.status_code < 500:
-            raise CoverSourceClientError(f"status:{response.status_code}")
-        return response
+            return await client.post(url, headers=headers, json={"url": source_url})
 
-    response = await _request_with_retries(
-        "url",
-        _do_request,
-        logger=logger,
+    response, host = await _perform_upload(
         request_id=request_id,
+        kind="url",
+        path=UPLOAD_URL_PATH,
+        request_cb=_request,
+        logger=logger,
+        try_extra={"source": source_url},
     )
 
-    status = response.status_code
-    if status in {429} or 500 <= status < 600:
-        raise CoverSourceUnavailableError(f"status:{status}")
-
     try:
-        payload = response.json()
-    except ValueError:
-        raise CoverSourceUnavailableError("invalid-json") from None
+        payload_json: Any = response.json()
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise CoverSourceUnavailableError("invalid-json") from exc
 
-    if not isinstance(payload, Mapping):
-        payload = {"data": payload}
+    if not isinstance(payload_json, Mapping):
+        payload_json = {"data": payload_json}
 
-    kie_file_id = _extract_kie_file_id(payload)
+    kie_file_id = _extract_kie_file_id(payload_json)
     if not kie_file_id:
         raise CoverSourceUnavailableError("missing-kie-file-id")
+
+    _log_ok(logger, request_id=request_id, kind="url", host=host, kie_file_id=kie_file_id)
     return kie_file_id
 
 
@@ -295,6 +440,8 @@ def validate_audio_file(
     mime_type: Optional[str],
     file_name: Optional[str],
     file_size: Optional[int],
+    *,
+    user_id: Optional[int] = None,
 ) -> tuple[str, str]:
     """Validate Telegram file metadata and return filename & mime."""
 
@@ -320,8 +467,9 @@ def validate_audio_file(
             raise CoverSourceValidationError("unknown-mime")
 
     if not name:
-        extension = ".mp3" if mime.endswith("mpeg") else ".wav"
-        name = f"cover{extension}"
+        suffix = "mp3" if mime.endswith("mpeg") else "wav"
+        user_part = str(user_id) if user_id is not None else "user"
+        name = f"cover-{user_part}.{suffix}"
 
     return name, mime
 
@@ -337,4 +485,3 @@ __all__ = [
     "ensure_audio_url",
     "validate_audio_file",
 ]
-
