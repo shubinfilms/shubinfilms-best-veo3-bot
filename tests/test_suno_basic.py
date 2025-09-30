@@ -1265,20 +1265,36 @@ def test_policy_error_message_text(bot_module):
     message = bot_module._suno_error_message(
         400, "The description contains artist name: The Weeknd"
     )
-    assert "living artist/brand" in message
+    assert message == (
+        "❌ Ошибка: описание содержит запрещённые слова (например, имя артиста).\n"
+        "Пожалуйста, измените описание и попробуйте снова."
+    )
 
 
 def test_delivery_uses_remote_urls(monkeypatch):
     service = SunoService(redis=None, telegram_token="test-token")
 
-    meta = TelegramMeta(chat_id=123, msg_id=77, title="Demo", ts="now", req_id="req-1")
+    meta = TelegramMeta(
+        chat_id=123,
+        msg_id=77,
+        title="Demo",
+        ts="now",
+        req_id="req-1",
+        user_title="Future",
+    )
     link = TaskLink(user_id=555, prompt="Prompt", ts="now")
 
     monkeypatch.setattr(service, "_load_mapping", lambda task_id: meta)
     monkeypatch.setattr(service, "_load_user_link", lambda task_id: link)
     monkeypatch.setattr(service, "_save_task_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(service, "_send_text", lambda *args, **kwargs: None)
-    monkeypatch.setattr(service, "_send_image_url", lambda *args, **kwargs: False)
+    image_calls: list[tuple] = []
+
+    def _fake_send_image_url(*args, **kwargs):
+        image_calls.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr(service, "_send_image_url", _fake_send_image_url)
     monkeypatch.setattr(service, "_send_audio", lambda *args, **kwargs: False)
     monkeypatch.setattr(service, "_send_image", lambda *args, **kwargs: False)
 
@@ -1324,5 +1340,8 @@ def test_delivery_uses_remote_urls(monkeypatch):
     assert len(sent_audio) == 2
     assert sent_audio[0]["url"] == "https://cdn/audio1.mp3"
     assert sent_audio[0]["thumb"] == "https://cdn/image1.jpg"
-    assert "Take 1" in str(sent_audio[0]["caption"])
-    assert sent_audio[1]["title"].endswith("(Take 2)")
+    assert sent_audio[0]["caption"] == "🎵 Future (Take 1)\n42 sec • tag-one"
+    assert sent_audio[0]["title"] == "Future (Take 1)"
+    assert sent_audio[1]["title"] == "Future (Take 2)"
+    assert sent_audio[1]["caption"] == "🎵 Future (Take 2)\n38 sec • tag-two"
+    assert not image_calls

@@ -4840,8 +4840,8 @@ def _suno_error_message(status: Optional[int], reason: Optional[str]) -> str:
         lowered = reason.lower()
         if any(phrase in lowered for phrase in ("artist name", "living artist", "brand")):
             return (
-                "⚠️ Your description includes a living artist/brand. "
-                "Please remove explicit names and try: '80s dark R&B, neon city mood, falsetto vocals, cinematic builds'."
+                "❌ Ошибка: описание содержит запрещённые слова (например, имя артиста).\n"
+                "Пожалуйста, измените описание и попробуйте снова."
             )
     if reason:
         return f"⚠️ Generation failed: {md2_escape(reason)}"
