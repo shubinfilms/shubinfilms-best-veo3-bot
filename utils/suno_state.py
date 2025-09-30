@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, MutableMapping, Optional
 
+import enum
+
 import html
 import re
 
@@ -94,12 +96,18 @@ def _clean_lyrics(value: Optional[str]) -> Optional[str]:
     return _apply_limit(text, LYRICS_MAX_LENGTH)
 
 
+class LyricsSource(enum.StrEnum):
+    USER = "user"
+    AI = "ai"
+
+
 @dataclass
 class SunoState:
     mode: Literal["instrumental", "lyrics", "cover"] = "instrumental"
     title: Optional[str] = None
     style: Optional[str] = None
     lyrics: Optional[str] = None
+    lyrics_source: LyricsSource = LyricsSource.AI
     card_message_id: Optional[int] = None
     card_text_hash: Optional[str] = None
     card_markup_hash: Optional[str] = None
@@ -123,6 +131,7 @@ class SunoState:
             "title": self.title,
             "style": self.style,
             "lyrics": self.lyrics,
+            "lyrics_source": self.lyrics_source.value,
             "has_lyrics": self.has_lyrics,
             "card_message_id": self.card_message_id,
             "card_text_hash": self.card_text_hash,
@@ -139,6 +148,19 @@ class SunoState:
         }
 
 
+def _parse_lyrics_source(raw: Any) -> LyricsSource:
+    if isinstance(raw, LyricsSource):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text:
+            try:
+                return LyricsSource(text)
+            except ValueError:
+                pass
+    return LyricsSource.AI
+
+
 def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     raw_mode = payload.get("mode")
     mode: Literal["instrumental", "lyrics", "cover"]
@@ -147,6 +169,7 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     else:
         mode = "lyrics" if bool(payload.get("has_lyrics")) else "instrumental"
     state = SunoState(mode=mode)
+    state.lyrics_source = _parse_lyrics_source(payload.get("lyrics_source"))
     set_title(state, payload.get("title"))
     set_style(state, payload.get("style"))
     set_lyrics(state, payload.get("lyrics"))
@@ -279,6 +302,7 @@ def reset_suno_card_state(
     state.title = None
     state.style = None
     state.lyrics = None
+    state.lyrics_source = LyricsSource.AI
     state.preset = None
     state.cover_source_url = None
     state.cover_source_label = None
@@ -296,6 +320,11 @@ def reset_suno_card_state(
 
 def set_lyrics(state: SunoState, value: Optional[str]) -> SunoState:
     state.lyrics = _clean_lyrics(value)
+    return state
+
+
+def set_lyrics_source(state: SunoState, value: Any) -> SunoState:
+    state.lyrics_source = _parse_lyrics_source(value)
     return state
 
 
@@ -341,6 +370,7 @@ def build_generation_payload(
         "style": state.style or "",
         "instrumental": not state.has_lyrics,
         "has_lyrics": state.has_lyrics,
+        "lyrics_source": state.lyrics_source.value,
     }
     tags: list[str] = []
     if state.style:
@@ -360,13 +390,19 @@ def build_generation_payload(
             payload["inputAudioUrl"] = state.cover_source_url
         payload["instrumental"] = False
         payload["has_lyrics"] = False
-    elif state.has_lyrics:
+    if state.mode == "lyrics" and state.lyrics_source == LyricsSource.USER:
         payload["lyrics"] = state.lyrics or ""
+    else:
+        payload.pop("lyrics", None)
     if lang:
         payload["lang"] = lang
     if state.style:
         payload["prompt"] = state.style
-    elif state.lyrics and state.has_lyrics:
+    elif (
+        state.mode == "lyrics"
+        and state.lyrics_source == LyricsSource.USER
+        and state.lyrics
+    ):
         payload["prompt"] = state.lyrics
     elif state.title:
         payload["prompt"] = state.title
@@ -420,8 +456,14 @@ def suno_is_ready_to_start(state: SunoState) -> bool:
             return False
         if field == "style" and not state.style:
             return False
-        if field == "lyrics" and not state.lyrics:
-            return False
+        if field == "lyrics":
+            if state.mode != "lyrics":
+                continue
+            if state.lyrics_source == LyricsSource.AI:
+                continue
+            if not state.lyrics:
+                return False
+            continue
         if field == "reference" and not state.kie_file_id:
             return False
     return True
@@ -432,6 +474,7 @@ __all__ = [
     "LYRICS_PREVIEW_LIMIT",
     "STYLE_MAX_LENGTH",
     "TITLE_MAX_LENGTH",
+    "LyricsSource",
     "SunoState",
     "build_generation_payload",
     "clear_lyrics",
@@ -443,6 +486,7 @@ __all__ = [
     "sanitize_payload_for_log",
     "suno_is_ready_to_start",
     "set_lyrics",
+    "set_lyrics_source",
     "set_style",
     "set_cover_source",
     "set_title",
