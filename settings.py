@@ -64,6 +64,9 @@ class _AppSettings(BaseModel):
     SUNO_INSTR_PATH: str = Field(default="/api/v1/generate/add-instrumental")
     SUNO_VOCAL_PATH: str = Field(default="/api/v1/generate/add-vocals")
     SUNO_MODEL: str = Field(default="V5")
+    UPLOAD_BASE_URL: Optional[str] = Field(default=None)
+    UPLOAD_STREAM_PATH: str = Field(default="/api/v1/upload/stream")
+    UPLOAD_URL_PATH: str = Field(default="/api/v1/upload/url")
 
     @field_validator("LOG_LEVEL", mode="before")
     def _normalize_level(cls, value: object) -> str:
@@ -227,6 +230,12 @@ SUNO_COVER_INFO_PATH = _APP_SETTINGS.SUNO_COVER_INFO_PATH
 SUNO_INSTR_PATH = _APP_SETTINGS.SUNO_INSTR_PATH
 SUNO_VOCAL_PATH = _APP_SETTINGS.SUNO_VOCAL_PATH
 SUNO_MODEL = _APP_SETTINGS.SUNO_MODEL or "V5"
+
+UPLOAD_BASE_URL = (
+    _strip_optional(_APP_SETTINGS.UPLOAD_BASE_URL) or SUNO_API_BASE
+).rstrip("/")
+UPLOAD_STREAM_PATH = _APP_SETTINGS.UPLOAD_STREAM_PATH
+UPLOAD_URL_PATH = _APP_SETTINGS.UPLOAD_URL_PATH
 SUNO_READY = bool(
     SUNO_ENABLED and SUNO_API_TOKEN and SUNO_CALLBACK_SECRET and SUNO_CALLBACK_URL
 )
@@ -327,6 +336,9 @@ __all__ = [
     "SUNO_MODEL",
     "SUNO_READY",
     "SUNO_ENABLED",
+    "UPLOAD_BASE_URL",
+    "UPLOAD_STREAM_PATH",
+    "UPLOAD_URL_PATH",
     "resolve_outbound_ip",
     "token_tail",
 ]

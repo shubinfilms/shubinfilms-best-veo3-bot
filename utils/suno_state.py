@@ -107,6 +107,9 @@ class SunoState:
     preset: Optional[str] = None
     cover_source_url: Optional[str] = None
     cover_source_label: Optional[str] = None
+    source_file_id: Optional[str] = None
+    source_url: Optional[str] = None
+    kie_file_id: Optional[str] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -127,6 +130,9 @@ class SunoState:
             "preset": self.preset,
             "cover_source_url": self.cover_source_url,
             "cover_source_label": self.cover_source_label,
+            "source_file_id": self.source_file_id,
+            "source_url": self.source_url,
+            "kie_file_id": self.kie_file_id,
         }
 
 
@@ -167,6 +173,17 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     raw_cover_label = payload.get("cover_source_label")
     if isinstance(raw_cover_label, str):
         state.cover_source_label = raw_cover_label.strip() or None
+    raw_source_file_id = payload.get("source_file_id")
+    if isinstance(raw_source_file_id, str):
+        state.source_file_id = raw_source_file_id.strip() or None
+    raw_source_url = payload.get("source_url")
+    if isinstance(raw_source_url, str):
+        state.source_url = raw_source_url.strip() or None
+    raw_kie_file_id = payload.get("kie_file_id")
+    if isinstance(raw_kie_file_id, str):
+        state.kie_file_id = raw_kie_file_id.strip() or None
+    if state.source_url is None and state.cover_source_url:
+        state.source_url = state.cover_source_url
     return state
 
 
@@ -211,15 +228,37 @@ def clear_style(state: SunoState) -> SunoState:
     return state
 
 
-def set_cover_source(state: SunoState, url: Optional[str], label: Optional[str] = None) -> SunoState:
+def set_cover_source(
+    state: SunoState,
+    url: Optional[str],
+    label: Optional[str] = None,
+    *,
+    file_id: Optional[str] = None,
+    source_url: Optional[str] = None,
+    kie_file_id: Optional[str] = None,
+) -> SunoState:
     state.cover_source_url = (url or "").strip() or None
     state.cover_source_label = (label or "").strip() or None
+    if file_id is not None:
+        text = str(file_id).strip()
+        state.source_file_id = text or None
+    if source_url is not None:
+        text = str(source_url).strip()
+        state.source_url = text or None
+    elif url is not None:
+        state.source_url = state.cover_source_url
+    if kie_file_id is not None:
+        text = str(kie_file_id).strip()
+        state.kie_file_id = text or None
     return state
 
 
 def clear_cover_source(state: SunoState) -> SunoState:
     state.cover_source_url = None
     state.cover_source_label = None
+    state.source_file_id = None
+    state.source_url = None
+    state.kie_file_id = None
     return state
 
 
