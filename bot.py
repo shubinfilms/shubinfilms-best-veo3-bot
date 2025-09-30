@@ -89,6 +89,7 @@ from ui_helpers import (
     show_referral_card,
     pm_main_kb,
     pm_result_kb,
+    sync_suno_start_message,
 )
 
 from utils.suno_state import (
@@ -117,7 +118,6 @@ from utils.suno_modes import (
     FIELD_PROMPTS as SUNO_FIELD_PROMPTS,
     default_style_text as suno_default_style_text,
     get_mode_config as get_suno_mode_config,
-    iter_mode_configs as iter_suno_mode_configs,
 )
 from utils.input_state import (
     WaitInputState,
@@ -134,7 +134,8 @@ from utils.input_state import (
 from utils.telegram_utils import label_to_command, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
-from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX
+from keyboards import CB_FAQ_PREFIX, CB_PM_PREFIX, suno_modes_keyboard
+from texts import SUNO_MODE_PROMPT
 
 from redis_utils import (
     credit,
@@ -4946,12 +4947,7 @@ def _music_flow_steps(flow: str) -> list[str]:
 
 
 def _music_flow_keyboard() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for config in iter_suno_mode_configs():
-        rows.append(
-            [InlineKeyboardButton(config.button_label, callback_data=f"suno:mode:{config.key}")]
-        )
-    return InlineKeyboardMarkup(rows)
+    return suno_modes_keyboard()
 
 
 async def _music_show_main_menu(
@@ -4966,16 +4962,7 @@ async def _music_show_main_menu(
     state_dict["suno_lyrics_confirmed"] = False
     state_dict["suno_cover_source_label"] = None
     state_dict["suno_auto_lyrics_generated"] = False
-    last_mode = state_dict.get("suno_last_mode")
-    if isinstance(last_mode, str):
-        config = get_suno_mode_config(last_mode)
-        subtitle = f"Last used: {config.emoji} {config.title}"
-    else:
-        subtitle = "Pick what you want to create."
-    text = (
-        "🎵 <b>Music generation</b>\n"
-        f"{subtitle}"
-    )
+    text = SUNO_MODE_PROMPT
     await tg_safe_send(
         ctx.bot.send_message,
         method_name="sendMessage",
@@ -5438,7 +5425,41 @@ async def suno_entry(
     suno_state_obj = load_suno_state(ctx)
     s["suno_state"] = suno_state_obj.to_dict()
     _reset_suno_card_cache(s)
-    await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO, force_new=force_new)
+    if force_new:
+        card_state = s.get("suno_card")
+        msg_id: Optional[int] = None
+        if isinstance(card_state, dict):
+            stored_id = card_state.get("msg_id")
+            if isinstance(stored_id, int):
+                msg_id = stored_id
+        if msg_id is None and isinstance(s.get("last_ui_msg_id_suno"), int):
+            msg_id = s.get("last_ui_msg_id_suno")
+        if isinstance(msg_id, int):
+            try:
+                await ctx.bot.delete_message(chat_id, msg_id)
+            except BadRequest:
+                pass
+            except Exception:
+                pass
+            if isinstance(card_state, dict):
+                card_state["msg_id"] = None
+                card_state["last_text_hash"] = None
+                card_state["last_markup_hash"] = None
+        msg_ids = s.get("msg_ids")
+        if isinstance(msg_ids, dict):
+            msg_ids["suno"] = None
+        s["last_ui_msg_id_suno"] = None
+    await sync_suno_start_message(
+        ctx,
+        chat_id,
+        s,
+        suno_state=suno_state_obj,
+        ready=False,
+        generating=False,
+        waiting_enqueue=False,
+    )
+    save_suno_state(ctx, suno_state_obj)
+    s["suno_state"] = suno_state_obj.to_dict()
     await _music_show_main_menu(chat_id, ctx, s)
 
 

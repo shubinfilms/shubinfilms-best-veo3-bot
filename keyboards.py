@@ -96,3 +96,17 @@ def faq_keyboard() -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def suno_modes_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎼 Инструментал", callback_data="suno:mode:instrumental")],
+        [InlineKeyboardButton("🎤 Вокал", callback_data="suno:mode:lyrics")],
+        [InlineKeyboardButton("🎚️ Ковер", callback_data="suno:mode:cover")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def suno_start_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="suno:start")]]
+    return InlineKeyboardMarkup(rows)

@@ -23,6 +23,7 @@ from utils.suno_state import (
     load as load_suno_state,
     save as save_suno_state,
     style_preview as suno_style_preview,
+    suno_is_ready_to_start,
 )
 from utils.suno_modes import (
     FIELD_ICONS as SUNO_FIELD_ICONS,
@@ -31,6 +32,8 @@ from utils.suno_modes import (
     default_style_text as suno_default_style_text,
     get_mode_config as get_suno_mode_config,
 )
+from keyboards import suno_start_keyboard
+from texts import SUNO_START_READY_MESSAGE
 from telegram_utils import safe_edit, SafeEditResult
 from utils.telegram_safe import safe_edit_message
 
@@ -175,7 +178,6 @@ def _suno_keyboard(
     price: int,
     generating: bool,
     flow: Optional[str],
-    ready: bool,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -192,14 +194,7 @@ def _suno_keyboard(
         rows.append([InlineKeyboardButton("🎧 Источник", callback_data="suno:edit:cover")])
         rows.append([InlineKeyboardButton("🎛️ Стиль", callback_data="suno:edit:style")])
 
-    if generating:
-        start_label = "⏳ Генерация…"
-    elif ready:
-        start_label = "▶️ Начать генерацию"
-    else:
-        start_label = "🔒 Заполните поля"
-    bottom_row = [InlineKeyboardButton(start_label, callback_data="suno:start")]
-    bottom_row.append(InlineKeyboardButton("🔙 Назад", callback_data="suno:menu"))
+    bottom_row = [InlineKeyboardButton("🔙 Назад", callback_data="suno:menu")]
     bottom_row.append(InlineKeyboardButton("❌ Отмена", callback_data="suno:cancel"))
     rows.append(bottom_row)
     return InlineKeyboardMarkup(rows)
@@ -212,7 +207,7 @@ def render_suno_card(
     balance: Optional[int] = None,
     generating: bool = False,
     waiting_enqueue: bool = False,
-) -> Tuple[str, InlineKeyboardMarkup]:
+) -> Tuple[str, InlineKeyboardMarkup, bool]:
     mode = suno_state.mode
     config = get_suno_mode_config(mode)
 
@@ -332,22 +327,90 @@ def render_suno_card(
 
         text = "\n".join(lines)
 
-    ready = True
-    if mode == "instrumental":
-        ready = bool(suno_state.style and suno_state.title)
-    elif mode == "lyrics":
-        ready = bool(suno_state.style and suno_state.title and suno_state.lyrics)
-    elif mode == "cover":
-        ready = bool(suno_state.kie_file_id and suno_state.title)
+    ready = suno_is_ready_to_start(suno_state)
 
     keyboard = _suno_keyboard(
         suno_state,
         price=price,
         generating=generating or waiting_enqueue,
         flow=mode,
-        ready=ready,
     )
-    return text, keyboard
+    return text, keyboard, ready
+
+
+async def sync_suno_start_message(
+    ctx: Any,
+    chat_id: int,
+    state_dict: MutableMapping[str, Any],
+    *,
+    suno_state: SunoState,
+    ready: bool,
+    generating: bool,
+    waiting_enqueue: bool,
+) -> Optional[int]:
+    should_show = ready and not generating and not waiting_enqueue
+
+    raw_id = state_dict.get("suno_start_msg_id")
+    start_msg_id = raw_id if isinstance(raw_id, int) else None
+    if start_msg_id is None and isinstance(suno_state.start_msg_id, int):
+        start_msg_id = suno_state.start_msg_id
+
+    if not should_show:
+        if isinstance(start_msg_id, int):
+            try:
+                await ctx.bot.delete_message(chat_id, start_msg_id)
+            except BadRequest as exc:
+                logger.debug("delete suno start failed: %s", exc)
+            except Exception as exc:  # pragma: no cover - network issues
+                logger.warning("delete suno start error: %s", exc)
+            start_msg_id = None
+    else:
+        text = SUNO_START_READY_MESSAGE
+        markup = suno_start_keyboard()
+        if isinstance(start_msg_id, int):
+            try:
+                await safe_edit_message(
+                    ctx,
+                    chat_id,
+                    start_msg_id,
+                    text,
+                    markup,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as exc:
+                logger.debug("edit suno start failed: %s", exc)
+                start_msg_id = None
+            except Exception as exc:  # pragma: no cover - network issues
+                logger.warning("edit suno start error: %s", exc)
+                start_msg_id = None
+        if start_msg_id is None:
+            try:
+                msg = await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                start_msg_id = msg.message_id
+            except Exception as exc:  # pragma: no cover - network issues
+                logger.error("send suno start failed: %s", exc)
+                start_msg_id = None
+
+    if isinstance(start_msg_id, int):
+        state_dict["suno_start_msg_id"] = start_msg_id
+        msg_ids = state_dict.get("msg_ids")
+        if isinstance(msg_ids, MutableMapping):
+            msg_ids["suno_start"] = start_msg_id
+    else:
+        state_dict.pop("suno_start_msg_id", None)
+        msg_ids = state_dict.get("msg_ids")
+        if isinstance(msg_ids, MutableMapping):
+            msg_ids.pop("suno_start", None)
+
+    suno_state.start_msg_id = start_msg_id
+    return start_msg_id
 
 
 async def refresh_suno_card(
@@ -371,7 +434,7 @@ async def refresh_suno_card(
         balance_num = int(balance_val) if balance_val is not None else None
     except Exception:
         balance_num = None
-    text, markup = render_suno_card(
+    text, markup, ready = render_suno_card(
         suno_state_obj,
         price=price,
         balance=balance_num,
@@ -462,6 +525,15 @@ async def refresh_suno_card(
         suno_state_obj.card_markup_hash = markup_hash
         suno_state_obj.card_chat_id = chat_id
         suno_state_obj.last_card_hash = text_hash
+        await sync_suno_start_message(
+            ctx,
+            chat_id,
+            state_dict,
+            suno_state=suno_state_obj,
+            ready=ready,
+            generating=generating,
+            waiting_enqueue=waiting_enqueue,
+        )
         save_suno_state(ctx, suno_state_obj)
         state_dict["suno_state"] = suno_state_obj.to_dict()
         state_dict[state_key] = msg_id
@@ -500,6 +572,17 @@ async def refresh_suno_card(
     suno_state_obj.card_markup_hash = card_markup_hash if isinstance(card_markup_hash, str) else None
     suno_state_obj.card_chat_id = chat_id
     suno_state_obj.last_card_hash = suno_state_obj.card_text_hash
+
+    await sync_suno_start_message(
+        ctx,
+        chat_id,
+        state_dict,
+        suno_state=suno_state_obj,
+        ready=ready,
+        generating=generating,
+        waiting_enqueue=waiting_enqueue,
+    )
+
     save_suno_state(ctx, suno_state_obj)
     state_dict["suno_state"] = suno_state_obj.to_dict()
 
