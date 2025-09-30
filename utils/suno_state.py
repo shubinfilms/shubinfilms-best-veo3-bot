@@ -7,6 +7,7 @@ import html
 import re
 
 from suno.client import get_preset_config
+from utils.suno_modes import get_mode_config as get_suno_mode_config
 
 
 TITLE_MAX_LENGTH = 300
@@ -110,6 +111,7 @@ class SunoState:
     source_file_id: Optional[str] = None
     source_url: Optional[str] = None
     kie_file_id: Optional[str] = None
+    start_msg_id: Optional[int] = None
 
     @property
     def has_lyrics(self) -> bool:
@@ -133,6 +135,7 @@ class SunoState:
             "source_file_id": self.source_file_id,
             "source_url": self.source_url,
             "kie_file_id": self.kie_file_id,
+            "start_msg_id": self.start_msg_id,
         }
 
 
@@ -184,6 +187,9 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
         state.kie_file_id = raw_kie_file_id.strip() or None
     if state.source_url is None and state.cover_source_url:
         state.source_url = state.cover_source_url
+    raw_start_msg_id = payload.get("start_msg_id")
+    if isinstance(raw_start_msg_id, int):
+        state.start_msg_id = raw_start_msg_id
     return state
 
 
@@ -381,6 +387,20 @@ def sanitize_payload_for_log(payload: Mapping[str, Any]) -> dict[str, Any]:
     return preview
 
 
+def suno_is_ready_to_start(state: SunoState) -> bool:
+    config = get_suno_mode_config(state.mode)
+    for field in config.required_fields:
+        if field == "title" and not state.title:
+            return False
+        if field == "style" and not state.style:
+            return False
+        if field == "lyrics" and not state.lyrics:
+            return False
+        if field == "reference" and not state.kie_file_id:
+            return False
+    return True
+
+
 __all__ = [
     "LYRICS_MAX_LENGTH",
     "LYRICS_PREVIEW_LIMIT",
@@ -395,6 +415,7 @@ __all__ = [
     "load",
     "save",
     "sanitize_payload_for_log",
+    "suno_is_ready_to_start",
     "set_lyrics",
     "set_style",
     "set_cover_source",

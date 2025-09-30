@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 
 from telegram_utils import SafeEditResult, safe_edit
 from ui_helpers import refresh_suno_card, render_suno_card
+from texts import SUNO_START_READY_MESSAGE
 from utils.suno_state import (
     SunoState,
     build_generation_payload,
@@ -114,14 +115,14 @@ def _setup_suno_context() -> tuple[SimpleNamespace, dict[str, object], FakeBot, 
 
 
 def _render(state: SunoState, *, price: int = 30, balance: int | None = None):
-    text, markup = render_suno_card(
+    text, markup, ready = render_suno_card(
         state,
         price=price,
         balance=balance,
         generating=False,
         waiting_enqueue=False,
     )
-    return text, markup
+    return text, markup, ready
 
 
 def test_render_includes_escaped_fields() -> None:
@@ -129,7 +130,7 @@ def test_render_includes_escaped_fields() -> None:
     set_title(state, "  Test <Track>  ")
     set_style(state, "Dream pop <b>lush</b>")
     set_lyrics(state, "Line one\nLine two")
-    text, _ = _render(state)
+    text, _, _ = _render(state)
     assert "🏷️ Название: <i>Test</i>" in text
     assert "<Track" not in text
     assert "🎹 Стиль: <i>Dream pop lush</i>" in text
@@ -138,20 +139,20 @@ def test_render_includes_escaped_fields() -> None:
 
 def test_render_shows_dash_for_missing_values() -> None:
     state = SunoState()
-    text, _ = _render(state)
+    text, _, _ = _render(state)
     assert "🏷️ Название: <i>—</i>" in text
     assert "🎹 Стиль: <i>—</i>" in text
     assert "📜" not in text
 
     state_lyrics = SunoState(mode="lyrics")
-    text_lyrics, _ = _render(state_lyrics)
+    text_lyrics, _, _ = _render(state_lyrics)
     assert "📜 Текст: <i>—</i>" in text_lyrics
 
 
 def test_render_has_no_br_tags() -> None:
     state = SunoState()
     set_style(state, "Calm\nAmbient")
-    text, _ = _render(state)
+    text, _, _ = _render(state)
     assert "<br" not in text.lower()
 
 
@@ -160,7 +161,7 @@ def test_lyrics_preview_and_payload() -> None:
     lyrics = "\n".join(lines)
     state = SunoState(mode="lyrics")
     set_lyrics(state, lyrics)
-    text, _ = _render(state)
+    text, _, _ = _render(state)
     assert "📜 Текст: <i>First verse" in text
     payload = build_generation_payload(state, model="V5", lang="ru")
     assert payload["lyrics"] == "First verse\nSecond line\nThird"
@@ -205,6 +206,28 @@ def test_refresh_updates_title_and_message_state() -> None:
     assert "Название: <i>Test</i>" in edited_payload["text"]
     assert state_dict["suno_card"]["msg_id"] == state_dict["last_ui_msg_id_suno"]
     assert load(ctx).title == "Test"
+
+
+def test_start_message_sent_when_ready() -> None:
+    bot = FakeBot()
+    ctx = SimpleNamespace(bot=bot, user_data={})
+    state_dict = {
+        "suno_card": {"msg_id": None, "last_text_hash": None, "last_markup_hash": None},
+        "msg_ids": {},
+    }
+
+    suno_state = load(ctx)
+    set_title(suno_state, "Готовый трек")
+    set_style(suno_state, "ambient, chill")
+    save(ctx, suno_state)
+
+    asyncio.run(refresh_suno_card(ctx, chat_id=321, state_dict=state_dict, price=30))
+
+    texts = [call.get("text") for call in bot.sent]
+    assert SUNO_START_READY_MESSAGE in texts, "start message should be sent when ready"
+    last_markup = bot.sent[-1].get("reply_markup")
+    assert isinstance(last_markup, InlineKeyboardMarkup)
+    assert last_markup.inline_keyboard[0][0].callback_data == "suno:start"
 
 
 def test_refresh_skips_duplicate_payload() -> None:
