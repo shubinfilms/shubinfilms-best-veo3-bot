@@ -40,6 +40,8 @@ class _AppSettings(BaseModel):
 
     TMP_CLEANUP_HOURS: int = Field(default=24, ge=1, le=240)
 
+    WELCOME_BONUS_ENABLED: bool = Field(default=False)
+
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
     KIE_API_KEY: Optional[str] = Field(default=None)
 
@@ -198,6 +200,7 @@ TMP_CLEANUP_HOURS = int(_APP_SETTINGS.TMP_CLEANUP_HOURS)
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
+WELCOME_BONUS_ENABLED = bool(_APP_SETTINGS.WELCOME_BONUS_ENABLED)
 
 
 # Feature toggles

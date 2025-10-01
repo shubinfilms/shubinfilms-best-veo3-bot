@@ -30,6 +30,8 @@ rds = _r
 _PFX = REDIS_PREFIX
 _TTL = 24 * 60 * 60
 
+WAIT_KEYS: Tuple[str, ...] = ("wait:*", "fsm:*", "hub:*:state")
+
 _USERS_SET_KEY = f"{_PFX}:users"
 _DEAD_USERS_SET_KEY = f"{_PFX}:users:dead"
 _PROMO_USED_SET_KEY = f"{_PFX}:promo:used"
@@ -77,6 +79,66 @@ _user_profile_memory: Dict[int, Dict[str, str]] = {}
 _wait_lock = Lock()
 _wait_memory: Dict[str, float] = {}
 _WAIT_TTL_DEFAULT = 15 * 60
+
+
+def get_redis() -> Optional[Any]:
+    """Return the configured Redis client if available."""
+
+    return _r
+
+
+def get_prefix() -> str:
+    """Return the configured Redis key prefix."""
+
+    return _PFX
+
+
+def reset_user_state(
+    r: Optional[Any], prefix: str, user_id: int, chat_id: Optional[int] = None
+) -> int:
+    """Remove cached wait/FSM/hub state keys for ``user_id``.
+
+    Returns the number of deleted keys. When ``chat_id`` is provided, wait keys for the
+    chat are purged as well.
+    """
+
+    if not r:
+        return 0
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return 0
+
+    if uid <= 0:
+        return 0
+
+    patterns = [
+        f"{prefix}:wait:{uid}:*",
+        f"{prefix}:fsm:{uid}:*",
+        f"{prefix}:hub:{uid}:*:state",
+    ]
+    if chat_id is not None:
+        try:
+            cid = int(chat_id)
+        except (TypeError, ValueError):
+            cid = None
+        else:
+            if cid > 0:
+                patterns.append(f"{prefix}:wait:{cid}:*")
+
+    deleted = 0
+    for pattern in patterns:
+        for key in r.scan_iter(pattern):
+            if isinstance(key, bytes):
+                key = key.decode()
+            try:
+                r.delete(key)
+                deleted += 1
+            except Exception:
+                # Best-effort: continue removing other keys.
+                continue
+    return deleted
 
 
 async def clear_wait_flags(r: Any, user_id: int, prefix: str) -> int:

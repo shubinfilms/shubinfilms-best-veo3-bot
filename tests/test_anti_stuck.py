@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from typing import Optional
 from types import SimpleNamespace
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -33,19 +34,29 @@ def test_menu_command_clears_wait_flags(monkeypatch):
         args=[],
     )
 
-    clear_calls: list[tuple[object, int, str]] = []
+    reset_calls: list[tuple[object, str, int, Optional[int]]] = []
 
-    async def fake_clear(redis_client, user_id, prefix):
-        clear_calls.append((redis_client, user_id, prefix))
+    fake_redis = object()
+
+    def fake_get_redis() -> object:
+        return fake_redis
+
+    def fake_get_prefix() -> str:
+        return "test-prefix"
+
+    def fake_reset(redis_client, prefix, user_id, chat_id=None):
+        reset_calls.append((redis_client, prefix, user_id, chat_id))
         return 1
 
-    monkeypatch.setattr(telegram_utils, "clear_wait_flags", fake_clear)
+    monkeypatch.setattr(telegram_utils, "get_redis", fake_get_redis)
+    monkeypatch.setattr(telegram_utils, "get_prefix", fake_get_prefix)
+    monkeypatch.setattr(telegram_utils, "reset_user_state", fake_reset)
 
     handler = telegram_utils.with_state_reset(bot_module.on_menu)
     update = _make_update(user_id=111, chat_id=777, text="/menu")
 
     asyncio.run(handler(update, ctx))
 
-    assert clear_calls == [(ctx.bot_data["redis"], 111, "test-prefix")]
+    assert reset_calls == [(fake_redis, "test-prefix", 111, 777)]
     sent_menu = [payload for payload in ctx.bot.sent if isinstance(payload, dict)]
     assert sent_menu, "menu should be rendered after reset"

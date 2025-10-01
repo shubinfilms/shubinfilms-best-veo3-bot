@@ -19,12 +19,13 @@ from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, 
 import requests
 from requests import Response
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.ext import ContextTypes
 
 from metrics import telegram_send_total
-from redis_utils import clear_wait_flags
+from redis_utils import get_prefix, get_redis, reset_user_state
 from settings import REDIS_PREFIX
 
 log = logging.getLogger("telegram.utils")
@@ -84,31 +85,32 @@ def _purge_wait_hints(context: Any) -> None:
 def with_state_reset(
     handler: Callable[[Any, Any], Awaitable[Any]]
 ) -> Callable[[Any, Any], Awaitable[Any]]:
-    """Wrap ``handler`` to reset wait-state flags and provide unified error handling."""
+    """Wrap ``handler`` to reset wait/FSM state before execution."""
 
     @wraps(handler)
-    async def wrapped(update: Any, context: Any, *args: Any, **kwargs: Any) -> Any:
+    async def wrapped(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         logger = _context_logger(context)
 
-        message = getattr(getattr(update, "message", None), "text", None)
-        callback_query = getattr(update, "callback_query", None)
-        callback_data = getattr(callback_query, "data", None)
-        logger.info("IN cmd=%s cq=%s", message, callback_data)
+        user_id = (update.effective_user.id if update.effective_user else None) if update else None
+        chat_id = (update.effective_chat.id if update and update.effective_chat else None)
 
-        bot_data = getattr(context, "bot_data", {}) if context is not None else {}
-        redis_client = None
-        redis_prefix = REDIS_PREFIX
-        if isinstance(bot_data, MutableMapping):
-            redis_client = bot_data.get("redis")
-            redis_prefix = bot_data.get("redis_prefix", REDIS_PREFIX)
-
-        user = getattr(update, "effective_user", None) if update is not None else None
-        user_id = getattr(user, "id", None)
-        if redis_client and user_id:
-            try:
-                await clear_wait_flags(redis_client, int(user_id), redis_prefix)
-            except Exception:
-                logger.warning("wait_flags.clear_failed", exc_info=True)
+        try:
+            redis_client = get_redis()
+            prefix = get_prefix() or REDIS_PREFIX
+            if redis_client and user_id:
+                deleted = reset_user_state(redis_client, prefix, int(user_id), chat_id)
+                if deleted:
+                    logger.info(
+                        "state_reset",
+                        extra={"deleted": int(deleted), "uid": user_id, "cid": chat_id},
+                    )
+        except Exception as exc:
+            logger.warning("state_reset_failed", extra={"err": repr(exc)[:200]})
 
         _purge_wait_hints(context)
 
@@ -140,6 +142,23 @@ def with_state_reset(
             return None
 
     return wrapped
+
+
+async def safe_answer_callback(
+    update: Update,
+    text: Optional[str] = None,
+    show_alert: bool = False,
+    **kwargs: Any,
+) -> None:
+    """Safely answer callback queries to avoid stuck buttons."""
+
+    try:
+        if update and update.callback_query:
+            await update.callback_query.answer(
+                text=text or "", show_alert=show_alert, **kwargs
+            )
+    except Exception:
+        log.debug("callback.answer_failed", exc_info=True)
 
 _DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
 _HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL

@@ -269,6 +269,7 @@ from telegram_utils import (
     md2_escape,
     mask_tokens,
     with_state_reset,
+    safe_answer_callback,
 )
 from utils.api_client import request_with_retries
 from utils.safe_send import safe_delete_message
@@ -4624,16 +4625,11 @@ async def show_emoji_hub_for_chat(
 
 async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
+    await safe_answer_callback(update, cache_time=0)
 
     query = update.callback_query
     if query is None or not query.data:
         return
-
-    try:
-        await query.answer(cache_time=0)
-    except BadRequest:
-        with suppress(BadRequest):
-            await query.answer()
 
     data = (query.data or "").strip()
     if not data.startswith(HUB_CALLBACK_PREFIX):
@@ -9490,10 +9486,10 @@ configure_faq(
 
 
 async def cb_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
@@ -9508,10 +9504,10 @@ async def cb_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cb_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
@@ -9529,10 +9525,10 @@ async def cb_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cb_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
@@ -9546,10 +9542,10 @@ async def cb_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cb_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
@@ -9563,10 +9559,10 @@ async def cb_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
@@ -9580,11 +9576,11 @@ async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
     data = query.data
-    await query.answer()
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
@@ -9607,12 +9603,12 @@ async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cb_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer_callback(update)
     query = update.callback_query
     if query is None or query.data is None:
         return
     data = query.data
     if data == "faq:menu":
-        await query.answer()
         chat = query.message.chat if query.message else update.effective_chat
         chat_id = chat.id if chat else _resolve_chat_id(update)
         if chat_id is None:
@@ -10197,14 +10193,12 @@ async def on_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     action_value = action_value.strip().lower()
 
     if prefix == "act":
+        await safe_answer_callback(update)
         if action_value == "menu":
             await handle_menu(update, ctx)
             return
 
         handler = MAIN_ACTIONS.get(action_value)
-        with suppress(BadRequest):
-            await query.answer()
-
         if handler is None:
             return
 
@@ -10214,10 +10208,10 @@ async def on_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if prefix == "lang":
         user = update.effective_user
         if user is None or action_value not in LANGUAGE_LABELS:
-            with suppress(BadRequest):
-                await query.answer("Неизвестный язык", show_alert=True)
+            await safe_answer_callback(update, "Неизвестный язык", show_alert=True)
             return
 
+        await safe_answer_callback(update)
         set_user_preferred_language(user.id, action_value)
         ctx.user_data["preferred_language"] = action_value
 
@@ -10338,12 +10332,12 @@ async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"FFMPEG: `{FFMPEG_BIN}`",
     ]
     parts.append(f"DB: `{'ok' if ledger_storage.ping() else 'error'}`")
-    lock_status = "disabled"
-    if runner_lock_state.get("enabled"):
-        lock_status = "owned" if runner_lock_state.get("owned") else "free"
-    lock_payload: Dict[str, Any] = {"ok": True, "lock": lock_status}
-    if runner_lock_state.get("heartbeat_at"):
-        lock_payload["hb"] = runner_lock_state.get("heartbeat_at")
+    lock_payload: Dict[str, Any] = {
+        "enabled": bool(runner_lock_state.get("enabled")),
+        "owned": bool(runner_lock_state.get("owned")),
+        "owner": runner_lock_state.get("owner"),
+        "hb": runner_lock_state.get("heartbeat_at"),
+    }
     parts.append(f"LOCK: `{json.dumps(lock_payload, ensure_ascii=False)}`")
     await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
 
@@ -10562,7 +10556,7 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             await message.reply_text(final_text)
     else:
         await message.reply_text(final_text)
-async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
+async def _legacy_error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
 
     user_id: Optional[int] = None
@@ -10594,9 +10588,20 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
                 disable_web_page_preview=True,
             )
         except Exception:
-            continue
+                continue
         else:
             break
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    update_repr = repr(update)[:500] if update is not None else None
+    error_repr = repr(context.error)[:500] if getattr(context, "error", None) else None
+    log.exception(
+        "handler_error",
+        extra={"update": update_repr, "err": error_repr},
+    )
+    if isinstance(update, Update) or update is None:
+        await _legacy_error_handler(update, context)
 
 async def show_banana_card(
     chat_id: int,
@@ -12816,280 +12821,108 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
 #   Redis runner lock
 # ==========================
 
+
 class RedisLockBusy(RuntimeError):
     """Raised when Redis runner lock is already held by another instance."""
 
 
+LOCK_KEY = f"{REDIS_PREFIX}:prod:lock:runner"
+HEARTBEAT_KEY = f"{LOCK_KEY}:heartbeat"
+LOCK_TTL = 60
+STALE_TTL = 180
+HEARTBEAT_INTERVAL = 15
+
+
+def _lock_owner() -> str:
+    host = os.getenv("HOSTNAME") or socket.gethostname() or "?"
+    return f"{host}:{os.getpid()}"
+
+
 runner_lock_state: Dict[str, Any] = {
-    "enabled": bool(REDIS_URL) and REDIS_LOCK_ENABLED and redis_asyncio is not None,
+    "enabled": bool(redis_client) and REDIS_LOCK_ENABLED,
     "owned": False,
     "heartbeat_at": None,
-    "started_at": None,
-    "host": None,
-    "pid": None,
+    "owner": None,
 }
 
 
-class RedisRunnerLock:
-    LOCK_TTL_SECONDS = 60
-    HEARTBEAT_INTERVAL = 25
-    STALE_THRESHOLD_SECONDS = 90
+def acquire_runner_lock(r: Optional[redis.Redis]) -> bool:
+    if not REDIS_LOCK_ENABLED:
+        runner_lock_state.update({"enabled": False, "owned": True, "owner": None})
+        return True
+    if not r:
+        runner_lock_state.update({"enabled": False, "owned": True, "owner": None})
+        return True
 
-    def __init__(self, redis_url: str, key: str, enabled: bool, version: str):
-        self.redis_url = redis_url
-        self.key = key
-        self.version = version
-        self.enabled = enabled and bool(redis_url) and redis_asyncio is not None
-        runner_lock_state["enabled"] = self.enabled
+    now = int(time.time())
+    owner = _lock_owner()
 
-        self._redis: Optional["redis_asyncio.Redis"] = None
-        self._value: Dict[str, Any] = {}
-        self._heartbeat_task: Optional[asyncio.Task[None]] = None
-        self._released = False
-        self._acquired = False
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._signal_handlers: List[signal.Signals] = []
-        self._stop_callbacks: List[Callable[[Optional[signal.Signals]], None]] = []
+    if r.setnx(LOCK_KEY, owner):
+        r.expire(LOCK_KEY, LOCK_TTL)
+        r.set(HEARTBEAT_KEY, now, ex=LOCK_TTL)
+        runner_lock_state.update(
+            {"enabled": True, "owned": True, "owner": owner, "heartbeat_at": datetime.now(timezone.utc).isoformat()}
+        )
+        return True
 
-    async def __aenter__(self) -> "RedisRunnerLock":
-        if not self.enabled:
-            log.info("Redis runner lock disabled (enabled=%s, redis_asyncio=%s)", REDIS_LOCK_ENABLED, bool(redis_asyncio))
-            return self
+    hb_raw = r.get(HEARTBEAT_KEY)
+    try:
+        hb_value = int(hb_raw) if hb_raw is not None else 0
+    except (TypeError, ValueError):
+        hb_value = 0
 
-        assert redis_asyncio is not None  # for type checkers
-        self._redis = redis_asyncio.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
-        try:
-            await self._acquire()
-        except Exception:
-            await self._close_redis()
-            raise
-        self._loop = asyncio.get_running_loop()
-        self._install_signal_handlers()
-        return self
+    if not hb_raw or now - hb_value > STALE_TTL:
+        r.set(LOCK_KEY, owner, ex=LOCK_TTL)
+        r.set(HEARTBEAT_KEY, now, ex=LOCK_TTL)
+        runner_lock_state.update(
+            {"enabled": True, "owned": True, "owner": owner, "heartbeat_at": datetime.now(timezone.utc).isoformat(), "stolen": True}
+        )
+        return True
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.release()
+    return False
 
-    def add_stop_callback(self, callback: Callable[[Optional[signal.Signals]], None]) -> None:
-        if not callable(callback):
-            raise TypeError("callback must be callable")
-        self._stop_callbacks.append(callback)
 
-    async def _acquire(self) -> None:
-        if not self._redis:
-            return
+def release_runner_lock(r: Optional[redis.Redis]) -> None:
+    runner_lock_state.update({"owned": False, "heartbeat_at": None, "owner": None})
+    runner_lock_state.pop("stolen", None)
+    if not REDIS_LOCK_ENABLED or not r:
+        return
+    try:
+        r.delete(LOCK_KEY)
+        r.delete(HEARTBEAT_KEY)
+    except Exception as exc:
+        log.warning("runner_lock.release_failed | err=%s", exc)
 
-        backoff = 1.0
-        while True:
-            now_iso = _utcnow_iso()
-            host = socket.gethostname()
-            pid = os.getpid()
-            self._value = {
-                "host": host,
-                "pid": pid,
-                "started_at": now_iso,
-                "heartbeat_at": now_iso,
-                "version": self.version,
-            }
-            payload = json.dumps(self._value, ensure_ascii=False)
 
-            try:
-                acquired = await self._redis.set(self.key, payload, nx=True, px=self.LOCK_TTL_SECONDS * 1000)
-            except Exception as exc:
-                log.exception("Redis lock SET failed: %s", exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 5.0)
-                continue
+def heartbeat(r: Optional[redis.Redis]) -> None:
+    if not REDIS_LOCK_ENABLED or not r:
+        return
+    now = int(time.time())
+    try:
+        r.set(HEARTBEAT_KEY, now, ex=LOCK_TTL)
+        r.expire(LOCK_KEY, LOCK_TTL)
+        runner_lock_state["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        log.warning("runner_lock.heartbeat_failed | err=%s", exc)
 
-            if acquired:
-                self._on_acquired(takeover=False)
-                return
-
-            existing_raw = await self._redis.get(self.key)
-            existing = self._decode_existing(existing_raw)
-            if self._is_stale(existing):
-                event("LOCK_STALE_TAKEOVER", key=self.key, previous_host=existing.get("host"),
-                      previous_pid=existing.get("pid"), previous_heartbeat_at=existing.get("heartbeat_at"))
-                try:
-                    await self._redis.getdel(self.key)
-                except Exception as exc:
-                    log.warning("Redis lock GETDEL failed: %s", exc)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 5.0)
-                    continue
-
-                takeover = await self._redis.set(self.key, payload, nx=True, px=self.LOCK_TTL_SECONDS * 1000)
-                if takeover:
-                    self._on_acquired(takeover=True)
-                    return
-
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 5.0)
-                continue
-
-            runner_lock_state.update({
-                "owned": False,
-                "heartbeat_at": existing.get("heartbeat_at"),
-                "started_at": existing.get("started_at"),
-                "host": existing.get("host"),
-                "pid": existing.get("pid"),
-            })
-            event("LOCK_BUSY", key=self.key, owner_host=existing.get("host"), owner_pid=existing.get("pid"),
-                  owner_heartbeat_at=existing.get("heartbeat_at"))
-            raise RedisLockBusy("redis runner lock busy")
-
-    def _on_acquired(self, takeover: bool) -> None:
-        self._acquired = True
-        runner_lock_state.update({
-            "owned": True,
-            "heartbeat_at": self._value.get("heartbeat_at"),
-            "started_at": self._value.get("started_at"),
-            "host": self._value.get("host"),
-            "pid": self._value.get("pid"),
-        })
-        event("LOCK_ACQUIRED", key=self.key, host=self._value.get("host"), pid=self._value.get("pid"), takeover=takeover)
-        log.info("Redis runner lock acquired (takeover=%s)", takeover)
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-
-        self._remove_signal_handlers()
-
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._heartbeat_task
-
-        if not self.enabled or not self._redis:
-            runner_lock_state.update({
-                "owned": False,
-                "heartbeat_at": None,
-                "started_at": None,
-                "host": None,
-                "pid": None,
-            })
-            return
-
-        try:
-            await self._redis.delete(self.key)
-            event("LOCK_RELEASED", key=self.key, host=self._value.get("host"), pid=self._value.get("pid"))
-            log.info("Redis runner lock released")
-        except Exception as exc:
-            log.warning("Redis lock delete failed: %s", exc)
-        finally:
-            runner_lock_state.update({
-                "owned": False,
-                "heartbeat_at": None,
-                "started_at": None,
-                "host": None,
-                "pid": None,
-            })
-            await self._close_redis()
-
-    async def _heartbeat_loop(self) -> None:
-        if not self._redis:
-            return
-        try:
-            while not self._released:
-                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
-                if self._released:
-                    break
-                await self._heartbeat_once()
-        except asyncio.CancelledError:
-            pass
-
-    async def _heartbeat_once(self) -> None:
-        if not self._redis or not self._acquired:
-            return
-        hb_iso = _utcnow_iso()
-        self._value["heartbeat_at"] = hb_iso
-        payload = json.dumps(self._value, ensure_ascii=False)
-        try:
-            updated = await self._redis.set(self.key, payload, xx=True, px=self.LOCK_TTL_SECONDS * 1000)
-        except Exception as exc:
-            log.warning("Redis heartbeat failed: %s", exc)
-            return
-
-        if updated:
-            runner_lock_state["heartbeat_at"] = hb_iso
-            event("LOCK_HEARTBEAT", key=self.key, heartbeat_at=hb_iso)
-        else:
-            log.warning("Redis heartbeat lost lock (key missing)")
-
-    def _decode_existing(self, raw: Optional[str]) -> Dict[str, Any]:
-        if not raw:
-            return {}
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {}
-
-    def _is_stale(self, existing: Dict[str, Any]) -> bool:
-        if not existing:
-            return True
-        hb = _parse_iso8601(existing.get("heartbeat_at")) or _parse_iso8601(existing.get("started_at"))
-        if not hb:
-            return True
-        return (datetime.now(timezone.utc) - hb).total_seconds() > self.STALE_THRESHOLD_SECONDS
-
-    def _install_signal_handlers(self) -> None:
-        if not self.enabled:
-            return
-        if not self._loop:
-            return
-        for sig_name in ("SIGTERM", "SIGINT"):
-            if not hasattr(signal, sig_name):
-                continue
-            sig = getattr(signal, sig_name)
-            try:
-                def _handler(s: signal.Signals = sig) -> None:
-                    for cb in list(self._stop_callbacks):
-                        try:
-                            cb(s)
-                        except Exception as exc:
-                            log.warning("Runner lock stop callback failed: %s", exc)
-                    asyncio.create_task(self._on_signal(s))
-
-                self._loop.add_signal_handler(sig, _handler)
-                self._signal_handlers.append(sig)
-            except (NotImplementedError, RuntimeError):
-                continue
-
-    def _remove_signal_handlers(self) -> None:
-        if not self._loop:
-            return
-        for sig in self._signal_handlers:
-            try:
-                self._loop.remove_signal_handler(sig)
-            except (NotImplementedError, RuntimeError):
-                pass
-        self._signal_handlers.clear()
-
-    async def _on_signal(self, sig: signal.Signals) -> None:
-        log.info("Signal received: %s. Releasing Redis lock.", sig.name if hasattr(sig, "name") else str(sig))
-        await self.release()
-
-    async def _close_redis(self) -> None:
-        if not self._redis:
-            return
-        try:
-            close = getattr(self._redis, "aclose", None)
-            if callable(close):
-                await close()
-            else:
-                await self._redis.close()
-        except Exception:
-            pass
-        self._redis = None
 
 def _reset_handler(callback: Any) -> Any:
     return safe_handler(with_state_reset(callback))
+
+
+async def on_update_log(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if update.callback_query:
+            kind = "callback"
+        elif update.message:
+            kind = "msg"
+        else:
+            kind = "other"
+        uid = update.effective_user.id if update.effective_user else None
+        cid = update.effective_chat.id if update.effective_chat else None
+        log.debug("update", extra={"kind": kind, "uid": uid, "cid": cid})
+    except Exception:
+        log.debug("update_log_failed", exc_info=True)
 
 
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
@@ -13123,7 +12956,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("whoami",), safe_handler(whoami_command)),
     (("suno_debug",), safe_handler(suno_debug_command)),
     (("broadcast",), safe_handler(broadcast_command)),
-    (("my_balance",), safe_handler(my_balance_command)),
+    (("my_balance",), _reset_handler(my_balance_command)),
     (("add_balance",), safe_handler(add_balance_command)),
     (("sub_balance",), safe_handler(sub_balance_command)),
     (("transactions",), safe_handler(transactions_command)),
@@ -13131,10 +12964,10 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (rf"^{HUB_CALLBACK_PREFIX}", safe_handler(with_state_reset(hub_router))),
-    (r"^video:", safe_handler(cb_video)),
-    (r"^img:", safe_handler(cb_image)),
-    (r"^music:", safe_handler(cb_music)),
+    (rf"^{HUB_CALLBACK_PREFIX}", _reset_handler(hub_router)),
+    (r"^video:", _reset_handler(cb_video)),
+    (r"^img:", _reset_handler(cb_image)),
+    (r"^music:", _reset_handler(cb_music)),
     (r"^buy:", safe_handler(cb_buy)),
     (r"^lang:", safe_handler(cb_lang)),
     (r"^help:", safe_handler(cb_help)),
@@ -13179,6 +13012,8 @@ def register_handlers(application: Any) -> None:
                     bot_data["redis"] = redis_client
             else:
                 bot_data["redis"] = redis_client
+
+    application.add_handler(MessageHandler(filters.ALL, on_update_log), group=-9999)
 
     welcome_handler = MessageHandler(
         filters.ALL,
@@ -13267,157 +13102,178 @@ async def run_bot_async() -> None:
     except Exception:
         log.exception("handler registration failed")
         raise
-    application.add_error_handler(error_handler)
+    application.add_error_handler(on_error)
 
-    lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
+    lock_enabled = REDIS_LOCK_ENABLED and bool(redis_client)
+    lock_acquired = False
+    heartbeat_job = None
+    manual_signal_handlers: List[signal.Signals] = []
 
     try:
-        async with lock:
-            log.info(
-                "Bot starting… (Redis=%s, lock=%s)",
-                "on" if redis_client else "off",
-                "enabled" if lock.enabled else "disabled",
+        if not acquire_runner_lock(redis_client):
+            raise RedisLockBusy()
+        lock_acquired = True
+        log.info(
+            "Bot starting… (Redis=%s, lock=%s)",
+            "on" if redis_client else "off",
+            "enabled" if lock_enabled else "disabled",
+        )
+
+        try:
+            await _run_suno_probe()
+        except Exception as exc:
+            log.warning("SUNO probe execution failed: %s", exc)
+
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        graceful_task: Optional[asyncio.Task[None]] = None
+
+        async def _await_active_tasks() -> None:
+            deadline = time.time() + 10.0
+            while time.time() < deadline and ACTIVE_TASKS:
+                await asyncio.sleep(0.1)
+            stop_event.set()
+
+        def _trigger_stop(sig: Optional[signal.Signals] = None, *, reason: str = "external") -> None:
+            nonlocal graceful_task
+            if stop_event.is_set():
+                return
+            if sig is not None:
+                sig_name = sig.name if hasattr(sig, "name") else str(sig)
+                log.info("Stop signal received: %s. Triggering shutdown.", sig_name)
+            else:
+                log.info("Stop requested (%s). Triggering shutdown.", reason)
+            SHUTDOWN_EVENT.set()
+            if application.updater:
+                loop.create_task(application.updater.stop())
+            if graceful_task is None or graceful_task.done():
+                graceful_task = loop.create_task(_await_active_tasks())
+
+        for sig_name in ("SIGINT", "SIGTERM"):
+            if not hasattr(signal, sig_name):
+                continue
+            sig_obj = getattr(signal, sig_name)
+            try:
+                loop.add_signal_handler(sig_obj, lambda s=sig_obj: _trigger_stop(s))
+                manual_signal_handlers.append(sig_obj)
+            except (NotImplementedError, RuntimeError):
+                continue
+
+        previous_post_stop = application.post_stop
+
+        async def _post_stop(app) -> None:
+            _trigger_stop(reason="post_stop")
+            if previous_post_stop:
+                await previous_post_stop(app)
+
+        application.post_stop = _post_stop
+
+        # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
+        await application.initialize()
+
+        async def _runner_heartbeat(_: ContextTypes.DEFAULT_TYPE) -> None:
+            await asyncio.to_thread(heartbeat, redis_client)
+
+        if lock_enabled and application.job_queue:
+            heartbeat_job = application.job_queue.run_repeating(
+                _runner_heartbeat,
+                interval=HEARTBEAT_INTERVAL,
+                first=HEARTBEAT_INTERVAL,
+                name="runner-heartbeat",
             )
 
+        try:
+            commands_ru = [
+                BotCommand("menu", "⭐ Главное меню"),
+                BotCommand("video", "🎬 Генерация видео (VEO)"),
+                BotCommand("image", "🎨 Генерация изображений (Midjourney/Banana)"),
+                BotCommand(
+                    "music",
+                    "🎵 Генерация музыки (Suno: инструментал/вокал/кавер)",
+                ),
+                BotCommand("buy", "💎 Купить генерации (прайс/кнопки оплаты)"),
+                BotCommand("lang", "🌍 Изменить язык (RU/EN)"),
+                BotCommand("help", "🆘 Поддержка (контакт @BestVeo3_Support)"),
+                BotCommand("faq", "❓ FAQ (короткая памятка)"),
+            ]
+            commands_en = [
+                BotCommand("menu", "⭐ Main menu"),
+                BotCommand("video", "🎬 Generate video (VEO)"),
+                BotCommand("image", "🎨 Generate images (Midjourney/Banana)"),
+                BotCommand(
+                    "music",
+                    "🎵 Generate music (Suno: instrumental/vocal/cover)",
+                ),
+                BotCommand("buy", "💎 Buy generations (pricing/payment)"),
+                BotCommand("lang", "🌍 Change language (RU/EN)"),
+                BotCommand("help", "🆘 Support (contact @BestVeo3_Support)"),
+                BotCommand("faq", "❓ FAQ (quick guide)"),
+            ]
+            await application.bot.set_my_commands(commands_ru)
+            await application.bot.set_my_commands(commands_ru, language_code="ru")
+            await application.bot.set_my_commands(commands_en, language_code="en")
+        except Exception as exc:
+            log.warning("Failed to set bot commands: %s", exc)
+
+        try:
             try:
-                await _run_suno_probe()
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+                log.info("Webhook deleted")
             except Exception as exc:
-                log.warning("SUNO probe execution failed: %s", exc)
+                event("WEBHOOK_DELETE_ERROR", error=str(exc))
+                log.warning("Delete webhook failed: %s", exc)
 
-            loop = asyncio.get_running_loop()
-            stop_event = asyncio.Event()
-            manual_signal_handlers: List[signal.Signals] = []
+            await application.start()
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
 
-            graceful_task: Optional[asyncio.Task[None]] = None
-
-            async def _await_active_tasks() -> None:
-                deadline = time.time() + 10.0
-                while time.time() < deadline and ACTIVE_TASKS:
-                    await asyncio.sleep(0.1)
-                stop_event.set()
-
-            def _trigger_stop(sig: Optional[signal.Signals] = None, *, reason: str = "external") -> None:
-                nonlocal graceful_task
-                if stop_event.is_set():
-                    return
-                if sig is not None:
-                    sig_name = sig.name if hasattr(sig, "name") else str(sig)
-                    log.info("Stop signal received: %s. Triggering shutdown.", sig_name)
-                else:
-                    log.info("Stop requested (%s). Triggering shutdown.", reason)
-                SHUTDOWN_EVENT.set()
-                if application.updater:
-                    loop.create_task(application.updater.stop())
-                if graceful_task is None or graceful_task.done():
-                    graceful_task = loop.create_task(_await_active_tasks())
-
-            lock.add_stop_callback(lambda sig: _trigger_stop(sig))
-
-            if not lock.enabled:
-                for sig_name in ("SIGINT", "SIGTERM"):
-                    if not hasattr(signal, sig_name):
-                        continue
-                    sig_obj = getattr(signal, sig_name)
-                    try:
-                        loop.add_signal_handler(sig_obj, lambda s=sig_obj: _trigger_stop(s))
-                        manual_signal_handlers.append(sig_obj)
-                    except (NotImplementedError, RuntimeError):
-                        continue
-
-            previous_post_stop = application.post_stop
-
-            async def _post_stop(app) -> None:
-                _trigger_stop(reason="post_stop")
-                if previous_post_stop:
-                    await previous_post_stop(app)
-
-            application.post_stop = _post_stop
-
-            # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
-            await application.initialize()
+            log.info("Application started")
 
             try:
-                commands_ru = [
-                    BotCommand("menu", "⭐ Главное меню"),
-                    BotCommand("video", "🎬 Генерация видео (VEO)"),
-                    BotCommand("image", "🎨 Генерация изображений (Midjourney/Banana)"),
-                    BotCommand(
-                        "music",
-                        "🎵 Генерация музыки (Suno: инструментал/вокал/кавер)",
-                    ),
-                    BotCommand("buy", "💎 Купить генерации (прайс/кнопки оплаты)"),
-                    BotCommand("lang", "🌍 Изменить язык (RU/EN)"),
-                    BotCommand("help", "🆘 Поддержка (контакт @BestVeo3_Support)"),
-                    BotCommand("faq", "❓ FAQ (короткая памятка)"),
-                ]
-                commands_en = [
-                    BotCommand("menu", "⭐ Main menu"),
-                    BotCommand("video", "🎬 Generate video (VEO)"),
-                    BotCommand("image", "🎨 Generate images (Midjourney/Banana)"),
-                    BotCommand(
-                        "music",
-                        "🎵 Generate music (Suno: instrumental/vocal/cover)",
-                    ),
-                    BotCommand("buy", "💎 Buy generations (pricing/payment)"),
-                    BotCommand("lang", "🌍 Change language (RU/EN)"),
-                    BotCommand("help", "🆘 Support (contact @BestVeo3_Support)"),
-                    BotCommand("faq", "❓ FAQ (quick guide)"),
-                ]
-                await application.bot.set_my_commands(commands_ru)
-                await application.bot.set_my_commands(commands_ru, language_code="ru")
-                await application.bot.set_my_commands(commands_en, language_code="en")
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                _trigger_stop(reason="cancelled")
+                raise
+        finally:
+            for sig_obj in manual_signal_handlers:
+                try:
+                    loop.remove_signal_handler(sig_obj)
+                except (NotImplementedError, RuntimeError):
+                    pass
+
+            if heartbeat_job:
+                heartbeat_job.schedule_removal()
+                heartbeat_job = None
+
+            if application.updater:
+                try:
+                    await application.updater.stop()
+                except RuntimeError as exc:
+                    log.warning("Updater stop failed: %s", exc)
+                except Exception as exc:
+                    log.warning("Updater stop failed with unexpected error: %s", exc)
+
+            try:
+                await application.stop()
             except Exception as exc:
-                log.warning("Failed to set bot commands: %s", exc)
+                log.warning("Application stop failed: %s", exc)
 
             try:
-                try:
-                    await application.bot.delete_webhook(drop_pending_updates=True)
-                    event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-                    log.info("Webhook deleted")
-                except Exception as exc:
-                    event("WEBHOOK_DELETE_ERROR", error=str(exc))
-                    log.warning("Delete webhook failed: %s", exc)
-
-                await application.start()
-                await application.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                )
-
-                log.info("Application started")
-
-                try:
-                    await stop_event.wait()
-                except asyncio.CancelledError:
-                    _trigger_stop(reason="cancelled")
-                    raise
-            finally:
-                for sig_obj in manual_signal_handlers:
-                    try:
-                        loop.remove_signal_handler(sig_obj)
-                    except (NotImplementedError, RuntimeError):
-                        pass
-
-                if application.updater:
-                    try:
-                        await application.updater.stop()
-                    except RuntimeError as exc:
-                        log.warning("Updater stop failed: %s", exc)
-                    except Exception as exc:
-                        log.warning("Updater stop failed with unexpected error: %s", exc)
-
-                try:
-                    await application.stop()
-                except Exception as exc:
-                    log.warning("Application stop failed: %s", exc)
-
-                try:
-                    await application.shutdown()
-                except Exception as exc:
-                    log.warning("Application shutdown failed: %s", exc)
-                application.post_stop = previous_post_stop
+                await application.shutdown()
+            except Exception as exc:
+                log.warning("Application shutdown failed: %s", exc)
+            application.post_stop = previous_post_stop
     except RedisLockBusy:
         log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+    finally:
+        if heartbeat_job:
+            heartbeat_job.schedule_removal()
+        if lock_acquired:
+            release_runner_lock(redis_client)
 
 
 def main() -> None:
