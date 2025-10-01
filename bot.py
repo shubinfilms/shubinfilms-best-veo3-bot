@@ -193,6 +193,8 @@ from settings import (
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
+    WELCOME_BONUS as SETTINGS_WELCOME_BONUS,
+    WELCOME_BONUS_REDIS_KEY,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -630,7 +632,7 @@ def _env_int(k: str, default: int) -> int:
 START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
-WELCOME_BONUS_GEMS = max(0, _env_int("WELCOME_BONUS_GEMS", 10))
+WELCOME_BONUS = max(0, _env_int("WELCOME_BONUS_GEMS", int(SETTINGS_WELCOME_BONUS)))
 SUPPORT_PUBLIC_URL = _env("SUPPORT_PUBLIC_URL", "https://t.me/BestVeo3_Support") or "https://t.me/BestVeo3_Support"
 
 
@@ -8738,62 +8740,93 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-async def _process_welcome_bonus(
+async def _ensure_welcome_bonus(
     update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
 ) -> Optional[LedgerOpResult]:
-    if update is None:
-        return None
-    user = update.effective_user
-    if user is None:
-        return None
-    uid = user.id
-
-    cached: Optional[LedgerOpResult] = getattr(update, "_welcome_bonus_result", None)
-    if getattr(update, "_welcome_bonus_checked", False):
+    cached: Optional[LedgerOpResult] = ctx.user_data.get("welcome_bonus_result")
+    if ctx.user_data.get("welcome_bonus_checked"):
         return cached
 
-    setattr(update, "_welcome_bonus_checked", True)
+    uid: Optional[int] = None
+    chat_id: Optional[int] = None
 
     try:
-        result = ledger_storage.grant_signup_bonus(uid, WELCOME_BONUS_GEMS)
-    except Exception as exc:
-        log.exception("signup_bonus_failed | user_id=%s err=%s", uid, exc)
-        return cached
+        if update is None:
+            ctx.user_data["welcome_bonus_checked"] = True
+            return cached
 
-    setattr(update, "_welcome_bonus_result", result)
+        user = update.effective_user
+        chat = update.effective_chat
+        uid = user.id if user else None
+        chat_id = chat.id if chat else None
 
-    balance_after = result.balance
-    _set_cached_balance(ctx, balance_after)
+        if uid is None or WELCOME_BONUS <= 0:
+            ctx.user_data["welcome_bonus_checked"] = True
+            return cached
 
-    if result.applied and WELCOME_BONUS_GEMS > 0:
-        log_evt("bonus_granted", user_id=uid, amount=WELCOME_BONUS_GEMS)
-        message = update.effective_message
-        if message is not None:
+        should_grant = True
+        if redis_client:
+            redis_key = WELCOME_BONUS_REDIS_KEY.format(uid=uid)
             try:
-                await message.reply_text(
-                    f"🎁 Добро пожаловать! Начислил +{WELCOME_BONUS_GEMS}💎 на баланс."
+                should_grant = bool(
+                    redis_client.set(redis_key, str(int(time.time())), nx=True)
                 )
-            except Exception as exc:
-                log.warning("welcome_bonus_notify_failed | user_id=%s err=%s", uid, exc)
-            try:
-                await message.reply_text(f"💎 Ваш баланс: {balance_after}")
-            except Exception as exc:
-                log.warning("welcome_balance_notify_failed | user_id=%s err=%s", uid, exc)
-            else:
-                setattr(update, "_welcome_bonus_announced", True)
-    return result
+            except Exception as redis_exc:  # pragma: no cover - defensive logging
+                log.warning(
+                    "welcome_bonus_redis_failed | user_id=%s err=%s",
+                    uid,
+                    redis_exc,
+                )
+                should_grant = True
+        else:
+            should_grant = True
+
+        result: Optional[LedgerOpResult] = cached
+        if should_grant or cached is None:
+            result = ledger_storage.grant_signup_bonus(uid, WELCOME_BONUS)
+
+        if result is None:
+            ctx.user_data["welcome_bonus_checked"] = True
+            return cached
+
+        ctx.user_data["welcome_bonus_result"] = result
+        _set_cached_balance(ctx, result.balance)
+
+        if result.applied and WELCOME_BONUS > 0:
+            log_evt("bonus_granted", user_id=uid, amount=WELCOME_BONUS)
+            if chat_id is not None and not ctx.user_data.get("welcome_bonus_announced"):
+                try:
+                    await safe_send_text(
+                        ctx.bot,
+                        chat_id,
+                        f"🎁 Добро пожаловать! Начислил +{WELCOME_BONUS}💎 на баланс.",
+                    )
+                except Exception as exc:  # pragma: no cover - telegram transient errors
+                    log.warning(
+                        "welcome_bonus_notify_failed | user_id=%s err=%s",
+                        uid,
+                        exc,
+                    )
+                else:
+                    ctx.user_data["welcome_bonus_announced"] = True
+
+        ctx.user_data["welcome_bonus_checked"] = True
+        return result
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        log.exception("welcome_bonus_failed | user_id=%s err=%s", uid, exc)
+        return cached
 
 
 async def welcome_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await _process_welcome_bonus(update, ctx)
+    await _ensure_welcome_bonus(update, ctx)
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     uid = update.effective_user.id if update.effective_user else None
 
-    bonus_result = await _process_welcome_bonus(update, ctx)
+    bonus_result = await _ensure_welcome_bonus(update, ctx)
 
     await _handle_referral_deeplink(update, ctx)
 
@@ -8803,7 +8836,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             balance_to_show = bonus_result.balance
         else:
             balance_to_show = None
-        if not getattr(update, "_welcome_bonus_announced", False):
+        if not ctx.user_data.get("welcome_bonus_announced"):
             if balance_to_show is None:
                 balance_to_show = _safe_get_balance(uid)
             if update.message is not None and balance_to_show is not None:
@@ -8811,6 +8844,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"💎 Ваш баланс: {balance_to_show}")
                 except Exception as exc:
                     log.warning("welcome_balance_notify_failed | user_id=%s err=%s", uid, exc)
+                else:
+                    ctx.user_data["welcome_bonus_announced"] = True
             _set_cached_balance(ctx, balance_to_show or 0)
 
     await handle_menu(update, ctx)
@@ -9087,7 +9122,7 @@ async def support_new_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     if query is None:
         return
-    await _process_welcome_bonus(update, ctx)
+    await _ensure_welcome_bonus(update, ctx)
     with suppress(BadRequest):
         await query.answer()
     await _prompt_support_ticket(update, ctx, source="callback")
@@ -9197,7 +9232,7 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
-    await _process_welcome_bonus(update, ctx)
+    await _ensure_welcome_bonus(update, ctx)
     await message.reply_text(HELP_TEXT, reply_markup=support_keyboard())
 
 
@@ -9208,7 +9243,7 @@ async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 async def support_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await _process_welcome_bonus(update, ctx)
+    await _ensure_welcome_bonus(update, ctx)
     await _prompt_support_ticket(update, ctx, source="command")
 
 

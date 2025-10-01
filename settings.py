@@ -40,6 +40,9 @@ class _AppSettings(BaseModel):
 
     TMP_CLEANUP_HOURS: int = Field(default=24, ge=1, le=240)
 
+    WELCOME_BONUS: int = Field(default=10, ge=0)
+    WELCOME_BONUS_REDIS_KEY: str = Field(default="user:{uid}:welcome_bonus_v1")
+
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
     KIE_API_KEY: Optional[str] = Field(default=None)
 
@@ -198,6 +201,13 @@ TMP_CLEANUP_HOURS = int(_APP_SETTINGS.TMP_CLEANUP_HOURS)
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
+
+WELCOME_BONUS = int(max(0, _APP_SETTINGS.WELCOME_BONUS))
+_welcome_bonus_key_template = _APP_SETTINGS.WELCOME_BONUS_REDIS_KEY or "user:{uid}:welcome_bonus_v1"
+if _welcome_bonus_key_template.startswith(f"{REDIS_PREFIX}:"):
+    WELCOME_BONUS_REDIS_KEY = _welcome_bonus_key_template
+else:
+    WELCOME_BONUS_REDIS_KEY = f"{REDIS_PREFIX}:{_welcome_bonus_key_template}"
 
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:
