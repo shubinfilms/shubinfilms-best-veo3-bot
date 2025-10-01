@@ -24,10 +24,11 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
-from redis_utils import clear_wait_flags
+from redis_utils import redis_delete_keys
 from settings import REDIS_PREFIX
 
 log = logging.getLogger("telegram.utils")
+BOT_LOG = logging.getLogger("bot")
 
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
@@ -81,6 +82,65 @@ def _purge_wait_hints(context: Any) -> None:
                 container.pop(key, None)
 
 
+def extract_user_id(*sources: Any) -> Optional[int]:
+    for src in sources:
+        if not src:
+            continue
+        user = getattr(src, "effective_user", None)
+        user_id = getattr(user, "id", None)
+        if user_id:
+            try:
+                return int(user_id)
+            except (TypeError, ValueError):
+                continue
+        from_user = getattr(getattr(src, "message", None), "from_user", None)
+        if from_user is not None:
+            user_id = getattr(from_user, "id", None)
+            if user_id:
+                try:
+                    return int(user_id)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+async def reset_user_state(update: Any = None, context: Any = None) -> int:
+    """Remove wait/fsm flags for the user associated with ``update``/``context``."""
+
+    user_id = extract_user_id(update, context)
+    if not user_id:
+        _purge_wait_hints(context)
+        return 0
+
+    redis_client = None
+    redis_prefix = REDIS_PREFIX
+
+    candidates = []
+    if context is not None:
+        candidates.append(getattr(context, "bot_data", None))
+        application = getattr(context, "application", None)
+        candidates.append(getattr(application, "bot_data", None))
+    if update is not None:
+        candidates.append(getattr(update, "bot_data", None))
+        application = getattr(update, "application", None)
+        candidates.append(getattr(application, "bot_data", None))
+
+    for candidate in candidates:
+        if isinstance(candidate, MutableMapping):
+            redis_client = candidate.get("redis") if redis_client is None else redis_client
+            redis_prefix = candidate.get("redis_prefix", redis_prefix)
+
+    patterns = [
+        f"{redis_prefix}:wait:{user_id}:*",
+        f"{redis_prefix}:fsm:{user_id}:*",
+    ]
+
+    deleted = await redis_delete_keys(redis_client, patterns) if redis_client else 0
+    BOT_LOG.debug("state.reset | user=%s deleted=%s", user_id, deleted)
+    _purge_wait_hints(context)
+    return deleted
+
+
 def with_state_reset(
     handler: Callable[[Any, Any], Awaitable[Any]]
 ) -> Callable[[Any, Any], Awaitable[Any]]:
@@ -90,27 +150,25 @@ def with_state_reset(
     async def wrapped(update: Any, context: Any, *args: Any, **kwargs: Any) -> Any:
         logger = _context_logger(context)
 
-        message = getattr(getattr(update, "message", None), "text", None)
-        callback_query = getattr(update, "callback_query", None)
-        callback_data = getattr(callback_query, "data", None)
-        logger.info("IN cmd=%s cq=%s", message, callback_data)
+        query = getattr(update, "callback_query", None)
+        if query is not None:
+            answer = getattr(query, "answer", None)
+            if callable(answer):
+                try:
+                    await answer()
+                except BadRequest:
+                    with suppress(BadRequest):
+                        await answer()
+                except Exception:
+                    logger.debug("callback.answer_failed", exc_info=True)
 
-        bot_data = getattr(context, "bot_data", {}) if context is not None else {}
-        redis_client = None
-        redis_prefix = REDIS_PREFIX
-        if isinstance(bot_data, MutableMapping):
-            redis_client = bot_data.get("redis")
-            redis_prefix = bot_data.get("redis_prefix", REDIS_PREFIX)
+        try:
+            await reset_user_state(update, context)
+        except Exception:
+            logger.warning("state_reset_failed", exc_info=True)
 
-        user = getattr(update, "effective_user", None) if update is not None else None
-        user_id = getattr(user, "id", None)
-        if redis_client and user_id:
-            try:
-                await clear_wait_flags(redis_client, int(user_id), redis_prefix)
-            except Exception:
-                logger.warning("wait_flags.clear_failed", exc_info=True)
-
-        _purge_wait_hints(context)
+        user_id = extract_user_id(update, context)
+        BOT_LOG.debug("handler.invoke | name=%s user=%s", getattr(handler, "__name__", "handler"), user_id)
 
         try:
             result = handler(update, context, *args, **kwargs)
@@ -139,10 +197,8 @@ def with_state_reset(
                         pass
             return None
 
+    setattr(wrapped, "__with_state_reset__", True)
     return wrapped
-
-_DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
-_HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL
 
 _ALLOWED_HTML_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "blockquote", "tg-spoiler"}
 _ALLOWED_HTML_ATTRS = {"a": {"href"}}
@@ -251,33 +307,27 @@ def sanitize_html(text: str) -> str:
 def build_hub_text(user_balance: int) -> str:
     """Render the main hub text with the current balance."""
 
-    try:
-        balance_value = int(user_balance)
-    except (TypeError, ValueError):
-        balance_value = 0
-
-    return (
-        "👋 Добро пожаловать!\n\n"
-        f"💎 Ваш баланс: {balance_value}\n"
-        f"📈 Больше идей и примеров — [канал с промптами]({_HUB_PROMPTS_URL})\n\n"
-        "Выберите, что хотите сделать:"
-    )
+    return "<b>🏠 Главное меню</b>\nВыберите нужный раздел:"
 
 
 def build_hub_keyboard() -> InlineKeyboardMarkup:
-    """Return a compact 2x3 inline keyboard for the emoji hub."""
+    """Return the default inline keyboard for the main hub."""
 
     rows = [
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data="hub:prompt")],
         [
-            InlineKeyboardButton("🎬", callback_data="hub:video"),
-            InlineKeyboardButton("🎨", callback_data="hub:image"),
-            InlineKeyboardButton("🎵", callback_data="hub:music"),
+            InlineKeyboardButton("🎬 Генерация видео", callback_data="hub:video"),
+            InlineKeyboardButton("🎨 Генерация изображений", callback_data="hub:image"),
         ],
         [
-            InlineKeyboardButton("🧠", callback_data="hub:prompt"),
-            InlineKeyboardButton("💬", callback_data="hub:chat"),
-            InlineKeyboardButton("💎", callback_data="hub:balance"),
+            InlineKeyboardButton("🎵 Генерация музыки", callback_data="hub:music"),
+            InlineKeyboardButton("💬 Обычный чат", callback_data="hub:chat"),
         ],
+        [
+            InlineKeyboardButton("💎 Баланс", callback_data="hub:balance"),
+            InlineKeyboardButton("🌐 Язык", callback_data="hub:lang"),
+        ],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="hub:help")],
     ]
     return InlineKeyboardMarkup(rows)
 

@@ -12,19 +12,24 @@ def test_build_hub_keyboard_layout():
     keyboard = build_hub_keyboard()
     rows = keyboard.inline_keyboard
 
-    assert len(rows) == 2
-    assert all(len(row) == 3 for row in rows)
-
     expected = [
-        ("🎬", "hub:video"),
-        ("🎨", "hub:image"),
-        ("🎵", "hub:music"),
-        ("🧠", "hub:prompt"),
-        ("💬", "hub:chat"),
-        ("💎", "hub:balance"),
+        [("🧠 Prompt-Master", "hub:prompt")],
+        [
+            ("🎬 Генерация видео", "hub:video"),
+            ("🎨 Генерация изображений", "hub:image"),
+        ],
+        [
+            ("🎵 Генерация музыки", "hub:music"),
+            ("💬 Обычный чат", "hub:chat"),
+        ],
+        [
+            ("💎 Баланс", "hub:balance"),
+            ("🌐 Язык", "hub:lang"),
+        ],
+        [("🆘 Поддержка", "hub:help")],
     ]
 
-    actual = [(button.text, button.callback_data) for row in rows for button in row]
+    actual = [[(button.text, button.callback_data) for button in row] for row in rows]
 
     assert actual == expected
 
@@ -32,14 +37,4 @@ def test_build_hub_keyboard_layout():
 def test_build_hub_text_contains_balance_and_link():
     text = build_hub_text(123)
 
-    assert text.startswith("👋 Добро пожаловать!")
-    assert "💎 Ваш баланс: 123" in text
-
-    link_marker = "[канал с промптами]("
-    assert link_marker in text
-    start = text.index(link_marker) + len(link_marker)
-    end = text.index(")", start)
-    url = text[start:end]
-
-    assert url
-    assert url.strip() != ""
+    assert text == "<b>🏠 Главное меню</b>\nВыберите нужный раздел:"

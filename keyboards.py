@@ -7,6 +7,7 @@ HUB_CALLBACK_PREFIX = "hub:"
 
 def hub_main_keyboard() -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton("🧠 Prompt-Master", callback_data=f"{HUB_CALLBACK_PREFIX}prompt")],
         [
             InlineKeyboardButton("🎬 Генерация видео", callback_data=f"{HUB_CALLBACK_PREFIX}video"),
             InlineKeyboardButton(
@@ -14,12 +15,14 @@ def hub_main_keyboard() -> InlineKeyboardMarkup:
             ),
         ],
         [
-            InlineKeyboardButton("🎧 Музыка", callback_data=f"{HUB_CALLBACK_PREFIX}music"),
-            InlineKeyboardButton("💎 Баланс", callback_data=f"{HUB_CALLBACK_PREFIX}balance"),
+            InlineKeyboardButton(
+                "🎵 Генерация музыки", callback_data=f"{HUB_CALLBACK_PREFIX}music"
+            ),
+            InlineKeyboardButton("💬 Обычный чат", callback_data=f"{HUB_CALLBACK_PREFIX}chat"),
         ],
         [
+            InlineKeyboardButton("💎 Баланс", callback_data=f"{HUB_CALLBACK_PREFIX}balance"),
             InlineKeyboardButton("🌐 Язык", callback_data=f"{HUB_CALLBACK_PREFIX}lang"),
-            InlineKeyboardButton("❓ FAQ", callback_data=f"{HUB_CALLBACK_PREFIX}faq"),
         ],
         [InlineKeyboardButton("🆘 Поддержка", callback_data=f"{HUB_CALLBACK_PREFIX}help")],
     ]
