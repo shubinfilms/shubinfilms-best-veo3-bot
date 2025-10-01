@@ -14,6 +14,9 @@ from logging_utils import configure_logging, log_environment
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
@@ -13434,7 +13437,7 @@ def register_handlers(application: Any) -> None:
     application.add_handler(card_input_handler, group=10)
 
     command_names = _command_names_for_log()
-    application.logger.info("Registering handlers for commands: %s", command_names)
+    logger.info("Registering handlers for commands: %s", command_names)
     for names, callback in COMMAND_HANDLER_SPECS:
         application.add_handler(
             CommandHandler(list(names), wrap_cmd(callback)),
