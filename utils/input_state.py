@@ -125,7 +125,7 @@ def _key(user_id: int) -> str:
     return _KEY_TMPL.format(user_id=int(user_id))
 
 
-_DEFAULT_TTL_SECONDS = 90
+_DEFAULT_TTL_SECONDS = 15 * 60
 
 
 def _with_new_expiry(state: WaitInputState, ttl_seconds: int) -> WaitInputState:
@@ -143,9 +143,10 @@ def set_wait_state(user_id: int, state: WaitInputState, *, ttl_seconds: int = _D
     state_with_expiry = _with_new_expiry(state, ttl_seconds)
     payload = json.dumps(state_with_expiry.to_dict(), ensure_ascii=False)
     storage_key = _key(user_id)
+    ttl_seconds = max(int(ttl_seconds), 1)
     if _redis:
         try:
-            _redis.set(storage_key, payload, ex=24 * 60 * 60)
+            _redis.set(storage_key, payload, ex=ttl_seconds)
         except Exception:  # pragma: no cover - redis connectivity issues
             _logger.exception("Failed to save wait-state to redis", extra={"user_id": user_id})
             _memory_store[int(user_id)] = state_with_expiry.to_dict()

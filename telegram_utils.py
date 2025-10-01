@@ -13,6 +13,7 @@ from asyncio.subprocess import PIPE
 from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from functools import wraps
 from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
 
 import requests
@@ -23,6 +24,8 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
+from redis_utils import clear_wait_flags
+from settings import REDIS_PREFIX
 
 log = logging.getLogger("telegram.utils")
 
@@ -49,6 +52,94 @@ def mask_tokens(text: Any) -> str:
         if token:
             cleaned = cleaned.replace(token, "***")
     return cleaned
+
+
+def _context_logger(context: Any) -> logging.Logger:
+    if context is None:
+        return log
+    application = getattr(context, "application", None)
+    logger = getattr(application, "logger", None)
+    if isinstance(logger, logging.Logger):
+        return logger
+    return log
+
+
+def _purge_wait_hints(context: Any) -> None:
+    if context is None:
+        return
+    for attr in ("chat_data", "user_data"):
+        container = getattr(context, attr, None)
+        if not isinstance(container, MutableMapping):
+            continue
+        for key in list(container.keys()):
+            if not isinstance(key, str):
+                continue
+            lowered = key.lower()
+            if lowered in {"wait", "waiting", "wait_state", "waiting_state"} or lowered.startswith(
+                ("wait_", "_wait")
+            ):
+                container.pop(key, None)
+
+
+def with_state_reset(
+    handler: Callable[[Any, Any], Awaitable[Any]]
+) -> Callable[[Any, Any], Awaitable[Any]]:
+    """Wrap ``handler`` to reset wait-state flags and provide unified error handling."""
+
+    @wraps(handler)
+    async def wrapped(update: Any, context: Any, *args: Any, **kwargs: Any) -> Any:
+        logger = _context_logger(context)
+
+        message = getattr(getattr(update, "message", None), "text", None)
+        callback_query = getattr(update, "callback_query", None)
+        callback_data = getattr(callback_query, "data", None)
+        logger.info("IN cmd=%s cq=%s", message, callback_data)
+
+        bot_data = getattr(context, "bot_data", {}) if context is not None else {}
+        redis_client = None
+        redis_prefix = REDIS_PREFIX
+        if isinstance(bot_data, MutableMapping):
+            redis_client = bot_data.get("redis")
+            redis_prefix = bot_data.get("redis_prefix", REDIS_PREFIX)
+
+        user = getattr(update, "effective_user", None) if update is not None else None
+        user_id = getattr(user, "id", None)
+        if redis_client and user_id:
+            try:
+                await clear_wait_flags(redis_client, int(user_id), redis_prefix)
+            except Exception:
+                logger.warning("wait_flags.clear_failed", exc_info=True)
+
+        _purge_wait_hints(context)
+
+        try:
+            result = handler(update, context, *args, **kwargs)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("handler error")
+            query = getattr(update, "callback_query", None)
+            if query is not None:
+                answer = getattr(query, "answer", None)
+                if callable(answer):
+                    try:
+                        await answer("Ошибка. Попробуйте ещё раз.", show_alert=False)
+                    except Exception:
+                        pass
+            chat = getattr(update, "effective_chat", None)
+            if chat is not None:
+                send = getattr(chat, "send_message", None)
+                if callable(send):
+                    try:
+                        await send("Упс… Попробуйте /menu")
+                    except Exception:
+                        pass
+            return None
+
+    return wrapped
 
 _DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
 _HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL

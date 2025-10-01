@@ -2,6 +2,28 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 CB_FAQ_PREFIX = "faq:"
 CB_PM_PREFIX = "pm:"
+HUB_CALLBACK_PREFIX = "hub:"
+
+
+def hub_main_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("🎬 Генерация видео", callback_data=f"{HUB_CALLBACK_PREFIX}video"),
+            InlineKeyboardButton(
+                "🎨 Генерация изображений", callback_data=f"{HUB_CALLBACK_PREFIX}image"
+            ),
+        ],
+        [
+            InlineKeyboardButton("🎧 Музыка", callback_data=f"{HUB_CALLBACK_PREFIX}music"),
+            InlineKeyboardButton("💎 Баланс", callback_data=f"{HUB_CALLBACK_PREFIX}balance"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Язык", callback_data=f"{HUB_CALLBACK_PREFIX}lang"),
+            InlineKeyboardButton("❓ FAQ", callback_data=f"{HUB_CALLBACK_PREFIX}faq"),
+        ],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data=f"{HUB_CALLBACK_PREFIX}help")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 _PM_LABELS = {

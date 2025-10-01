@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -76,6 +77,119 @@ _user_profile_memory: Dict[int, Dict[str, str]] = {}
 _wait_lock = Lock()
 _wait_memory: Dict[str, float] = {}
 _WAIT_TTL_DEFAULT = 15 * 60
+
+
+async def clear_wait_flags(r: Any, user_id: int, prefix: str) -> int:
+    """Remove all ``wait`` keys for ``user_id`` under ``prefix``.
+
+    Works with both async and sync Redis clients. Returns number of deleted keys.
+    """
+
+    if not r:
+        return 0
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return 0
+
+    if uid <= 0:
+        return 0
+
+    pattern = f"{prefix}:wait:{uid}:*"
+    keys: list[str] = []
+
+    try:
+        iterator = r.scan_iter(pattern)
+        if inspect.isasyncgen(iterator):
+            async for key in iterator:
+                if isinstance(key, bytes):
+                    key = key.decode()
+                keys.append(str(key))
+        else:
+            for key in iterator:
+                if isinstance(key, bytes):
+                    key = key.decode()
+                keys.append(str(key))
+    except AttributeError:
+        # ``scan_iter`` not available, fall back to SCAN.
+        try:
+            if hasattr(r, "scan"):
+                cursor: int | str = 0
+                while True:
+                    if inspect.iscoroutinefunction(r.scan):
+                        cursor, batch = await r.scan(cursor=cursor, match=pattern, count=64)
+                    else:
+                        cursor, batch = await asyncio.to_thread(
+                            r.scan, cursor=cursor, match=pattern, count=64
+                        )
+                    for key in batch:
+                        if isinstance(key, bytes):
+                            key = key.decode()
+                        keys.append(str(key))
+                    if not cursor:
+                        break
+        except Exception:
+            log = logging.getLogger("redis-utils")
+            log.warning("clear_wait_flags.scan_failed", exc_info=True)
+            keys = []
+    except Exception:
+        log = logging.getLogger("redis-utils")
+        log.warning("clear_wait_flags.iter_failed", exc_info=True)
+        keys = []
+
+    if not keys:
+        return 0
+
+    try:
+        if inspect.iscoroutinefunction(r.delete):
+            deleted = await r.delete(*keys) or 0
+        else:
+            deleted = await asyncio.to_thread(r.delete, *keys) or 0
+    except Exception:
+        log = logging.getLogger("redis-utils")
+        log.warning("clear_wait_flags.delete_failed", exc_info=True)
+        return 0
+
+    return int(deleted)
+
+
+async def set_wait_flag(
+    r: Any,
+    user_id: int,
+    name: str,
+    prefix: str,
+    *,
+    ttl_sec: int = 900,
+) -> Optional[str]:
+    """Set a wait flag for ``user_id`` with a bounded TTL."""
+
+    if not r:
+        return None
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+
+    if uid <= 0:
+        return None
+
+    normalized = str(name or "").strip() or "default"
+    key = f"{prefix}:wait:{uid}:{normalized}"
+    payload_ttl = max(int(ttl_sec or 0), 1)
+
+    try:
+        if inspect.iscoroutinefunction(r.set):
+            await r.set(key, "1", ex=payload_ttl)
+        else:
+            await asyncio.to_thread(r.set, key, "1", ex=payload_ttl)
+    except Exception:
+        log = logging.getLogger("redis-utils")
+        log.warning("set_wait_flag.failed", exc_info=True)
+        return None
+
+    return key
 
 if not _redis_url:
     _logger.warning(
