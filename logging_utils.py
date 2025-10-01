@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from settings import LOG_JSON, LOG_LEVEL, MAX_IN_LOG_BODY
 
@@ -140,6 +140,66 @@ def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
     logger.info("environment", extra={"meta": {"env": safe_env}})
 
 
+class SafeLoggerAdapter(logging.LoggerAdapter):
+    """Logger adapter that shields reserved LogRecord fields."""
+
+    RESERVED = {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "lineno",
+        "exc_info",
+        "func",
+        "sinfo",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "process",
+        "processName",
+        "stack_info",
+    }
+
+    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[override]
+        """Drop or rename reserved keys from ``extra`` payloads."""
+
+        combined: dict[str, Any] = {}
+        if self.extra:
+            combined.update(self.extra)
+
+        call_extra = kwargs.get("extra")
+        if isinstance(call_extra, Mapping):
+            combined.update(call_extra)
+        elif call_extra is not None:
+            combined["extra"] = call_extra
+
+        safe_extra: dict[str, Any] = {}
+        for key, value in combined.items():
+            safe_key = key if key not in self.RESERVED else f"extra_{key}"
+            safe_extra[safe_key] = value
+
+        new_kwargs = dict(kwargs)
+        if safe_extra:
+            new_kwargs["extra"] = safe_extra
+        elif "extra" in new_kwargs:
+            new_kwargs.pop("extra", None)
+
+        return msg, new_kwargs
+
+
+def get_logger(name: str = "veo3-bot", *, extra: Optional[Mapping[str, Any]] = None) -> SafeLoggerAdapter:
+    """Return a :class:`SafeLoggerAdapter` for the requested logger name."""
+
+    base_extra = dict(extra or {})
+    return SafeLoggerAdapter(logging.getLogger(name), base_extra)
+
+
 def configure_logging(app_name: str) -> None:
     """Configure root logging to emit JSON logs with secret redaction."""
 
@@ -168,7 +228,9 @@ def configure_logging(app_name: str) -> None:
 
 __all__ = [
     "JsonFormatter",
+    "SafeLoggerAdapter",
     "configure_logging",
+    "get_logger",
     "log_environment",
     "refresh_secret_cache",
 ]
