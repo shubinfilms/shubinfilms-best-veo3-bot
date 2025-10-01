@@ -76,7 +76,8 @@ def test_send_audio_uses_prepared_file(monkeypatch, tmp_path):
     assert first_call["method"] == "sendAudio"
     assert first_call["file_name"] == "Prepared.mp3"
     assert first_call["extra"] == {"title": "Song", "performer": "Tester"}
-    assert first_call["path"] == prepared_path
+    assert first_call["path"].name == "Prepared.mp3"
+    assert first_call["path"].parent == prepared_path.parent
     assert second_call["method"] == "sendDocument"
     assert second_call["file_name"] == "Prepared.mp3"
     assert second_call["extra"] is None

@@ -137,7 +137,10 @@ def test_click_sends_correct_sticker_and_not_prinyato_again(monkeypatch):
     assert len(sticker_entries_after) == 1
     assert len(launch_calls) == 1
     assert notify_calls == [SUNO_STARTING_MESSAGE]
-    assert second_update.callback_query._answered[-1][0] == "Уже идёт генерация — дождитесь завершения"
+    assert (
+        second_update.callback_query._answered[-1][0]
+        == "Уже идёт генерация музыки — дождитесь завершения."
+    )
     assert second_update.callback_query.message.replies == []
 
     state_after_second = bot_module.state(ctx)

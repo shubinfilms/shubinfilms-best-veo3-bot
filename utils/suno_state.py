@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping, MutableMapping, Optional
 
 import enum
+import hashlib
 
 import html
 import re
@@ -68,6 +69,14 @@ def _apply_limit(value: str, max_length: int) -> str:
     return value[: max_length].rstrip()
 
 
+def _hash_lyrics(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    digest = hashlib.sha256()
+    digest.update(value.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _clean_title(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -107,6 +116,7 @@ class SunoState:
     title: Optional[str] = None
     style: Optional[str] = None
     lyrics: Optional[str] = None
+    lyrics_hash: Optional[str] = None
     lyrics_source: LyricsSource = LyricsSource.AI
     card_message_id: Optional[int] = None
     card_text_hash: Optional[str] = None
@@ -133,6 +143,7 @@ class SunoState:
             "title": self.title,
             "style": self.style,
             "lyrics": self.lyrics,
+            "lyrics_hash": self.lyrics_hash,
             "lyrics_source": self.lyrics_source.value,
             "has_lyrics": self.has_lyrics,
             "card_message_id": self.card_message_id,
@@ -177,6 +188,9 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     set_title(state, payload.get("title"))
     set_style(state, payload.get("style"))
     set_lyrics(state, payload.get("lyrics"))
+    raw_hash = payload.get("lyrics_hash")
+    if isinstance(raw_hash, str) and raw_hash.strip():
+        state.lyrics_hash = raw_hash.strip()
     raw_msg_id = payload.get("card_message_id")
     if isinstance(raw_msg_id, int):
         state.card_message_id = raw_msg_id
@@ -314,6 +328,7 @@ def reset_suno_card_state(
     state.title = None
     state.style = None
     state.lyrics = None
+    state.lyrics_hash = None
     state.lyrics_source = LyricsSource.AI
     state.preset = None
     state.cover_source_url = None
@@ -333,7 +348,13 @@ def reset_suno_card_state(
 
 
 def set_lyrics(state: SunoState, value: Optional[str]) -> SunoState:
-    state.lyrics = _clean_lyrics(value)
+    cleaned = _clean_lyrics(value)
+    state.lyrics = cleaned
+    state.lyrics_hash = _hash_lyrics(state.lyrics)
+    if cleaned:
+        state.lyrics_source = LyricsSource.USER
+    elif state.lyrics_source == LyricsSource.USER:
+        state.lyrics_source = LyricsSource.AI
     return state
 
 
@@ -344,6 +365,8 @@ def set_lyrics_source(state: SunoState, value: Any) -> SunoState:
 
 def clear_lyrics(state: SunoState) -> SunoState:
     state.lyrics = None
+    state.lyrics_hash = None
+    state.lyrics_source = LyricsSource.AI
     return state
 
 

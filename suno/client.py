@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import time
 import re
@@ -171,17 +172,43 @@ class SunoClient:
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
         }
-        if SUNO_CALLBACK_URL:
-            headers["X-Callback-Url"] = SUNO_CALLBACK_URL
-        if SUNO_CALLBACK_SECRET:
-            headers["X-Callback-Secret"] = SUNO_CALLBACK_SECRET
-            headers.setdefault("X-Callback-Token", SUNO_CALLBACK_SECRET)
+        callback_url = self._resolve_callback_url()
+        callback_secret = self._resolve_callback_secret()
+        if callback_url:
+            headers["X-Callback-Url"] = callback_url
+        if callback_secret:
+            headers["X-Callback-Secret"] = callback_secret
+            headers.setdefault("X-Callback-Token", callback_secret)
         if req_id:
             headers["X-Request-ID"] = req_id
         return headers
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
+
+    @staticmethod
+    def _env_value(name: str) -> str:
+        return (os.getenv(name) or "").strip()
+
+    def _resolve_callback_url(self, override: Optional[str] = None) -> str:
+        if override:
+            return override.strip()
+        if SUNO_CALLBACK_URL:
+            return SUNO_CALLBACK_URL.strip()
+        env_value = self._env_value("SUNO_CALLBACK_URL")
+        if env_value:
+            return env_value
+        return ""
+
+    def _resolve_callback_secret(self, override: Optional[str] = None) -> str:
+        if override:
+            return override.strip()
+        if SUNO_CALLBACK_SECRET:
+            return SUNO_CALLBACK_SECRET.strip()
+        env_value = self._env_value("SUNO_CALLBACK_SECRET")
+        if env_value:
+            return env_value
+        return ""
 
     @staticmethod
     def _normalize_path(path: str) -> str:
@@ -663,8 +690,8 @@ class SunoClient:
     ) -> dict[str, Any]:
         if not self.token:
             raise SunoClientError("SUNO_API_TOKEN is not configured", status=401)
-        callback_url = (call_back_url or SUNO_CALLBACK_URL or "").strip()
-        callback_secret = (call_back_secret or SUNO_CALLBACK_SECRET or "").strip()
+        callback_url = self._resolve_callback_url(call_back_url)
+        callback_secret = self._resolve_callback_secret(call_back_secret)
         if not callback_url or not callback_secret:
             raise SunoClientError("Suno callback configuration missing", status=422)
         title_text = str(title or "").strip()
