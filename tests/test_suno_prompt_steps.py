@@ -21,6 +21,8 @@ def _capture_prompt(bot, start_index: int) -> tuple[str, int]:
             text.startswith("Шаг")
             or text.startswith("✅")
             or text.startswith("Все обязательные поля заполнены")
+            or text.startswith("Введите")
+            or text.startswith("Пришлите")
         ):
             prompt_text = text
     if prompt_text is None:
@@ -36,7 +38,7 @@ def _capture_prompt(bot, start_index: int) -> tuple[str, int]:
             ["Night Drive", "Calm focus"],
             [
                 t("suno.prompt.step.title", index=1, total=2, current="—"),
-                t("suno.prompt.step.style", index=2, total=2, current="—"),
+                t("suno.prompt.step.style", index=1, total=2, current="—"),
                 SUNO_START_READY_MESSAGE,
             ],
         ),
@@ -45,8 +47,8 @@ def _capture_prompt(bot, start_index: int) -> tuple[str, int]:
             ["City Lights", "Dream pop", "First line\nSecond line"],
             [
                 t("suno.prompt.step.title", index=1, total=3, current="—"),
+                t("suno.prompt.step.lyrics"),
                 t("suno.prompt.step.style", index=2, total=3, current="—"),
-                t("suno.prompt.step.lyrics", index=3, total=3),
                 SUNO_START_READY_MESSAGE,
             ],
         ),
@@ -55,8 +57,8 @@ def _capture_prompt(bot, start_index: int) -> tuple[str, int]:
             ["Cover Title", "https://example.com/audio.mp3", "Ambient chill"],
             [
                 t("suno.prompt.step.title", index=1, total=3, current="—"),
-                t("suno.prompt.step.source", index=2, total=3),
-                t("suno.prompt.step.style", index=3, total=3, current="—"),
+                t("suno.prompt.step.source", index=1, total=3),
+                t("suno.prompt.step.style", index=2, total=3, current="—"),
                 SUNO_START_READY_MESSAGE,
             ],
         ),

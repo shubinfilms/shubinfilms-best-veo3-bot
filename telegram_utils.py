@@ -695,13 +695,22 @@ async def safe_edit_text(bot: Any, chat_id: int, message_id: int, text: str) -> 
     return await safe_edit_markdown_v2(bot, chat_id, message_id, text)
 
 
-async def safe_send_text(bot: Any, chat_id: int, text: str) -> Optional[Any]:
-    return await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True,
-    )
+async def safe_send_text(
+    bot: Any,
+    chat_id: int,
+    text: str,
+    *,
+    parse_mode: Optional[str] = ParseMode.MARKDOWN_V2,
+    disable_web_page_preview: bool = True,
+) -> Optional[Any]:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": disable_web_page_preview,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return await bot.send_message(**payload)
 
 
 async def safe_send_placeholder(bot: Any, chat_id: int, text: str) -> Optional[Message]:

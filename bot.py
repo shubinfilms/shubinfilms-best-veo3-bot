@@ -2984,6 +2984,30 @@ def _wait_preview(text: str) -> str:
     return truncate_text(normalized, 120) or "—"
 
 
+def _extract_command_token(message: Optional[Message]) -> Optional[str]:
+    if message is None:
+        return None
+    text = message.text
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    return stripped.split()[0]
+
+
+def _clear_user_wait_states(
+    user_id: int,
+    *,
+    reason: str,
+    clear_dialog_registry: bool = False,
+) -> None:
+    clear_wait(user_id, reason=reason)
+    if clear_dialog_registry:
+        with suppress(Exception):
+            input_state.clear(user_id, reason=reason)
+
+
 def is_command_or_button(message: Message) -> bool:
     text = message.text
     if not isinstance(text, str):
@@ -3187,9 +3211,15 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if wait_state is None:
         return
 
-    if message.text is None:
+    text = message.text
+    if text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
         raise ApplicationHandlerStop
+
+    command_token = _extract_command_token(message)
+    if command_token:
+        _clear_user_wait_states(user_id, reason=f"command:{command_token}")
+        return
 
     if is_command_or_button(message):
         touch_wait(user_id)
@@ -3206,6 +3236,19 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         touch_wait(user_id)
         await _wait_acknowledge(message, ack_text=ack_text)
         raise ApplicationHandlerStop
+
+
+async def command_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    command_token = _extract_command_token(update.effective_message)
+    if not command_token:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    _clear_user_wait_states(user.id, reason=f"command_gate:{command_token}")
+
 
 async def _handle_suno_waiting_input(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -8799,7 +8842,8 @@ async def _ensure_welcome_bonus(
                     await safe_send_text(
                         ctx.bot,
                         chat_id,
-                        f"🎁 Добро пожаловать! Начислил +{WELCOME_BONUS}💎 на баланс.",
+                        f"🎁 <b>Добро пожаловать!</b> Начислил <b>+{WELCOME_BONUS}💎</b> на баланс.",
+                        parse_mode=ParseMode.HTML,
                     )
                 except Exception as exc:  # pragma: no cover - telegram transient errors
                     log.warning(
@@ -9666,11 +9710,39 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text(final_text)
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
-    try:
-        if update and update.effective_chat:
-            await context.bot.send_message(update.effective_chat.id, "⚠️ Системная ошибка. Попробуйте ещё раз.")
-    except Exception:
-        pass
+
+    user_id: Optional[int] = None
+    chat_id: Optional[int] = None
+
+    if update:
+        if update.effective_user:
+            user_id = update.effective_user.id
+        if update.effective_chat:
+            chat_id = update.effective_chat.id
+
+    if user_id is not None:
+        _clear_user_wait_states(user_id, reason="error", clear_dialog_registry=True)
+
+    notify_targets: List[int] = []
+    if chat_id is not None:
+        notify_targets.append(chat_id)
+    elif user_id is not None:
+        notify_targets.append(user_id)
+    elif ADMIN_IDS:
+        notify_targets.append(ADMIN_IDS[0])
+
+    for target in notify_targets:
+        try:
+            await context.bot.send_message(
+                target,
+                "⚠️ <b>Системная ошибка.</b> Попробуйте ещё раз.",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            continue
+        else:
+            break
 
 async def show_banana_card(
     chat_id: int,
@@ -12233,6 +12305,13 @@ def register_handlers(application: Any) -> None:
         )
         support_reply_handler.block = False
         application.add_handler(support_reply_handler, group=0)
+
+    command_gate_handler = MessageHandler(
+        filters.COMMAND,
+        command_gate,
+    )
+    command_gate_handler.block = False
+    application.add_handler(command_gate_handler, group=0)
 
     card_input_handler = MessageHandler(
         filters.TEXT,
