@@ -66,5 +66,5 @@ def test_cover_upload_url_ok(monkeypatch):
         generating=False,
         waiting_enqueue=False,
     )
-    assert "загружено ✅ (id: kie-test-123)" in text
+    assert "Источник: <i>🔗 Ссылка</i>" in text
     assert ready is True

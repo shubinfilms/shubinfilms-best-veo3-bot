@@ -184,10 +184,11 @@ def _from_mapping(payload: Mapping[str, Any]) -> SunoState:
     else:
         mode = "lyrics" if bool(payload.get("has_lyrics")) else "instrumental"
     state = SunoState(mode=mode)
-    state.lyrics_source = _parse_lyrics_source(payload.get("lyrics_source"))
+    parsed_source = _parse_lyrics_source(payload.get("lyrics_source"))
     set_title(state, payload.get("title"))
     set_style(state, payload.get("style"))
     set_lyrics(state, payload.get("lyrics"))
+    state.lyrics_source = parsed_source
     raw_hash = payload.get("lyrics_hash")
     if isinstance(raw_hash, str) and raw_hash.strip():
         state.lyrics_hash = raw_hash.strip()

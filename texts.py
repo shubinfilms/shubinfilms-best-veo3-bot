@@ -42,9 +42,7 @@ SUNO_RU = {
         "Сейчас: “{current}”"
     ),
     "suno.prompt.step.lyrics": (
-        "Шаг {index}/{total} (текст): Пришлите текст песни (до {limit} символов) или отправьте /skip, "
-        "чтобы сгенерировать автоматически.\n"
-        "Сейчас: “{current}”"
+        "Шаг {index}/{total} (текст): Пришлите текст песни сообщением."
     ),
     "suno.prompt.step.source": (
         f"Шаг {{index}}/{{total}} (источник): Пришлите аудио-файл (mp3/wav, до {MAX_AUDIO_MB} МБ) "

@@ -240,12 +240,10 @@ def render_suno_card(
     lyrics_preview_value = suno_lyrics_preview(suno_state.lyrics)
     lyrics_value = html.escape(lyrics_preview_value) if lyrics_preview_value else "—"
 
-    if suno_state.kie_file_id:
-        source_value = f"загружено ✅ (id: {html.escape(suno_state.kie_file_id)})"
-    elif suno_state.cover_source_label:
-        source_value = html.escape(suno_state.cover_source_label)
-    elif suno_state.cover_source_url:
-        source_value = html.escape(suno_state.cover_source_url)
+    if suno_state.source_file_id:
+        source_value = "🎧 Файл"
+    elif suno_state.cover_source_url or suno_state.source_url:
+        source_value = "🔗 Ссылка"
     else:
         source_value = "—"
 
