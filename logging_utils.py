@@ -1,4 +1,4 @@
-"""Utilities for structured JSON logging with secret redaction."""
+"""Utilities for structured JSON logging with safe contextual payloads."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from settings import LOG_JSON, LOG_LEVEL, MAX_IN_LOG_BODY
 
@@ -81,6 +81,32 @@ def _sanitize(value: Any) -> Any:
     return value
 
 
+RESERVED_LOG_KEYS = {
+    "name",
+    "msg",
+    "args",
+    "levelname",
+    "levelno",
+    "pathname",
+    "filename",
+    "module",
+    "exc_info",
+    "exc_text",
+    "stack_info",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "processName",
+    "process",
+    "message",
+    "asctime",
+}
+
+
 class JsonFormatter(logging.Formatter):
     """Format log records into JSON with structured metadata."""
 
@@ -88,11 +114,11 @@ class JsonFormatter(logging.Formatter):
         message = record.getMessage()
         message = _truncate(_redact_text(message))
         meta: dict[str, Any] = {}
-        extra_meta = getattr(record, "meta", None)
-        if isinstance(extra_meta, Mapping):
-            meta.update(_sanitize(dict(extra_meta)))
-        elif extra_meta is not None:
-            meta["extra"] = _sanitize(extra_meta)
+        ctx = getattr(record, "ctx", None)
+        if isinstance(ctx, Mapping):
+            meta.update(_sanitize(dict(ctx)))
+        elif ctx is not None:
+            meta["ctx"] = _sanitize(ctx)
 
         meta.setdefault("logger", record.name)
         meta.setdefault("module", record.module)
@@ -138,81 +164,165 @@ def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
             continue
         safe_env[name] = _redact_text(value) if redact else value
 
-    logger.info("environment", extra={"meta": {"env": safe_env}})
+    logger.info("environment", extra=build_log_extra(meta={"env": safe_env}))
+
+
+def _normalize_extra(extra: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    if not extra:
+        return {"ctx": {}}
+
+    ctx_payload: dict[str, Any] = {}
+    if "ctx" in extra and isinstance(extra["ctx"], Mapping):
+        ctx_payload.update(extra["ctx"])
+
+    for key, value in extra.items():
+        if key == "ctx":
+            continue
+        if key in RESERVED_LOG_KEYS:
+            safe_key = f"field_{key}"
+        else:
+            safe_key = key
+        if isinstance(value, Mapping):
+            ctx_payload[safe_key] = dict(value)
+        else:
+            ctx_payload[safe_key] = value
+
+    normalized: dict[str, Any] = {"ctx": ctx_payload}
+    meta_value = ctx_payload.get("meta")
+    if meta_value is not None:
+        normalized["meta"] = meta_value
+    return normalized
+
+
+class SafeLogger(logging.Logger):
+    """Custom logger that ensures ``extra`` payloads are safely wrapped."""
+
+    def _log(
+        self,
+        level: int,
+        msg: Any,
+        args: Any,
+        exc_info=None,
+        extra: Optional[Mapping[str, Any]] = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+    ) -> None:  # type: ignore[override]
+        normalized_extra: Optional[dict[str, Any]]
+        if isinstance(extra, Mapping):
+            if "ctx" in extra and len(extra) == 1 and isinstance(extra["ctx"], Mapping):
+                normalized_extra = {"ctx": dict(extra["ctx"])}
+            else:
+                normalized_extra = _normalize_extra(extra)
+        elif extra is not None:
+            normalized_extra = _normalize_extra({"payload": extra})
+        else:
+            normalized_extra = None
+
+        super()._log(
+            level,
+            msg,
+            args,
+            exc_info=exc_info,
+            extra=normalized_extra,
+            stack_info=stack_info,
+            stacklevel=stacklevel,
+        )
 
 
 class CtxLogger(logging.LoggerAdapter):
-    """Logger adapter that injects safe context fields into log records."""
-
-    RESERVED = {
-        "name",
-        "msg",
-        "args",
-        "levelname",
-        "levelno",
-        "pathname",
-        "filename",
-        "module",
-        "lineno",
-        "exc_info",
-        "func",
-        "sinfo",
-        "created",
-        "msecs",
-        "relativeCreated",
-        "thread",
-        "threadName",
-        "process",
-        "processName",
-        "stack_info",
-    }
-
-    CONTEXT_FIELDS = ("cmd", "user_id", "chat_id", "state")
+    """Logger adapter that wraps ``extra`` payloads under ``ctx`` key."""
 
     def process(
         self,
         msg: str,
-        kwargs: dict[str, Any],
-    ) -> tuple[str, dict[str, Any]]:  # type: ignore[override]
-        """Sanitize ``extra`` payloads and enforce safe context keys."""
-
+        kwargs: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any]]:  # type: ignore[override]
         combined: dict[str, Any] = {}
-        if isinstance(self.extra, Mapping):
-            combined.update(self.extra)
 
-        call_extra = kwargs.get("extra")
+        base_extra = getattr(self, "extra", None)
+        if isinstance(base_extra, Mapping):
+            combined.update(base_extra)
+
+        call_extra = kwargs.pop("extra", None)
         if isinstance(call_extra, Mapping):
             combined.update(call_extra)
         elif call_extra is not None:
-            combined["meta"] = call_extra
+            combined["payload"] = call_extra
 
-        safe_extra: dict[str, Any] = {}
-        for field in self.CONTEXT_FIELDS:
-            safe_extra[field] = combined.get(field)
-
-        meta_payload: dict[str, Any] = {}
-        if "meta" in combined and isinstance(combined["meta"], Mapping):
-            meta_payload.update(combined["meta"])
-        elif "meta" in combined:
-            meta_payload["meta"] = combined["meta"]
-
-        for key, value in combined.items():
-            if key in self.CONTEXT_FIELDS or key == "meta":
-                continue
-            safe_key = key
-            if safe_key in self.RESERVED or safe_key in self.CONTEXT_FIELDS:
-                safe_key = f"extra_{safe_key}"
-            safe_extra[safe_key] = value
-
-        if meta_payload:
-            safe_extra["meta"] = meta_payload
-
+        normalized = _normalize_extra(combined)
         new_kwargs = dict(kwargs)
-        new_kwargs["extra"] = safe_extra
+        new_kwargs["extra"] = normalized
         return msg, new_kwargs
 
 
 SafeLoggerAdapter = CtxLogger
+
+
+if logging.getLoggerClass() is not SafeLogger:
+    logging.setLoggerClass(SafeLogger)
+
+
+def build_log_extra(
+    update: Optional[Any] = None,
+    context: Optional[Any] = None,
+    *,
+    command: Optional[str] = None,
+    meta: Optional[Mapping[str, Any]] = None,
+    **fields: Any,
+) -> dict[str, Any]:
+    """Construct a safe ``extra`` payload for logging.
+
+    The resulting mapping always contains a single top-level key ``ctx`` and never
+    attempts to overwrite reserved :class:`logging.LogRecord` attributes.
+    """
+
+    ctx_payload: dict[str, Any] = {}
+
+    env_name = os.getenv("ENV", os.getenv("ENVIRONMENT", "prod"))
+    if env_name:
+        ctx_payload.setdefault("env", env_name)
+
+    if update is not None:
+        user = getattr(update, "effective_user", None)
+        chat = getattr(update, "effective_chat", None)
+        if user is not None:
+            ctx_payload["user_id"] = getattr(user, "id", None)
+        if chat is not None:
+            ctx_payload["chat_id"] = getattr(chat, "id", None)
+
+        ctx_payload["update_type"] = type(update).__name__
+
+        if command is None:
+            message = getattr(update, "effective_message", None)
+            text = getattr(message, "text", None)
+            if isinstance(text, str) and text.startswith("/"):
+                command = text.split()[0]
+
+    if command:
+        ctx_payload["command"] = command.lstrip("/")
+
+    if context is not None:
+        try:
+            current_state = getattr(context, "chat_data", {}).get("state")  # type: ignore[assignment]
+        except Exception:
+            current_state = None
+        if current_state is not None:
+            ctx_payload.setdefault("state", current_state)
+
+    if meta is not None:
+        if isinstance(meta, Mapping):
+            ctx_payload["meta"] = dict(meta)
+        else:
+            ctx_payload["meta"] = meta
+
+    for key, value in fields.items():
+        if key in RESERVED_LOG_KEYS or key == "ctx":
+            safe_key = f"field_{key}"
+        else:
+            safe_key = key
+        ctx_payload[safe_key] = value
+
+    return {"ctx": ctx_payload}
 
 
 def _install_record_factory_defaults() -> None:
@@ -221,18 +331,10 @@ def _install_record_factory_defaults() -> None:
         return
 
     _RECORD_FACTORY_INSTALLED = True
-    factory = logging.getLogRecordFactory()
-
-    def _factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
-        record = factory(*args, **kwargs)
-        for field in CtxLogger.CONTEXT_FIELDS:
-            if not hasattr(record, field):
-                setattr(record, field, None)
-        if not hasattr(record, "meta"):
-            setattr(record, "meta", None)
-        return record
-
-    logging.setLogRecordFactory(_factory)
+    # No-op placeholder kept for backwards compatibility. Custom factories
+    # that inject reserved attributes would lead to ``KeyError`` when callers
+    # provide extras with the same names, so we intentionally avoid modifying
+    # the default factory here.
 
 
 def get_logger(name: str = "veo3-bot", *, extra: Optional[Mapping[str, Any]] = None) -> CtxLogger:
@@ -248,8 +350,7 @@ def configure_logging(app_name: str) -> None:
     if not LOG_JSON:
         logging.basicConfig(
             level=getattr(logging, LOG_LEVEL, logging.INFO),
-            format="%(asctime)s %(levelname)s [%(name)s] %(message)s | "
-            "cmd=%(cmd)s user_id=%(user_id)s chat_id=%(chat_id)s state=%(state)s",
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s | ctx=%(ctx)s",
         )
         _install_record_factory_defaults()
         return
@@ -278,6 +379,7 @@ __all__ = [
     "JsonFormatter",
     "CtxLogger",
     "SafeLoggerAdapter",
+    "build_log_extra",
     "configure_logging",
     "get_logger",
     "log_environment",

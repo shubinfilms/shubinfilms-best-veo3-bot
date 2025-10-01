@@ -10,13 +10,14 @@ import logging
 import os
 import warnings
 
-from logging_utils import configure_logging, get_logger, log_environment
+from logging_utils import build_log_extra, configure_logging, get_logger, log_environment
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 logger = get_logger("veo3-bot.bot")
 log = get_logger("veo3-bot")
 singleton_log = get_logger("veo3-bot.singleton")
+update_log = get_logger("veo3-bot.update")
 
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
@@ -68,6 +69,7 @@ from telegram.ext import (
     filters,
     AIORateLimiter,
     PreCheckoutQueryHandler,
+    ApplicationHandlerStop,
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 from telegram.warnings import PTBUserWarning
@@ -993,59 +995,6 @@ def _extract_update_entities(update: Optional[Update]) -> tuple[Optional[int], O
     return (chat_id, user_id)
 
 
-def _build_log_extra(
-    update: Optional[Update],
-    *,
-    cmd: Optional[str] = None,
-    meta: Optional[Mapping[str, Any]] = None,
-    **fields: Any,
-) -> dict[str, Any]:
-    extra: dict[str, Any] = {}
-
-    if update is not None:
-        user = getattr(update, "effective_user", None)
-        chat = getattr(update, "effective_chat", None)
-        if user is not None and getattr(user, "id", None) is not None:
-            extra["user_id"] = user.id
-        if chat is not None and getattr(chat, "id", None) is not None:
-            extra["chat_id"] = chat.id
-
-        message = getattr(update, "effective_message", None)
-        message_cmd = None
-        if message is not None:
-            text = getattr(message, "text", None)
-            if isinstance(text, str) and text.startswith("/"):
-                message_cmd = text.split()[0].lstrip("/")
-        if cmd is None and message_cmd:
-            cmd = message_cmd
-
-        query = getattr(update, "callback_query", None)
-        if query is not None and getattr(query, "data", None):
-            data_preview = str(query.data)[:64]
-            extra.setdefault("meta", {})["callback_data"] = data_preview
-
-    if cmd is not None:
-        extra["cmd"] = cmd
-
-    if meta is not None:
-        if isinstance(meta, Mapping):
-            extra.setdefault("meta", {}).update(meta)
-        else:
-            extra["meta"] = meta
-
-    if "meta" in fields:
-        value = fields.pop("meta")
-        if isinstance(value, Mapping):
-            extra.setdefault("meta", {}).update(value)
-        else:
-            extra["meta"] = value
-
-    for key, value in fields.items():
-        extra[key] = value
-
-    return extra
-
-
 async def _notify_safe_handler_error(
     update: Optional[Update], ctx: Optional[ContextTypes.DEFAULT_TYPE]
 ) -> None:
@@ -1084,8 +1033,9 @@ async def _handle_safe_handler_exception(
     handler_name = getattr(callback, "__name__", repr(callback))
     log.exception(
         "handler_failed",
-        extra=_build_log_extra(
+        extra=build_log_extra(
             update,
+            ctx,
             handler=handler_name,
             meta={"exc": repr(exc)},
         ),
@@ -1103,39 +1053,35 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        bot_logger = logging.getLogger("bot")
-        user_id = None
-        update_type = None
-        command_name = None
-        callback_data = None
-
         if update is not None:
-            update_type = type(update).__name__
-            user = getattr(update, "effective_user", None)
-            user_id = getattr(user, "id", None)
+            update_log.debug("update.received", extra=build_log_extra(update, ctx))
 
             message = getattr(update, "effective_message", None)
             text = getattr(message, "text", None)
             if isinstance(text, str) and text.startswith("/"):
-                command_name = text.split()[0]
+                log.debug(
+                    "command.dispatch",
+                    extra=build_log_extra(update, ctx, command=text.split()[0]),
+                )
 
             query = getattr(update, "callback_query", None)
             if query is not None and getattr(query, "data", None):
-                callback_data = str(query.data)[:64]
-
-        if update_type:
-            bot_logger.debug("update.received | type=%s user=%s", update_type, user_id)
-        if command_name:
-            clean_name = command_name.lstrip("/") if isinstance(command_name, str) else command_name
-            log.debug("command.dispatch", extra=_build_log_extra(update, cmd=clean_name))
-        if callback_data:
-            bot_logger.debug("callback.dispatch | data=%s user=%s", callback_data, user_id)
+                update_log.debug(
+                    "callback.dispatch",
+                    extra=build_log_extra(
+                        update,
+                        ctx,
+                        meta={"callback_data": str(query.data)[:64]},
+                    ),
+                )
 
         try:
             result = callback(update, ctx, *args, **kwargs)
             if asyncio.iscoroutine(result):
                 return await result
             return result
+        except ApplicationHandlerStop:
+            raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive safety net
@@ -3463,30 +3409,30 @@ async def _apply_wait_state_input(
 async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
-        return
+        raise ApplicationHandlerStop
 
     user = update.effective_user
     user_id = user.id if user else None
     if user_id is None:
-        return
+        raise ApplicationHandlerStop
 
     wait_state = get_wait(user_id)
     if wait_state is None:
-        return
+        raise ApplicationHandlerStop
 
     text = message.text
     if text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
-        return
+        raise ApplicationHandlerStop
 
     command_token = _extract_command_token(message)
     if command_token:
         _clear_user_wait_states(user_id, reason=f"command:{command_token}")
-        return
+        raise ApplicationHandlerStop
 
     if is_command_or_button(message):
         touch_wait(user_id)
-        return
+        raise ApplicationHandlerStop
 
     handled, ack_text = await _apply_wait_state_input(
         ctx,
@@ -3498,7 +3444,9 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if handled:
         touch_wait(user_id)
         await _wait_acknowledge(message, ack_text=ack_text)
-        return
+        raise ApplicationHandlerStop
+
+    raise ApplicationHandlerStop
 
 
 async def command_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10719,7 +10667,7 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
 
     log.exception(
         "handler.error",
-        extra=_build_log_extra(update, meta=extra_meta),
+        extra=build_log_extra(update, context, meta=extra_meta),
     )
 
     user_id: Optional[int] = None

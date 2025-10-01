@@ -6,7 +6,16 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from logging_utils import get_logger
+from logging_utils import build_log_extra, get_logger
+
+
+def test_build_log_extra_wraps_fields() -> None:
+    payload = build_log_extra(None, None, command="/menu", meta={"foo": "bar"}, name="test")
+    assert set(payload.keys()) == {"ctx"}
+    ctx = payload["ctx"]
+    assert ctx["command"] == "menu"
+    assert ctx["meta"] == {"foo": "bar"}
+    assert ctx["field_name"] == "test"
 
 
 def test_logging_extra_name_not_crash(caplog) -> None:
@@ -16,6 +25,6 @@ def test_logging_extra_name_not_crash(caplog) -> None:
 
     target = next((record for record in caplog.records if record.message == "check"), None)
     assert target is not None
-    assert getattr(target, "extra_name", None) == "menu"
-    assert getattr(target, "user", None) == 123
-    assert hasattr(target, "cmd") and getattr(target, "cmd") is None
+    ctx = getattr(target, "ctx")
+    assert ctx["field_name"] == "menu"
+    assert ctx["user"] == 123
