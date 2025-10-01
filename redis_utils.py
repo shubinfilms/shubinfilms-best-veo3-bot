@@ -70,6 +70,8 @@ _ref_inviter_memory: Dict[int, int] = {}
 _ref_users_memory: Dict[int, set[int]] = {}
 _ref_earned_memory: Dict[int, int] = {}
 _ref_joined_memory: Dict[int, float] = {}
+_user_profile_lock = Lock()
+_user_profile_memory: Dict[int, Dict[str, str]] = {}
 
 if not _redis_url:
     _logger.warning(
@@ -298,6 +300,68 @@ async def add_user(redis_conn: Optional["redis.Redis"], user: "TelegramUser") ->
             return False
 
     return await asyncio.to_thread(_store)
+
+
+def set_user_preferred_language(user_id: int, language_code: str) -> bool:
+    """Persist the preferred language for a user.
+
+    Returns ``True`` if the value was stored either in Redis or the fallback
+    memory store.
+    """
+
+    if not user_id:
+        return False
+
+    value = (language_code or "").strip().lower()
+    if not value:
+        return False
+
+    stored = False
+    if _r:
+        try:
+            _r.hset(_user_profile_key(int(user_id)), "preferred_language", value)
+            stored = True
+        except Exception as exc:  # pragma: no cover - network failure path
+            _logger.warning(
+                "set_user_preferred_language failed for %s: %s", user_id, exc
+            )
+
+    with _user_profile_lock:
+        profile = _user_profile_memory.setdefault(int(user_id), {})
+        profile["preferred_language"] = value
+        stored = True
+
+    return stored
+
+
+def get_user_preferred_language(user_id: int) -> Optional[str]:
+    """Return the preferred language stored for ``user_id`` if present."""
+
+    if not user_id:
+        return None
+
+    if _r:
+        try:
+            raw = _r.hget(_user_profile_key(int(user_id)), "preferred_language")
+        except Exception as exc:  # pragma: no cover - network failure path
+            _logger.warning(
+                "get_user_preferred_language failed for %s: %s", user_id, exc
+            )
+        else:
+            if raw is None:
+                pass
+            elif isinstance(raw, bytes):
+                return raw.decode("utf-8", "ignore") or None
+            else:
+                return str(raw) or None
+
+    with _user_profile_lock:
+        profile = _user_profile_memory.get(int(user_id))
+        if profile:
+            value = profile.get("preferred_language")
+            return value if value else None
+
+    return None
 
 
 async def get_users_count(redis_conn: Optional["redis.Redis"]) -> Optional[int]:

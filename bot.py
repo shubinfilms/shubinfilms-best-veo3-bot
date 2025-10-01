@@ -34,7 +34,7 @@ import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
-    KeyboardButton, BotCommand, User, Message
+    BotCommand, User, Message
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -177,6 +177,8 @@ from redis_utils import (
     add_ref_user,
     incr_ref_earned,
     get_ref_stats,
+    get_user_preferred_language,
+    set_user_preferred_language,
 )
 
 from ledger import (
@@ -3590,18 +3592,100 @@ def main_suggest_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🎬 Видео", callback_data="go:video"),
-                InlineKeyboardButton("🎨 Изображения", callback_data="go:image"),
+                InlineKeyboardButton("🎬 Генерация видео", callback_data="go:video"),
+                InlineKeyboardButton("🎨 Генерация изображений", callback_data="go:image"),
             ],
             [
-                InlineKeyboardButton("🎵 Музыка", callback_data="go:music"),
+                InlineKeyboardButton("🎵 Генерация музыки", callback_data="go:music"),
+                InlineKeyboardButton("🧠 Prompt-Master", callback_data="go:pm"),
+            ],
+            [
+                InlineKeyboardButton("💬 Обычный чат", callback_data="go:chat"),
                 InlineKeyboardButton("💎 Баланс", callback_data="go:balance"),
-            ],
-            [
-                InlineKeyboardButton("ℹ️ FAQ", callback_data="go:faq"),
             ],
         ]
     )
+
+
+def _build_main_menu_text(balance: int) -> str:
+    prompts_link = html.escape(PROMPTS_CHANNEL_URL, quote=True)
+    return (
+        "<b>⭐ Главное меню</b>\n"
+        f"💎 Баланс: <b>{balance}💎</b>\n"
+        f"📈 Кейсы и примеры: <a href=\"{prompts_link}\">канал с примерами</a>\n\n"
+        "Выберите режим:"
+    )
+
+
+async def render_main_menu(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
+) -> Optional[Message]:
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+
+    chat_id = chat.id if chat else (user.id if user else None)
+    if chat_id is None:
+        return None
+
+    user_id = user.id if user else None
+    balance = _safe_get_balance(user_id) if user_id else 0
+    _set_cached_balance(ctx, balance)
+
+    text = _build_main_menu_text(balance)
+    keyboard = main_suggest_kb()
+    payload = {
+        "text": text,
+        "reply_markup": keyboard,
+        "parse_mode": ParseMode.HTML,
+        "disable_web_page_preview": True,
+    }
+
+    if edit and message is not None:
+        try:
+            return await message.edit_text(**payload)
+        except BadRequest as exc:
+            err_text = str(exc).lower()
+            if "message is not modified" in err_text:
+                return message
+            log.debug("main_menu.edit_failed | chat=%s err=%s", chat_id, exc)
+        except TelegramError as exc:
+            log.warning("main_menu.edit_failed | chat=%s err=%s", chat_id, exc)
+
+    try:
+        return await ctx.bot.send_message(chat_id=chat_id, **payload)
+    except Exception as exc:  # pragma: no cover - network issues
+        log.warning("main_menu.send_failed | chat=%s err=%s", chat_id, exc)
+        return None
+
+
+def _normalize_language_code(code: Optional[str]) -> str:
+    if isinstance(code, str):
+        lowered = code.strip().lower()
+        if lowered.startswith("ru"):
+            return "ru"
+        if lowered.startswith("en"):
+            return "en"
+    return "ru"
+
+
+def _build_language_message(current_code: str) -> str:
+    label = LANGUAGE_LABELS.get(current_code, LANGUAGE_LABELS["ru"])
+    return (
+        "<b>🌍 Выбор языка</b>\n"
+        f"Текущий язык: <b>{html.escape(label)}</b>\n\n"
+        "Выберите язык интерфейса бота. Настройка применяется мгновенно."
+    )
+
+
+def _language_keyboard(current_code: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for code, label in LANGUAGE_LABELS.items():
+        mark = " ✅" if code == current_code else ""
+        rows.append(
+            [InlineKeyboardButton(f"{label}{mark}", callback_data=f"lang:{code}")]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 async def safe_send_typing(bot, chat_id: int) -> None:
@@ -3989,21 +4073,23 @@ WELCOME = (
 )
 
 
-MAIN_MENU_TEXT = "📋 *Главное меню*\nВыберите, что хотите сделать:"
-
-
 HELP_TEXT = (
-    "🆘 Поддержка.\n"
-    "Выберите, как связаться с командой."
+    "<b>🆘 Поддержка</b>\n"
+    f"Свяжитесь с нами: <a href=\"{html.escape(SUPPORT_PUBLIC_URL, quote=True)}\">@BestVeo3_Support</a>\n"
+    "Создайте тикет или напишите напрямую — ответим в течение нескольких минут."
 )
 
 
-MENU_BTN_VIDEO = "🎬 ГЕНЕРАЦИЯ ВИДЕО"
-MENU_BTN_IMAGE = "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"
+MENU_BTN_VIDEO = "🎬 Генерация видео"
+MENU_BTN_IMAGE = "🎨 Генерация изображений"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
 MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
+LANGUAGE_LABELS: Dict[str, str] = {
+    "ru": "🇷🇺 Русский",
+    "en": "🇬🇧 English",
+}
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
@@ -4025,18 +4111,6 @@ def render_welcome_for(
         balance = _safe_get_balance(uid)
     _set_cached_balance(ctx, balance)
     return WELCOME.format(balance=balance, prompts_url=PROMPTS_CHANNEL_URL)
-
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton(MENU_BTN_VIDEO)],
-        [KeyboardButton(MENU_BTN_IMAGE)],
-        [KeyboardButton(MENU_BTN_SUNO)],
-        [KeyboardButton(MENU_BTN_PM)],
-        [KeyboardButton(MENU_BTN_CHAT)],
-        [KeyboardButton(MENU_BTN_BALANCE)],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
 
 async def show_emoji_hub_for_chat(
     chat_id: int,
@@ -4276,6 +4350,10 @@ async def main_suggest_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         handler = image_command
     elif data == "go:music":
         handler = suno_command
+    elif data == "go:pm":
+        handler = prompt_master_command
+    elif data == "go:chat":
+        handler = chat_command
     elif data == "go:balance":
         handler = my_balance_command
     elif data == "go:faq":
@@ -8924,7 +9002,7 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         clear_wait(user_id)
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
-    menu_message = await safe_send(update, ctx, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+    menu_message = await render_main_menu(update, ctx, edit=bool(query and query.message))
     if isinstance(menu_message, Message):
         try:
             s["last_ui_msg_id_menu"] = menu_message.message_id
@@ -9260,10 +9338,78 @@ async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     message = update.effective_message
-    if message is None:
+    user = update.effective_user
+    if message is None or user is None:
         return
-    await message.reply_text("🌍 Переключение языка будет доступно в ближайшее время.")
 
+    stored = ctx.user_data.get("preferred_language")
+    current = stored if isinstance(stored, str) and stored else None
+    if not current:
+        current = get_user_preferred_language(user.id)
+    if not current:
+        current = _normalize_language_code(getattr(user, "language_code", ""))
+
+    ctx.user_data["preferred_language"] = current
+
+    text = _build_language_message(current)
+    keyboard = _language_keyboard(current)
+
+    await message.reply_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def lang_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or not query.data:
+        return
+
+    code = query.data.partition(":")[2].strip().lower()
+    if code not in LANGUAGE_LABELS:
+        with suppress(BadRequest):
+            await query.answer("Неизвестный язык", show_alert=True)
+        return
+
+    set_user_preferred_language(user.id, code)
+    ctx.user_data["preferred_language"] = code
+
+    text = _build_language_message(code)
+    keyboard = _language_keyboard(code)
+
+    message = query.message
+    if message is not None:
+        try:
+            await message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                log.debug(
+                    "lang.edit_failed | user=%s chat=%s err=%s",
+                    user.id,
+                    message.chat_id,
+                    exc,
+                )
+        except TelegramError as exc:
+            log.warning(
+                "lang.edit_failed | user=%s chat=%s err=%s",
+                user.id,
+                message.chat_id,
+                exc,
+            )
+
+    try:
+        await query.answer(f"Язык: {LANGUAGE_LABELS[code]}")
+    except Exception as exc:
+        log.debug("lang.answer_failed | user=%s err=%s", user.id, exc)
 
 def _support_contact_url() -> str:
     if SUPPORT_USER_ID > 0:
@@ -9427,7 +9573,12 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if message is None:
         return
     await _ensure_welcome_bonus(update, ctx)
-    await message.reply_text(HELP_TEXT, reply_markup=support_keyboard())
+    await message.reply_text(
+        HELP_TEXT,
+        reply_markup=support_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9468,9 +9619,32 @@ async def prompt_master_insert_callback_entry(update: Update, ctx: ContextTypes.
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    await update.message.reply_text(
-        "💳 Пополнение через *Telegram Stars*.\nЕсли звёзд не хватает — купите в официальном боте:",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
+    message = update.effective_message
+    if message is None:
+        return
+
+    lines = [
+        "<b>💎 Пополнение генераций</b>",
+        "Оплата проходит через <b>Telegram Stars</b>. Выберите пакет ниже:",
+    ]
+    for stars in STARS_PACK_ORDER:
+        diamonds = STARS_TO_DIAMONDS.get(stars)
+        if not diamonds:
+            continue
+        bonus = max(diamonds - stars, 0)
+        bonus_note = f" +{bonus}💎 бонус" if bonus else ""
+        lines.append(f"• ⭐ {stars} → 💎 {diamonds}{bonus_note}")
+    lines.append("")
+    lines.append(
+        "Нажмите кнопку, чтобы оплатить или узнать, где купить Stars."
+    )
+    text = "\n".join(lines)
+
+    await message.reply_text(
+        text,
+        reply_markup=stars_topup_kb(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -12421,6 +12595,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^pm:copy:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
     (rf"^{CB_PM_PREFIX}", safe_handler(prompt_master_callback_entry)),
     (rf"^{CB_FAQ_PREFIX}", safe_handler(faq_callback_entry)),
+    (r"^lang:(ru|en)$", safe_handler(lang_callback)),
     (r"^support:new$", safe_handler(support_new_callback)),
     (r"^support_reply:\d+$", safe_handler(support_reply_callback)),
     (r"^hub:", safe_handler(hub_router)),
@@ -12429,12 +12604,12 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
 ]
 
 REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
-    (MENU_BTN_VIDEO, safe_handler(handle_video_entry)),
-    (MENU_BTN_IMAGE, safe_handler(handle_image_entry)),
-    (MENU_BTN_SUNO, safe_handler(handle_music_entry)),
-    (MENU_BTN_PM, safe_handler(prompt_master_command)),
-    (MENU_BTN_CHAT, safe_handler(handle_chat_entry)),
-    (MENU_BTN_BALANCE, safe_handler(handle_balance_entry)),
+    (MENU_BTN_VIDEO, handle_video_entry),
+    (MENU_BTN_IMAGE, handle_image_entry),
+    (MENU_BTN_SUNO, handle_music_entry),
+    (MENU_BTN_PM, prompt_master_command),
+    (MENU_BTN_CHAT, handle_chat_entry),
+    (MENU_BTN_BALANCE, handle_balance_entry),
 ]
 
 
@@ -12497,7 +12672,7 @@ def register_handlers(application: Any) -> None:
         application.add_handler(
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
-                handler,
+                safe_handler(handler),
             )
         )
 
@@ -12596,15 +12771,35 @@ async def run_bot_async() -> None:
             await application.initialize()
 
             try:
-                await application.bot.set_my_commands([
+                commands_ru = [
                     BotCommand("menu", "⭐ Главное меню"),
-                    BotCommand("buy", "💎 Купить генерации"),
-                    BotCommand("video", "🎬 Генерация видео"),
-                    BotCommand("image", "🎨 Генерация изображений"),
-                    BotCommand("lang", "🌍 Изменить язык"),
-                    BotCommand("help", "🆘 Поддержка"),
-                    BotCommand("faq", "❓ FAQ"),
-                ])
+                    BotCommand("video", "🎬 Генерация видео (VEO)"),
+                    BotCommand("image", "🎨 Генерация изображений (Midjourney/Banana)"),
+                    BotCommand(
+                        "music",
+                        "🎵 Генерация музыки (Suno: инструментал/вокал/кавер)",
+                    ),
+                    BotCommand("buy", "💎 Купить генерации (прайс/кнопки оплаты)"),
+                    BotCommand("lang", "🌍 Изменить язык (RU/EN)"),
+                    BotCommand("help", "🆘 Поддержка (контакт @BestVeo3_Support)"),
+                    BotCommand("faq", "❓ FAQ (короткая памятка)"),
+                ]
+                commands_en = [
+                    BotCommand("menu", "⭐ Main menu"),
+                    BotCommand("video", "🎬 Generate video (VEO)"),
+                    BotCommand("image", "🎨 Generate images (Midjourney/Banana)"),
+                    BotCommand(
+                        "music",
+                        "🎵 Generate music (Suno: instrumental/vocal/cover)",
+                    ),
+                    BotCommand("buy", "💎 Buy generations (pricing/payment)"),
+                    BotCommand("lang", "🌍 Change language (RU/EN)"),
+                    BotCommand("help", "🆘 Support (contact @BestVeo3_Support)"),
+                    BotCommand("faq", "❓ FAQ (quick guide)"),
+                ]
+                await application.bot.set_my_commands(commands_ru)
+                await application.bot.set_my_commands(commands_ru, language_code="ru")
+                await application.bot.set_my_commands(commands_en, language_code="en")
             except Exception as exc:
                 log.warning("Failed to set bot commands: %s", exc)
 
