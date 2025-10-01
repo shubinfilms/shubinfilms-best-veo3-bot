@@ -195,10 +195,6 @@ from settings import (
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
-    WELCOME_BONUS as SETTINGS_WELCOME_BONUS,
-    WELCOME_BONUS_ENABLED as SETTINGS_WELCOME_BONUS_ENABLED,
-    WELCOME_BONUS_AMOUNT as SETTINGS_WELCOME_BONUS_AMOUNT,
-    WELCOME_BONUS_KEY_TTL_DAYS,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -638,19 +634,6 @@ def _env_int(k: str, default: int) -> int:
 START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
-_default_bonus_amount = (
-    SETTINGS_WELCOME_BONUS_AMOUNT
-    if SETTINGS_WELCOME_BONUS_AMOUNT is not None
-    else SETTINGS_WELCOME_BONUS
-)
-WELCOME_BONUS_AMOUNT = max(0, _env_int("WELCOME_BONUS_AMOUNT", int(_default_bonus_amount)))
-WELCOME_BONUS_KEY_TTL_SECONDS = max(
-    1, _env_int("WELCOME_BONUS_KEY_TTL_DAYS", WELCOME_BONUS_KEY_TTL_DAYS)
-) * 86400
-WELCOME_BONUS = WELCOME_BONUS_AMOUNT
-WELCOME_BONUS_ENABLED = bool(
-    _env_bool("WELCOME_BONUS_ENABLED", SETTINGS_WELCOME_BONUS_ENABLED)
-)
 SUPPORT_PUBLIC_URL = _env("SUPPORT_PUBLIC_URL", "https://t.me/BestVeo3_Support") or "https://t.me/BestVeo3_Support"
 
 
@@ -3976,124 +3959,6 @@ def _build_language_message(current_code: str) -> str:
         f"Текущий язык: <b>{html.escape(label)}</b>\n\n"
         "Выберите язык интерфейса бота. Настройка применяется мгновенно."
     )
-
-
-_welcome_bonus_memory: Dict[int, float] = {}
-
-
-def _bonus_granted_key(user_id: int) -> str:
-    return f"wb:{int(user_id)}"
-
-
-async def ensure_signup_bonus_once(
-    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> Optional[bool]:
-    if user_id <= 0:
-        return False
-    if not WELCOME_BONUS_ENABLED or WELCOME_BONUS_AMOUNT <= 0:
-        return False
-
-    redis_key = _bonus_granted_key(user_id)
-    should_grant = True
-    redis_error = False
-
-    if redis_client:
-        try:
-            should_grant = bool(
-                redis_client.set(
-                    redis_key,
-                    "1",
-                    nx=True,
-                    ex=WELCOME_BONUS_KEY_TTL_SECONDS,
-                )
-            )
-        except Exception as exc:  # pragma: no cover - redis issues
-            log.warning(
-                "welcome_bonus_redis_failed | user_id=%s err=%s",
-                user_id,
-                exc,
-            )
-            redis_error = True
-            should_grant = True
-
-    if not redis_client or redis_error:
-        now = time.time()
-        expires_at = _welcome_bonus_memory.get(user_id)
-        if isinstance(expires_at, (int, float)) and expires_at > now:
-            should_grant = False
-        else:
-            _welcome_bonus_memory[user_id] = now + WELCOME_BONUS_KEY_TTL_SECONDS
-
-    if not should_grant:
-        return False
-
-    try:
-        result = ledger_storage.grant_signup_bonus(user_id, WELCOME_BONUS_AMOUNT)
-    except UniqueViolation:  # pragma: no cover - defensive double guard
-        return False
-    except Exception as exc:  # pragma: no cover - ledger errors
-        log.exception("welcome_bonus_failed | user_id=%s err=%s", user_id, exc)
-        if redis_client and not redis_error:
-            with suppress(Exception):
-                redis_client.delete(redis_key)
-        if not redis_client or redis_error:
-            _welcome_bonus_memory.pop(user_id, None)
-        return None
-
-    if not isinstance(result, LedgerOpResult):
-        return None
-
-    if not result.applied:
-        if not result.duplicate and redis_client and not redis_error:
-            with suppress(Exception):
-                redis_client.delete(redis_key)
-        if not redis_client or redis_error:
-            _welcome_bonus_memory.pop(user_id, None)
-        return False
-
-    _set_cached_balance(ctx, result.balance)
-    log_evt("bonus_granted", user_id=user_id, amount=WELCOME_BONUS_AMOUNT)
-
-    try:
-        await send_html(
-            ctx.bot,
-            chat_id=user_id,
-            text=(
-                "🎁 <b>Добро пожаловать!</b> Начислил "
-                f"<b>+{WELCOME_BONUS_AMOUNT}💎</b> на баланс."
-            ),
-        )
-    except Exception as exc:  # pragma: no cover - telegram transient errors
-        log.warning(
-            "welcome_bonus_notify_failed | user_id=%s err=%s",
-            user_id,
-            exc,
-        )
-
-    return True
-
-
-async def ensure_signup_bonus(
-    update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
-) -> bool:
-    if update is None:
-        return False
-
-    user = update.effective_user
-    if user is None:
-        return False
-
-    state: Dict[str, Any] = ctx.user_data.setdefault("_signup_bonus_state", {})
-    if state.get("checked"):
-        return bool(state.get("granted", False))
-
-    outcome = await ensure_signup_bonus_once(ctx, user.id)
-    if outcome is None:
-        return False
-
-    state["checked"] = True
-    state["granted"] = bool(outcome)
-    return bool(outcome)
 
 
 def _language_keyboard(current_code: str) -> InlineKeyboardMarkup:
@@ -9442,7 +9307,6 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def welcome_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await ensure_signup_bonus(update, ctx)
 
 
 async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -9450,10 +9314,9 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id if user else None
 
-    bonus_granted = await ensure_signup_bonus(update, ctx)
     await _handle_referral_deeplink(update, ctx)
 
-    if uid is not None and not bonus_granted:
+    if uid is not None:
         _set_cached_balance(ctx, _safe_get_balance(uid))
 
     await handle_menu(update, ctx)
@@ -9996,7 +9859,6 @@ async def support_new_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     if query is None:
         return
-    await ensure_signup_bonus(update, ctx)
     with suppress(BadRequest):
         await query.answer()
     await _prompt_support_ticket(update, ctx, source="callback")
@@ -10106,7 +9968,6 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
-    await ensure_signup_bonus(update, ctx)
     await message.reply_text(
         HELP_TEXT,
         reply_markup=support_keyboard(),
@@ -10122,7 +9983,6 @@ async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 async def support_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await ensure_signup_bonus(update, ctx)
     await _prompt_support_ticket(update, ctx, source="command")
 
 
