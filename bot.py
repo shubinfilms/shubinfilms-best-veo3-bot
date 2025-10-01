@@ -10189,6 +10189,7 @@ async def transactions_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
         msg_ids["balance"] = sent.message_id
 
 
+@with_state_reset
 async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -13149,7 +13150,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("whoami",), safe_handler(whoami_command)),
     (("suno_debug",), safe_handler(suno_debug_command)),
     (("broadcast",), safe_handler(broadcast_command)),
-    (("my_balance",), safe_handler(my_balance_command)),
+    (("my_balance",), _reset_handler(my_balance_command)),
     (("add_balance",), safe_handler(add_balance_command)),
     (("sub_balance",), safe_handler(sub_balance_command)),
     (("transactions",), safe_handler(transactions_command)),
@@ -13364,30 +13365,26 @@ async def run_bot_async() -> None:
 
             try:
                 commands_ru = [
-                    BotCommand("menu", "⭐ Главное меню"),
-                    BotCommand("video", "🎬 Генерация видео (VEO)"),
-                    BotCommand("image", "🎨 Генерация изображений (Midjourney/Banana)"),
-                    BotCommand(
-                        "music",
-                        "🎵 Генерация музыки (Suno: инструментал/вокал/кавер)",
-                    ),
-                    BotCommand("buy", "💎 Купить генерации (прайс/кнопки оплаты)"),
-                    BotCommand("lang", "🌍 Изменить язык (RU/EN)"),
-                    BotCommand("help", "🆘 Поддержка (контакт @BestVeo3_Support)"),
-                    BotCommand("faq", "❓ FAQ (короткая памятка)"),
+                    BotCommand("menu", "Главное меню"),
+                    BotCommand("image", "Генерация изображений"),
+                    BotCommand("video", "Генерация видео"),
+                    BotCommand("music", "Генерация музыки"),
+                    BotCommand("buy", "Купить генерации"),
+                    BotCommand("lang", "Изменить язык"),
+                    BotCommand("help", "Поддержка"),
+                    BotCommand("faq", "FAQ"),
+                    BotCommand("my_balance", "Баланс"),
                 ]
                 commands_en = [
-                    BotCommand("menu", "⭐ Main menu"),
-                    BotCommand("video", "🎬 Generate video (VEO)"),
-                    BotCommand("image", "🎨 Generate images (Midjourney/Banana)"),
-                    BotCommand(
-                        "music",
-                        "🎵 Generate music (Suno: instrumental/vocal/cover)",
-                    ),
-                    BotCommand("buy", "💎 Buy generations (pricing/payment)"),
-                    BotCommand("lang", "🌍 Change language (RU/EN)"),
-                    BotCommand("help", "🆘 Support (contact @BestVeo3_Support)"),
-                    BotCommand("faq", "❓ FAQ (quick guide)"),
+                    BotCommand("menu", "Main menu"),
+                    BotCommand("image", "Generate images"),
+                    BotCommand("video", "Generate video"),
+                    BotCommand("music", "Generate music"),
+                    BotCommand("buy", "Buy generations"),
+                    BotCommand("lang", "Change language"),
+                    BotCommand("help", "Support"),
+                    BotCommand("faq", "FAQ"),
+                    BotCommand("my_balance", "Balance"),
                 ]
                 await application.bot.set_my_commands(commands_ru)
                 await application.bot.set_my_commands(commands_ru, language_code="ru")
