@@ -24,7 +24,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
-from redis_utils import clear_all_waits
+from redis_utils import reset_user_state as redis_reset_user_state
 from settings import REDIS_PREFIX
 
 log = logging.getLogger("telegram.utils")
@@ -132,7 +132,7 @@ async def reset_user_state(update: Any = None, context: Any = None) -> int:
 
     deleted = 0
     if redis_client:
-        deleted = await clear_all_waits(redis_client, user_id, prefix=redis_prefix)
+        deleted = await redis_reset_user_state(redis_client, redis_prefix, user_id)
         BOT_LOG.debug(
             "state.reset | user=%s deleted=%s prefix=%s",
             user_id,

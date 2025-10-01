@@ -8,6 +8,7 @@
 # odex/fix-balance-reset-after-deploy
 import logging
 import os
+import warnings
 
 from logging_utils import configure_logging, log_environment
 
@@ -49,6 +50,7 @@ from telegram.ext import (
     PreCheckoutQueryHandler,
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
+from telegram.warnings import PTBUserWarning
 
 from handlers import (
     configure_faq,
@@ -182,6 +184,7 @@ from redis_utils import (
     get_user_preferred_language,
     set_user_preferred_language,
     set_wait_flag,
+    cleanup_stale_waits,
 )
 
 from ledger import (
@@ -1047,7 +1050,11 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
         if update_type:
             bot_logger.debug("update.received | type=%s user=%s", update_type, user_id)
         if command_name:
-            bot_logger.debug("command.dispatch | name=%s user=%s", command_name, user_id)
+            clean_name = command_name.lstrip("/") if isinstance(command_name, str) else command_name
+            log.debug(
+                "command.dispatch",
+                extra={"name": clean_name, "user": user_id},
+            )
         if callback_data:
             bot_logger.debug("callback.dispatch | data=%s user=%s", callback_data, user_id)
 
@@ -2808,6 +2815,9 @@ def tg_direct_file_url(bot_token: str, file_path: str) -> str:
     return f"https://api.telegram.org/file/bot{bot_token}/{p.lstrip('/')}"
 
 # ---------- User state ----------
+WAIT_WATCHDOG_INTERVAL = 300
+WAIT_WATCHDOG_THRESHOLD = 1800
+
 WAIT_SUNO_TITLE = "WAIT_SUNO_TITLE"
 WAIT_SUNO_STYLE = "WAIT_SUNO_STYLE"
 WAIT_SUNO_LYRICS = "WAIT_SUNO_LYRICS"
@@ -9372,6 +9382,47 @@ async def _mark_wait_flag(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, name: st
         log.debug("wait_flag.set_failed | user_id=%s name=%s", user_id, name, exc_info=True)
 
 
+async def wait_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic cleanup for stale wait flags lingering in Redis."""
+
+    sources = []
+    if context is not None:
+        sources.append(getattr(context, "application", None))
+        sources.append(context)
+
+    redis_client = None
+    redis_prefix = REDIS_PREFIX
+
+    for source in sources:
+        if source is None:
+            continue
+        bot_data = getattr(source, "bot_data", None)
+        if not isinstance(bot_data, MutableMapping):
+            continue
+        if redis_client is None and bot_data.get("redis") is not None:
+            redis_client = bot_data.get("redis")
+        redis_prefix = bot_data.get("redis_prefix", redis_prefix)
+
+    if redis_client is None:
+        return
+
+    try:
+        removed = await cleanup_stale_waits(
+            redis_client,
+            redis_prefix,
+            max_ttl_seconds=WAIT_WATCHDOG_THRESHOLD,
+        )
+    except Exception:
+        log.debug("wait_watchdog.error", exc_info=True)
+        return
+
+    if removed:
+        log.info(
+            "wait_watchdog.cleaned",
+            extra={"deleted": removed, "prefix": redis_prefix},
+        )
+
+
 async def _reset_user_context(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, reason: str
 ) -> Optional[int]:
@@ -13275,6 +13326,20 @@ def register_handlers(application: Any) -> None:
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(on_text)), group=10)
 
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", PTBUserWarning)
+        job_queue = getattr(application, "job_queue", None)
+    if job_queue is not None:
+        try:
+            job_queue.run_repeating(
+                wait_watchdog_job,
+                interval=WAIT_WATCHDOG_INTERVAL,
+                first=WAIT_WATCHDOG_INTERVAL,
+                name="wait-watchdog",
+            )
+        except Exception:
+            log.warning("wait_watchdog.schedule_failed", exc_info=True)
+
 
 # ==========================
 #   Entry (fixed for PTB 21.x)
@@ -13368,23 +13433,23 @@ async def run_bot_async() -> None:
                     BotCommand("menu", "Главное меню"),
                     BotCommand("image", "Генерация изображений"),
                     BotCommand("video", "Генерация видео"),
-                    BotCommand("music", "Генерация музыки"),
+                    BotCommand("music", "Генерация музыки (Suno)"),
+                    BotCommand("my_balance", "Баланс"),
                     BotCommand("buy", "Купить генерации"),
                     BotCommand("lang", "Изменить язык"),
                     BotCommand("help", "Поддержка"),
                     BotCommand("faq", "FAQ"),
-                    BotCommand("my_balance", "Баланс"),
                 ]
                 commands_en = [
                     BotCommand("menu", "Main menu"),
                     BotCommand("image", "Generate images"),
                     BotCommand("video", "Generate video"),
-                    BotCommand("music", "Generate music"),
+                    BotCommand("music", "Generate music (Suno)"),
+                    BotCommand("my_balance", "Balance"),
                     BotCommand("buy", "Buy generations"),
                     BotCommand("lang", "Change language"),
                     BotCommand("help", "Support"),
                     BotCommand("faq", "FAQ"),
-                    BotCommand("my_balance", "Balance"),
                 ]
                 await application.bot.set_my_commands(commands_ru)
                 await application.bot.set_my_commands(commands_ru, language_code="ru")
