@@ -37,11 +37,15 @@ def _assert_main_menu_payload(payload: dict, expected_balance: int) -> None:
     assert payload.get("parse_mode") == bot_module.ParseMode.HTML
     markup = payload["reply_markup"]
     rows = markup.inline_keyboard
+    for row in rows:
+        for btn in row:
+            assert btn.callback_data.startswith("hub:"), "callback prefix must be hub:"
+            assert len(btn.callback_data.encode("utf-8")) <= 64, "callback data too long"
     assert [[btn.callback_data for btn in row] for row in rows] == [
-        ["go:video", "go:image"],
-        ["go:music", "go:balance"],
-        ["go:lang", "go:help"],
-        ["go:faq"],
+        ["hub:video", "hub:image"],
+        ["hub:music", "hub:balance"],
+        ["hub:lang", "hub:faq"],
+        ["hub:help"],
     ]
 
 

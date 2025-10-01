@@ -202,6 +202,8 @@ UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
 
 # Feature toggles
 WELCOME_BONUS_ENABLED = False
+WELCOME_BONUS_AMOUNT = 0
+WELCOME_BONUS_TTL_DAYS = 0
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:
     if value is None:

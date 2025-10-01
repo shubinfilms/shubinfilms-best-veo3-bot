@@ -4,7 +4,7 @@ import os
 import sys
 from typing import Dict
 
-from telegram.ext import AIORateLimiter, ApplicationBuilder, CommandHandler
+from telegram.ext import AIORateLimiter, ApplicationBuilder, CommandHandler, MessageHandler
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
@@ -74,7 +74,32 @@ def test_chat_and_prompt_master_handlers_registered() -> None:
     assert not missing, f"commands not registered: {sorted(missing)}"
 
     assert any(pattern.startswith("^pm:") for pattern in callback_patterns)
-    assert any("hub" in pattern and pattern.startswith("^(?:hub") for pattern in callback_patterns)
+    assert any(pattern.startswith("^hub:") for pattern in callback_patterns)
+
+    command_groups = {
+        group
+        for group, handlers in application.handlers.items()
+        for handler in handlers
+        if isinstance(handler, CommandHandler)
+    }
+    assert command_groups == {0}
+
+    on_text_group = None
+    for group, handlers in application.handlers.items():
+        for handler in handlers:
+            if not isinstance(handler, MessageHandler):
+                continue
+            target = getattr(handler, "callback", None)
+            while hasattr(target, "__wrapped__"):
+                target = target.__wrapped__  # type: ignore[attr-defined]
+            if getattr(target, "__name__", "") == "on_text":
+                on_text_group = group
+                break
+        if on_text_group is not None:
+            break
+
+    assert on_text_group is not None, "fallback text handler must exist"
+    assert on_text_group >= 10
 
 
 def test_reply_button_routes_match_expected() -> None:
