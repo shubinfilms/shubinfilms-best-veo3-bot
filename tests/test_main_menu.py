@@ -42,9 +42,10 @@ def _assert_main_menu_payload(payload: dict, expected_balance: int) -> None:
             assert btn.callback_data.startswith("hub:"), "callback prefix must be hub:"
             assert len(btn.callback_data.encode("utf-8")) <= 64, "callback data too long"
     assert [[btn.callback_data for btn in row] for row in rows] == [
+        ["hub:prompt"],
         ["hub:video", "hub:image"],
-        ["hub:music", "hub:balance"],
-        ["hub:lang", "hub:faq"],
+        ["hub:music", "hub:chat"],
+        ["hub:balance", "hub:lang"],
         ["hub:help"],
     ]
 
@@ -65,7 +66,7 @@ def test_menu_command(monkeypatch):
         payload
         for payload in bot.sent
         if isinstance(payload, dict)
-        and payload.get("text", "").startswith("👋 Добро пожаловать!")
+        and payload.get("text", "") == bot_module._build_main_menu_text(0)
     ]
 
     assert menu_messages, "main menu message should be sent"
@@ -97,7 +98,7 @@ def test_start_flow_without_bonus(monkeypatch):
         payload
         for payload in bot.sent
         if isinstance(payload, dict)
-        and payload.get("text", "").startswith("👋 Добро пожаловать!")
+        and payload.get("text", "") == bot_module._build_main_menu_text(0)
     ]
     assert menu_messages, "main menu message should be sent"
     _assert_main_menu_payload(menu_messages[-1], expected_balance=0)

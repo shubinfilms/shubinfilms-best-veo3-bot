@@ -6,7 +6,7 @@ import os
 import time
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - optional import for type checking only
     from typing import TYPE_CHECKING
@@ -79,6 +79,98 @@ _wait_memory: Dict[str, float] = {}
 _WAIT_TTL_DEFAULT = 15 * 60
 
 
+async def _gather_keys(r: Any, pattern: str) -> list[str]:
+    """Collect keys from ``r`` matching ``pattern`` using SCAN semantics."""
+
+    if not pattern:
+        return []
+
+    keys: list[str] = []
+
+    try:
+        iterator = r.scan_iter(pattern)
+    except AttributeError:
+        iterator = None
+
+    if iterator is not None:
+        try:
+            if inspect.isasyncgen(iterator):
+                async for key in iterator:
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    keys.append(str(key))
+            else:
+                for key in iterator:
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    keys.append(str(key))
+            return keys
+        except Exception:
+            log = logging.getLogger("redis-utils")
+            log.warning("scan_iter_failed | pattern=%s", pattern, exc_info=True)
+            return []
+
+    try:
+        if hasattr(r, "scan"):
+            cursor: int | str = 0
+            while True:
+                if inspect.iscoroutinefunction(r.scan):
+                    cursor, batch = await r.scan(cursor=cursor, match=pattern, count=64)
+                else:
+                    cursor, batch = await asyncio.to_thread(
+                        r.scan, cursor=cursor, match=pattern, count=64
+                    )
+                for key in batch:
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    keys.append(str(key))
+                if not cursor:
+                    break
+    except Exception:
+        log = logging.getLogger("redis-utils")
+        log.warning("scan_failed | pattern=%s", pattern, exc_info=True)
+        return []
+
+    return keys
+
+
+async def _delete_keys(r: Any, keys: Iterable[str]) -> int:
+    payload = [str(key) for key in keys]
+    if not payload:
+        return 0
+
+    try:
+        if inspect.iscoroutinefunction(r.delete):
+            deleted = await r.delete(*payload) or 0
+        else:
+            deleted = await asyncio.to_thread(r.delete, *payload) or 0
+    except Exception:
+        log = logging.getLogger("redis-utils")
+        log.warning("delete_failed | keys=%s", len(payload), exc_info=True)
+        return 0
+
+    return int(deleted)
+
+
+async def redis_delete_keys(r: Any, patterns: Sequence[str]) -> int:
+    """Delete keys in ``r`` matching any of ``patterns`` and return total removed."""
+
+    if not r:
+        return 0
+
+    total_deleted = 0
+    for pattern in patterns:
+        pattern = str(pattern or "").strip()
+        if not pattern:
+            continue
+        keys = await _gather_keys(r, pattern)
+        if not keys:
+            continue
+        total_deleted += await _delete_keys(r, keys)
+
+    return total_deleted
+
+
 async def clear_wait_flags(r: Any, user_id: int, prefix: str) -> int:
     """Remove all ``wait`` keys for ``user_id`` under ``prefix``.
 
@@ -97,61 +189,7 @@ async def clear_wait_flags(r: Any, user_id: int, prefix: str) -> int:
         return 0
 
     pattern = f"{prefix}:wait:{uid}:*"
-    keys: list[str] = []
-
-    try:
-        iterator = r.scan_iter(pattern)
-        if inspect.isasyncgen(iterator):
-            async for key in iterator:
-                if isinstance(key, bytes):
-                    key = key.decode()
-                keys.append(str(key))
-        else:
-            for key in iterator:
-                if isinstance(key, bytes):
-                    key = key.decode()
-                keys.append(str(key))
-    except AttributeError:
-        # ``scan_iter`` not available, fall back to SCAN.
-        try:
-            if hasattr(r, "scan"):
-                cursor: int | str = 0
-                while True:
-                    if inspect.iscoroutinefunction(r.scan):
-                        cursor, batch = await r.scan(cursor=cursor, match=pattern, count=64)
-                    else:
-                        cursor, batch = await asyncio.to_thread(
-                            r.scan, cursor=cursor, match=pattern, count=64
-                        )
-                    for key in batch:
-                        if isinstance(key, bytes):
-                            key = key.decode()
-                        keys.append(str(key))
-                    if not cursor:
-                        break
-        except Exception:
-            log = logging.getLogger("redis-utils")
-            log.warning("clear_wait_flags.scan_failed", exc_info=True)
-            keys = []
-    except Exception:
-        log = logging.getLogger("redis-utils")
-        log.warning("clear_wait_flags.iter_failed", exc_info=True)
-        keys = []
-
-    if not keys:
-        return 0
-
-    try:
-        if inspect.iscoroutinefunction(r.delete):
-            deleted = await r.delete(*keys) or 0
-        else:
-            deleted = await asyncio.to_thread(r.delete, *keys) or 0
-    except Exception:
-        log = logging.getLogger("redis-utils")
-        log.warning("clear_wait_flags.delete_failed", exc_info=True)
-        return 0
-
-    return int(deleted)
+    return await redis_delete_keys(r, [pattern])
 
 
 async def set_wait_flag(
@@ -189,6 +227,7 @@ async def set_wait_flag(
         log.warning("set_wait_flag.failed", exc_info=True)
         return None
 
+    logging.getLogger("bot").debug("wait.set | key=%s ttl=%s", key, payload_ttl)
     return key
 
 if not _redis_url:

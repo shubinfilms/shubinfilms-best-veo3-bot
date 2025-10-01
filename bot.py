@@ -1024,6 +1024,33 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        bot_logger = logging.getLogger("bot")
+        user_id = None
+        update_type = None
+        command_name = None
+        callback_data = None
+
+        if update is not None:
+            update_type = type(update).__name__
+            user = getattr(update, "effective_user", None)
+            user_id = getattr(user, "id", None)
+
+            message = getattr(update, "effective_message", None)
+            text = getattr(message, "text", None)
+            if isinstance(text, str) and text.startswith("/"):
+                command_name = text.split()[0]
+
+            query = getattr(update, "callback_query", None)
+            if query is not None and getattr(query, "data", None):
+                callback_data = str(query.data)[:64]
+
+        if update_type:
+            bot_logger.debug("update.received | type=%s user=%s", update_type, user_id)
+        if command_name:
+            bot_logger.debug("command.dispatch | name=%s user=%s", command_name, user_id)
+        if callback_data:
+            bot_logger.debug("callback.dispatch | data=%s user=%s", callback_data, user_id)
+
         try:
             result = callback(update, ctx, *args, **kwargs)
             if asyncio.iscoroutine(result):
@@ -3607,12 +3634,7 @@ def main_suggest_kb(_current_language: str = "ru") -> InlineKeyboardMarkup:
 
 
 def _build_main_menu_text(balance: int) -> str:
-    prompts_link = html.escape(PROMPTS_CHANNEL_URL, quote=True)
-    return (
-        "👋 Добро пожаловать!\n"
-        f"💎 Ваш баланс: <b>{balance}💎</b>\n"
-        f"📢 Канал с примерами — <a href=\"{prompts_link}\">подписаться</a>"
-    )
+    return "<b>🏠 Главное меню</b>\nВыберите нужный раздел:"
 
 
 async def send_main_menu(target: Any, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[Message]:
@@ -4629,12 +4651,6 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if query is None or not query.data:
         return
 
-    try:
-        await query.answer(cache_time=0)
-    except BadRequest:
-        with suppress(BadRequest):
-            await query.answer()
-
     data = (query.data or "").strip()
     if not data.startswith(HUB_CALLBACK_PREFIX):
         await query.edit_message_text("Неизвестная команда. Нажмите /menu")
@@ -4643,7 +4659,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     route = data.split(":", 1)[1] if ":" in data else ""
     user = update.effective_user
     user_id = user.id if user else None
-    log.info("hub.route", extra={"user": user_id, "route": route})
+    logging.getLogger("bot").debug("callback.hub | action=%s user=%s", route or "menu", user_id)
 
     message = query.message
     chat = update.effective_chat
@@ -9396,7 +9412,7 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def welcome_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
 
-
+@with_state_reset
 async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     user = update.effective_user
@@ -9411,12 +9427,14 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_main_menu(update, ctx)
 
 
+@with_state_reset
 async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     ctx.user_data.clear()
     await send_main_menu(update, ctx)
 
 
+@with_state_reset
 async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -9425,6 +9443,7 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_video_card(chat_id, ctx)
 
 
+@with_state_reset
 async def on_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -9433,6 +9452,7 @@ async def on_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_image_card(chat_id, ctx)
 
 
+@with_state_reset
 async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -9441,6 +9461,7 @@ async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_music_card(chat_id, ctx)
 
 
+@with_state_reset
 async def on_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -9449,6 +9470,7 @@ async def on_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_buy_card(chat_id, ctx)
 
 
+@with_state_reset
 async def on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -9457,6 +9479,7 @@ async def on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_help_card(chat_id, ctx)
 
 
+@with_state_reset
 async def on_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -9465,6 +9488,7 @@ async def on_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_faq_card(chat_id, ctx)
 
 
+@with_state_reset
 async def on_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
@@ -13089,6 +13113,8 @@ class RedisRunnerLock:
         self._redis = None
 
 def _reset_handler(callback: Any) -> Any:
+    if getattr(callback, "__with_state_reset__", False):
+        return safe_handler(callback)
     return safe_handler(with_state_reset(callback))
 
 
@@ -13131,7 +13157,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (rf"^{HUB_CALLBACK_PREFIX}", safe_handler(with_state_reset(hub_router))),
+    (r"^hub:.*", safe_handler(with_state_reset(hub_router))),
     (r"^video:", safe_handler(cb_video)),
     (r"^img:", safe_handler(cb_image)),
     (r"^music:", safe_handler(cb_music)),
