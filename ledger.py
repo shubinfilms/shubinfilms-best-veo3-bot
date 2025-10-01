@@ -155,6 +155,23 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                 cur.execute(ddl_promo)
             conn.commit()
 
+        try:
+            with self.pool.connection() as conn:
+                old_autocommit = conn.autocommit
+                conn.autocommit = True
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_ledger_opid_unique
+                              ON ledger (op_id)
+                            """
+                        )
+                finally:
+                    conn.autocommit = old_autocommit
+        except Exception:  # pragma: no cover - defensive logging
+            log.exception("failed to ensure idx_ledger_opid_unique")
+
     @staticmethod
     def _ensure_user(cur: psycopg.Cursor[Any], uid: int) -> None:
         cur.execute("INSERT INTO users (id) VALUES (%s) ON CONFLICT DO NOTHING", (uid,))
@@ -298,7 +315,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         self, uid: int, amount: int, meta: Optional[Dict[str, Any]] = None
     ) -> LedgerOpResult:
         amount = int(amount)
-        op_id = f"signup:{uid}"
+        op_id = f"signup_bonus:{uid}"
         meta_json = self._json_meta(meta)
 
         with self.pool.connection() as conn:
@@ -317,19 +334,6 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                     already = False
 
                 if already:
-                    return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
-
-                cur.execute(
-                    """
-                    SELECT 1 FROM ledger WHERE op_id=%s
-                    """,
-                    (op_id,),
-                )
-                if cur.fetchone():
-                    cur.execute(
-                        "UPDATE users SET signup_bonus_granted = TRUE WHERE id=%s",
-                        (uid,),
-                    )
                     return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
 
                 if amount <= 0:
@@ -353,13 +357,28 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                 new_balance_row = cur.fetchone()
                 new_balance = int(new_balance_row[0]) if new_balance_row else old_balance
 
-                cur.execute(
-                    """
-                    INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
-                    VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
-                    """,
-                    (uid, amount, "signup_bonus", op_id, meta_json),
-                )
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
+                        VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
+                        """,
+                        (uid, amount, "signup_bonus", op_id, meta_json),
+                    )
+                except UniqueViolation:
+                    cur.execute(
+                        "UPDATE users SET signup_bonus_granted = TRUE WHERE id=%s",
+                        (uid,),
+                    )
+                    conn.rollback()
+                    return LedgerOpResult(
+                        False,
+                        old_balance,
+                        op_id,
+                        "signup_bonus",
+                        old_balance,
+                        duplicate=True,
+                    )
 
         self._log_operation(
             "credit", uid, op_id, amount, "signup_bonus", old_balance, new_balance, meta
@@ -612,7 +631,7 @@ class _MemoryLedgerStorage(_LedgerHelpers):
         self, uid: int, amount: int, meta: Optional[Dict[str, Any]] = None
     ) -> LedgerOpResult:
         amount = int(amount)
-        op_id = f"signup:{uid}"
+        op_id = f"signup_bonus:{uid}"
         with self._lock:
             user = self._ensure_user(uid)
             old_balance = int(user["balance"])

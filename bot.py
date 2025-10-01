@@ -186,6 +186,7 @@ from ledger import (
     LedgerOpResult,
     BalanceRecalcResult,
     InsufficientBalance,
+    UniqueViolation,
 )
 from roles import SUPPORT_USER_ID, is_support
 from settings import (
@@ -196,7 +197,7 @@ from settings import (
     SUNO_LOG_KEY,
     SUNO_READY,
     WELCOME_BONUS as SETTINGS_WELCOME_BONUS,
-    WELCOME_BONUS_REDIS_KEY,
+    WELCOME_BONUS_ENABLED as SETTINGS_WELCOME_BONUS_ENABLED,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -635,6 +636,9 @@ START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
 WELCOME_BONUS = max(0, _env_int("WELCOME_BONUS_GEMS", int(SETTINGS_WELCOME_BONUS)))
+WELCOME_BONUS_ENABLED = bool(
+    _env_bool("WELCOME_BONUS_ENABLED", SETTINGS_WELCOME_BONUS_ENABLED)
+)
 SUPPORT_PUBLIC_URL = _env("SUPPORT_PUBLIC_URL", "https://t.me/BestVeo3_Support") or "https://t.me/BestVeo3_Support"
 
 
@@ -3069,7 +3073,12 @@ def _suno_field_preview(state: SunoState, field: str) -> str:
 
 def _suno_prompt_text(field: str, suno_state_obj: SunoState) -> str:
     flow = "cover" if field == "cover" else suno_state_obj.mode
-    step_alias = "source" if field in {"lyrics", "cover"} else field
+    if field == "cover":
+        step_alias = "source"
+    elif field == "lyrics":
+        step_alias = "lyrics"
+    else:
+        step_alias = field
     order = _music_flow_steps(flow)
     steps_for_count = [item for item in order if item != "ready"]
     total = len(steps_for_count) or 1
@@ -3588,20 +3597,28 @@ def _chat_state_waiting_input(state_dict: Dict[str, Any]) -> bool:
     return False
 
 
-def main_suggest_kb() -> InlineKeyboardMarkup:
+def main_suggest_kb(current_language: str = "ru") -> InlineKeyboardMarkup:
+    normalized = _normalize_language_code(current_language)
+    ru_label = "🌐 Язык: RU" if normalized == "ru" else "RU"
+    en_label = "🌐 Язык: EN" if normalized == "en" else "EN"
+
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🎬 Генерация видео", callback_data="go:video"),
-                InlineKeyboardButton("🎨 Генерация изображений", callback_data="go:image"),
+                InlineKeyboardButton("🎬 Генерация видео", callback_data="act:video"),
+                InlineKeyboardButton("🎨 Генерация изображений", callback_data="act:image"),
             ],
             [
-                InlineKeyboardButton("🎵 Генерация музыки", callback_data="go:music"),
-                InlineKeyboardButton("🧠 Prompt-Master", callback_data="go:pm"),
+                InlineKeyboardButton("🎵 Генерация музыки", callback_data="act:music"),
+                InlineKeyboardButton("🧠 Prompt-Master", callback_data="act:prompt"),
             ],
             [
-                InlineKeyboardButton("💬 Обычный чат", callback_data="go:chat"),
-                InlineKeyboardButton("💎 Баланс", callback_data="go:balance"),
+                InlineKeyboardButton("💬 Обычный чат", callback_data="act:chat"),
+                InlineKeyboardButton("💎 Баланс", callback_data="act:balance"),
+            ],
+            [
+                InlineKeyboardButton(ru_label, callback_data="lang:ru"),
+                InlineKeyboardButton(en_label, callback_data="lang:en"),
             ],
         ]
     )
@@ -3632,8 +3649,20 @@ async def render_main_menu(
     balance = _safe_get_balance(user_id) if user_id else 0
     _set_cached_balance(ctx, balance)
 
+    preferred_lang: Optional[str] = None
+    if user_id:
+        stored_lang = ctx.user_data.get("preferred_language")
+        if isinstance(stored_lang, str) and stored_lang:
+            preferred_lang = stored_lang
+        else:
+            preferred_lang = get_user_preferred_language(user_id)
+            if preferred_lang:
+                ctx.user_data["preferred_language"] = preferred_lang
+    if not preferred_lang and user is not None:
+        preferred_lang = _normalize_language_code(getattr(user, "language_code", ""))
+
     text = _build_main_menu_text(balance)
-    keyboard = main_suggest_kb()
+    keyboard = main_suggest_kb(preferred_lang or "ru")
     payload = {
         "text": text,
         "reply_markup": keyboard,
@@ -3676,6 +3705,98 @@ def _build_language_message(current_code: str) -> str:
         f"Текущий язык: <b>{html.escape(label)}</b>\n\n"
         "Выберите язык интерфейса бота. Настройка применяется мгновенно."
     )
+
+
+def _bonus_granted_key(user_id: int) -> str:
+    return f"{REDIS_PREFIX}:bonus:granted:{int(user_id)}"
+
+
+async def ensure_signup_bonus_once(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> Optional[bool]:
+    if user_id <= 0:
+        return False
+    if not WELCOME_BONUS_ENABLED or WELCOME_BONUS <= 0:
+        return False
+
+    redis_key = _bonus_granted_key(user_id)
+    should_grant = True
+    redis_error = False
+
+    if redis_client:
+        try:
+            should_grant = bool(redis_client.set(redis_key, "1", nx=True))
+        except Exception as exc:  # pragma: no cover - redis issues
+            log.warning(
+                "welcome_bonus_redis_failed | user_id=%s err=%s",
+                user_id,
+                exc,
+            )
+            redis_error = True
+            should_grant = True
+
+    if not should_grant:
+        return False
+
+    try:
+        result = ledger_storage.grant_signup_bonus(user_id, WELCOME_BONUS)
+    except UniqueViolation:  # pragma: no cover - defensive double guard
+        return False
+    except Exception as exc:  # pragma: no cover - ledger errors
+        log.exception("welcome_bonus_failed | user_id=%s err=%s", user_id, exc)
+        if redis_client and not redis_error:
+            with suppress(Exception):
+                redis_client.delete(redis_key)
+        return None
+
+    if not isinstance(result, LedgerOpResult):
+        return None
+
+    if not result.applied:
+        if not result.duplicate and redis_client and not redis_error:
+            with suppress(Exception):
+                redis_client.delete(redis_key)
+        return False
+
+    _set_cached_balance(ctx, result.balance)
+    log_evt("bonus_granted", user_id=user_id, amount=WELCOME_BONUS)
+
+    try:
+        await ctx.bot.send_message(
+            chat_id=user_id,
+            text=f"🎁 Добро пожаловать! Начислил +{WELCOME_BONUS}💎 на баланс.",
+        )
+    except Exception as exc:  # pragma: no cover - telegram transient errors
+        log.warning(
+            "welcome_bonus_notify_failed | user_id=%s err=%s",
+            user_id,
+            exc,
+        )
+
+    return True
+
+
+async def ensure_signup_bonus(
+    update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    if update is None:
+        return False
+
+    user = update.effective_user
+    if user is None:
+        return False
+
+    state: Dict[str, Any] = ctx.user_data.setdefault("_signup_bonus_state", {})
+    if state.get("checked"):
+        return bool(state.get("granted", False))
+
+    outcome = await ensure_signup_bonus_once(ctx, user.id)
+    if outcome is None:
+        return False
+
+    state["checked"] = True
+    state["granted"] = bool(outcome)
+    return bool(outcome)
 
 
 def _language_keyboard(current_code: str) -> InlineKeyboardMarkup:
@@ -4337,38 +4458,6 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
 
-async def main_suggest_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-
-    data = (query.data or "").strip()
-    handler: Optional[Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]] = None
-    if data == "go:video":
-        handler = video_command
-    elif data == "go:image":
-        handler = image_command
-    elif data == "go:music":
-        handler = suno_command
-    elif data == "go:pm":
-        handler = prompt_master_command
-    elif data == "go:chat":
-        handler = chat_command
-    elif data == "go:balance":
-        handler = my_balance_command
-    elif data == "go:faq":
-        handler = faq_command_entry
-
-    try:
-        await query.answer()
-    except Exception as exc:
-        chat_id = query.message.chat_id if query.message else None
-        log.debug("chat.main_suggest_answer_failed | chat=%s err=%s", chat_id, exc)
-
-    if handler is None:
-        return
-
-    await handler(update, ctx)
 
 
 def video_menu_kb() -> InlineKeyboardMarkup:
@@ -4385,7 +4474,7 @@ def video_menu_kb() -> InlineKeyboardMarkup:
             f"🖼️ Оживить изображение (Veo) — 💎 {TOKEN_COSTS['veo_photo']}",
             callback_data="mode:veo_photo",
         )],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="act:menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -4400,7 +4489,7 @@ def image_menu_kb() -> InlineKeyboardMarkup:
             f"🍌 Редактор изображений (Banana) — 💎 {TOKEN_COSTS['banana']}",
             callback_data="mode:banana",
         )],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="act:menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -4410,7 +4499,7 @@ def inline_topup_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
             [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="act:menu")],
         ]
     )
 
@@ -4423,7 +4512,7 @@ def balance_menu_kb() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")],
         [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="act:menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -5412,7 +5501,7 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔁 Повторить", callback_data="suno:repeat")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="act:menu")],
         ]
     )
 
@@ -5420,8 +5509,8 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 def _music_flow_steps(flow: str) -> list[str]:
     mapping = {
         "instrumental": ["title", "style", "ready"],
-        "lyrics": ["title", "style", "source", "ready"],
-        "cover": ["title", "style", "source", "ready"],
+        "lyrics": ["title", "lyrics", "style", "ready"],
+        "cover": ["title", "source", "style", "ready"],
     }
     return mapping.get(flow, [])
 
@@ -5492,15 +5581,11 @@ def _music_step_prompt_text(
             total=prompt_total,
             current=current,
         )
+    if step == "lyrics":
+        return t("suno.prompt.step.lyrics")
     if step == "source":
-        if flow == "cover":
-            return t(
-                "suno.prompt.step.source",
-                index=prompt_index,
-                total=prompt_total,
-            )
         return t(
-            "suno.prompt.step.lyrics",
+            "suno.prompt.step.source",
             index=prompt_index,
             total=prompt_total,
         )
@@ -5524,6 +5609,8 @@ def _music_card_message_id(state_dict: Dict[str, Any]) -> Optional[int]:
 def _music_waiting_payload(flow: str, step: str) -> tuple[str, Optional[WaitKind]]:
     if step == "title":
         return WAIT_SUNO_TITLE, WaitKind.SUNO_TITLE
+    if step == "lyrics":
+        return WAIT_SUNO_LYRICS, WaitKind.SUNO_LYRICS
     if step == "style":
         return WAIT_SUNO_STYLE, WaitKind.SUNO_STYLE
     if step == "source":
@@ -5551,18 +5638,19 @@ def _music_update_step(
             if not suno_state_obj.title:
                 state_dict["suno_step"] = "title"
                 return "title"
+        elif step == "lyrics":
+            if flow_key == "lyrics":
+                if suno_state_obj.lyrics_source == LyricsSource.USER:
+                    if not suno_state_obj.lyrics:
+                        state_dict["suno_step"] = "lyrics"
+                        return "lyrics"
+                continue
         elif step == "source":
             if flow_key == "cover":
                 if not suno_state_obj.kie_file_id:
                     state_dict["suno_step"] = "source"
                     return "source"
-            elif flow_key == "lyrics":
-                if suno_state_obj.lyrics_source == LyricsSource.USER:
-                    if not suno_state_obj.lyrics:
-                        state_dict["suno_step"] = "source"
-                        return "source"
-                else:
-                    continue
+            continue
         elif step == "style":
             if not suno_state_obj.style:
                 state_dict["suno_step"] = "style"
@@ -5595,7 +5683,8 @@ async def sync_suno_prompt(
     steps_for_count = [item for item in order if item != "ready"]
     display_total = len(steps_for_count) or 1
     if current_step in steps_for_count:
-        display_index = steps_for_count.index(current_step) + 1
+        completed_before = steps_for_count.index(current_step)
+        display_index = completed_before if completed_before > 0 else 1
     elif current_step == "ready":
         display_index = display_total
     else:
@@ -8924,10 +9013,12 @@ async def poll_mj_and_send_photos(
                     )
                     return
 
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
-                    [InlineKeyboardButton("Назад в меню", callback_data="back")],
-                ])
+                keyboard = InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
+                        [InlineKeyboardButton("Назад в меню", callback_data="act:menu")],
+                    ]
+                )
                 await ctx.bot.send_message(chat_id, "Галерея сгенерирована.", reply_markup=keyboard)
 
                 success = True
@@ -8975,7 +9066,7 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{diamonds}")]
         )
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="act:menu")])
     return InlineKeyboardMarkup(rows)
 
 async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9010,119 +9101,26 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-async def _ensure_welcome_bonus(
-    update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
-) -> Optional[LedgerOpResult]:
-    cached: Optional[LedgerOpResult] = ctx.user_data.get("welcome_bonus_result")
-    if ctx.user_data.get("welcome_bonus_checked"):
-        return cached
-
-    uid: Optional[int] = None
-    chat_id: Optional[int] = None
-
-    try:
-        if update is None:
-            ctx.user_data["welcome_bonus_checked"] = True
-            return cached
-
-        user = update.effective_user
-        chat = update.effective_chat
-        uid = user.id if user else None
-        chat_id = chat.id if chat else None
-
-        if uid is None or WELCOME_BONUS <= 0:
-            ctx.user_data["welcome_bonus_checked"] = True
-            return cached
-
-        should_grant = True
-        if redis_client:
-            redis_key = WELCOME_BONUS_REDIS_KEY.format(uid=uid)
-            try:
-                should_grant = bool(
-                    redis_client.set(redis_key, str(int(time.time())), nx=True)
-                )
-            except Exception as redis_exc:  # pragma: no cover - defensive logging
-                log.warning(
-                    "welcome_bonus_redis_failed | user_id=%s err=%s",
-                    uid,
-                    redis_exc,
-                )
-                should_grant = True
-        else:
-            should_grant = True
-
-        result: Optional[LedgerOpResult] = cached
-        if should_grant or cached is None:
-            result = ledger_storage.grant_signup_bonus(uid, WELCOME_BONUS)
-
-        if result is None:
-            ctx.user_data["welcome_bonus_checked"] = True
-            return cached
-
-        ctx.user_data["welcome_bonus_result"] = result
-        _set_cached_balance(ctx, result.balance)
-
-        if result.applied and WELCOME_BONUS > 0:
-            log_evt("bonus_granted", user_id=uid, amount=WELCOME_BONUS)
-            if chat_id is not None and not ctx.user_data.get("welcome_bonus_announced"):
-                try:
-                    await safe_send_text(
-                        ctx.bot,
-                        chat_id,
-                        f"🎁 <b>Добро пожаловать!</b> Начислил <b>+{WELCOME_BONUS}💎</b> на баланс.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception as exc:  # pragma: no cover - telegram transient errors
-                    log.warning(
-                        "welcome_bonus_notify_failed | user_id=%s err=%s",
-                        uid,
-                        exc,
-                    )
-                else:
-                    ctx.user_data["welcome_bonus_announced"] = True
-
-        ctx.user_data["welcome_bonus_checked"] = True
-        return result
-    except Exception as exc:  # pragma: no cover - defensive fallback
-        log.exception("welcome_bonus_failed | user_id=%s err=%s", uid, exc)
-        return cached
-
-
 async def welcome_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await _ensure_welcome_bonus(update, ctx)
+    await ensure_signup_bonus(update, ctx)
 
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    uid = update.effective_user.id if update.effective_user else None
+    user = update.effective_user
+    uid = user.id if user else None
 
-    bonus_result = await _ensure_welcome_bonus(update, ctx)
-
+    bonus_granted = await ensure_signup_bonus(update, ctx)
     await _handle_referral_deeplink(update, ctx)
 
-    if uid is not None:
-        balance_to_show: Optional[int]
-        if bonus_result is not None:
-            balance_to_show = bonus_result.balance
-        else:
-            balance_to_show = None
-        if not ctx.user_data.get("welcome_bonus_announced"):
-            if balance_to_show is None:
-                balance_to_show = _safe_get_balance(uid)
-            if update.message is not None and balance_to_show is not None:
-                try:
-                    await update.message.reply_text(f"💎 Ваш баланс: {balance_to_show}")
-                except Exception as exc:
-                    log.warning("welcome_balance_notify_failed | user_id=%s err=%s", uid, exc)
-                else:
-                    ctx.user_data["welcome_bonus_announced"] = True
-            _set_cached_balance(ctx, balance_to_show or 0)
+    if uid is not None and not bonus_granted:
+        _set_cached_balance(ctx, _safe_get_balance(uid))
 
     await handle_menu(update, ctx)
 
 
-async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_menu(update, ctx)
 
 
@@ -9362,54 +9360,6 @@ async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def lang_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ensure_user_record(update)
-    query = update.callback_query
-    user = update.effective_user
-    if query is None or user is None or not query.data:
-        return
-
-    code = query.data.partition(":")[2].strip().lower()
-    if code not in LANGUAGE_LABELS:
-        with suppress(BadRequest):
-            await query.answer("Неизвестный язык", show_alert=True)
-        return
-
-    set_user_preferred_language(user.id, code)
-    ctx.user_data["preferred_language"] = code
-
-    text = _build_language_message(code)
-    keyboard = _language_keyboard(code)
-
-    message = query.message
-    if message is not None:
-        try:
-            await message.edit_text(
-                text,
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                log.debug(
-                    "lang.edit_failed | user=%s chat=%s err=%s",
-                    user.id,
-                    message.chat_id,
-                    exc,
-                )
-        except TelegramError as exc:
-            log.warning(
-                "lang.edit_failed | user=%s chat=%s err=%s",
-                user.id,
-                message.chat_id,
-                exc,
-            )
-
-    try:
-        await query.answer(f"Язык: {LANGUAGE_LABELS[code]}")
-    except Exception as exc:
-        log.debug("lang.answer_failed | user=%s err=%s", user.id, exc)
 
 def _support_contact_url() -> str:
     if SUPPORT_USER_ID > 0:
@@ -9462,7 +9412,7 @@ async def support_new_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     if query is None:
         return
-    await _ensure_welcome_bonus(update, ctx)
+    await ensure_signup_bonus(update, ctx)
     with suppress(BadRequest):
         await query.answer()
     await _prompt_support_ticket(update, ctx, source="callback")
@@ -9572,7 +9522,7 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
         return
-    await _ensure_welcome_bonus(update, ctx)
+    await ensure_signup_bonus(update, ctx)
     await message.reply_text(
         HELP_TEXT,
         reply_markup=support_keyboard(),
@@ -9588,7 +9538,7 @@ async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 async def support_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await _ensure_welcome_bonus(update, ctx)
+    await ensure_signup_bonus(update, ctx)
     await _prompt_support_ticket(update, ctx, source="command")
 
 
@@ -9733,6 +9683,96 @@ async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
     balance = _safe_get_balance(user.id)
     await message.reply_text(f"💎 Ваш баланс: {balance}")
+
+
+MAIN_ACTIONS: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]] = {
+    "video": video_command,
+    "image": image_command,
+    "music": suno_command,
+    "prompt": prompt_master_command,
+    "chat": chat_command,
+    "balance": my_balance_command,
+}
+
+
+async def on_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    data = (query.data or "").strip()
+    prefix, _, action_value = data.partition(":")
+    action_value = action_value.strip().lower()
+
+    if prefix == "act":
+        if action_value == "menu":
+            await handle_menu(update, ctx)
+            return
+
+        handler = MAIN_ACTIONS.get(action_value)
+        with suppress(BadRequest):
+            await query.answer()
+
+        if handler is None:
+            return
+
+        await handler(update, ctx)
+        return
+
+    if prefix == "lang":
+        user = update.effective_user
+        if user is None or action_value not in LANGUAGE_LABELS:
+            with suppress(BadRequest):
+                await query.answer("Неизвестный язык", show_alert=True)
+            return
+
+        set_user_preferred_language(user.id, action_value)
+        ctx.user_data["preferred_language"] = action_value
+
+        message = query.message
+        menu_message_id = state(ctx).get("last_ui_msg_id_menu")
+        triggered_from_menu = (
+            isinstance(menu_message_id, int)
+            and message is not None
+            and message.message_id == menu_message_id
+        )
+
+        if triggered_from_menu:
+            await render_main_menu(update, ctx, edit=True)
+        elif message is not None:
+            text = _build_language_message(action_value)
+            keyboard = _language_keyboard(action_value)
+            try:
+                await message.edit_text(
+                    text,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    log.debug(
+                        "lang.edit_failed | user=%s chat=%s err=%s",
+                        user.id,
+                        message.chat_id,
+                        exc,
+                    )
+            except TelegramError as exc:
+                log.warning(
+                    "lang.edit_failed | user=%s chat=%s err=%s",
+                    user.id,
+                    message.chat_id if message else None,
+                    exc,
+                )
+
+        with suppress(BadRequest):
+            await query.answer(f"Язык: {LANGUAGE_LABELS[action_value]}")
+        return
+
+    with suppress(BadRequest):
+        await query.answer()
 
 
 async def add_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12551,8 +12591,8 @@ class RedisRunnerLock:
         self._redis = None
 
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("start",), safe_handler(start)),
-    (("menu",), safe_handler(menu_command)),
+    (("start",), safe_handler(on_start)),
+    (("menu",), safe_handler(on_menu)),
     (("cancel",), safe_handler(cancel_command)),
     (("faq",), safe_handler(faq_command_entry)),
     (("prompt_master",), safe_handler(prompt_master_command)),
@@ -12589,17 +12629,16 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
+    (r"^(act|lang):", safe_handler(on_action)),
     (r"^pm:insert:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_insert_callback_entry)),
     (r"^pm:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
     (r"^pm:(back|menu|switch)$", safe_handler(prompt_master_callback_entry)),
     (r"^pm:copy:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
     (rf"^{CB_PM_PREFIX}", safe_handler(prompt_master_callback_entry)),
     (rf"^{CB_FAQ_PREFIX}", safe_handler(faq_callback_entry)),
-    (r"^lang:(ru|en)$", safe_handler(lang_callback)),
     (r"^support:new$", safe_handler(support_new_callback)),
     (r"^support_reply:\d+$", safe_handler(support_reply_callback)),
     (r"^hub:", safe_handler(hub_router)),
-    (r"^go:", safe_handler(main_suggest_router)),
     (None, safe_handler(on_callback)),
 ]
 
