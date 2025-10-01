@@ -42,12 +42,15 @@ def test_chat_and_prompt_master_handlers_registered() -> None:
     register_handlers(application)
 
     commands: set[str] = set()
+    command_handlers: Dict[str, CommandHandler] = {}
     callback_patterns: set[str] = set()
 
     for handlers in application.handlers.values():
         for handler in handlers:
             if isinstance(handler, CommandHandler):
                 commands.update(handler.commands)
+                for command_name in handler.commands:
+                    command_handlers[command_name] = handler
             pattern = getattr(handler, "pattern", None)
             if pattern is None:
                 continue
@@ -68,9 +71,26 @@ def test_chat_and_prompt_master_handlers_registered() -> None:
         "buy",
         "lang",
         "help",
+        "faq",
+        "my_balance",
     }
     missing = expected_commands - commands
     assert not missing, f"commands not registered: {sorted(missing)}"
+
+    def has_state_reset(callback) -> bool:
+        seen = set()
+        current = callback
+        while current and current not in seen:
+            if getattr(current, "__with_state_reset__", False):
+                return True
+            seen.add(current)
+            current = getattr(current, "__wrapped__", None)
+        return False
+
+    for command_name in expected_commands:
+        handler = command_handlers.get(command_name)
+        assert handler is not None, f"handler missing for /{command_name}"
+        assert has_state_reset(handler.callback), f"/{command_name} must reset state"
 
     assert any(pattern.startswith("^pm:") for pattern in callback_patterns)
     assert "^hub:.*" in callback_patterns

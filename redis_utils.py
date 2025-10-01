@@ -192,6 +192,51 @@ async def clear_wait_flags(r: Any, user_id: int, prefix: str) -> int:
     return await redis_delete_keys(r, [pattern])
 
 
+async def clear_all_waits(r: Any, user_id: int, prefix: Optional[str] = None) -> int:
+    """Remove all ``wait`` and ``fsm`` flags for ``user_id``.
+
+    Parameters
+    ----------
+    r:
+        Redis client (sync or async) used for deleting keys.
+    user_id:
+        Telegram user identifier. Non-positive and invalid values are ignored.
+    prefix:
+        Optional Redis key prefix. Defaults to :data:`settings.REDIS_PREFIX`.
+
+    Returns
+    -------
+    int
+        Number of keys removed from Redis.
+    """
+
+    if not r:
+        return 0
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return 0
+
+    if uid <= 0:
+        return 0
+
+    effective_prefix = str(prefix or _PFX).strip() or _PFX
+    patterns = [
+        f"{effective_prefix}:wait:{uid}:*",
+        f"{effective_prefix}:fsm:{uid}:*",
+    ]
+
+    deleted = await redis_delete_keys(r, patterns)
+    _logger.debug(
+        "cleared %s wait/fsm keys (user=%s prefix=%s)",
+        deleted,
+        uid,
+        effective_prefix,
+    )
+    return deleted
+
+
 async def set_wait_flag(
     r: Any,
     user_id: int,

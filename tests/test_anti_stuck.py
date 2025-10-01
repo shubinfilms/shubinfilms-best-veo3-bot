@@ -33,13 +33,13 @@ def test_menu_command_clears_wait_flags(monkeypatch):
         args=[],
     )
 
-    clear_calls: list[tuple[object, int, str]] = []
+    clear_calls: list[tuple[object, int, str | None]] = []
 
-    async def fake_clear(redis_client, user_id, prefix):
+    async def fake_clear(redis_client, user_id, *, prefix=None):
         clear_calls.append((redis_client, user_id, prefix))
         return 1
 
-    monkeypatch.setattr(telegram_utils, "clear_wait_flags", fake_clear)
+    monkeypatch.setattr(telegram_utils, "clear_all_waits", fake_clear)
 
     handler = telegram_utils.with_state_reset(bot_module.on_menu)
     update = _make_update(user_id=111, chat_id=777, text="/menu")

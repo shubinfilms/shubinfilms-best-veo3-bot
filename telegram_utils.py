@@ -24,7 +24,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
-from redis_utils import redis_delete_keys
+from redis_utils import clear_all_waits
 from settings import REDIS_PREFIX
 
 log = logging.getLogger("telegram.utils")
@@ -130,13 +130,15 @@ async def reset_user_state(update: Any = None, context: Any = None) -> int:
             redis_client = candidate.get("redis") if redis_client is None else redis_client
             redis_prefix = candidate.get("redis_prefix", redis_prefix)
 
-    patterns = [
-        f"{redis_prefix}:wait:{user_id}:*",
-        f"{redis_prefix}:fsm:{user_id}:*",
-    ]
-
-    deleted = await redis_delete_keys(redis_client, patterns) if redis_client else 0
-    BOT_LOG.debug("state.reset | user=%s deleted=%s", user_id, deleted)
+    deleted = 0
+    if redis_client:
+        deleted = await clear_all_waits(redis_client, user_id, prefix=redis_prefix)
+        BOT_LOG.debug(
+            "state.reset | user=%s deleted=%s prefix=%s",
+            user_id,
+            deleted,
+            redis_prefix,
+        )
     _purge_wait_hints(context)
     return deleted
 
@@ -145,6 +147,9 @@ def with_state_reset(
     handler: Callable[[Any, Any], Awaitable[Any]]
 ) -> Callable[[Any, Any], Awaitable[Any]]:
     """Wrap ``handler`` to reset wait-state flags and provide unified error handling."""
+
+    if getattr(handler, "__with_state_reset__", False):
+        return handler
 
     @wraps(handler)
     async def wrapped(update: Any, context: Any, *args: Any, **kwargs: Any) -> Any:
@@ -162,12 +167,15 @@ def with_state_reset(
                 except Exception:
                     logger.debug("callback.answer_failed", exc_info=True)
 
+        cleared = 0
         try:
-            await reset_user_state(update, context)
+            cleared = await reset_user_state(update, context)
         except Exception:
             logger.warning("state_reset_failed", exc_info=True)
 
         user_id = extract_user_id(update, context)
+        if cleared > 0:
+            BOT_LOG.info("cleared %s wait/fsm keys (user=%s)", cleared, user_id)
         BOT_LOG.debug("handler.invoke | name=%s user=%s", getattr(handler, "__name__", "handler"), user_id)
 
         try:
