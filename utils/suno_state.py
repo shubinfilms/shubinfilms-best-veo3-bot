@@ -16,7 +16,7 @@ from utils.suno_modes import get_mode_config as get_suno_mode_config
 TITLE_MAX_LENGTH = 300
 STYLE_MAX_LENGTH = 500
 LYRICS_MAX_LENGTH = 2000
-LYRICS_PREVIEW_LIMIT = 80
+LYRICS_PREVIEW_LIMIT = 140
 _STORAGE_KEY = "suno_state"
 
 
