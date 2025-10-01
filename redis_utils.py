@@ -192,22 +192,22 @@ async def clear_wait_flags(r: Any, user_id: int, prefix: str) -> int:
     return await redis_delete_keys(r, [pattern])
 
 
-async def clear_all_waits(r: Any, user_id: int, prefix: Optional[str] = None) -> int:
-    """Remove all ``wait`` and ``fsm`` flags for ``user_id``.
+async def reset_user_state(r: Any, prefix: str, user_id: int) -> int:
+    """Remove wait/fsm/signup bonus markers for ``user_id`` under ``prefix``.
 
     Parameters
     ----------
     r:
-        Redis client (sync or async) used for deleting keys.
+        Redis client (sync or async).
+    prefix:
+        Redis key prefix (e.g. ``"veo3:prod"``).
     user_id:
         Telegram user identifier. Non-positive and invalid values are ignored.
-    prefix:
-        Optional Redis key prefix. Defaults to :data:`settings.REDIS_PREFIX`.
 
     Returns
     -------
     int
-        Number of keys removed from Redis.
+        Number of keys removed.
     """
 
     if not r:
@@ -224,16 +224,149 @@ async def clear_all_waits(r: Any, user_id: int, prefix: Optional[str] = None) ->
     effective_prefix = str(prefix or _PFX).strip() or _PFX
     patterns = [
         f"{effective_prefix}:wait:{uid}:*",
+        f"{effective_prefix}:wait:*:{uid}:*",
         f"{effective_prefix}:fsm:{uid}:*",
+        f"{effective_prefix}:signup_bonus:{uid}",
     ]
 
-    deleted = await redis_delete_keys(r, patterns)
-    _logger.debug(
-        "cleared %s wait/fsm keys (user=%s prefix=%s)",
-        deleted,
-        uid,
-        effective_prefix,
-    )
+    total_deleted = 0
+    for pattern in patterns:
+        if not pattern:
+            continue
+        keys: list[str] = []
+        iscan = getattr(r, "iscan", None)
+        if callable(iscan):
+            try:
+                iterator = iscan(match=pattern)
+                if inspect.isasyncgen(iterator):
+                    async for key in iterator:
+                        if isinstance(key, bytes):
+                            key = key.decode()
+                        keys.append(str(key))
+                elif inspect.isgenerator(iterator):
+                    keys.extend(str(k.decode() if isinstance(k, bytes) else k) for k in iterator)
+                elif inspect.isawaitable(iterator):
+                    awaited = await iterator
+                    if isinstance(awaited, tuple) and len(awaited) == 2:
+                        _, batch = awaited
+                        iterable = batch
+                    else:
+                        iterable = awaited
+                    keys.extend(
+                        str(k.decode() if isinstance(k, bytes) else k)
+                        for k in (iterable or [])
+                    )
+                else:
+                    target = iterator
+                    if isinstance(target, tuple) and len(target) == 2:
+                        _, batch = target
+                        target = batch
+                    keys.extend(
+                        str(k.decode() if isinstance(k, bytes) else k)
+                        for k in (target or [])
+                    )
+            except Exception:
+                _logger.debug("reset_user_state.iscan_failed | pattern=%s", pattern, exc_info=True)
+
+        if not keys:
+            keys = await _gather_keys(r, pattern)
+
+        total_deleted += await _delete_keys(r, keys)
+
+    if total_deleted:
+        _logger.debug(
+            "reset_user_state.cleared | prefix=%s user=%s deleted=%s",
+            effective_prefix,
+            uid,
+            total_deleted,
+        )
+    return total_deleted
+
+
+async def clear_all_waits(r: Any, user_id: int, prefix: Optional[str] = None) -> int:
+    """Backward-compatible wrapper for :func:`reset_user_state`."""
+
+    effective_prefix = str(prefix or _PFX).strip() or _PFX
+    return await reset_user_state(r, effective_prefix, user_id)
+
+
+async def _ttl_seconds(r: Any, key: str) -> Optional[float]:
+    if not r or not key:
+        return None
+
+    ttl_value: Optional[float] = None
+
+    used_attr: Optional[str] = None
+    for attr in ("pttl", "ttl"):
+        getter = getattr(r, attr, None)
+        if not callable(getter):
+            continue
+        try:
+            if inspect.iscoroutinefunction(getter):
+                ttl_value = await getter(key)  # type: ignore[assignment]
+            else:
+                ttl_value = await asyncio.to_thread(getter, key)
+        except Exception:
+            continue
+        else:
+            used_attr = attr
+            break
+
+    if ttl_value is None:
+        return None
+
+    try:
+        ttl_float = float(ttl_value)
+    except (TypeError, ValueError):
+        return None
+
+    if ttl_float < 0:
+        # Redis returns -1 (no expiry) and -2 (missing key). Treat both as stale.
+        return ttl_float
+
+    if used_attr == "pttl":
+        ttl_float /= 1000.0
+
+    return ttl_float
+
+
+async def cleanup_stale_waits(
+    r: Any,
+    prefix: str,
+    *,
+    max_ttl_seconds: int = 900,
+) -> int:
+    """Remove ``wait`` keys that appear to be stuck (TTL too large or missing)."""
+
+    if not r:
+        return 0
+
+    effective_prefix = str(prefix or _PFX).strip() or _PFX
+    pattern = f"{effective_prefix}:wait:*"
+
+    keys = await _gather_keys(r, pattern)
+    if not keys:
+        return 0
+
+    stale: list[str] = []
+    for key in keys:
+        ttl = await _ttl_seconds(r, key)
+        if ttl is None:
+            continue
+        if ttl < 0 or ttl > max_ttl_seconds:
+            stale.append(key)
+
+    if not stale:
+        return 0
+
+    deleted = await _delete_keys(r, stale)
+    if deleted:
+        _logger.debug(
+            "wait.cleanup | prefix=%s deleted=%s threshold=%s",
+            effective_prefix,
+            deleted,
+            max_ttl_seconds,
+        )
     return deleted
 
 
