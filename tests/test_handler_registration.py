@@ -58,7 +58,23 @@ def test_chat_and_prompt_master_handlers_registered() -> None:
 
     assert "chat" in commands
     assert "prompt_master" in commands
+
+    expected_commands = {
+        "start",
+        "menu",
+        "video",
+        "image",
+        "music",
+        "buy",
+        "lang",
+        "help",
+        "faq",
+    }
+    missing = expected_commands - commands
+    assert not missing, f"commands not registered: {sorted(missing)}"
+
     assert any(pattern.startswith("^pm:") for pattern in callback_patterns)
+    assert any("hub" in pattern and pattern.startswith("^(?:hub") for pattern in callback_patterns)
 
 
 def test_reply_button_routes_match_expected() -> None:

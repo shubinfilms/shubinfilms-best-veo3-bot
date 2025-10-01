@@ -73,6 +73,10 @@ _ref_joined_memory: Dict[int, float] = {}
 _user_profile_lock = Lock()
 _user_profile_memory: Dict[int, Dict[str, str]] = {}
 
+_wait_lock = Lock()
+_wait_memory: Dict[str, float] = {}
+_WAIT_TTL_DEFAULT = 15 * 60
+
 if not _redis_url:
     _logger.warning(
         "REDIS_URL is not configured; falling back to in-memory task-meta store"
@@ -109,6 +113,67 @@ def _memory_get(key: str) -> Optional[str]:
 def _memory_delete(key: str) -> None:
     with _memory_lock:
         _memory_store.pop(key, None)
+
+
+def wait_key(user_id: int) -> str:
+    """Return the base Redis key for wait flags for ``user_id``."""
+
+    return f"{_PFX}:wait:{int(user_id)}"
+
+
+def _wait_entry_key(user_id: int, kind: str) -> str:
+    normalized = str(kind or "").strip() or "default"
+    return f"{wait_key(user_id)}:{normalized}"
+
+
+def wait_set(user_id: int, kind: str, *, ttl: int = _WAIT_TTL_DEFAULT) -> None:
+    """Store a wait flag for ``user_id`` and ``kind``."""
+
+    key = _wait_entry_key(user_id, kind)
+    ttl = max(int(ttl or _WAIT_TTL_DEFAULT), 1)
+    if _r:
+        try:
+            _r.setex(key, ttl, "1")
+            return
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _logger.warning("wait_set.redis_failed | user=%s kind=%s err=%s", user_id, kind, exc)
+    expires_at = time.time() + ttl
+    with _wait_lock:
+        _wait_memory[key] = expires_at
+
+
+def wait_clear(user_id: int) -> int:
+    """Remove all wait flags for ``user_id``. Returns the number of deleted keys."""
+
+    base = wait_key(user_id)
+    pattern = f"{base}:*"
+    removed = 0
+    if _r:
+        try:
+            cursor = 0
+            keys: list[str] = []
+            while True:
+                cursor, batch = _r.scan(cursor=cursor, match=pattern, count=64)
+                if batch:
+                    keys.extend(batch)
+                if cursor == 0:
+                    break
+            if keys:
+                removed = _r.delete(*keys) or 0
+            return int(removed)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _logger.warning("wait_clear.redis_failed | user=%s err=%s", user_id, exc)
+    with _wait_lock:
+        expired_keys = [key for key in _wait_memory if key.startswith(pattern[:-1])]
+        for key in expired_keys:
+            _wait_memory.pop(key, None)
+        removed = len(expired_keys)
+    with _memory_lock:
+        stale = [key for key in _memory_store if key.startswith(pattern[:-1])]
+        for key in stale:
+            _memory_store.pop(key, None)
+        removed += len(stale)
+    return removed
 
 
 def save_task_meta(

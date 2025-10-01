@@ -38,13 +38,13 @@ def _assert_main_menu_payload(payload: dict, expected_balance: int) -> None:
     markup = payload["reply_markup"]
     rows = markup.inline_keyboard
     assert [[btn.callback_data for btn in row] for row in rows] == [
-        ["menu:video"],
-        ["menu:image"],
-        ["menu:music"],
-        ["menu:buy"],
-        ["menu:lang"],
-        ["menu:help"],
-        ["menu:faq"],
+        ["hub:video"],
+        ["hub:image"],
+        ["hub:music"],
+        ["hub:buy"],
+        ["hub:lang"],
+        ["hub:help"],
+        ["hub:faq"],
     ]
 
 

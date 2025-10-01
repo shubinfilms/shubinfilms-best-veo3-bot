@@ -191,22 +191,71 @@ def build_hub_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def send_html(bot, chat_id: int, text: str, **kwargs):
-    """Send an HTML-formatted message with sane defaults."""
+async def send_html(
+    target: Any,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    *,
+    bot: Any | None = None,
+    disable_web_page_preview: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Send a Telegram message rendered as HTML.
 
-    return await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        **kwargs,
-    )
+    The ``target`` argument can be a chat identifier, an ``Update`` object or a
+    PTB ``CallbackContext``.  When an integer is provided ``bot`` must also be
+    supplied.  This helper normalises parse mode and disables link previews by
+    default.
+    """
+
+    resolved_bot = None
+    chat_id = None
+
+    if hasattr(target, "bot") and hasattr(target, "application"):
+        resolved_bot = target.bot
+        chat = getattr(target, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+    elif hasattr(target, "bot") and bot is None:
+        resolved_bot = target.bot
+        chat_id = getattr(target, "chat_id", None)
+    elif hasattr(target, "send_message") and bot is None:
+        resolved_bot = target
+    elif isinstance(target, (int, str)):
+        chat_id = int(target)
+        resolved_bot = bot
+    else:
+        resolved_bot = bot
+
+    if resolved_bot is None:
+        raise ValueError("send_html requires a bot instance")
+
+    if chat_id is None:
+        chat_id = getattr(target, "chat_id", None)
+
+    if chat_id is None:
+        chat = getattr(target, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+
+    if chat_id is None:
+        raise ValueError("send_html requires a chat identifier")
+
+    payload = dict(kwargs)
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    payload.setdefault("parse_mode", ParseMode.HTML)
+    if disable_web_page_preview:
+        payload.setdefault("disable_web_page_preview", True)
+
+    return await resolved_bot.send_message(chat_id=chat_id, text=text, **payload)
 
 
-def escape(value: Optional[str]) -> str:
+def escape(value: str) -> str:
     """Escape ``value`` for safe HTML rendering without touching quotes."""
 
     return html.escape(value or "", quote=False)
+
+
 
 
 def _extract_status(exc: BaseException) -> Optional[int]:
