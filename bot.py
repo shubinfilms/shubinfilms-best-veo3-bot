@@ -2856,9 +2856,7 @@ _SUNO_WAIT_TO_FIELD = {
 _SUNO_PROMPTS = {
     "title": "Введите короткое название трека. Отправьте /cancel, чтобы остановить.",
     "style": "Опишите стиль/теги (например, „эмбиент, мягкие барабаны“). Отправьте /cancel, чтобы остановить.",
-    "lyrics": (
-        f"Пришлите текст песни (до {LYRICS_MAX_LENGTH} символов) или отправьте /skip, чтобы сгенерировать автоматически."
-    ),
+    "lyrics": "Пришлите текст песни сообщением.",
     "cover": f"Пришлите аудио-файл (mp3/wav, до {COVER_MAX_AUDIO_MB} МБ) или ссылку на аудио (http/https).",
 }
 
@@ -3249,8 +3247,7 @@ async def _handle_suno_waiting_input(
     if custom_reply:
         await _send_with_retry(lambda: message.reply_text(custom_reply))
 
-    if changed:
-        await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
+    await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
 
     if flow in {"instrumental", "lyrics", "cover"}:
         pending_step = current_step if isinstance(current_step, str) else None
@@ -5068,9 +5065,9 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 
 def _music_flow_steps(flow: str) -> list[str]:
     mapping = {
-        "instrumental": ["style", "title"],
-        "lyrics": ["style", "title", "lyrics"],
-        "cover": ["source", "style", "title"],
+        "instrumental": ["title", "style"],
+        "lyrics": ["title", "style", "lyrics"],
+        "cover": ["title", "source", "style"],
     }
     return mapping.get(flow, [])
 
@@ -5142,23 +5139,24 @@ def _music_step_prompt_text(
             current=current,
         )
     if step == "lyrics":
-        current = _suno_field_preview(suno_state, "lyrics")
         return t(
             "suno.prompt.step.lyrics",
             index=prompt_index,
             total=prompt_total,
-            current=current,
-            limit=LYRICS_MAX_LENGTH,
         )
     if step == "source":
-        current = _suno_field_preview(suno_state, "cover")
         return t(
             "suno.prompt.step.source",
             index=prompt_index,
             total=prompt_total,
-            current=current,
         )
     return t("suno.prompt.step.generic")
+
+
+def _music_should_skip_step(flow: str, step: str, suno_state: SunoState) -> bool:
+    if flow == "lyrics" and step == "lyrics" and suno_state.lyrics_source != LyricsSource.USER:
+        return True
+    return False
 
 
 def _music_wait_kind(step: str) -> Optional[WaitKind]:
@@ -5191,7 +5189,12 @@ async def _music_prompt_step(
     step: Optional[str],
     user_id: Optional[int],
 ) -> None:
-    if not step:
+    suno_state_obj = load_suno_state(ctx)
+    current_step = step
+    while current_step and _music_should_skip_step(flow, current_step, suno_state_obj):
+        current_step = _music_next_step(state_dict)
+
+    if not current_step:
         await tg_safe_send(
             ctx.bot.send_message,
             method_name="sendMessage",
@@ -5201,9 +5204,10 @@ async def _music_prompt_step(
         )
         return
 
-    index, total = _music_step_index(state_dict, step)
-    suno_state_obj = load_suno_state(ctx)
-    text = _music_step_prompt_text(flow, step, index, total, suno_state_obj)
+    state_dict["suno_step"] = current_step
+
+    index, total = _music_step_index(state_dict, current_step)
+    text = _music_step_prompt_text(flow, current_step, index, total, suno_state_obj)
     await tg_safe_send(
         ctx.bot.send_message,
         method_name="sendMessage",
@@ -5212,11 +5216,11 @@ async def _music_prompt_step(
         text=text,
     )
 
-    if flow == "cover" and step == "source":
+    if flow == "cover" and current_step == "source":
         state_dict["suno_waiting_state"] = WAIT_SUNO_REFERENCE
         return
 
-    wait_kind = _music_wait_kind(step)
+    wait_kind = _music_wait_kind(current_step)
     if wait_kind is not None:
         if wait_kind == WaitKind.SUNO_STYLE:
             waiting_value = WAIT_SUNO_STYLE
@@ -10349,24 +10353,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as exc:
                     log.warning(
                         "suno start sticker failed | user=%s chat=%s err=%s",
-                        uid,
-                        chat_id,
-                        exc,
-                    )
-
-            if emoji_msg_id is None:
-                fallback_emoji = START_EMOJI_FALLBACK or "🎬"
-                try:
-                    fallback_message = await safe_send_placeholder(
-                        ctx.bot,
-                        chat_id,
-                        fallback_emoji,
-                    )
-                    if fallback_message is not None:
-                        emoji_msg_id = getattr(fallback_message, "message_id", None)
-                except Exception as exc:
-                    log.warning(
-                        "suno start fallback emoji failed | user=%s chat=%s err=%s",
                         uid,
                         chat_id,
                         exc,

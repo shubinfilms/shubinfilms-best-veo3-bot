@@ -80,5 +80,5 @@ def test_cover_upload_stream_ok(monkeypatch):
         generating=False,
         waiting_enqueue=False,
     )
-    assert "загружено ✅ (id: kie-audio-999)" in text
+    assert "Источник: <i>🎧 Файл</i>" in text
     assert ready is True

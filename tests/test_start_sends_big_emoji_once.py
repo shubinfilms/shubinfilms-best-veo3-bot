@@ -68,7 +68,6 @@ def test_click_sends_correct_sticker_and_not_prinyato_again(monkeypatch):
     start_msg_id = _prepare_ready_context(ctx, chat_id, user_id)
 
     monkeypatch.setattr(bot_module, "START_EMOJI_STICKER_ID", "sticker-file-id")
-    monkeypatch.setattr(bot_module, "START_EMOJI_FALLBACK", "🎬")
 
     launch_calls: list[dict[str, object]] = []
 
@@ -155,7 +154,6 @@ def test_second_click_blocked(monkeypatch):
     start_msg_id = _prepare_ready_context(ctx, chat_id, user_id)
 
     monkeypatch.setattr(bot_module, "START_EMOJI_STICKER_ID", "sticker")
-    monkeypatch.setattr(bot_module, "START_EMOJI_FALLBACK", "🎬")
 
     async def fake_launch(*_args, **_kwargs):  # type: ignore[override]
         return None
@@ -192,7 +190,7 @@ def test_second_click_blocked(monkeypatch):
         assert msg_ids.get("suno_start") == start_msg_id
 
 
-def test_start_sticker_fallback_to_emoji(monkeypatch):
+def test_start_sticker_failure_no_fallback(monkeypatch):
     bot = FakeBot()
     ctx = SimpleNamespace(bot=bot, user_data={})
     chat_id = 333
@@ -200,7 +198,6 @@ def test_start_sticker_fallback_to_emoji(monkeypatch):
     _prepare_ready_context(ctx, chat_id, user_id)
 
     monkeypatch.setattr(bot_module, "START_EMOJI_STICKER_ID", "broken-sticker")
-    monkeypatch.setattr(bot_module, "START_EMOJI_FALLBACK", "🎬")
 
     async def fake_launch(*_args, **_kwargs):  # type: ignore[override]
         return None
@@ -227,9 +224,9 @@ def test_start_sticker_fallback_to_emoji(monkeypatch):
     assert not sticker_entries
 
     fallback_messages = [item for item in bot.sent if item.get("text") == "🎬"]
-    assert len(fallback_messages) == 1
+    assert not fallback_messages
 
     assert bot.edited, "start message should still be edited when sticker fails"
 
     suno_state_after = load_suno_state(ctx)
-    assert suno_state_after.start_emoji_msg_id == 100
+    assert suno_state_after.start_emoji_msg_id is None
