@@ -21,12 +21,9 @@ class DummyRedis:
     def __init__(self) -> None:
         self.storage: dict[str, str] = {}
 
-    def set(self, key: str, value: str, nx: bool = False):
-        if nx:
-            if key in self.storage:
-                return False
-            self.storage[key] = value
-            return True
+    def set(self, key: str, value: str, nx: bool = False, ex: int | None = None):
+        if nx and key in self.storage:
+            return False
         self.storage[key] = value
         return True
 
@@ -75,15 +72,21 @@ def test_bonus_once(monkeypatch):
     monkeypatch.setattr(bot_module, "redis_client", dummy_redis)
     monkeypatch.setattr(bot_module, "WELCOME_BONUS_ENABLED", True)
     monkeypatch.setattr(bot_module, "WELCOME_BONUS", 10)
+    monkeypatch.setattr(bot_module, "WELCOME_BONUS_AMOUNT", 10)
+    monkeypatch.setattr(bot_module, "_welcome_bonus_memory", {})
 
     granted_first = asyncio.run(bot_module.ensure_signup_bonus_once(ctx, user_id))
     granted_second = asyncio.run(bot_module.ensure_signup_bonus_once(ctx, user_id))
 
     assert granted_first is True
     assert granted_second is False
-    assert [msg["text"] for msg in bot.sent] == [
-        "🎁 Добро пожаловать! Начислил +10💎 на баланс."
-    ]
+    assert len(bot.sent) == 1
+    bonus_payload = bot.sent[0]
+    assert bonus_payload["chat_id"] == user_id
+    assert bonus_payload["text"] == "🎁 <b>Добро пожаловать!</b> Начислил <b>+10💎</b> на баланс."
+    parse_mode = bonus_payload.get("parse_mode")
+    parse_mode_value = getattr(parse_mode, "value", parse_mode)
+    assert parse_mode_value == "HTML"
     assert bot_module.ledger_storage.get_balance(user_id) == 10
 
 
@@ -102,16 +105,20 @@ def test_menu_command(monkeypatch):
     menu_messages = [
         payload
         for payload in bot.sent
-        if isinstance(payload, dict) and str(payload.get("text", "")).startswith("<b>⭐ Главное меню")
+        if isinstance(payload, dict)
+        and str(payload.get("text", "")).startswith("👋 Добро пожаловать!")
     ]
     assert menu_messages, "main menu message should be sent"
     markup = menu_messages[-1]["reply_markup"]
     rows = markup.inline_keyboard
     assert [[btn.callback_data for btn in row] for row in rows] == [
-        ["act:video", "act:image"],
-        ["act:music", "act:prompt"],
-        ["act:chat", "act:balance"],
-        ["lang:ru", "lang:en"],
+        ["menu:video"],
+        ["menu:image"],
+        ["menu:music"],
+        ["menu:buy"],
+        ["menu:lang"],
+        ["menu:help"],
+        ["menu:faq"],
     ]
 
 
@@ -121,6 +128,9 @@ def test_start_flow(monkeypatch):
 
     dummy_redis = DummyRedis()
     monkeypatch.setattr(bot_module, "redis_client", dummy_redis)
+    monkeypatch.setattr(bot_module, "WELCOME_BONUS", 10)
+    monkeypatch.setattr(bot_module, "WELCOME_BONUS_AMOUNT", 10)
+    monkeypatch.setattr(bot_module, "_welcome_bonus_memory", {})
 
     async def fake_hub(*_args, **_kwargs):
         return None
@@ -133,16 +143,22 @@ def test_start_flow(monkeypatch):
     bonus_messages = [
         payload
         for payload in bot.sent
-        if isinstance(payload, dict) and payload.get("text", "").startswith("🎁 Добро пожаловать!")
+        if isinstance(payload, dict)
+        and payload.get("text", "").startswith("🎁 <b>Добро пожаловать!</b>")
     ]
-    assert bonus_messages == [
-        {"chat_id": 9001, "text": "🎁 Добро пожаловать! Начислил +10💎 на баланс."}
-    ]
+    assert bonus_messages
+    bonus_payload = bonus_messages[0]
+    assert bonus_payload["chat_id"] == 9001
+    assert bonus_payload["text"] == "🎁 <b>Добро пожаловать!</b> Начислил <b>+10💎</b> на баланс."
+    parse_mode = bonus_payload.get("parse_mode")
+    parse_mode_value = getattr(parse_mode, "value", parse_mode)
+    assert parse_mode_value == "HTML"
 
     menu_messages = [
         payload
         for payload in bot.sent
-        if isinstance(payload, dict) and str(payload.get("text", "")).startswith("<b>⭐ Главное меню")
+        if isinstance(payload, dict)
+        and str(payload.get("text", "")).startswith("👋 Добро пожаловать!")
     ]
     assert len(menu_messages) == 1
 
@@ -151,13 +167,15 @@ def test_start_flow(monkeypatch):
     bonus_messages_after = [
         payload
         for payload in bot.sent
-        if isinstance(payload, dict) and payload.get("text", "").startswith("🎁 Добро пожаловать!")
+        if isinstance(payload, dict)
+        and payload.get("text", "").startswith("🎁 <b>Добро пожаловать!</b>")
     ]
     assert len(bonus_messages_after) == 1, "bonus should not be sent twice"
     menu_messages_after = [
         payload
         for payload in bot.sent
-        if isinstance(payload, dict) and str(payload.get("text", "")).startswith("<b>⭐ Главное меню")
+        if isinstance(payload, dict)
+        and str(payload.get("text", "")).startswith("👋 Добро пожаловать!")
     ]
     assert len(menu_messages_after) == 2
 
@@ -226,9 +244,15 @@ def test_html_escape(monkeypatch):
     bot = ctx.bot
     dummy_redis = DummyRedis()
     monkeypatch.setattr(bot_module, "redis_client", dummy_redis)
+    monkeypatch.setattr(bot_module, "WELCOME_BONUS", 10)
+    monkeypatch.setattr(bot_module, "WELCOME_BONUS_AMOUNT", 10)
+    monkeypatch.setattr(bot_module, "_welcome_bonus_memory", {})
 
     asyncio.run(bot_module.ensure_signup_bonus_once(ctx, 701))
 
-    assert bot.sent == [
-        {"chat_id": 701, "text": "🎁 Добро пожаловать! Начислил +10💎 на баланс."}
-    ]
+    assert bot.sent
+    payload = bot.sent[0]
+    assert payload["chat_id"] == 701
+    assert payload["text"] == "🎁 <b>Добро пожаловать!</b> Начислил <b>+10💎</b> на баланс."
+    parse_mode = payload.get("parse_mode")
+    assert getattr(parse_mode, "value", parse_mode) == "HTML"

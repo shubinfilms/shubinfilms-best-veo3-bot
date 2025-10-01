@@ -43,6 +43,8 @@ class _AppSettings(BaseModel):
     WELCOME_BONUS: int = Field(default=10, ge=0)
     WELCOME_BONUS_ENABLED: bool = Field(default=True)
     WELCOME_BONUS_REDIS_KEY: str = Field(default="user:{uid}:welcome_bonus_v1")
+    WELCOME_BONUS_AMOUNT: Optional[int] = Field(default=None)
+    WELCOME_BONUS_KEY_TTL_DAYS: Optional[int] = Field(default=None)
 
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
     KIE_API_KEY: Optional[str] = Field(default=None)
@@ -210,6 +212,18 @@ if _welcome_bonus_key_template.startswith(f"{REDIS_PREFIX}:"):
     WELCOME_BONUS_REDIS_KEY = _welcome_bonus_key_template
 else:
     WELCOME_BONUS_REDIS_KEY = f"{REDIS_PREFIX}:{_welcome_bonus_key_template}"
+
+WELCOME_BONUS_AMOUNT = int(
+    max(
+        0,
+        _APP_SETTINGS.WELCOME_BONUS_AMOUNT
+        if _APP_SETTINGS.WELCOME_BONUS_AMOUNT is not None
+        else WELCOME_BONUS,
+    )
+)
+WELCOME_BONUS_KEY_TTL_DAYS = int(
+    max(1, _APP_SETTINGS.WELCOME_BONUS_KEY_TTL_DAYS or 3650)
+)
 
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:

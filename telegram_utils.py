@@ -191,6 +191,24 @@ def build_hub_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+async def send_html(bot, chat_id: int, text: str, **kwargs):
+    """Send an HTML-formatted message with sane defaults."""
+
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        **kwargs,
+    )
+
+
+def escape(value: Optional[str]) -> str:
+    """Escape ``value`` for safe HTML rendering without touching quotes."""
+
+    return html.escape(value or "", quote=False)
+
+
 def _extract_status(exc: BaseException) -> Optional[int]:
     for attr in ("status_code", "code", "error_code"):
         value = getattr(exc, attr, None)
