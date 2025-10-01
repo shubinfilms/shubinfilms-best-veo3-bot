@@ -199,6 +199,10 @@ REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
 
+
+# Feature toggles
+WELCOME_BONUS_ENABLED = False
+
 def _strip_optional(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None

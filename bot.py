@@ -158,6 +158,7 @@ from redis_utils import (
     clear_task_meta,
     get_balance,
     get_ledger_count,
+    wait_clear,
     get_ledger_entries,
     get_all_user_ids,
     get_users_count,
@@ -1033,6 +1034,65 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
     wrapped = functools.wraps(callback)(_execute)
     setattr(wrapped, "__safe_handler_wrapped__", True)
     return wrapped
+
+
+def with_state_reset(
+    callback: Callable[[Optional[Update], Optional[ContextTypes.DEFAULT_TYPE]], Awaitable[Any]]
+) -> Callable[[Optional[Update], Optional[ContextTypes.DEFAULT_TYPE]], Awaitable[Any]]:
+    """Wrap a handler to clear wait flags and recover from failures."""
+
+    @functools.wraps(callback)
+    async def _wrapped(
+        update: Optional[Update],
+        ctx: Optional[ContextTypes.DEFAULT_TYPE],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        user_id: Optional[int] = None
+        if update is not None:
+            user = update.effective_user
+            if user is not None:
+                try:
+                    user_id = int(user.id)
+                except (TypeError, ValueError):
+                    user_id = None
+        if user_id is not None:
+            try:
+                await asyncio.to_thread(wait_clear, user_id)
+            except Exception:  # pragma: no cover - defensive logging
+                log.warning("wait_clear_failed", extra={"user_id": user_id}, exc_info=True)
+
+        try:
+            result = callback(update, ctx, *args, **kwargs)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - fallback to main menu
+            chat_id, fallback_user = _extract_update_entities(update)
+            log.exception(
+                "handler_state_reset_failed",
+                extra={"handler": getattr(callback, "__name__", repr(callback)), "chat_id": chat_id, "user_id": fallback_user},
+            )
+            if ctx is None:
+                return None
+            bot = getattr(ctx, "bot", None)
+            target_id = chat_id or fallback_user
+            if bot is not None and target_id is not None:
+                with suppress(Exception):
+                    await send_html(
+                        target_id,
+                        "Что-то пошло не так, вернулся в меню.",
+                        bot=bot,
+                    )
+            if chat_id is not None:
+                with suppress(Exception):
+                    await render_main_menu(chat_id, ctx, user_id=fallback_user)
+            return None
+
+    setattr(_wrapped, "__state_reset_wrapped__", True)
+    return _wrapped
 
 try:
     import telegram as _tg
@@ -3592,13 +3652,13 @@ def _chat_state_waiting_input(state_dict: Dict[str, Any]) -> bool:
 
 def main_suggest_kb(_current_language: str = "ru") -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🎬 Генерация видео", callback_data="menu:video")],
-        [InlineKeyboardButton("🎨 Генерация изображений", callback_data="menu:image")],
-        [InlineKeyboardButton("🎧 Генерация музыки", callback_data="menu:music")],
-        [InlineKeyboardButton("💎 Купить генерации", callback_data="menu:buy")],
-        [InlineKeyboardButton("🌐 Изменить язык", callback_data="menu:lang")],
-        [InlineKeyboardButton("🆘 Поддержка", callback_data="menu:help")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="menu:faq")],
+        [InlineKeyboardButton("🎬 Генерация видео", callback_data="hub:video")],
+        [InlineKeyboardButton("🎨 Генерация изображений", callback_data="hub:image")],
+        [InlineKeyboardButton("🎧 Генерация музыки", callback_data="hub:music")],
+        [InlineKeyboardButton("💎 Купить генерации", callback_data="hub:buy")],
+        [InlineKeyboardButton("🌐 Изменить язык", callback_data="hub:lang")],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="hub:help")],
+        [InlineKeyboardButton("❓ FAQ", callback_data="hub:faq")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -3651,7 +3711,7 @@ async def render_main_menu(
             log.warning("main_menu.edit_failed | chat=%s err=%s", chat_id, exc)
 
     try:
-        return await send_html(ctx.bot, chat_id, text, reply_markup=keyboard)
+        return await send_html(chat_id, text, reply_markup=keyboard, bot=ctx.bot)
     except Exception as exc:  # pragma: no cover - network issues
         log.warning("main_menu.send_failed | chat=%s err=%s", chat_id, exc)
         return None
@@ -3682,7 +3742,7 @@ async def _render_card(
             log.warning("card.edit_failed | chat=%s err=%s", chat_id, exc)
 
     try:
-        return await send_html(ctx.bot, chat_id, text, reply_markup=keyboard)
+        return await send_html(chat_id, text, reply_markup=keyboard, bot=ctx.bot)
     except Exception as exc:  # pragma: no cover - network issues
         log.warning("card.send_failed | chat=%s err=%s", chat_id, exc)
         return None
@@ -3702,7 +3762,7 @@ def _video_card_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🚀 Сгенерировать", callback_data="video:start")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
         ]
     )
 
@@ -3739,7 +3799,7 @@ def _image_card_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🖼 Midjourney", callback_data="img:midjourney")],
             [InlineKeyboardButton("🍌 Banana", callback_data="img:banana")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
         ]
     )
 
@@ -3774,7 +3834,7 @@ def _music_card_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🚀 Сгенерировать", callback_data="music:start")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
         ]
     )
 
@@ -3809,7 +3869,7 @@ def _buy_card_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("💳 Тарифы", callback_data="buy:plans")],
             [InlineKeyboardButton("🆘 Написать", url=SUPPORT_PUBLIC_URL)],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
         ]
     )
 
@@ -3845,7 +3905,7 @@ def _help_card_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("✉️ Написать в поддержку", url=SUPPORT_PUBLIC_URL)],
             [InlineKeyboardButton("🗂 Создать тикет", callback_data="help:ticket")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
         ]
     )
 
@@ -3879,7 +3939,7 @@ def _faq_card_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📚 Открыть FAQ", callback_data=f"{CB_FAQ_PREFIX}root")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
         ]
     )
 
@@ -3914,7 +3974,7 @@ def _lang_card_keyboard(current: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:set:ru")],
         [InlineKeyboardButton("🇬🇧 English", callback_data="lang:set:en")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
     ]
     mark = "✅"
     if current == "ru":
@@ -9228,7 +9288,7 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{diamonds}")]
         )
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -9411,17 +9471,30 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or query.data is None:
         return
+
+    data = (query.data or "").strip()
+    if ":" not in data:
+        return
+
+    prefix, _, value = data.partition(":")
+    if prefix not in {"hub", "menu"}:
+        return
+
+    section = value or "root"
+    if section == "back":
+        section = "root"
+
     await query.answer()
+
     chat = query.message.chat if query.message else update.effective_chat
     chat_id = chat.id if chat else _resolve_chat_id(update)
     if chat_id is None:
         return
-    data = query.data
-    _, _, value = data.partition(":")
-    section = value or "root"
-    user_id = await _reset_user_context(update, ctx, reason=f"menu:{section}")
+
+    user_id = await _reset_user_context(update, ctx, reason=f"hub:{section}")
     if user_id:
         set_mode(user_id, False)
+
     message = query.message
     if section == "root":
         await render_main_menu(chat_id, ctx, user_id=user_id, message=message, edit=True)
@@ -13037,30 +13110,34 @@ class RedisRunnerLock:
             pass
         self._redis = None
 
+def _reset_handler(callback: Any) -> Any:
+    return safe_handler(with_state_reset(callback))
+
+
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("start",), safe_handler(on_start)),
-    (("menu",), safe_handler(on_menu)),
+    (("start",), _reset_handler(on_start)),
+    (("menu",), _reset_handler(on_menu)),
     (("cancel",), safe_handler(cancel_command)),
-    (("faq",), safe_handler(on_faq)),
+    (("faq",), _reset_handler(on_faq)),
     (("prompt_master",), safe_handler(prompt_master_command)),
     (("pm_reset",), safe_handler(prompt_master_reset_command)),
     (("chat",), safe_handler(chat_command)),
     (("reset",), safe_handler(chat_reset_command)),
     (("history",), safe_handler(chat_history_command)),
-    (("image", "mj"), safe_handler(on_image)),
-    (("video", "veo"), safe_handler(on_video)),
-    (("music", "suno"), safe_handler(on_music)),
+    (("image", "mj"), _reset_handler(on_image)),
+    (("video", "veo"), _reset_handler(on_video)),
+    (("music", "suno"), _reset_handler(on_music)),
     (("balance",), safe_handler(balance_command)),
-    (("help",), safe_handler(on_help)),
+    (("help",), _reset_handler(on_help)),
     (("support",), safe_handler(support_command)),
 ]
 
 ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("buy",), safe_handler(on_buy)),
+    (("buy",), _reset_handler(on_buy)),
     (("suno_last",), safe_handler(suno_last_command)),
     (("suno_task",), safe_handler(suno_task_command)),
     (("suno_retry",), safe_handler(suno_retry_command)),
-    (("lang",), safe_handler(on_lang)),
+    (("lang",), _reset_handler(on_lang)),
     (("health",), safe_handler(health)),
     (("topup",), safe_handler(topup)),
     (("promo",), safe_handler(promo_command)),
@@ -13076,7 +13153,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (r"^menu:", safe_handler(cb_menu)),
+    (r"^(?:hub|menu):", _reset_handler(cb_menu)),
     (r"^video:", safe_handler(cb_video)),
     (r"^img:", safe_handler(cb_image)),
     (r"^music:", safe_handler(cb_music)),
@@ -13092,7 +13169,6 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_PM_PREFIX}", safe_handler(prompt_master_callback_entry)),
     (r"^support:new$", safe_handler(support_new_callback)),
     (r"^support_reply:\d+$", safe_handler(support_reply_callback)),
-    (r"^hub:", safe_handler(hub_router)),
     (None, safe_handler(on_callback)),
 ]
 
