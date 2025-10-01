@@ -158,7 +158,7 @@ from redis_utils import (
     clear_task_meta,
     get_balance,
     get_ledger_count,
-    wait_clear,
+    clear_wait as redis_clear_wait,
     get_ledger_entries,
     get_all_user_ids,
     get_users_count,
@@ -1010,6 +1010,25 @@ async def _handle_safe_handler_exception(
     await _notify_safe_handler_error(update, ctx)
 
 
+def _reset_context_wait_flags(ctx: Optional[ContextTypes.DEFAULT_TYPE]) -> None:
+    if ctx is None:
+        return
+
+    for attr in ("chat_data", "user_data"):
+        container = getattr(ctx, attr, None)
+        if not isinstance(container, MutableMapping):
+            continue
+        for key in list(container.keys()):
+            if not isinstance(key, str):
+                continue
+            lowered = key.lower()
+            if lowered in {"wait", "waiting", "wait_state", "waiting_state"}:
+                container.pop(key, None)
+                continue
+            if lowered.startswith("wait_") or lowered.startswith("_wait"):
+                container.pop(key, None)
+
+
 def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
     if getattr(callback, "__safe_handler_wrapped__", False):
         return callback  # type: ignore[return-value]
@@ -1058,9 +1077,11 @@ def with_state_reset(
                     user_id = None
         if user_id is not None:
             try:
-                await asyncio.to_thread(wait_clear, user_id)
+                await asyncio.to_thread(redis_clear_wait, user_id)
             except Exception:  # pragma: no cover - defensive logging
                 log.warning("wait_clear_failed", extra={"user_id": user_id}, exc_info=True)
+
+        _reset_context_wait_flags(ctx)
 
         try:
             result = callback(update, ctx, *args, **kwargs)
@@ -3655,7 +3676,7 @@ def main_suggest_kb(_current_language: str = "ru") -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎬 Генерация видео", callback_data="hub:video")],
         [InlineKeyboardButton("🎨 Генерация изображений", callback_data="hub:image")],
         [InlineKeyboardButton("🎧 Генерация музыки", callback_data="hub:music")],
-        [InlineKeyboardButton("💎 Купить генерации", callback_data="hub:buy")],
+        [InlineKeyboardButton("💎 Баланс", callback_data="hub:balance")],
         [InlineKeyboardButton("🌐 Изменить язык", callback_data="hub:lang")],
         [InlineKeyboardButton("🆘 Поддержка", callback_data="hub:help")],
         [InlineKeyboardButton("❓ FAQ", callback_data="hub:faq")],
@@ -3851,6 +3872,49 @@ async def render_music_card(
         ctx,
         _music_card_text(),
         _music_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _balance_card_text(balance: int) -> str:
+    return (
+        "<b>💎 Баланс</b>\n"
+        f"На счету: <b>{balance}💎</b>\n\n"
+        "Пополните баланс или вернитесь в главное меню."
+    )
+
+
+def _balance_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💳 Пополнить баланс", callback_data="hub:buy")],
+            [InlineKeyboardButton("🧾 История операций", callback_data="tx:open")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="hub:back")],
+        ]
+    )
+
+
+async def render_balance_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: Optional[int] = None,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    uid = user_id
+    if uid is None:
+        uid = get_user_id(ctx)
+        if uid is None:
+            uid = chat_id
+    balance = _safe_get_balance(uid)
+    _set_cached_balance(ctx, balance)
+    return await _render_card(
+        chat_id,
+        ctx,
+        _balance_card_text(balance),
+        _balance_card_keyboard(),
         message=message,
         edit=edit,
     )
@@ -9504,6 +9568,14 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await render_image_card(chat_id, ctx, message=message, edit=True)
     elif section == "music":
         await render_music_card(chat_id, ctx, message=message, edit=True)
+    elif section == "balance":
+        await render_balance_card(
+            chat_id,
+            ctx,
+            user_id=user_id,
+            message=message,
+            edit=True,
+        )
     elif section == "buy":
         await render_buy_card(chat_id, ctx, message=message, edit=True)
     elif section == "lang":

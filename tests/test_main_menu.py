@@ -41,7 +41,7 @@ def _assert_main_menu_payload(payload: dict, expected_balance: int) -> None:
         ["hub:video"],
         ["hub:image"],
         ["hub:music"],
-        ["hub:buy"],
+        ["hub:balance"],
         ["hub:lang"],
         ["hub:help"],
         ["hub:faq"],

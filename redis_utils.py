@@ -151,7 +151,7 @@ def wait_clear(user_id: int) -> int:
     if _r:
         try:
             cursor = 0
-            keys: list[str] = []
+            keys: List[str] = []
             while True:
                 cursor, batch = _r.scan(cursor=cursor, match=pattern, count=64)
                 if batch:
@@ -173,6 +173,57 @@ def wait_clear(user_id: int) -> int:
         for key in stale:
             _memory_store.pop(key, None)
         removed += len(stale)
+    return removed
+
+
+def clear_wait(user_id: int) -> int:
+    """Remove all wait-related keys for ``user_id`` across legacy patterns."""
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return 0
+
+    if uid <= 0:
+        return 0
+
+    removed = wait_clear(uid)
+
+    pattern = f"{_PFX}:wait:*:{uid}"
+    if _r:
+        try:
+            cursor = 0
+            keys: List[str] = []
+            while True:
+                cursor, batch = _r.scan(cursor=cursor, match=pattern, count=64)
+                if batch:
+                    keys.extend(batch)
+                if cursor == 0:
+                    break
+            if keys:
+                removed += _r.delete(*keys) or 0
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _logger.warning("clear_wait.redis_failed | user=%s err=%s", uid, exc)
+
+    suffix = f":{uid}"
+    prefix = f"{_PFX}:wait:"
+
+    with _wait_lock:
+        for key in list(_wait_memory.keys()):
+            if not key.startswith(prefix):
+                continue
+            if key.endswith(suffix):
+                _wait_memory.pop(key, None)
+                removed += 1
+
+    with _memory_lock:
+        for key in list(_memory_store.keys()):
+            if not key.startswith(prefix):
+                continue
+            if key.endswith(suffix):
+                _memory_store.pop(key, None)
+                removed += 1
+
     return removed
 
 
