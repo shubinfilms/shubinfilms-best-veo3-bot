@@ -1,7 +1,6 @@
 """Tests for Telegram handler registration and reply button wiring."""
 
 import asyncio
-import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -41,7 +40,6 @@ def _build_application():
     application = (
         ApplicationBuilder().token("123:ABC").rate_limiter(AIORateLimiter()).build()
     )
-    application.logger = logging.getLogger("test.bot")
     return application
 
 

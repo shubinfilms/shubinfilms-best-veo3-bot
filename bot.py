@@ -10,11 +10,13 @@ import logging
 import os
 import warnings
 
-from logging_utils import configure_logging, log_environment
+from logging_utils import configure_logging, get_logger, log_environment
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-logger = logging.getLogger(__name__)
+logger = get_logger("veo3-bot.bot")
+log = get_logger("veo3-bot")
+singleton_log = get_logger("veo3-bot.singleton")
 logging.basicConfig(level=logging.INFO)
 
 configure_logging("bot")
@@ -814,7 +816,7 @@ def _load_suno_config() -> SunoConfig:
         has_key=has_key,
     )
     if enabled:
-        logging.getLogger("veo3-bot").info(
+        log.info(
             "suno configuration",
             extra={
                 "meta": {
@@ -978,8 +980,6 @@ POLL_TIMEOUT_SECS  = int(_env("POLL_TIMEOUT_SECS", str(20 * 60)))
 KIE_STRICT_POLLING = _env("KIE_STRICT_POLLING", "false").lower() == "true"
 
 logging.getLogger("kie").setLevel(logging.INFO)
-log = logging.getLogger("veo3-bot")
-singleton_log = logging.getLogger("veo3-bot.singleton")
 
 _SAFE_HANDLER_ERROR_TEXT = "⚠️ Системная ошибка. Попробуйте ещё раз."
 
@@ -1074,7 +1074,7 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
             clean_name = command_name.lstrip("/") if isinstance(command_name, str) else command_name
             log.debug(
                 "command.dispatch",
-                extra={"name": clean_name, "user": user_id},
+                extra={"cmd_name": clean_name, "user_id": user_id},
             )
         if callback_data:
             bot_logger.debug("callback.dispatch | data=%s user=%s", callback_data, user_id)
