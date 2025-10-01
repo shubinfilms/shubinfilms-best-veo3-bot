@@ -116,6 +116,7 @@ class JsonFormatter(logging.Formatter):
 
 _CONFIGURED = False
 _CONFIG_LOCK = threading.Lock()
+_RECORD_FACTORY_INSTALLED = False
 
 
 def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
@@ -140,8 +141,8 @@ def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
     logger.info("environment", extra={"meta": {"env": safe_env}})
 
 
-class SafeLoggerAdapter(logging.LoggerAdapter):
-    """Logger adapter that shields reserved LogRecord fields."""
+class CtxLogger(logging.LoggerAdapter):
+    """Logger adapter that injects safe context fields into log records."""
 
     RESERVED = {
         "name",
@@ -166,45 +167,91 @@ class SafeLoggerAdapter(logging.LoggerAdapter):
         "stack_info",
     }
 
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[override]
-        """Drop or rename reserved keys from ``extra`` payloads."""
+    CONTEXT_FIELDS = ("cmd", "user_id", "chat_id", "state")
+
+    def process(
+        self,
+        msg: str,
+        kwargs: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:  # type: ignore[override]
+        """Sanitize ``extra`` payloads and enforce safe context keys."""
 
         combined: dict[str, Any] = {}
-        if self.extra:
+        if isinstance(self.extra, Mapping):
             combined.update(self.extra)
 
         call_extra = kwargs.get("extra")
         if isinstance(call_extra, Mapping):
             combined.update(call_extra)
         elif call_extra is not None:
-            combined["extra"] = call_extra
+            combined["meta"] = call_extra
 
         safe_extra: dict[str, Any] = {}
+        for field in self.CONTEXT_FIELDS:
+            safe_extra[field] = combined.get(field)
+
+        meta_payload: dict[str, Any] = {}
+        if "meta" in combined and isinstance(combined["meta"], Mapping):
+            meta_payload.update(combined["meta"])
+        elif "meta" in combined:
+            meta_payload["meta"] = combined["meta"]
+
         for key, value in combined.items():
-            safe_key = key if key not in self.RESERVED else f"extra_{key}"
+            if key in self.CONTEXT_FIELDS or key == "meta":
+                continue
+            safe_key = key
+            if safe_key in self.RESERVED or safe_key in self.CONTEXT_FIELDS:
+                safe_key = f"extra_{safe_key}"
             safe_extra[safe_key] = value
 
-        new_kwargs = dict(kwargs)
-        if safe_extra:
-            new_kwargs["extra"] = safe_extra
-        elif "extra" in new_kwargs:
-            new_kwargs.pop("extra", None)
+        if meta_payload:
+            safe_extra["meta"] = meta_payload
 
+        new_kwargs = dict(kwargs)
+        new_kwargs["extra"] = safe_extra
         return msg, new_kwargs
 
 
-def get_logger(name: str = "veo3-bot", *, extra: Optional[Mapping[str, Any]] = None) -> SafeLoggerAdapter:
-    """Return a :class:`SafeLoggerAdapter` for the requested logger name."""
+SafeLoggerAdapter = CtxLogger
+
+
+def _install_record_factory_defaults() -> None:
+    global _RECORD_FACTORY_INSTALLED
+    if _RECORD_FACTORY_INSTALLED:
+        return
+
+    _RECORD_FACTORY_INSTALLED = True
+    factory = logging.getLogRecordFactory()
+
+    def _factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = factory(*args, **kwargs)
+        for field in CtxLogger.CONTEXT_FIELDS:
+            if not hasattr(record, field):
+                setattr(record, field, None)
+        if not hasattr(record, "meta"):
+            setattr(record, "meta", None)
+        return record
+
+    logging.setLogRecordFactory(_factory)
+
+
+def get_logger(name: str = "veo3-bot", *, extra: Optional[Mapping[str, Any]] = None) -> CtxLogger:
+    """Return a :class:`CtxLogger` for the requested logger name."""
 
     base_extra = dict(extra or {})
-    return SafeLoggerAdapter(logging.getLogger(name), base_extra)
+    return CtxLogger(logging.getLogger(name), base_extra)
 
 
 def configure_logging(app_name: str) -> None:
     """Configure root logging to emit JSON logs with secret redaction."""
 
     if not LOG_JSON:
-        logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+        logging.basicConfig(
+            level=getattr(logging, LOG_LEVEL, logging.INFO),
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s | "
+            "cmd=%(cmd)s user_id=%(user_id)s chat_id=%(chat_id)s state=%(state)s",
+        )
+        _install_record_factory_defaults()
         return
 
     global _CONFIGURED
@@ -224,10 +271,12 @@ def configure_logging(app_name: str) -> None:
         for noisy in ("httpx", "urllib3", "aiogram", "telegram", "uvicorn", "gunicorn", "pydantic"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
         _CONFIGURED = True
+        _install_record_factory_defaults()
 
 
 __all__ = [
     "JsonFormatter",
+    "CtxLogger",
     "SafeLoggerAdapter",
     "configure_logging",
     "get_logger",

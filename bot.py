@@ -17,7 +17,6 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 logger = get_logger("veo3-bot.bot")
 log = get_logger("veo3-bot")
 singleton_log = get_logger("veo3-bot.singleton")
-logging.basicConfig(level=logging.INFO)
 
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
@@ -981,7 +980,7 @@ KIE_STRICT_POLLING = _env("KIE_STRICT_POLLING", "false").lower() == "true"
 
 logging.getLogger("kie").setLevel(logging.INFO)
 
-_SAFE_HANDLER_ERROR_TEXT = "⚠️ Системная ошибка. Попробуйте ещё раз."
+_SAFE_HANDLER_ERROR_TEXT = "⚠️ Сбой обработчика. Попробуйте ещё раз."
 
 
 def _extract_update_entities(update: Optional[Update]) -> tuple[Optional[int], Optional[int]]:
@@ -992,6 +991,59 @@ def _extract_update_entities(update: Optional[Update]) -> tuple[Optional[int], O
     chat_id = chat.id if chat else (user.id if user else None)
     user_id = user.id if user else None
     return (chat_id, user_id)
+
+
+def _build_log_extra(
+    update: Optional[Update],
+    *,
+    cmd: Optional[str] = None,
+    meta: Optional[Mapping[str, Any]] = None,
+    **fields: Any,
+) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+
+    if update is not None:
+        user = getattr(update, "effective_user", None)
+        chat = getattr(update, "effective_chat", None)
+        if user is not None and getattr(user, "id", None) is not None:
+            extra["user_id"] = user.id
+        if chat is not None and getattr(chat, "id", None) is not None:
+            extra["chat_id"] = chat.id
+
+        message = getattr(update, "effective_message", None)
+        message_cmd = None
+        if message is not None:
+            text = getattr(message, "text", None)
+            if isinstance(text, str) and text.startswith("/"):
+                message_cmd = text.split()[0].lstrip("/")
+        if cmd is None and message_cmd:
+            cmd = message_cmd
+
+        query = getattr(update, "callback_query", None)
+        if query is not None and getattr(query, "data", None):
+            data_preview = str(query.data)[:64]
+            extra.setdefault("meta", {})["callback_data"] = data_preview
+
+    if cmd is not None:
+        extra["cmd"] = cmd
+
+    if meta is not None:
+        if isinstance(meta, Mapping):
+            extra.setdefault("meta", {}).update(meta)
+        else:
+            extra["meta"] = meta
+
+    if "meta" in fields:
+        value = fields.pop("meta")
+        if isinstance(value, Mapping):
+            extra.setdefault("meta", {}).update(value)
+        else:
+            extra["meta"] = value
+
+    for key, value in fields.items():
+        extra[key] = value
+
+    return extra
 
 
 async def _notify_safe_handler_error(
@@ -1030,10 +1082,13 @@ async def _handle_safe_handler_exception(
     ctx: Optional[ContextTypes.DEFAULT_TYPE],
 ) -> None:
     handler_name = getattr(callback, "__name__", repr(callback))
-    chat_id, user_id = _extract_update_entities(update)
     log.exception(
         "handler_failed",
-        extra={"handler": handler_name, "chat_id": chat_id, "user_id": user_id},
+        extra=_build_log_extra(
+            update,
+            handler=handler_name,
+            meta={"exc": repr(exc)},
+        ),
     )
     await _notify_safe_handler_error(update, ctx)
 
@@ -1072,10 +1127,7 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
             bot_logger.debug("update.received | type=%s user=%s", update_type, user_id)
         if command_name:
             clean_name = command_name.lstrip("/") if isinstance(command_name, str) else command_name
-            log.debug(
-                "command.dispatch",
-                extra={"cmd_name": clean_name, "user_id": user_id},
-            )
+            log.debug("command.dispatch", extra=_build_log_extra(update, cmd=clean_name))
         if callback_data:
             bot_logger.debug("callback.dispatch | data=%s user=%s", callback_data, user_id)
 
@@ -10660,7 +10712,15 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await message.reply_text(final_text)
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error: %s", context.error)
+    error_obj = getattr(context, "error", None)
+    extra_meta: Optional[dict[str, Any]] = None
+    if error_obj is not None:
+        extra_meta = {"error": repr(error_obj)}
+
+    log.exception(
+        "handler.error",
+        extra=_build_log_extra(update, meta=extra_meta),
+    )
 
     user_id: Optional[int] = None
     chat_id: Optional[int] = None
@@ -10686,7 +10746,7 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
         try:
             await context.bot.send_message(
                 target,
-                "⚠️ <b>Системная ошибка.</b> Попробуйте ещё раз.",
+                _SAFE_HANDLER_ERROR_TEXT,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
