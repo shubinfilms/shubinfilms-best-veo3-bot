@@ -120,7 +120,7 @@ def test_handle_voice_success(monkeypatch, bot_module):
     async def fake_safe_edit(bot, chat_id, message_id, text):
         edits.append(text)
 
-    async def fake_safe_send_text(bot, chat_id, text):
+    async def fake_safe_send_text(bot, chat_id, text, **kwargs):
         sends.append(text)
 
     async def fake_run_ffmpeg(data, args):

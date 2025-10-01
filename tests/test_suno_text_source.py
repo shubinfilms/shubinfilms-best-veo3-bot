@@ -58,6 +58,22 @@ def test_user_lyrics_persist_and_display():
     )
 
     waiting_field = state_dict.get("suno_waiting_state")
+    assert waiting_field == bot_module.WAIT_SUNO_LYRICS
+
+    lyrics_value = "Line one\nLine two"
+    lyrics_msg = DummyMessage(lyrics_value, chat_id)
+    asyncio.run(
+        bot_module._handle_suno_waiting_input(
+            ctx,
+            chat_id,
+            lyrics_msg,
+            state_dict,
+            waiting_field,
+            user_id=user_id,
+        )
+    )
+
+    waiting_field = state_dict.get("suno_waiting_state")
     assert waiting_field == bot_module.WAIT_SUNO_STYLE
 
     style_msg = DummyMessage("Dream pop", chat_id)
@@ -77,23 +93,11 @@ def test_user_lyrics_persist_and_display():
         for item in bot.sent
         if isinstance(item, dict) and isinstance(item.get("text"), str)
     ]
-    assert any("Шаг 3/3 (текст)" in text for text in prompt_texts)
+    assert any("Пришлите текст песни" in text for text in prompt_texts)
+    assert any("Шаг 2/3 (стиль)" in text for text in prompt_texts)
 
-    waiting_field = state_dict.get("suno_waiting_state") or bot_module.WAIT_SUNO_LYRICS
+    waiting_field = state_dict.get("suno_waiting_state") or bot_module.WAIT_SUNO_STYLE
     state_dict["suno_waiting_state"] = waiting_field
-
-    lyrics_value = "Line one\nLine two"
-    lyrics_msg = DummyMessage(lyrics_value, chat_id)
-    asyncio.run(
-        bot_module._handle_suno_waiting_input(
-            ctx,
-            chat_id,
-            lyrics_msg,
-            state_dict,
-            waiting_field,
-            user_id=user_id,
-        )
-    )
 
     updated_state = bot_module.load_suno_state(ctx)
     assert updated_state.lyrics == lyrics_value

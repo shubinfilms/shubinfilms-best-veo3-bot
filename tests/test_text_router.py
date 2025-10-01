@@ -301,7 +301,7 @@ def test_wait_state_filters_commands_during_wait() -> None:
 
     assert state_dict.get("last_prompt") is None
     assert message.replies == []
-    assert state_after is not None and state_after.kind == WaitKind.MJ_PROMPT
+    assert state_after is None
 
 
 def test_wait_state_filters_button_labels_during_wait() -> None:

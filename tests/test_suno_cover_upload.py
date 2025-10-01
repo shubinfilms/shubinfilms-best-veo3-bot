@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,8 @@ if str(ROOT) not in sys.path:
 
 
 from suno.cover_source import CoverSourceUnavailableError
+from dataclasses import replace
+
 from tests.suno_test_utils import DummyMessage, bot_module, setup_cover_context
 
 
@@ -23,6 +26,12 @@ class DummyAudio:
 
 def _prepare_state(chat_id: int):
     ctx, state_dict, bot = setup_cover_context(chat_id=chat_id)
+    base_override = os.getenv("SUNO_API_BASE")
+    if base_override:
+        try:
+            bot_module.SUNO_CONFIG = replace(bot_module.SUNO_CONFIG, base=base_override.rstrip("/"))
+        except Exception:
+            pass
     asyncio.run(
         bot_module._music_begin_flow(
             chat_id,

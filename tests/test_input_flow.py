@@ -67,7 +67,12 @@ class FakeBot:
         self.deleted.append((chat_id, message_id))
 
 
-async def _run_apply(wait_state: WaitInputState, message: DummyMessage, ctx: SimpleNamespace, user_id: int) -> bool:
+async def _run_apply(
+    wait_state: WaitInputState,
+    message: DummyMessage,
+    ctx: SimpleNamespace,
+    user_id: int,
+) -> tuple[bool, object]:
     return await bot_module._apply_wait_state_input(ctx, message, wait_state, user_id=user_id)
 
 
@@ -92,7 +97,7 @@ def test_wait_state_updates_veo_prompt() -> None:
     message = DummyMessage(chat_id=777, text=" Test prompt ")
 
     try:
-        handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+        handled, _ = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
         state_after = get_wait_state(user_id)
     finally:
         bot_module.show_veo_card = original_show  # type: ignore[assignment]
@@ -126,7 +131,7 @@ def test_wait_state_updates_banana_prompt() -> None:
     message = DummyMessage(chat_id=888, text="  Fix face blemishes  ")
 
     try:
-        handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+        handled, _ = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
         state_after = get_wait_state(user_id)
     finally:
         bot_module.show_banana_card = original_show  # type: ignore[assignment]
@@ -167,7 +172,7 @@ def test_wait_state_suno_title_updates_card() -> None:
     message = DummyMessage(chat_id=888, text="  <b>My Song</b>  ")
 
     try:
-        handled = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
+        handled, _ = asyncio.run(_run_apply(wait_state, message, ctx, user_id))
         state_after = get_wait_state(user_id)
     finally:
         bot_module.refresh_suno_card = original_refresh  # type: ignore[assignment]
