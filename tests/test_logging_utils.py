@@ -14,6 +14,8 @@ def test_logging_extra_name_not_crash(caplog) -> None:
     with caplog.at_level(logging.DEBUG, logger="veo3-bot-test"):
         logger.debug("check", extra={"name": "menu", "user": 123})
 
-    assert any(record.message == "check" for record in caplog.records)
-    assert any(getattr(record, "extra_name", None) == "menu" for record in caplog.records)
-    assert any(getattr(record, "user", None) == 123 for record in caplog.records)
+    target = next((record for record in caplog.records if record.message == "check"), None)
+    assert target is not None
+    assert getattr(target, "extra_name", None) == "menu"
+    assert getattr(target, "user", None) == 123
+    assert hasattr(target, "cmd") and getattr(target, "cmd") is None
