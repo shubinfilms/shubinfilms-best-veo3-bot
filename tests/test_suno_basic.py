@@ -983,7 +983,7 @@ def test_launch_suno_notify_ok_flow(monkeypatch, bot_module):
     assert notify_total_after == notify_total_before + 1
     assert enqueue_total_after == enqueue_total_before + 1
     assert notify_calls["count"] == 1
-    assert edited_payloads and edited_payloads[-1].startswith("✅ Task created")
+    assert edited_payloads and edited_payloads[-1].startswith("✅ Задача создана")
     assert start_calls["count"] == 1
     assert debit_calls["count"] == 1
 
@@ -1397,8 +1397,8 @@ def test_launch_suno_generation_uses_state(monkeypatch, bot_module):
         )
     )
 
-    assert status_texts and status_texts[0] == "⏳ Sending request…"
-    assert edited_payloads and edited_payloads[-1].startswith("✅ Task created")
+    assert status_texts and status_texts[0] == "⏳ Отправляем запрос…"
+    assert edited_payloads and edited_payloads[-1].startswith("✅ Задача создана")
     assert start_calls.get("title") == "State Title"
     assert start_calls.get("style") == "Dream vibes"
     assert start_calls.get("lyrics") == "Hello world"
@@ -1707,11 +1707,14 @@ def test_telegram_url_retry_then_download(monkeypatch, tmp_path):
     monkeypatch.setattr("telegram_utils.send_audio_request", _fake_send_audio_request, raising=False)
     monkeypatch.setattr(service, "_download_audio", lambda *args, **kwargs: audio_file)
 
-    def _fake_send_file(method, field, chat_id, path, *, caption, reply_to, extra=None):
-        events.append("local")
-        assert method == "sendAudio"
-        assert extra == {"title": "Title (Take 1)"}
-        return True
+    def _fake_send_file(method, field, chat_id, path, *, caption, reply_to, extra=None, file_name=None):
+        if method == "sendAudio":
+            events.append("local")
+            assert extra == {"title": "Title (Take 1)"}
+            return True
+        if method == "sendDocument":
+            return True
+        raise AssertionError(f"unexpected method {method}")
 
     monkeypatch.setattr(service, "_send_file", _fake_send_file)
     monkeypatch.setattr(service, "_log_delivery", lambda *args, **kwargs: None)

@@ -67,6 +67,7 @@ class _AppSettings(BaseModel):
     UPLOAD_BASE_URL: Optional[str] = Field(default=None)
     UPLOAD_STREAM_PATH: str = Field(default="/api/v1/upload/stream")
     UPLOAD_URL_PATH: str = Field(default="/api/v1/upload/url")
+    UPLOAD_BASE64_PATH: str = Field(default="/api/v1/upload/base64")
     UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
     @field_validator("LOG_LEVEL", mode="before")
@@ -238,6 +239,7 @@ UPLOAD_BASE_URL = (
 ).rstrip("/")
 UPLOAD_STREAM_PATH = _APP_SETTINGS.UPLOAD_STREAM_PATH
 UPLOAD_URL_PATH = _APP_SETTINGS.UPLOAD_URL_PATH
+UPLOAD_BASE64_PATH = _APP_SETTINGS.UPLOAD_BASE64_PATH
 SUNO_READY = bool(
     SUNO_ENABLED and SUNO_API_TOKEN and SUNO_CALLBACK_SECRET and SUNO_CALLBACK_URL
 )
@@ -341,6 +343,7 @@ __all__ = [
     "UPLOAD_BASE_URL",
     "UPLOAD_STREAM_PATH",
     "UPLOAD_URL_PATH",
+    "UPLOAD_BASE64_PATH",
     "resolve_outbound_ip",
     "token_tail",
 ]

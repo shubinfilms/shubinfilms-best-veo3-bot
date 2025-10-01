@@ -1344,6 +1344,27 @@ class SunoService:
             raise RuntimeError("TELEGRAM_TOKEN is not configured")
         return f"https://api.telegram.org/bot{self.telegram_token}/{method}"
 
+    def _ensure_named_path(self, path: Path, desired_name: Optional[str]) -> Path:
+        if not desired_name:
+            return path
+        safe_name = Path(desired_name).name.strip()
+        if not safe_name:
+            return path
+        target = path.with_name(safe_name)
+        if target == path:
+            return path
+        try:
+            if target.exists():
+                target.unlink()
+            path = path.rename(target)
+            return path
+        except Exception as exc:
+            log.debug(
+                "audio.rename_failed",
+                extra={"meta": {"from": str(path), "to": str(target), "err": str(exc)}},
+            )
+            return path
+
     def _send_text(self, chat_id: int, text: str, *, reply_to: Optional[int] = None) -> None:
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_to:
@@ -1772,15 +1793,19 @@ class SunoService:
 
         if prepared_path and prepared_path.exists():
             try:
+                desired_name = prepared_meta.get("file_name")
+                prepared_path = self._ensure_named_path(prepared_path, desired_name)
+                prepared_meta["file_name"] = prepared_path.name
+                file_name = prepared_meta.get("file_name") or prepared_path.name
                 audio_extra: Dict[str, Optional[str]] = {}
                 if remote_title:
                     audio_extra["title"] = remote_title
                 performer = prepared_meta.get("performer")
                 if performer:
                     audio_extra["performer"] = performer
-                file_name = prepared_meta.get("file_name") or prepared_path.name
 
-                audio_sent = self._send_file(
+                send_file = self._send_file
+                audio_sent = send_file(
                     "sendAudio",
                     "audio",
                     chat_id,
@@ -1790,7 +1815,7 @@ class SunoService:
                     extra=audio_extra,
                     file_name=file_name,
                 )
-                document_sent = self._send_file(
+                document_sent = send_file(
                     "sendDocument",
                     "document",
                     chat_id,
@@ -1853,9 +1878,12 @@ class SunoService:
         if not local_path:
             return False, last_reason
         extra: Dict[str, Any] = {"title": remote_title} if remote_title else {}
+        local_path = self._ensure_named_path(local_path, prepared_meta.get("file_name"))
+        prepared_meta["file_name"] = local_path.name
         file_name = prepared_meta.get("file_name") or local_path.name
         try:
-            audio_sent = self._send_file(
+            send_file = self._send_file
+            audio_sent = send_file(
                 "sendAudio",
                 "audio",
                 chat_id,
@@ -1865,7 +1893,7 @@ class SunoService:
                 extra=extra,
                 file_name=file_name,
             )
-            document_sent = self._send_file(
+            document_sent = send_file(
                 "sendDocument",
                 "document",
                 chat_id,

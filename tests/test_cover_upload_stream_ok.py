@@ -64,7 +64,7 @@ def test_cover_upload_stream_ok(monkeypatch):
     )
 
     assert result is True
-    assert message.replies[-1] == "🎧 Источник загружен. Можно продолжать."
+    assert message.replies[-1] == "✅ Принято"
     assert captured["filename"] == "demo.mp3"
     assert captured["mime"] == "audio/mpeg"
     assert captured["uploaded_bytes"] == b"1234"

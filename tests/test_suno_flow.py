@@ -359,7 +359,7 @@ def test_title_inserts_into_card() -> None:
 
     assert load(ctx).title == "Новая песня ✨"
     assert state_dict["suno_waiting_state"] == bot_module.IDLE_SUNO
-    assert msg.replies[-1]["text"] == "✅ Название обновлено."
+    assert msg.replies[0]["text"] == "✅ Принято"
     assert fake_bot.edited, "card should be edited after title update"
     assert "Название: <i>Новая песня ✨</i>" in fake_bot.edited[-1]["text"]
 
@@ -383,7 +383,7 @@ def test_style_inserts_into_card() -> None:
     saved = load(ctx)
     assert saved.style == "Спокойный синтвейв — ночь\nГитары 🎸"
     assert state_dict["suno_waiting_state"] == bot_module.IDLE_SUNO
-    assert msg.replies[-1]["text"] == "✅ Стиль обновлён."
+    assert msg.replies[0]["text"] == "✅ Принято"
     assert fake_bot.edited and "Стиль: <i>Спокойный синтвейв — ночь" in fake_bot.edited[-1]["text"]
 
 
@@ -412,7 +412,7 @@ def test_lyrics_inserts_into_card() -> None:
 
     saved = load(ctx)
     assert saved.lyrics == "Первая строка\nВторая 🎤\n\nТретья"
-    assert msg.replies[-1]["text"] == "✅ Текст песни обновлён."
+    assert msg.replies[0]["text"] == "✅ Принято"
     assert fake_bot.edited and "Текст: <i>Первая строка" in fake_bot.edited[-1]["text"]
 
 
@@ -480,7 +480,7 @@ def test_cancel_and_clear() -> None:
         )
     )
     assert load(ctx).style is None
-    assert clear_msg.replies[-1]["text"] == "✅ Стиль очищен."
+    assert clear_msg.replies[0]["text"] == "✅ Принято"
 
     # Restore style
     state_dict["suno_waiting_state"] = bot_module.WAIT_SUNO_STYLE
@@ -523,7 +523,7 @@ def test_prompt_includes_preview() -> None:
     save(ctx, suno_state)
 
     prompt_text = bot_module._suno_prompt_text("title", suno_state)
-    assert 'Сейчас: "Мелодия ветра"' in prompt_text
+    assert 'Сейчас: “Мелодия ветра”' in prompt_text
 
 
 def test_suno_card_resend_on_missing() -> None:
@@ -713,8 +713,8 @@ def test_suno_enqueue_retries_then_success(monkeypatch) -> None:
 
     assert attempts["count"] == 3
     assert debit_calls["count"] == 1
-    assert status_texts and status_texts[0] == "⏳ Sending request…"
-    assert edited_messages and edited_messages[-1].startswith("✅ Task created")
+    assert status_texts and status_texts[0] == "⏳ Отправляем запрос…"
+    assert edited_messages and edited_messages[-1].startswith("✅ Задача создана")
     assert not refunds
 
 
@@ -813,7 +813,7 @@ def test_suno_enqueue_all_failures(monkeypatch) -> None:
 
     assert attempts["count"] == bot._SUNO_ENQUEUE_MAX_ATTEMPTS
     assert sum(sleeps) <= bot._SUNO_ENQUEUE_MAX_DELAY + 1e-6
-    assert status_texts and status_texts[0] == "⏳ Sending request…"
+    assert status_texts and status_texts[0] == "⏳ Отправляем запрос…"
     assert edited_messages and edited_messages[-1] == "⚠️ Generation failed: boom"
     assert refunds and refunds[-1]["user_message"].startswith("⚠️ Generation failed: boom")
 
@@ -905,7 +905,7 @@ def test_suno_enqueue_handles_400_error(monkeypatch) -> None:
     asyncio.run(_run())
 
     expected = "❗️Error: your description mentions an artist/brand. Remove the reference and try again."
-    assert status_texts and status_texts[0] == "⏳ Sending request…"
+    assert status_texts and status_texts[0] == "⏳ Отправляем запрос…"
     assert edited_messages and edited_messages[-1] == expected
     assert refunds and refunds[-1]["user_message"].startswith(expected)
     assert "Токены возвращены" in refunds[-1]["user_message"]

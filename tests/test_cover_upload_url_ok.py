@@ -51,7 +51,7 @@ def test_cover_upload_url_ok(monkeypatch):
     )
 
     assert result is True
-    assert message.replies[-1] == "🎧 Источник загружен. Можно продолжать."
+    assert message.replies[-1] == "✅ Принято"
     assert captured["uploaded"] == "https://example.com/song.mp3"
     assert captured["ensured"] == "https://example.com/song.mp3"
 

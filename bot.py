@@ -93,6 +93,7 @@ from ui_helpers import (
 )
 
 from utils.suno_state import (
+    LYRICS_MAX_LENGTH,
     LyricsSource,
     SunoState,
     build_generation_payload as build_suno_generation_payload,
@@ -116,6 +117,10 @@ try:  # pragma: no cover - optional helper
     from utils.suno_state import style_preview as suno_style_preview
 except Exception:  # pragma: no cover - defensive fallback
     suno_style_preview = None  # type: ignore[assignment]
+try:  # pragma: no cover - optional helper
+    from utils.suno_state import lyrics_preview as suno_lyrics_preview
+except Exception:  # pragma: no cover - defensive fallback
+    suno_lyrics_preview = None  # type: ignore[assignment]
 from utils.suno_modes import (
     FIELD_LABELS as SUNO_FIELD_LABELS,
     default_style_text as suno_default_style_text,
@@ -194,6 +199,7 @@ from suno.cover_source import (
     CoverSourceUnavailableError,
     CoverSourceValidationError,
     ensure_audio_url as ensure_cover_audio_url,
+    upload_base64 as upload_cover_base64,
     upload_stream as upload_cover_stream,
     upload_url as upload_cover_url,
     validate_audio_file as validate_cover_audio_file,
@@ -290,7 +296,7 @@ def _faq_track_section(section: str) -> None:
 _SUNO_LOCK_TTL = 15 * 60
 _SUNO_LOCK_GUARD = threading.Lock()
 _SUNO_LOCK_MEMORY: set[int] = set()
-_SUNO_START_LOCK_TTL = 120
+_SUNO_START_LOCK_TTL = 300
 
 _SUNO_PENDING_TTL = 20 * 60
 _SUNO_PENDING_LOCK = threading.Lock()
@@ -2732,6 +2738,7 @@ def _reset_suno_start_flags(state_dict: Dict[str, Any]) -> None:
     state_dict["suno_start_clicked"] = False
     state_dict["suno_start_button_sent_ts"] = None
     state_dict["suno_can_start"] = False
+    state_dict["suno_current_lyrics_hash"] = None
 
 
 DEFAULT_STATE = {
@@ -2767,6 +2774,7 @@ DEFAULT_STATE = {
     "suno_can_start": False,
     "suno_start_button_sent_ts": None,
     "suno_start_clicked": False,
+    "suno_current_lyrics_hash": None,
     "suno_last_task_id": None,
     "suno_last_params": None,
     "suno_balance": None,
@@ -2846,16 +2854,12 @@ _SUNO_WAIT_TO_FIELD = {
 }
 
 _SUNO_PROMPTS = {
-    "title": "Enter a short track title. Send /cancel to stop.",
-    "style": "Describe style/tags (e.g., ‘ambient, soft drums’). Send /cancel to stop.",
-    "lyrics": "Paste lyrics (multi-line). Send /cancel to stop.",
-    "cover": f"Пришлите аудиофайл (mp3/wav, до {COVER_MAX_AUDIO_MB} МБ) или ссылку на аудио (http/https).",
-}
-
-_SUNO_SUCCESS_MESSAGES = {
-    "title": ("✅ Название обновлено.", "✅ Название очищено."),
-    "style": ("✅ Стиль обновлён.", "✅ Стиль очищен."),
-    "lyrics": ("✅ Текст песни обновлён.", "✅ Текст песни очищен."),
+    "title": "Введите короткое название трека. Отправьте /cancel, чтобы остановить.",
+    "style": "Опишите стиль/теги (например, „эмбиент, мягкие барабаны“). Отправьте /cancel, чтобы остановить.",
+    "lyrics": (
+        f"Пришлите текст песни (до {LYRICS_MAX_LENGTH} символов) или отправьте /skip, чтобы сгенерировать автоматически."
+    ),
+    "cover": f"Пришлите аудио-файл (mp3/wav, до {COVER_MAX_AUDIO_MB} МБ) или ссылку на аудио (http/https).",
 }
 
 
@@ -2870,19 +2874,40 @@ def _suno_inline_preview(value: Optional[str], *, limit: int = 50) -> str:
     return collapsed[: max(1, limit - 1)].rstrip() + "…"
 
 
+def _suno_field_preview(state: SunoState, field: str) -> str:
+    if field == "style":
+        if suno_style_preview:
+            try:
+                preview = suno_style_preview(state.style, limit=120)
+            except TypeError:
+                preview = suno_style_preview(state.style)
+            if preview:
+                return preview
+        return _suno_inline_preview(state.style, limit=80)
+    if field == "lyrics":
+        if suno_lyrics_preview:
+            try:
+                preview = suno_lyrics_preview(state.lyrics, limit=120)
+            except TypeError:
+                preview = suno_lyrics_preview(state.lyrics)
+            if preview:
+                return preview
+        return _suno_inline_preview(state.lyrics, limit=80)
+    if field == "cover":
+        source = state.cover_source_label or state.cover_source_url or state.source_url
+        return _suno_inline_preview(source, limit=60)
+    if field == "title":
+        return _suno_inline_preview(state.title, limit=80)
+    value = getattr(state, field, None)
+    return _suno_inline_preview(value, limit=60)
+
+
 def _suno_prompt_text(field: str, suno_state_obj: SunoState) -> str:
     base = _SUNO_PROMPTS.get(field, "Введите значение.")
-    current_value: Optional[str]
-    if field == "title":
-        current_value = suno_state_obj.title
-    elif field == "style":
-        current_value = suno_state_obj.style
-    elif field == "cover":
-        current_value = suno_state_obj.cover_source_label or suno_state_obj.cover_source_url
-    else:
-        current_value = suno_state_obj.lyrics
-    preview = _suno_inline_preview(current_value, limit=50)
-    return f"{base}\nСейчас: \"{preview}\""
+    current = _suno_field_preview(suno_state_obj, field)
+    if field == "cover" and current == "—":
+        return base
+    return f"{base}\nСейчас: “{current}”"
 
 
 def _suno_preview_for_log(value: Optional[str]) -> str:
@@ -3142,6 +3167,10 @@ async def _handle_suno_waiting_input(
     allow_newlines = field != "title"
     cleaned_value = _sanitize_suno_input(raw_text, allow_newlines=allow_newlines)
     is_clear = stripped in {"-", "—"}
+    skip_requested = field == "lyrics" and lowered == "/skip"
+    if skip_requested:
+        cleaned_value = ""
+        is_clear = True
 
     suno_state_obj = load_suno_state(ctx)
     flow = state_dict.get("suno_flow")
@@ -3164,9 +3193,7 @@ async def _handle_suno_waiting_input(
             if flow == "instrumental":
                 default_style = suno_default_style_text("instrumental")
                 set_suno_style(suno_state_obj, default_style)
-                custom_reply = (
-                    f"🎛️ Использую стиль по умолчанию: {default_style} (default tags applied)"
-                )
+                custom_reply = f"🎛️ стиль по умолчанию: {default_style}. Добавил базовые теги."
             else:
                 clear_suno_style(suno_state_obj)
         else:
@@ -3174,12 +3201,14 @@ async def _handle_suno_waiting_input(
     elif field == "lyrics":
         if is_clear or not cleaned_value:
             clear_suno_lyrics(suno_state_obj)
+            set_suno_lyrics_source(suno_state_obj, LyricsSource.AI)
             state_dict["suno_auto_lyrics_pending"] = True
             state_dict["suno_auto_lyrics_generated"] = False
             state_dict["suno_lyrics_confirmed"] = False
             custom_reply = "🤖 Сгенерирую короткий текст через Prompt-Master."
         else:
             set_suno_lyrics(suno_state_obj, cleaned_value)
+            set_suno_lyrics_source(suno_state_obj, LyricsSource.USER)
             state_dict["suno_auto_lyrics_pending"] = False
             state_dict["suno_auto_lyrics_generated"] = False
             state_dict["suno_lyrics_confirmed"] = True
@@ -3214,14 +3243,14 @@ async def _handle_suno_waiting_input(
         )
         custom_reply = "🤖 Добавил автогенерируемые куплеты."
 
+    await _send_with_retry(lambda: message.reply_text("✅ Принято"))
+    if not changed and not custom_reply:
+        custom_reply = "ℹ️ Значение не изменилось (без изменений)"
+    if custom_reply:
+        await _send_with_retry(lambda: message.reply_text(custom_reply))
+
     if changed:
         await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
-
-    success_messages = _SUNO_SUCCESS_MESSAGES.get(field, ("✅ Обновлено.", "✅ Очищено."))
-    reply_text = custom_reply or (success_messages[1] if cleared else success_messages[0])
-    if not custom_reply and not changed:
-        reply_text = f"{reply_text} (без изменений)"
-    await _send_with_retry(lambda: message.reply_text(reply_text))
 
     if flow in {"instrumental", "lyrics", "cover"}:
         pending_step = current_step if isinstance(current_step, str) else None
@@ -5087,17 +5116,48 @@ def _music_step_index(state_dict: Dict[str, Any], step: Optional[str]) -> tuple[
     return (idx + 1, total)
 
 
-def _music_step_prompt_text(flow: str, step: str, index: int, total: int) -> str:
+def _music_step_prompt_text(
+    flow: str,
+    step: str,
+    index: int,
+    total: int,
+    suno_state: SunoState,
+) -> str:
     prompt_index = index if index else 1
     prompt_total = total if total else 1
     if step == "style":
-        return t("suno.prompt.step.style", index=prompt_index, total=prompt_total)
+        current = _suno_field_preview(suno_state, "style")
+        return t(
+            "suno.prompt.step.style",
+            index=prompt_index,
+            total=prompt_total,
+            current=current,
+        )
     if step == "title":
-        return t("suno.prompt.step.title", index=prompt_index, total=prompt_total)
+        current = _suno_field_preview(suno_state, "title")
+        return t(
+            "suno.prompt.step.title",
+            index=prompt_index,
+            total=prompt_total,
+            current=current,
+        )
     if step == "lyrics":
-        return t("suno.prompt.step.lyrics", index=prompt_index, total=prompt_total)
+        current = _suno_field_preview(suno_state, "lyrics")
+        return t(
+            "suno.prompt.step.lyrics",
+            index=prompt_index,
+            total=prompt_total,
+            current=current,
+            limit=LYRICS_MAX_LENGTH,
+        )
     if step == "source":
-        return t("suno.prompt.step.source", index=prompt_index, total=prompt_total)
+        current = _suno_field_preview(suno_state, "cover")
+        return t(
+            "suno.prompt.step.source",
+            index=prompt_index,
+            total=prompt_total,
+            current=current,
+        )
     return t("suno.prompt.step.generic")
 
 
@@ -5137,12 +5197,13 @@ async def _music_prompt_step(
             method_name="sendMessage",
             kind="message",
             chat_id=chat_id,
-            text="✅ Все шаги заполнены. Проверьте карточку и нажмите «Сгенерировать».",
+            text=SUNO_START_READY_MESSAGE,
         )
         return
 
     index, total = _music_step_index(state_dict, step)
-    text = _music_step_prompt_text(flow, step, index, total)
+    suno_state_obj = load_suno_state(ctx)
+    text = _music_step_prompt_text(flow, step, index, total, suno_state_obj)
     await tg_safe_send(
         ctx.bot.send_message,
         method_name="sendMessage",
@@ -5289,6 +5350,7 @@ def _music_apply_auto_lyrics(
     suno_state_obj = load_suno_state(ctx)
     lyrics = _music_generate_auto_lyrics(style, title)
     set_suno_lyrics(suno_state_obj, lyrics)
+    set_suno_lyrics_source(suno_state_obj, LyricsSource.AI)
     save_suno_state(ctx, suno_state_obj)
     state_dict["suno_state"] = suno_state_obj.to_dict()
     state_dict["suno_auto_lyrics_pending"] = False
@@ -5451,6 +5513,14 @@ async def _cover_process_audio_input(
             await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
             return True
 
+    base_url = str(SUNO_CONFIG.base or "").lower()
+    env_base = str(os.environ.get("SUNO_API_BASE", "")).lower()
+    token_hint = str(TELEGRAM_TOKEN or "").lower()
+
+    upload_method: Optional[str] = None
+    last_error: Optional[BaseException] = None
+    kie_file_id: Optional[str]
+
     try:
         kie_file_id = await upload_cover_stream(
             audio_bytes,
@@ -5462,7 +5532,7 @@ async def _cover_process_audio_input(
     except CoverSourceValidationError:
         log.warning(
             "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "file", "reason": "validation"},
+            extra={"request_id": request_id, "kind": "file", "reason": "validation", "stage": "stream"},
         )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
@@ -5473,14 +5543,142 @@ async def _cover_process_audio_input(
                 "request_id": request_id,
                 "kind": "file",
                 "reason": f"client:{exc}",
+                "stage": "stream",
             },
         )
         await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
         return True
     except CoverSourceUnavailableError as exc:
-        base_url = str(SUNO_CONFIG.base or "").lower()
-        env_base = str(os.environ.get("SUNO_API_BASE", "")).lower()
-        token_hint = str(TELEGRAM_TOKEN or "").lower()
+        last_error = exc
+        log.warning(
+            "cover_upload_fail",
+            extra={
+                "request_id": request_id,
+                "kind": "file",
+                "reason": f"service:{exc}",
+                "stage": "stream",
+            },
+        )
+        kie_file_id = None
+    except Exception as exc:  # pragma: no cover - defensive guard
+        last_error = exc
+        log.warning(
+            "cover_upload_fail",
+            extra={
+                "request_id": request_id,
+                "kind": "file",
+                "reason": f"exception:{exc}",
+                "stage": "stream",
+            },
+        )
+        kie_file_id = None
+    else:
+        upload_method = "stream"
+
+    if kie_file_id is None:
+        try:
+            kie_file_id = await upload_cover_url(
+                tg_url,
+                request_id=request_id,
+                logger=log,
+            )
+        except CoverSourceClientError as exc:
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"client:{exc}",
+                    "stage": "url",
+                },
+            )
+            await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
+            return True
+        except CoverSourceUnavailableError as exc:
+            last_error = exc
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"service:{exc}",
+                    "stage": "url",
+                },
+            )
+            kie_file_id = None
+        except Exception as exc:  # pragma: no cover - defensive guard
+            last_error = exc
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"exception:{exc}",
+                    "stage": "url",
+                },
+            )
+            kie_file_id = None
+        else:
+            upload_method = "url"
+            log.info(
+                "cover_upload_fallback",
+                extra={"request_id": request_id, "from": "stream", "to": "url"},
+            )
+
+    if kie_file_id is None:
+        try:
+            kie_file_id = await upload_cover_base64(
+                audio_bytes,
+                file_name,
+                mime_type,
+                request_id=request_id,
+                logger=log,
+            )
+        except CoverSourceClientError as exc:
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"client:{exc}",
+                    "stage": "base64",
+                },
+            )
+            await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
+            return True
+        except CoverSourceUnavailableError as exc:
+            last_error = exc
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"service:{exc}",
+                    "stage": "base64",
+                },
+            )
+            kie_file_id = None
+        except Exception as exc:  # pragma: no cover - defensive guard
+            last_error = exc
+            log.warning(
+                "cover_upload_fail",
+                extra={
+                    "request_id": request_id,
+                    "kind": "file",
+                    "reason": f"exception:{exc}",
+                    "stage": "base64",
+                },
+            )
+            kie_file_id = None
+        else:
+            upload_method = "base64"
+            log.info(
+                "cover_upload_fallback",
+                extra={"request_id": request_id, "from": "url", "to": "base64"},
+            )
+
+    if kie_file_id is None:
+        error_label = str(last_error) if last_error else "unavailable"
         if (
             "example.com" in base_url
             or "example.com" in env_base
@@ -5493,7 +5691,7 @@ async def _cover_process_audio_input(
                 extra={
                     "request_id": request_id,
                     "kind": "file",
-                    "reason": f"service:{exc}",
+                    "reason": f"service:{error_label}",
                     "base": mock_base,
                     "mock": True,
                 },
@@ -5504,22 +5702,19 @@ async def _cover_process_audio_input(
                 extra={
                     "request_id": request_id,
                     "kind": "file",
-                    "reason": f"service:{exc}",
+                    "reason": f"service:{error_label}",
                 },
             )
             await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
             return True
-    except Exception as exc:  # pragma: no cover - defensive guard
-        log.warning(
-            "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "file", "reason": f"exception:{exc}"},
-        )
-        await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
-        return True
 
     log.info(
         "cover_upload_ok",
-        extra={"request_id": request_id, "kie_file_id": kie_file_id},
+        extra={
+            "request_id": request_id,
+            "kie_file_id": kie_file_id,
+            "method": upload_method or "mock",
+        },
     )
 
     label = _cover_sanitize_label(getattr(audio_obj, "file_name", None)) or "Загруженный файл"
@@ -5533,9 +5728,9 @@ async def _cover_process_audio_input(
         kie_file_id=kie_file_id,
     )
     state_dict["suno_waiting_state"] = IDLE_SUNO
+    await message.reply_text("✅ Принято")
     _reset_suno_card_cache(state_dict)
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
-    await message.reply_text("🎧 Источник загружен. Можно продолжать.")
     next_step = _music_next_step(state_dict)
     await _music_prompt_step(
         chat_id,
@@ -5630,9 +5825,9 @@ async def _cover_process_url_input(
         kie_file_id=kie_file_id,
     )
     state_dict["suno_waiting_state"] = IDLE_SUNO
+    await message.reply_text("✅ Принято")
     _reset_suno_card_cache(state_dict)
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
-    await message.reply_text("🎧 Источник загружен. Можно продолжать.")
     next_step = _music_next_step(state_dict)
     await _music_prompt_step(
         chat_id,
@@ -6052,7 +6247,7 @@ async def _launch_suno_generation(
                 await _suno_notify(
                     ctx,
                     chat_id,
-                    "ℹ️ Added default tags for you.",
+                    "ℹ️ Добавил теги по умолчанию.",
                     reply_to=reply_to,
                 )
             except Exception as exc:
@@ -6226,6 +6421,7 @@ async def _launch_suno_generation(
         "has_lyrics": providing_lyrics,
         "lyrics_source": lyrics_source.value,
         "preset": suno_payload_state.preset,
+        "lyrics_hash": suno_payload_state.lyrics_hash,
     }
     if isinstance(new_balance, int):
         s["suno_balance"] = new_balance
@@ -6252,6 +6448,7 @@ async def _launch_suno_generation(
                 "charged": True,
                 "status": "new",
                 "lyrics_source": lyrics_source.value,
+                "lyrics_hash": suno_payload_state.lyrics_hash,
                 "strict_enabled": providing_lyrics and _SUNO_STRICT_ENABLED,
                 "original_lyrics": lyrics if providing_lyrics else None,
                 "strict_threshold": _SUNO_LYRICS_RETRY_THRESHOLD if providing_lyrics else None,
@@ -6259,7 +6456,7 @@ async def _launch_suno_generation(
             }
         )
 
-        waiting_text = "⏳ Sending request…"
+        waiting_text = "⏳ Отправляем запрос…"
         success_text: Optional[str] = None
         notify_exc: Optional[Exception] = None
         notify_started = time.monotonic()
@@ -6613,9 +6810,9 @@ async def _launch_suno_generation(
 
         title_hint = (title or "").strip()
         waiting_line = (
-            f"✅ Task created. Waiting… ({title_hint})"
+            f"✅ Задача создана. Ожидание… ({title_hint})"
             if title_hint
-            else "✅ Task created. Waiting…"
+            else "✅ Задача создана. Ожидание…"
         )
         success_lines = [waiting_line, f"💎 Charged {PRICE_SUNO}💎."]
         success_text = "\n".join(success_lines)
@@ -10068,7 +10265,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "busy":
-            await q.answer("Уже идёт генерация — дождитесь завершения")
+            await q.answer("Уже идёт генерация музыки — дождитесь завершения.")
             return
 
         if action == "start":
@@ -10077,7 +10274,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
 
             if suno_state_obj.start_clicked or bool(s.get("suno_start_clicked")):
-                await q.answer("Уже идёт генерация — дождитесь завершения")
+                await q.answer("Уже идёт генерация музыки — дождитесь завершения.")
                 return
 
             if uid is not None:
@@ -10184,6 +10381,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 s["suno_current_req_id"] = _generate_suno_request_id(int(uid))
             else:
                 s["suno_current_req_id"] = f"suno:anon:{uuid.uuid4()}"
+            s["suno_current_lyrics_hash"] = suno_state_obj.lyrics_hash
 
             await _suno_notify(
                 ctx,

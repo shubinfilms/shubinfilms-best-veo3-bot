@@ -9,15 +9,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from texts import t
+from texts import SUNO_START_READY_MESSAGE, t
 from tests.suno_test_utils import DummyMessage, bot_module, setup_cover_context
+from utils.suno_state import LYRICS_MAX_LENGTH
 
 
 def _capture_prompt(bot, start_index: int) -> tuple[str, int]:
     prompt_text: str | None = None
     for item in bot.sent[start_index:]:
         text = item.get("text") if isinstance(item, dict) else None
-        if isinstance(text, str) and (text.startswith("Шаг") or text.startswith("✅")):
+        if isinstance(text, str) and (
+            text.startswith("Шаг")
+            or text.startswith("✅")
+            or text.startswith("Все обязательные поля заполнены")
+        ):
             prompt_text = text
     if prompt_text is None:
         raise AssertionError("No prompt message captured")
@@ -31,29 +36,29 @@ def _capture_prompt(bot, start_index: int) -> tuple[str, int]:
             "instrumental",
             ["Calm focus", "Night Drive"],
             [
-                t("suno.prompt.step.style", index=1, total=2),
-                t("suno.prompt.step.title", index=2, total=2),
-                "✅ Все шаги заполнены. Проверьте карточку и нажмите «Сгенерировать».",
+                t("suno.prompt.step.style", index=1, total=2, current="—"),
+                t("suno.prompt.step.title", index=2, total=2, current="—"),
+                SUNO_START_READY_MESSAGE,
             ],
         ),
         (
             "lyrics",
             ["Dream pop", "City Lights", "First line\nSecond line"],
             [
-                t("suno.prompt.step.style", index=1, total=3),
-                t("suno.prompt.step.title", index=2, total=3),
-                t("suno.prompt.step.lyrics", index=3, total=3),
-                "✅ Все шаги заполнены. Проверьте карточку и нажмите «Сгенерировать».",
+                t("suno.prompt.step.style", index=1, total=3, current="—"),
+                t("suno.prompt.step.title", index=2, total=3, current="—"),
+                t("suno.prompt.step.lyrics", index=3, total=3, current="—", limit=LYRICS_MAX_LENGTH),
+                SUNO_START_READY_MESSAGE,
             ],
         ),
         (
             "cover",
             ["https://example.com/audio.mp3", "Ambient chill", "Cover Title"],
             [
-                t("suno.prompt.step.source", index=1, total=3),
-                t("suno.prompt.step.style", index=2, total=3),
-                t("suno.prompt.step.title", index=3, total=3),
-                "✅ Все шаги заполнены. Проверьте карточку и нажмите «Сгенерировать».",
+                t("suno.prompt.step.source", index=1, total=3, current="—"),
+                t("suno.prompt.step.style", index=2, total=3, current="—"),
+                t("suno.prompt.step.title", index=3, total=3, current="—"),
+                SUNO_START_READY_MESSAGE,
             ],
         ),
     ],

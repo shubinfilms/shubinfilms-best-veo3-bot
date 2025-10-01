@@ -260,11 +260,13 @@ def render_suno_card(
     elif mode == "lyrics":
         lines.append(f"🏷️ {t('suno.field.title')}: <i>{title_value}</i>")
         lines.append(f"🎹 {t('suno.field.style')}: <i>{style_value}</i>")
-        if suno_state.lyrics_source == LyricsSource.USER:
-            lines.append(f"📥 {t('suno.field.lyrics_source')}: <i>{html.escape(t('suno.lyrics_source.user'))}</i>")
-            lines.append(f"📜 {t('suno.field.lyrics')}: <i>{lyrics_value}</i>")
-        else:
-            lines.append(f"📥 {t('suno.field.lyrics_source')}: <i>{html.escape(t('suno.lyrics_source.ai'))}</i>")
+        source_label = (
+            t("suno.lyrics_source.user")
+            if suno_state.lyrics_source == LyricsSource.USER
+            else t("suno.lyrics_source.ai")
+        )
+        lines.append(f"📥 {t('suno.field.lyrics_source')}: <i>{html.escape(source_label)}</i>")
+        lines.append(f"📜 {t('suno.field.lyrics')}: <i>{lyrics_value}</i>")
     else:
         lines.append(f"🏷️ {t('suno.field.title')}: <i>{title_value}</i>")
         lines.append(f"🎧 {t('suno.field.source')}: <i>{source_value}</i>")

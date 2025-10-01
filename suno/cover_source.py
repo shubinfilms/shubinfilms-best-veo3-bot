@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from typing import IO, Any, Mapping, MutableMapping, Optional, Union
 from urllib.parse import urlparse
@@ -10,11 +11,13 @@ from urllib.parse import urlparse
 import httpx
 
 from settings import (
+    KIE_API_KEY,
     MAX_IN_LOG_BODY,
     SUNO_API_BASE,
     SUNO_API_TOKEN,
     SUNO_TIMEOUT_SEC,
     UPLOAD_BASE_URL,
+    UPLOAD_BASE64_PATH,
     UPLOAD_FALLBACK_ENABLED,
     UPLOAD_STREAM_PATH,
     UPLOAD_URL_PATH,
@@ -22,7 +25,7 @@ from settings import (
 
 MAX_AUDIO_MB = 50
 _ALLOWED_EXTENSIONS = {".mp3", ".wav"}
-_RETRY_DELAYS = (1, 2, 4)
+_RETRY_DELAYS = (0, 2)
 _CONNECT_TIMEOUT = 10.0
 _MAX_FAIL_BODY = min(1024, int(MAX_IN_LOG_BODY))
 
@@ -64,7 +67,7 @@ def _normalize_path(path: str) -> str:
 
 
 def _auth_header() -> dict[str, str]:
-    token = (SUNO_API_TOKEN or "").strip()
+    token = (KIE_API_KEY or SUNO_API_TOKEN or "").strip()
     if not token:
         raise CoverSourceUnavailableError("missing-token")
     if token.lower().startswith("bearer "):
@@ -402,6 +405,65 @@ async def upload_url(
     return kie_file_id
 
 
+async def upload_base64(
+    data: Union[bytes, bytearray, memoryview, IO[bytes]],
+    filename: str,
+    mime_type: Optional[str],
+    *,
+    request_id: str,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        payload = bytes(data)
+    else:
+        payload = data.read()
+    if not payload:
+        raise CoverSourceValidationError("empty-data")
+
+    headers = _auth_header()
+    headers["Content-Type"] = "application/json"
+    timeout = _timeout()
+    safe_filename = filename or "audio.bin"
+    content_type = mime_type or "application/octet-stream"
+    encoded = base64.b64encode(payload).decode("ascii")
+    body = {
+        "file_name": safe_filename,
+        "mime_type": content_type,
+        "file": encoded,
+    }
+
+    async def _request(url: str) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.post(url, headers=headers, json=body)
+
+    response, host = await _perform_upload(
+        request_id=request_id,
+        kind="base64",
+        path=UPLOAD_BASE64_PATH,
+        request_cb=_request,
+        logger=logger,
+        try_extra={"size": len(payload), "mime": content_type},
+    )
+
+    try:
+        payload_json: Any = response.json()
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise CoverSourceUnavailableError("invalid-json") from exc
+
+    if not isinstance(payload_json, Mapping):
+        if isinstance(payload_json, MutableMapping):
+            payload_json = dict(payload_json)
+        else:
+            payload_json = {"data": payload_json}
+
+    kie_file_id = _extract_kie_file_id(payload_json)
+    if not kie_file_id:
+        raise CoverSourceUnavailableError("missing-kie-file-id")
+
+    _log_ok(logger, request_id=request_id, kind="base64", host=host, kie_file_id=kie_file_id)
+    return kie_file_id
+
+
 def validate_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"}:
@@ -482,6 +544,7 @@ __all__ = [
     "CoverSourceUnavailableError",
     "upload_stream",
     "upload_url",
+    "upload_base64",
     "ensure_audio_url",
     "validate_audio_file",
 ]
