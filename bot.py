@@ -1725,8 +1725,7 @@ async def _pm_apply_result(
         suno_state_obj = load_suno_state(ctx)
         set_suno_lyrics(suno_state_obj, raw)
         suno_state_obj.mode = "lyrics"
-        save_suno_state(ctx, suno_state_obj)
-        s["suno_state"] = suno_state_obj.to_dict()
+        _persist_suno_state(ctx, s, suno_state_obj)
         s["suno_waiting_state"] = IDLE_SUNO
         _reset_suno_card_cache(s)
         s.setdefault("mode", "suno")
@@ -2747,6 +2746,33 @@ def _reset_suno_start_flags(state_dict: Dict[str, Any]) -> None:
     state_dict["suno_current_lyrics_hash"] = None
 
 
+def _sync_suno_snapshot(state_dict: Dict[str, Any], suno_state_obj: SunoState) -> None:
+    snapshot = suno_state_obj.to_dict()
+    state_dict["suno_state"] = snapshot
+    state_dict["suno_mode"] = suno_state_obj.mode
+    state_dict["suno_title"] = suno_state_obj.title
+    state_dict["suno_style_value"] = suno_state_obj.style
+    state_dict["suno_lyrics_text"] = suno_state_obj.lyrics
+    state_dict["suno_lyrics_source"] = suno_state_obj.lyrics_source.value
+    cover_payload: Optional[Dict[str, Optional[str]]]
+    url_value = suno_state_obj.source_url or suno_state_obj.cover_source_url
+    file_id = suno_state_obj.source_file_id
+    if url_value or file_id:
+        cover_payload = {"url": url_value, "file_id": file_id}
+    else:
+        cover_payload = None
+    state_dict["suno_cover_src"] = cover_payload
+
+
+def _persist_suno_state(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    state_dict: Dict[str, Any],
+    suno_state_obj: SunoState,
+) -> None:
+    save_suno_state(ctx, suno_state_obj)
+    _sync_suno_snapshot(state_dict, suno_state_obj)
+
+
 DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
@@ -2786,6 +2812,13 @@ DEFAULT_STATE = {
     "suno_balance": None,
     "suno_flow": None,
     "suno_step": None,
+    "suno_mode": None,
+    "suno_title": None,
+    "suno_style_value": None,
+    "suno_lyrics_text": None,
+    "suno_lyrics_source": None,
+    "suno_cover_src": None,
+    "suno_last_prompt_step": None,
     "suno_auto_lyrics_pending": False,
     "suno_lyrics_confirmed": False,
     "suno_cover_source_label": None,
@@ -3031,9 +3064,8 @@ async def _apply_wait_state_input(
                 suno_state_obj.mode = "lyrics"
             else:
                 clear_suno_lyrics(suno_state_obj)
-        save_suno_state(ctx, suno_state_obj)
         s = state(ctx)
-        s["suno_state"] = suno_state_obj.to_dict()
+        _persist_suno_state(ctx, s, suno_state_obj)
         s["suno_waiting_state"] = IDLE_SUNO
         msg_id = await refresh_suno_card(ctx, wait_state.chat_id, s, price=PRICE_SUNO)
         if user_id is not None:
@@ -3276,8 +3308,7 @@ async def _handle_suno_waiting_input(
     cleared = not after_value
 
     state_dict["suno_waiting_state"] = IDLE_SUNO
-    save_suno_state(ctx, suno_state_obj)
-    state_dict["suno_state"] = suno_state_obj.to_dict()
+    _persist_suno_state(ctx, state_dict, suno_state_obj)
 
     value_len = len(after_value or "")
     preview_log = _suno_preview_for_log(after_value)
@@ -3310,21 +3341,16 @@ async def _handle_suno_waiting_input(
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
 
     if flow in {"instrumental", "lyrics", "cover"}:
-        pending_step = current_step if isinstance(current_step, str) else None
-        if pending_step and field == pending_step:
-            next_step = _music_next_step(state_dict)
-        else:
-            next_step = state_dict.get("suno_step") if isinstance(state_dict.get("suno_step"), str) else None
-
-        if pending_step == field or next_step is not None:
-            await _music_prompt_step(
-                chat_id,
-                ctx,
-                state_dict,
-                flow=flow,
-                step=next_step,
-                user_id=user_id,
-            )
+        _music_update_step(state_dict, suno_state_obj, flow=flow)
+        await sync_suno_prompt(
+            ctx,
+            chat_id,
+            state_dict,
+            flow=flow,
+            user_id=user_id,
+            suno_state=suno_state_obj,
+            force=True,
+        )
     return True
 
 
@@ -3336,7 +3362,7 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
             suno_state_obj = load_suno_state(ctx)
         except Exception:
             suno_state_obj = SunoState()
-        state_dict["suno_state"] = suno_state_obj.to_dict()
+        _sync_suno_snapshot(state_dict, suno_state_obj)
     waiting = state_dict.get("suno_waiting_state")
     if waiting not in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS, WAIT_SUNO_REFERENCE}:
         state_dict["suno_waiting_state"] = IDLE_SUNO
@@ -5131,9 +5157,9 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 
 def _music_flow_steps(flow: str) -> list[str]:
     mapping = {
-        "instrumental": ["title", "style"],
-        "lyrics": ["title", "style", "lyrics"],
-        "cover": ["title", "source", "style"],
+        "instrumental": ["title", "style", "ready"],
+        "lyrics": ["title", "source", "style", "ready"],
+        "cover": ["title", "source", "style", "ready"],
     }
     return mapping.get(flow, [])
 
@@ -5197,41 +5223,24 @@ def _music_step_prompt_text(
             current=current,
         )
     if step == "title":
-        current = _suno_field_preview(suno_state, "title")
+        current = _suno_field_preview(suno_state, "title") or "—"
         return t(
             "suno.prompt.step.title",
             index=prompt_index,
             total=prompt_total,
             current=current,
         )
-    if step == "lyrics":
-        return t(
-            "suno.prompt.step.lyrics",
-            index=prompt_index,
-            total=prompt_total,
-        )
     if step == "source":
-        return t(
-            "suno.prompt.step.source",
-            index=prompt_index,
-            total=prompt_total,
-        )
+        if flow == "cover":
+            return t(
+                "suno.prompt.step.source",
+                index=prompt_index,
+                total=prompt_total,
+            )
+        return t("suno.prompt.step.lyrics")
+    if step == "ready":
+        return SUNO_START_READY_MESSAGE
     return t("suno.prompt.step.generic")
-
-
-def _music_should_skip_step(flow: str, step: str, suno_state: SunoState) -> bool:
-    if flow == "lyrics" and step == "lyrics" and suno_state.lyrics_source != LyricsSource.USER:
-        return True
-    return False
-
-
-def _music_wait_kind(step: str) -> Optional[WaitKind]:
-    mapping = {
-        "style": WaitKind.SUNO_STYLE,
-        "title": WaitKind.SUNO_TITLE,
-        "lyrics": WaitKind.SUNO_LYRICS,
-    }
-    return mapping.get(step)
 
 
 def _music_card_message_id(state_dict: Dict[str, Any]) -> Optional[int]:
@@ -5246,82 +5255,118 @@ def _music_card_message_id(state_dict: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-async def _music_prompt_step(
-    chat_id: int,
+def _music_waiting_payload(flow: str, step: str) -> tuple[str, Optional[WaitKind]]:
+    if step == "title":
+        return WAIT_SUNO_TITLE, WaitKind.SUNO_TITLE
+    if step == "style":
+        return WAIT_SUNO_STYLE, WaitKind.SUNO_STYLE
+    if step == "source":
+        if flow == "cover":
+            return WAIT_SUNO_REFERENCE, None
+        return WAIT_SUNO_LYRICS, WaitKind.SUNO_LYRICS
+    return IDLE_SUNO, None
+
+
+def _music_update_step(
+    state_dict: Dict[str, Any],
+    suno_state_obj: SunoState,
+    *,
+    flow: Optional[str] = None,
+) -> str:
+    allowed_flows = {"instrumental", "lyrics", "cover"}
+    flow_key = flow if isinstance(flow, str) and flow in allowed_flows else state_dict.get("suno_flow")
+    if not isinstance(flow_key, str) or flow_key not in allowed_flows:
+        flow_key = suno_state_obj.mode
+    state_dict["suno_flow"] = flow_key
+    order = _music_flow_steps(flow_key)
+    state_dict["suno_step_order"] = order
+    for step in order:
+        if step == "title":
+            if not suno_state_obj.title:
+                state_dict["suno_step"] = "title"
+                return "title"
+        elif step == "source":
+            if flow_key == "cover":
+                if not suno_state_obj.kie_file_id:
+                    state_dict["suno_step"] = "source"
+                    return "source"
+            elif flow_key == "lyrics":
+                if suno_state_obj.lyrics_source == LyricsSource.USER:
+                    if not suno_state_obj.lyrics:
+                        state_dict["suno_step"] = "source"
+                        return "source"
+                else:
+                    continue
+        elif step == "style":
+            if not suno_state_obj.style:
+                state_dict["suno_step"] = "style"
+                return "style"
+        elif step == "ready":
+            continue
+    state_dict["suno_step"] = "ready"
+    return "ready"
+
+
+async def sync_suno_prompt(
     ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
     state_dict: Dict[str, Any],
     *,
-    flow: str,
-    step: Optional[str],
-    user_id: Optional[int],
+    flow: Optional[str] = None,
+    user_id: Optional[int] = None,
+    suno_state: Optional[SunoState] = None,
+    force: bool = False,
 ) -> None:
-    suno_state_obj = load_suno_state(ctx)
-    current_step = step
-    while current_step and _music_should_skip_step(flow, current_step, suno_state_obj):
-        current_step = _music_next_step(state_dict)
+    suno_state_obj = suno_state if isinstance(suno_state, SunoState) else load_suno_state(ctx)
+    _sync_suno_snapshot(state_dict, suno_state_obj)
+    flow_key = flow if isinstance(flow, str) else state_dict.get("suno_flow")
+    if not isinstance(flow_key, str) or flow_key not in {"instrumental", "lyrics", "cover"}:
+        flow_key = suno_state_obj.mode
+    order = _music_flow_steps(flow_key)
+    state_dict["suno_step_order"] = order
+    current_step = _music_update_step(state_dict, suno_state_obj, flow=flow_key)
 
-    if not current_step:
-        await tg_safe_send(
-            ctx.bot.send_message,
-            method_name="sendMessage",
-            kind="message",
-            chat_id=chat_id,
-            text=SUNO_START_READY_MESSAGE,
-        )
-        return
+    display_order = [item for item in order if item != "title"]
+    if current_step in display_order and display_order:
+        display_index = display_order.index(current_step) + 1
+        display_total = len(display_order)
+    elif current_step in order and order:
+        display_index = order.index(current_step) + 1
+        display_total = len(order)
+    else:
+        display_index = 1
+        display_total = max(1, len(display_order) or len(order) or 1)
 
-    state_dict["suno_step"] = current_step
-
-    index, total = _music_step_index(state_dict, current_step)
-    text = _music_step_prompt_text(flow, current_step, index, total, suno_state_obj)
-    await tg_safe_send(
-        ctx.bot.send_message,
-        method_name="sendMessage",
-        kind="message",
-        chat_id=chat_id,
-        text=text,
-    )
-
-    if flow == "cover" and current_step == "source":
-        state_dict["suno_waiting_state"] = WAIT_SUNO_REFERENCE
-        return
-
-    wait_kind = _music_wait_kind(current_step)
-    if wait_kind is not None:
-        if wait_kind == WaitKind.SUNO_STYLE:
-            waiting_value = WAIT_SUNO_STYLE
-        elif wait_kind == WaitKind.SUNO_TITLE:
-            waiting_value = WAIT_SUNO_TITLE
-        else:
-            waiting_value = WAIT_SUNO_LYRICS
-        state_dict["suno_waiting_state"] = waiting_value
+    waiting_value, wait_kind = _music_waiting_payload(flow_key, current_step)
+    state_dict["suno_waiting_state"] = waiting_value
+    if wait_kind is not None and waiting_value != IDLE_SUNO and user_id is not None:
         _activate_wait_state(
             user_id=user_id,
             chat_id=chat_id,
             card_msg_id=_music_card_message_id(state_dict),
             kind=wait_kind,
-            meta={"flow": flow, "step": step},
+            meta={"flow": flow_key, "step": current_step},
         )
+
+    last_prompted = state_dict.get("suno_last_prompt_step")
+    should_send = force or last_prompted != current_step
+
+    if current_step == "ready":
+        prompt_text = SUNO_START_READY_MESSAGE
     else:
-        state_dict["suno_waiting_state"] = IDLE_SUNO
+        prompt_text = _music_step_prompt_text(
+            flow_key,
+            current_step,
+            display_index,
+            display_total,
+            suno_state_obj,
+        )
 
-
-def _music_next_step(state_dict: Dict[str, Any]) -> Optional[str]:
-    order_raw = state_dict.get("suno_step_order")
-    order = order_raw if isinstance(order_raw, list) else []
-    current = state_dict.get("suno_step")
-    if not order:
-        state_dict["suno_step"] = None
-        return None
-    if current not in order:
-        state_dict["suno_step"] = order[0]
-        return order[0]
-    idx = order.index(current)
-    if idx + 1 < len(order):
-        state_dict["suno_step"] = order[idx + 1]
-        return order[idx + 1]
-    state_dict["suno_step"] = None
-    return None
+    if should_send and prompt_text:
+        await _suno_notify(ctx, chat_id, prompt_text)
+        state_dict["suno_last_prompt_step"] = current_step
+    elif force:
+        state_dict["suno_last_prompt_step"] = current_step
 
 
 async def _music_begin_flow(
@@ -5364,27 +5409,26 @@ async def _music_begin_flow(
         card_chat_id=effective_chat_id if isinstance(effective_chat_id, int) else None,
     )
     state_dict["suno_cover_source_label"] = None
-    save_suno_state(ctx, suno_state_obj)
-    state_dict["suno_state"] = suno_state_obj.to_dict()
+    _persist_suno_state(ctx, state_dict, suno_state_obj)
     state_dict["suno_flow"] = flow
     state_dict["suno_last_mode"] = flow
-    order = _music_flow_steps(flow)
-    state_dict["suno_step_order"] = order
-    state_dict["suno_step"] = order[0] if order else None
     state_dict["suno_auto_lyrics_pending"] = False
     state_dict["suno_auto_lyrics_generated"] = False
     state_dict["suno_lyrics_confirmed"] = False
-    state_dict["suno_waiting_state"] = IDLE_SUNO
+    state_dict["suno_last_prompt_step"] = None
     _reset_suno_card_cache(state_dict)
+    current_step = _music_update_step(state_dict, suno_state_obj, flow=flow)
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
-    await _music_prompt_step(
-        chat_id,
-        ctx,
-        state_dict,
-        flow=flow,
-        step=state_dict.get("suno_step"),
-        user_id=user_id,
-    )
+    if current_step:
+        await sync_suno_prompt(
+            ctx,
+            chat_id,
+            state_dict,
+            flow=flow,
+            user_id=user_id,
+            suno_state=suno_state_obj,
+            force=True,
+        )
 
 
 def _music_generate_auto_lyrics(style: Optional[str], title: Optional[str]) -> str:
@@ -5421,8 +5465,7 @@ def _music_apply_auto_lyrics(
     lyrics = _music_generate_auto_lyrics(style, title)
     set_suno_lyrics(suno_state_obj, lyrics)
     set_suno_lyrics_source(suno_state_obj, LyricsSource.AI)
-    save_suno_state(ctx, suno_state_obj)
-    state_dict["suno_state"] = suno_state_obj.to_dict()
+    _persist_suno_state(ctx, state_dict, suno_state_obj)
     state_dict["suno_auto_lyrics_pending"] = False
     state_dict["suno_auto_lyrics_generated"] = True
     state_dict["suno_lyrics_confirmed"] = False
@@ -5448,8 +5491,7 @@ def _music_store_cover_source(
         source_url=effective_source_url,
         kie_file_id=kie_file_id,
     )
-    save_suno_state(ctx, suno_state_obj)
-    state_dict["suno_state"] = suno_state_obj.to_dict()
+    _persist_suno_state(ctx, state_dict, suno_state_obj)
     display_label = label or url or effective_source_url
     state_dict["suno_cover_source_label"] = display_label
 
@@ -5800,15 +5842,17 @@ async def _cover_process_audio_input(
     state_dict["suno_waiting_state"] = IDLE_SUNO
     await message.reply_text("✅ Принято")
     _reset_suno_card_cache(state_dict)
+    suno_state_obj = load_suno_state(ctx)
+    _music_update_step(state_dict, suno_state_obj, flow="cover")
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
-    next_step = _music_next_step(state_dict)
-    await _music_prompt_step(
-        chat_id,
+    await sync_suno_prompt(
         ctx,
+        chat_id,
         state_dict,
         flow="cover",
-        step=next_step,
         user_id=user_id,
+        suno_state=suno_state_obj,
+        force=True,
     )
     return True
 
@@ -5897,15 +5941,17 @@ async def _cover_process_url_input(
     state_dict["suno_waiting_state"] = IDLE_SUNO
     await message.reply_text("✅ Принято")
     _reset_suno_card_cache(state_dict)
+    suno_state_obj = load_suno_state(ctx)
+    _music_update_step(state_dict, suno_state_obj, flow="cover")
     await refresh_suno_card(ctx, chat_id, state_dict, price=PRICE_SUNO)
-    next_step = _music_next_step(state_dict)
-    await _music_prompt_step(
-        chat_id,
+    await sync_suno_prompt(
         ctx,
+        chat_id,
         state_dict,
         flow="cover",
-        step=next_step,
         user_id=user_id,
+        suno_state=suno_state_obj,
+        force=True,
     )
     return True
 
@@ -5934,7 +5980,7 @@ async def suno_entry(
             s["suno_balance"] = _safe_get_balance(int(balance_uid))
     s["mode"] = "suno"
     suno_state_obj = load_suno_state(ctx)
-    s["suno_state"] = suno_state_obj.to_dict()
+    _sync_suno_snapshot(s, suno_state_obj)
     _reset_suno_card_cache(s)
     if force_new:
         card_state = s.get("suno_card")
@@ -5969,8 +6015,7 @@ async def suno_entry(
         generating=False,
         waiting_enqueue=False,
     )
-    save_suno_state(ctx, suno_state_obj)
-    s["suno_state"] = suno_state_obj.to_dict()
+    _persist_suno_state(ctx, s, suno_state_obj)
     await _music_show_main_menu(chat_id, ctx, s)
 
 
@@ -6303,8 +6348,7 @@ async def _launch_suno_generation(
             try:
                 stored_state = load_suno_state(ctx)
                 set_suno_style(stored_state, default_style)
-                save_suno_state(ctx, stored_state)
-                s["suno_state"] = stored_state.to_dict()
+                _persist_suno_state(ctx, s, stored_state)
             except Exception as exc:
                 log.warning("suno.default_tags_state_update_failed | err=%s", exc)
             _reset_suno_card_cache(s)
@@ -6880,11 +6924,11 @@ async def _launch_suno_generation(
 
         title_hint = (title or "").strip()
         waiting_line = (
-            f"✅ Задача создана. Ожидание… ({title_hint})"
+            f"✅ Задача создана. Ожидайте… ({title_hint})"
             if title_hint
-            else "✅ Задача создана. Ожидание…"
+            else "✅ Задача создана. Ожидайте…"
         )
-        success_lines = [waiting_line, f"💎 Charged {PRICE_SUNO}💎."]
+        success_lines = [waiting_line, f"💎 Списано {PRICE_SUNO}💎."]
         success_text = "\n".join(success_lines)
         await _update_status_message(success_text, fallback=True)
 
@@ -9723,11 +9767,20 @@ async def prompt_master_insert_callback(update: Update, ctx: ContextTypes.DEFAUL
         suno_state_obj = load_suno_state(ctx)
         set_suno_lyrics(suno_state_obj, body_text)
         suno_state_obj.mode = "lyrics"
-        save_suno_state(ctx, suno_state_obj)
-        s["suno_state"] = suno_state_obj.to_dict()
+        _persist_suno_state(ctx, s, suno_state_obj)
         s["suno_waiting_state"] = IDLE_SUNO
+        s["suno_last_prompt_step"] = None
         _reset_suno_card_cache(s)
+        _music_update_step(s, suno_state_obj, flow="lyrics")
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await sync_suno_prompt(
+            ctx,
+            chat_id,
+            s,
+            flow="lyrics",
+            suno_state=suno_state_obj,
+            force=True,
+        )
         await query.answer("Промпт вставлен в карточку Suno")
         return
 
@@ -10333,7 +10386,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             clear_wait_state(uid, reason="suno_callback")
         s["mode"] = "suno"
         suno_state_obj = load_suno_state(ctx)
-        s["suno_state"] = suno_state_obj.to_dict()
+        _sync_suno_snapshot(s, suno_state_obj)
 
         if action == "menu":
             await q.answer()
@@ -10360,11 +10413,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             clear_suno_style(suno_state_obj)
             clear_suno_lyrics(suno_state_obj)
             clear_suno_cover_source(suno_state_obj)
-            save_suno_state(ctx, suno_state_obj)
-            s["suno_state"] = suno_state_obj.to_dict()
+            _persist_suno_state(ctx, s, suno_state_obj)
             s["suno_flow"] = None
             s["suno_step"] = None
             s["suno_step_order"] = None
+            s["suno_last_prompt_step"] = None
             _reset_suno_card_cache(s)
             if chat_id is not None:
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
@@ -10379,14 +10432,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 current_source = suno_state_obj.lyrics_source
                 new_source = LyricsSource.USER if current_source != LyricsSource.USER else LyricsSource.AI
                 set_suno_lyrics_source(suno_state_obj, new_source)
-                save_suno_state(ctx, suno_state_obj)
-                s["suno_state"] = suno_state_obj.to_dict()
+                _persist_suno_state(ctx, s, suno_state_obj)
                 s["suno_waiting_state"] = IDLE_SUNO
+                s["suno_last_prompt_step"] = None
                 _reset_suno_card_cache(s)
                 target_chat = chat_id
                 if target_chat is None and q.message is not None:
                     target_chat = q.message.chat_id
                 if target_chat is not None:
+                    _music_update_step(s, suno_state_obj, flow=s.get("suno_flow"))
                     await refresh_suno_card(ctx, target_chat, s, price=PRICE_SUNO)
                     ready_flag = suno_is_ready_to_start(suno_state_obj)
                     generating = bool(s.get("suno_generating"))
@@ -10399,6 +10453,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         ready=ready_flag,
                         generating=generating,
                         waiting_enqueue=waiting_enqueue,
+                    )
+                    await sync_suno_prompt(
+                        ctx,
+                        target_chat,
+                        s,
+                        flow=s.get("suno_flow"),
+                        user_id=uid,
+                        suno_state=suno_state_obj,
+                        force=True,
                     )
                 if target_chat is not None:
                     source_label = (
@@ -10422,16 +10485,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Недоступное поле", show_alert=True)
                 return
             if field == "cover":
-                s["suno_step"] = "source"
+                clear_suno_cover_source(suno_state_obj)
+                _persist_suno_state(ctx, s, suno_state_obj)
+                s["suno_cover_source_label"] = None
+                s["suno_last_prompt_step"] = None
+                _reset_suno_card_cache(s)
+                _music_update_step(s, suno_state_obj, flow="cover")
                 await q.answer()
-                await _music_prompt_step(
-                    chat_id,
-                    ctx,
-                    s,
-                    flow="cover",
-                    step="source",
-                    user_id=uid,
-                )
+                target_chat = chat_id if chat_id is not None else (q.message.chat_id if q.message else None)
+                if target_chat is not None:
+                    await refresh_suno_card(ctx, target_chat, s, price=PRICE_SUNO)
+                    await sync_suno_prompt(
+                        ctx,
+                        target_chat,
+                        s,
+                        flow="cover",
+                        user_id=uid,
+                        suno_state=suno_state_obj,
+                        force=True,
+                    )
                 return
             if field == "title":
                 waiting_state = WAIT_SUNO_TITLE
@@ -10516,12 +10588,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             clear_suno_lyrics(suno_state_obj)
             suno_state_obj.mode = "instrumental"
             suno_state_obj.preset = AMBIENT_NATURE_PRESET_ID
-            save_suno_state(ctx, suno_state_obj)
-            s["suno_state"] = suno_state_obj.to_dict()
+            _persist_suno_state(ctx, s, suno_state_obj)
             s["suno_waiting_state"] = IDLE_SUNO
             s["suno_flow"] = "instrumental"
-            s["suno_step_order"] = _music_flow_steps("instrumental")
-            s["suno_step"] = None
+            s["suno_last_prompt_step"] = None
+            _music_update_step(s, suno_state_obj, flow="instrumental")
             s["suno_auto_lyrics_pending"] = False
             s["suno_auto_lyrics_generated"] = False
             s["suno_lyrics_confirmed"] = False
@@ -10543,16 +10614,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     message_text,
                     reply_to=q.message,
                 )
+                await sync_suno_prompt(
+                    ctx,
+                    target_chat,
+                    s,
+                    flow="instrumental",
+                    user_id=uid,
+                    suno_state=suno_state_obj,
+                    force=True,
+                )
             return
 
         if action == "toggle" and argument == "instrumental":
             suno_state_obj.mode = "instrumental" if suno_state_obj.has_lyrics else "lyrics"
-            save_suno_state(ctx, suno_state_obj)
-            s["suno_state"] = suno_state_obj.to_dict()
+            _persist_suno_state(ctx, s, suno_state_obj)
             s["suno_waiting_state"] = IDLE_SUNO
+            s["suno_flow"] = suno_state_obj.mode
+            s["suno_last_prompt_step"] = None
+            _music_update_step(s, suno_state_obj, flow=suno_state_obj.mode)
             _reset_suno_card_cache(s)
             if chat_id is not None:
                 await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+                await sync_suno_prompt(
+                    ctx,
+                    chat_id,
+                    s,
+                    flow=suno_state_obj.mode,
+                    user_id=uid,
+                    suno_state=suno_state_obj,
+                    force=True,
+                )
             mode_label = "Инструментал" if suno_state_obj.mode == "instrumental" else "Со словами"
             await q.answer(f"Режим: {mode_label}")
             return
@@ -10603,8 +10694,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             suno_state_obj.start_clicked = True
             suno_state_obj.start_msg_id = start_msg_id if isinstance(start_msg_id, int) else None
             suno_state_obj.start_emoji_msg_id = None
-            save_suno_state(ctx, suno_state_obj)
-            s["suno_state"] = suno_state_obj.to_dict()
+            _persist_suno_state(ctx, s, suno_state_obj)
 
             if isinstance(start_msg_id, int):
                 try:
@@ -10648,8 +10738,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
 
             suno_state_obj.start_emoji_msg_id = emoji_msg_id
-            save_suno_state(ctx, suno_state_obj)
-            s["suno_state"] = suno_state_obj.to_dict()
+            _persist_suno_state(ctx, s, suno_state_obj)
             s["suno_start_clicked"] = True
             s["suno_can_start"] = False
             if uid is not None:
@@ -10920,11 +11009,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         suno_state_obj = load_suno_state(ctx)
         clear_suno_title(suno_state_obj)
         clear_suno_style(suno_state_obj)
-        save_suno_state(ctx, suno_state_obj)
-        s["suno_state"] = suno_state_obj.to_dict()
+        _persist_suno_state(ctx, s, suno_state_obj)
+        s["suno_last_prompt_step"] = None
+        _music_update_step(s, suno_state_obj, flow=s.get("suno_flow"))
         _reset_suno_card_cache(s)
         log.info("suno input cleared", extra={"field": "reset", "user_id": user_id})
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
+        await sync_suno_prompt(
+            ctx,
+            chat_id,
+            s,
+            flow=s.get("suno_flow"),
+            user_id=user_id,
+            suno_state=suno_state_obj,
+            force=True,
+        )
         await msg.reply_text("Название и стиль очищены.")
         return
 

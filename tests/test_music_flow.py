@@ -68,6 +68,18 @@ def test_instrumental_auto_style_default() -> None:
         bot_module._music_begin_flow(chat_id, ctx, state_dict, flow="instrumental", user_id=42)
     )
 
+    title_message = DummyMessage("Dreamscape")
+    asyncio.run(
+        bot_module._handle_suno_waiting_input(
+            ctx,
+            chat_id,
+            title_message,
+            state_dict,
+            bot_module.WAIT_SUNO_TITLE,
+            user_id=42,
+        )
+    )
+
     message = DummyMessage("")
     asyncio.run(
         bot_module._handle_suno_waiting_input(
@@ -81,7 +93,7 @@ def test_instrumental_auto_style_default() -> None:
     )
     suno_state = bot_module.load_suno_state(ctx)
     assert suno_state.style == bot_module._INSTRUMENTAL_DEFAULT_STYLE
-    assert state_dict.get("suno_step") == "title"
+    assert state_dict.get("suno_step") == "ready"
     assert any("стиль по умолчанию" in reply for reply in message.replies)
 
 
@@ -91,6 +103,18 @@ def test_lyrics_manual_and_auto_generation() -> None:
 
     asyncio.run(
         bot_module._music_begin_flow(chat_id, ctx, state_dict, flow="lyrics", user_id=99)
+    )
+
+    title_msg = DummyMessage("City Lights")
+    asyncio.run(
+        bot_module._handle_suno_waiting_input(
+            ctx,
+            chat_id,
+            title_msg,
+            state_dict,
+            bot_module.WAIT_SUNO_TITLE,
+            user_id=99,
+        )
     )
 
     # manual lyrics
@@ -112,6 +136,17 @@ def test_lyrics_manual_and_auto_generation() -> None:
     # restart flow to test auto lyrics
     asyncio.run(
         bot_module._music_begin_flow(chat_id, ctx, state_dict, flow="lyrics", user_id=99)
+    )
+    title_msg_auto = DummyMessage("City Lights")
+    asyncio.run(
+        bot_module._handle_suno_waiting_input(
+            ctx,
+            chat_id,
+            title_msg_auto,
+            state_dict,
+            bot_module.WAIT_SUNO_TITLE,
+            user_id=99,
+        )
     )
     auto_msg = DummyMessage("")
     asyncio.run(
@@ -151,6 +186,18 @@ def test_cover_upload_flow_accepts_audio() -> None:
         bot_module._music_begin_flow(chat_id, ctx, state_dict, flow="cover", user_id=7)
     )
     state_dict["mode"] = "suno"
+
+    title_cover_msg = DummyMessage("Cover Song", chat_id)
+    asyncio.run(
+        bot_module._handle_suno_waiting_input(
+            ctx,
+            chat_id,
+            title_cover_msg,
+            state_dict,
+            bot_module.WAIT_SUNO_TITLE,
+            user_id=7,
+        )
+    )
 
     class Audio:
         def __init__(self) -> None:
