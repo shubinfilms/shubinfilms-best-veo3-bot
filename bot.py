@@ -46,7 +46,6 @@ from telegram.ext import (
     filters,
     AIORateLimiter,
     PreCheckoutQueryHandler,
-    ApplicationHandlerStop,
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
@@ -198,6 +197,8 @@ from settings import (
     SUNO_READY,
     WELCOME_BONUS as SETTINGS_WELCOME_BONUS,
     WELCOME_BONUS_ENABLED as SETTINGS_WELCOME_BONUS_ENABLED,
+    WELCOME_BONUS_AMOUNT as SETTINGS_WELCOME_BONUS_AMOUNT,
+    WELCOME_BONUS_KEY_TTL_DAYS,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -255,6 +256,8 @@ from metrics import (
 from telegram_utils import (
     build_hub_keyboard,
     build_hub_text,
+    escape,
+    send_html,
     safe_send as tg_safe_send,
     safe_edit,
     safe_edit_text,
@@ -635,7 +638,16 @@ def _env_int(k: str, default: int) -> int:
 START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
-WELCOME_BONUS = max(0, _env_int("WELCOME_BONUS_GEMS", int(SETTINGS_WELCOME_BONUS)))
+_default_bonus_amount = (
+    SETTINGS_WELCOME_BONUS_AMOUNT
+    if SETTINGS_WELCOME_BONUS_AMOUNT is not None
+    else SETTINGS_WELCOME_BONUS
+)
+WELCOME_BONUS_AMOUNT = max(0, _env_int("WELCOME_BONUS_AMOUNT", int(_default_bonus_amount)))
+WELCOME_BONUS_KEY_TTL_SECONDS = max(
+    1, _env_int("WELCOME_BONUS_KEY_TTL_DAYS", WELCOME_BONUS_KEY_TTL_DAYS)
+) * 86400
+WELCOME_BONUS = WELCOME_BONUS_AMOUNT
 WELCOME_BONUS_ENABLED = bool(
     _env_bool("WELCOME_BONUS_ENABLED", SETTINGS_WELCOME_BONUS_ENABLED)
 )
@@ -1029,8 +1041,6 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
             if asyncio.iscoroutine(result):
                 return await result
             return result
-        except ApplicationHandlerStop:
-            raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive safety net
@@ -3362,7 +3372,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     text = message.text
     if text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
-        raise ApplicationHandlerStop
+        return
 
     command_token = _extract_command_token(message)
     if command_token:
@@ -3371,7 +3381,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     if is_command_or_button(message):
         touch_wait(user_id)
-        raise ApplicationHandlerStop
+        return
 
     handled, ack_text = await _apply_wait_state_input(
         ctx,
@@ -3383,7 +3393,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if handled:
         touch_wait(user_id)
         await _wait_acknowledge(message, ack_text=ack_text)
-        raise ApplicationHandlerStop
+        return
 
 
 async def command_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3597,82 +3607,58 @@ def _chat_state_waiting_input(state_dict: Dict[str, Any]) -> bool:
     return False
 
 
-def main_suggest_kb(current_language: str = "ru") -> InlineKeyboardMarkup:
-    normalized = _normalize_language_code(current_language)
-    ru_label = "🌐 Язык: RU" if normalized == "ru" else "RU"
-    en_label = "🌐 Язык: EN" if normalized == "en" else "EN"
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🎬 Генерация видео", callback_data="act:video"),
-                InlineKeyboardButton("🎨 Генерация изображений", callback_data="act:image"),
-            ],
-            [
-                InlineKeyboardButton("🎵 Генерация музыки", callback_data="act:music"),
-                InlineKeyboardButton("🧠 Prompt-Master", callback_data="act:prompt"),
-            ],
-            [
-                InlineKeyboardButton("💬 Обычный чат", callback_data="act:chat"),
-                InlineKeyboardButton("💎 Баланс", callback_data="act:balance"),
-            ],
-            [
-                InlineKeyboardButton(ru_label, callback_data="lang:ru"),
-                InlineKeyboardButton(en_label, callback_data="lang:en"),
-            ],
-        ]
-    )
+def main_suggest_kb(_current_language: str = "ru") -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎬 Генерация видео", callback_data="menu:video")],
+        [InlineKeyboardButton("🎨 Генерация изображений", callback_data="menu:image")],
+        [InlineKeyboardButton("🎧 Генерация музыки", callback_data="menu:music")],
+        [InlineKeyboardButton("💎 Купить генерации", callback_data="menu:buy")],
+        [InlineKeyboardButton("🌐 Изменить язык", callback_data="menu:lang")],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="menu:help")],
+        [InlineKeyboardButton("❓ FAQ", callback_data="menu:faq")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _build_main_menu_text(balance: int) -> str:
     prompts_link = html.escape(PROMPTS_CHANNEL_URL, quote=True)
     return (
-        "<b>⭐ Главное меню</b>\n"
-        f"💎 Баланс: <b>{balance}💎</b>\n"
-        f"📈 Кейсы и примеры: <a href=\"{prompts_link}\">канал с примерами</a>\n\n"
-        "Выберите режим:"
+        "👋 Добро пожаловать!\n\n"
+        f"💎 Ваш баланс: <b>{balance}💎</b>\n"
+        f"📈 Больше идей и примеров — <a href=\"{prompts_link}\">канал с промптами</a>\n\n"
+        "Выберите, что хотите сделать:"
     )
 
 
 async def render_main_menu(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: Optional[int] = None,
+    message: Optional[Message] = None,
+    edit: bool = False,
 ) -> Optional[Message]:
-    chat = update.effective_chat
-    user = update.effective_user
-    message = update.effective_message
+    if user_id is None:
+        user = ctx.user_data.get("_last_user")
+        try:
+            user_id = int(user)
+        except (TypeError, ValueError):
+            user_id = None
 
-    chat_id = chat.id if chat else (user.id if user else None)
-    if chat_id is None:
-        return None
-
-    user_id = user.id if user else None
     balance = _safe_get_balance(user_id) if user_id else 0
     _set_cached_balance(ctx, balance)
 
-    preferred_lang: Optional[str] = None
-    if user_id:
-        stored_lang = ctx.user_data.get("preferred_language")
-        if isinstance(stored_lang, str) and stored_lang:
-            preferred_lang = stored_lang
-        else:
-            preferred_lang = get_user_preferred_language(user_id)
-            if preferred_lang:
-                ctx.user_data["preferred_language"] = preferred_lang
-    if not preferred_lang and user is not None:
-        preferred_lang = _normalize_language_code(getattr(user, "language_code", ""))
-
     text = _build_main_menu_text(balance)
-    keyboard = main_suggest_kb(preferred_lang or "ru")
-    payload = {
-        "text": text,
-        "reply_markup": keyboard,
-        "parse_mode": ParseMode.HTML,
-        "disable_web_page_preview": True,
-    }
+    keyboard = main_suggest_kb()
 
     if edit and message is not None:
         try:
-            return await message.edit_text(**payload)
+            return await message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         except BadRequest as exc:
             err_text = str(exc).lower()
             if "message is not modified" in err_text:
@@ -3682,10 +3668,295 @@ async def render_main_menu(
             log.warning("main_menu.edit_failed | chat=%s err=%s", chat_id, exc)
 
     try:
-        return await ctx.bot.send_message(chat_id=chat_id, **payload)
+        return await send_html(ctx.bot, chat_id, text, reply_markup=keyboard)
     except Exception as exc:  # pragma: no cover - network issues
         log.warning("main_menu.send_failed | chat=%s err=%s", chat_id, exc)
         return None
+
+
+async def _render_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    if edit and message is not None:
+        try:
+            return await message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return message
+            log.debug("card.edit_failed | chat=%s err=%s", chat_id, exc)
+        except TelegramError as exc:
+            log.warning("card.edit_failed | chat=%s err=%s", chat_id, exc)
+
+    try:
+        return await send_html(ctx.bot, chat_id, text, reply_markup=keyboard)
+    except Exception as exc:  # pragma: no cover - network issues
+        log.warning("card.send_failed | chat=%s err=%s", chat_id, exc)
+        return None
+
+
+def _video_card_text() -> str:
+    return (
+        "<b>🎬 Генерация видео — VEO 3</b>\n"
+        "Создавайте ролики в форматах 16:9 и 9:16.\n"
+        "Выбирайте режим Fast для быстрых черновиков или Quality для финала.\n"
+        "Поддерживаются текстовые описания и референсы.\n\n"
+        "Нажмите «🚀 Сгенерировать», чтобы открыть конструктор VEO."
+    )
+
+
+def _video_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Сгенерировать", callback_data="video:start")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        ]
+    )
+
+
+async def render_video_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _video_card_text(),
+        _video_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _image_card_text() -> str:
+    return (
+        "<b>🎨 Генерация изображений</b>\n"
+        "Выберите движок и получите лучшие результаты:\n"
+        "• <b>Midjourney</b> — фотореализм и постеры.\n"
+        "• <b>Banana</b> — стилизованные иллюстрации, арты и логотипы.\n\n"
+        "Сначала выберите движок, затем опишите идею."
+    )
+
+
+def _image_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🖼 Midjourney", callback_data="img:midjourney")],
+            [InlineKeyboardButton("🍌 Banana", callback_data="img:banana")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        ]
+    )
+
+
+async def render_image_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _image_card_text(),
+        _image_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _music_card_text() -> str:
+    return (
+        "<b>🎧 Генерация музыки — Suno</b>\n"
+        "Пишите промпт, выбирайте стиль и получайте треки длиной до 2 минут.\n"
+        "Поддерживаются инструменталы, вокал и каверы.\n\n"
+        "Нажмите «🚀 Сгенерировать», чтобы открыть карточку Suno."
+    )
+
+
+def _music_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Сгенерировать", callback_data="music:start")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        ]
+    )
+
+
+async def render_music_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _music_card_text(),
+        _music_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _buy_card_text() -> str:
+    return (
+        "<b>💎 Купить генерации</b>\n"
+        "Пополните баланс и снимайте лимиты. Доступны пакеты для старта и бизнес-задач.\n\n"
+        "Нажмите «💳 Тарифы», чтобы получить актуальное предложение, или обратитесь в поддержку."
+    )
+
+
+def _buy_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💳 Тарифы", callback_data="buy:plans")],
+            [InlineKeyboardButton("🆘 Написать", url=SUPPORT_PUBLIC_URL)],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        ]
+    )
+
+
+async def render_buy_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _buy_card_text(),
+        _buy_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _help_card_text() -> str:
+    contact_url = html.escape(SUPPORT_PUBLIC_URL, quote=True)
+    return (
+        "<b>🆘 Поддержка</b>\n"
+        "Мы быстро отвечаем в Telegram и помогаем с промптами.\n\n"
+        f"Напишите напрямую: <a href=\"{contact_url}\">поддержка</a> или создайте тикет."
+    )
+
+
+def _help_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✉️ Написать в поддержку", url=SUPPORT_PUBLIC_URL)],
+            [InlineKeyboardButton("🗂 Создать тикет", callback_data="help:ticket")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        ]
+    )
+
+
+async def render_help_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _help_card_text(),
+        _help_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _faq_card_text() -> str:
+    return (
+        "<b>❓ FAQ</b>\n"
+        "Собрали короткие ответы про видео, изображения, музыку и оплату.\n"
+        "Можно читать внутри Telegram без переходов."
+    )
+
+
+def _faq_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📚 Открыть FAQ", callback_data=f"{CB_FAQ_PREFIX}root")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+        ]
+    )
+
+
+async def render_faq_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _faq_card_text(),
+        _faq_card_keyboard(),
+        message=message,
+        edit=edit,
+    )
+
+
+def _lang_card_text(current: str) -> str:
+    label = LANGUAGE_LABELS.get(current, LANGUAGE_LABELS["ru"])
+    return (
+        "<b>🌐 Изменить язык</b>\n"
+        f"Текущий язык интерфейса: <b>{escape(label)}</b>.\n\n"
+        "Выберите вариант ниже — переключение моментальное."
+    )
+
+
+def _lang_card_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:set:ru")],
+        [InlineKeyboardButton("🇬🇧 English", callback_data="lang:set:en")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")],
+    ]
+    mark = "✅"
+    if current == "ru":
+        rows[0][0].text += f" {mark}"
+    elif current == "en":
+        rows[1][0].text += f" {mark}"
+    return InlineKeyboardMarkup(rows)
+
+
+async def render_lang_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    current: str = "ru",
+    message: Optional[Message] = None,
+    edit: bool = False,
+) -> Optional[Message]:
+    return await _render_card(
+        chat_id,
+        ctx,
+        _lang_card_text(current),
+        _lang_card_keyboard(current),
+        message=message,
+        edit=edit,
+    )
 
 
 def _normalize_language_code(code: Optional[str]) -> str:
@@ -3707,8 +3978,11 @@ def _build_language_message(current_code: str) -> str:
     )
 
 
+_welcome_bonus_memory: Dict[int, float] = {}
+
+
 def _bonus_granted_key(user_id: int) -> str:
-    return f"{REDIS_PREFIX}:bonus:granted:{int(user_id)}"
+    return f"wb:{int(user_id)}"
 
 
 async def ensure_signup_bonus_once(
@@ -3716,7 +3990,7 @@ async def ensure_signup_bonus_once(
 ) -> Optional[bool]:
     if user_id <= 0:
         return False
-    if not WELCOME_BONUS_ENABLED or WELCOME_BONUS <= 0:
+    if not WELCOME_BONUS_ENABLED or WELCOME_BONUS_AMOUNT <= 0:
         return False
 
     redis_key = _bonus_granted_key(user_id)
@@ -3725,7 +3999,14 @@ async def ensure_signup_bonus_once(
 
     if redis_client:
         try:
-            should_grant = bool(redis_client.set(redis_key, "1", nx=True))
+            should_grant = bool(
+                redis_client.set(
+                    redis_key,
+                    "1",
+                    nx=True,
+                    ex=WELCOME_BONUS_KEY_TTL_SECONDS,
+                )
+            )
         except Exception as exc:  # pragma: no cover - redis issues
             log.warning(
                 "welcome_bonus_redis_failed | user_id=%s err=%s",
@@ -3735,11 +4016,19 @@ async def ensure_signup_bonus_once(
             redis_error = True
             should_grant = True
 
+    if not redis_client or redis_error:
+        now = time.time()
+        expires_at = _welcome_bonus_memory.get(user_id)
+        if isinstance(expires_at, (int, float)) and expires_at > now:
+            should_grant = False
+        else:
+            _welcome_bonus_memory[user_id] = now + WELCOME_BONUS_KEY_TTL_SECONDS
+
     if not should_grant:
         return False
 
     try:
-        result = ledger_storage.grant_signup_bonus(user_id, WELCOME_BONUS)
+        result = ledger_storage.grant_signup_bonus(user_id, WELCOME_BONUS_AMOUNT)
     except UniqueViolation:  # pragma: no cover - defensive double guard
         return False
     except Exception as exc:  # pragma: no cover - ledger errors
@@ -3747,6 +4036,8 @@ async def ensure_signup_bonus_once(
         if redis_client and not redis_error:
             with suppress(Exception):
                 redis_client.delete(redis_key)
+        if not redis_client or redis_error:
+            _welcome_bonus_memory.pop(user_id, None)
         return None
 
     if not isinstance(result, LedgerOpResult):
@@ -3756,15 +4047,21 @@ async def ensure_signup_bonus_once(
         if not result.duplicate and redis_client and not redis_error:
             with suppress(Exception):
                 redis_client.delete(redis_key)
+        if not redis_client or redis_error:
+            _welcome_bonus_memory.pop(user_id, None)
         return False
 
     _set_cached_balance(ctx, result.balance)
-    log_evt("bonus_granted", user_id=user_id, amount=WELCOME_BONUS)
+    log_evt("bonus_granted", user_id=user_id, amount=WELCOME_BONUS_AMOUNT)
 
     try:
-        await ctx.bot.send_message(
+        await send_html(
+            ctx.bot,
             chat_id=user_id,
-            text=f"🎁 Добро пожаловать! Начислил +{WELCOME_BONUS}💎 на баланс.",
+            text=(
+                "🎁 <b>Добро пожаловать!</b> Начислил "
+                f"<b>+{WELCOME_BONUS_AMOUNT}💎</b> на баланс."
+            ),
         )
     except Exception as exc:  # pragma: no cover - telegram transient errors
         log.warning(
@@ -9066,8 +9363,45 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{diamonds}")]
         )
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="act:menu")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:root")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _purge_wait_flags(user_id: int) -> None:
+    if user_id <= 0:
+        return
+    if redis_client is None:
+        return
+    try:
+        await asyncio.to_thread(redis_client.delete, f"wait:{int(user_id)}")
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.debug("wait_flag.clear_failed | user_id=%s err=%s", user_id, exc)
+
+
+async def _reset_user_context(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, reason: str
+) -> Optional[int]:
+    ctx.user_data.clear()
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is not None:
+        ctx.user_data["_last_user"] = user_id
+        _clear_user_wait_states(user_id, reason=reason, clear_dialog_registry=True)
+        await _purge_wait_flags(user_id)
+    else:
+        ctx.user_data.pop("_last_user", None)
+    return user_id
+
+
+def _resolve_chat_id(update: Update) -> Optional[int]:
+    chat = update.effective_chat
+    if chat is not None:
+        return chat.id
+    user = update.effective_user
+    if user is not None:
+        return user.id
+    return None
+
 
 async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
@@ -9087,13 +9421,18 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id is None:
         return
 
-    user_id = user.id if user else None
+    user_id = await _reset_user_context(update, ctx, reason="menu")
     if user_id:
         set_mode(user_id, False)
-        clear_wait(user_id)
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
-    menu_message = await render_main_menu(update, ctx, edit=bool(query and query.message))
+    menu_message = await render_main_menu(
+        chat_id,
+        ctx,
+        user_id=user_id,
+        message=query.message if query else None,
+        edit=bool(query and query.message),
+    )
     if isinstance(menu_message, Message):
         try:
             s["last_ui_msg_id_menu"] = menu_message.message_id
@@ -9124,12 +9463,257 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_menu(update, ctx)
 
 
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    user_id = await _reset_user_context(update, ctx, reason="command:/video")
+    if user_id:
+        set_mode(user_id, False)
+    await render_video_card(chat_id, ctx)
+
+
+async def on_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    await _reset_user_context(update, ctx, reason="command:/image")
+    await render_image_card(chat_id, ctx)
+
+
+async def on_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    await _reset_user_context(update, ctx, reason="command:/music")
+    await render_music_card(chat_id, ctx)
+
+
+async def on_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    await _reset_user_context(update, ctx, reason="command:/buy")
+    await render_buy_card(chat_id, ctx)
+
+
+async def on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    await _reset_user_context(update, ctx, reason="command:/help")
+    await render_help_card(chat_id, ctx)
+
+
+async def on_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    await _reset_user_context(update, ctx, reason="command:/faq")
+    await render_faq_card(chat_id, ctx)
+
+
+async def on_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    chat_id = _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    user = update.effective_user
+    user_id = user.id if user else None
+    current = "ru"
+    if user_id is not None:
+        stored = get_user_preferred_language(user_id)
+        if stored:
+            current = stored
+        elif user is not None:
+            current = _normalize_language_code(getattr(user, "language_code", ""))
+    await _reset_user_context(update, ctx, reason="command:/lang")
+    await render_lang_card(chat_id, ctx, current=current)
+
+
 configure_faq(
     show_main_menu=handle_menu,
     on_root_view=_faq_track_root,
     on_section_view=_faq_track_section,
 )
 
+
+async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    data = query.data
+    _, _, value = data.partition(":")
+    section = value or "root"
+    user_id = await _reset_user_context(update, ctx, reason=f"menu:{section}")
+    if user_id:
+        set_mode(user_id, False)
+    message = query.message
+    if section == "root":
+        await render_main_menu(chat_id, ctx, user_id=user_id, message=message, edit=True)
+    elif section == "video":
+        await render_video_card(chat_id, ctx, message=message, edit=True)
+    elif section == "image":
+        await render_image_card(chat_id, ctx, message=message, edit=True)
+    elif section == "music":
+        await render_music_card(chat_id, ctx, message=message, edit=True)
+    elif section == "buy":
+        await render_buy_card(chat_id, ctx, message=message, edit=True)
+    elif section == "lang":
+        current = "ru"
+        if user_id is not None:
+            stored = get_user_preferred_language(user_id)
+            if stored:
+                current = stored
+        await render_lang_card(chat_id, ctx, current=current, message=message, edit=True)
+    elif section == "help":
+        await render_help_card(chat_id, ctx, message=message, edit=True)
+    elif section == "faq":
+        await render_faq_card(chat_id, ctx, message=message, edit=True)
+
+
+async def cb_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    _, _, action = query.data.partition(":")
+    action = action or "open"
+    if action == "start":
+        await _reset_user_context(update, ctx, reason="video:start")
+        await video_command(update, ctx)
+    else:
+        await render_video_card(chat_id, ctx, message=query.message, edit=True)
+
+
+async def cb_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    _, _, action = query.data.partition(":")
+    action = action or "open"
+    if action in {"midjourney", "banana"}:
+        await _reset_user_context(update, ctx, reason=f"image:{action}")
+        engine = "mj" if action == "midjourney" else "banana"
+        s = state(ctx)
+        s["image_engine"] = engine
+        await image_command(update, ctx)
+    else:
+        await render_image_card(chat_id, ctx, message=query.message, edit=True)
+
+
+async def cb_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    _, _, action = query.data.partition(":")
+    if action == "start":
+        await _reset_user_context(update, ctx, reason="music:start")
+        await suno_command(update, ctx)
+    else:
+        await render_music_card(chat_id, ctx, message=query.message, edit=True)
+
+
+async def cb_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    _, _, action = query.data.partition(":")
+    if action == "plans":
+        await _reset_user_context(update, ctx, reason="buy:plans")
+        await topup(update, ctx)
+    else:
+        await render_buy_card(chat_id, ctx, message=query.message, edit=True)
+
+
+async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    _, _, action = query.data.partition(":")
+    if action == "ticket":
+        await _reset_user_context(update, ctx, reason="help:ticket")
+        await _prompt_support_ticket(update, ctx, source="menu")
+    else:
+        await render_help_card(chat_id, ctx, message=query.message, edit=True)
+
+
+async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    data = query.data
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    chat_id = chat.id if chat else _resolve_chat_id(update)
+    if chat_id is None:
+        return
+    _, _, action = data.partition(":")
+    lang_code = None
+    if action.startswith("set:"):
+        _, _, lang_code = action.partition(":")
+    elif action in {"ru", "en"}:
+        lang_code = action
+
+    if lang_code is not None:
+        lang_code = _normalize_language_code(lang_code)
+        user = update.effective_user
+        if user is not None:
+            set_user_preferred_language(user.id, lang_code)
+        await render_lang_card(chat_id, ctx, current=lang_code, message=query.message, edit=True)
+    else:
+        await render_lang_card(chat_id, ctx, message=query.message, edit=True)
+
+
+async def cb_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    data = query.data
+    if data == "faq:menu":
+        await query.answer()
+        chat = query.message.chat if query.message else update.effective_chat
+        chat_id = chat.id if chat else _resolve_chat_id(update)
+        if chat_id is None:
+            return
+        await render_faq_card(chat_id, ctx, message=query.message, edit=True)
+        return
+    await faq_callback(update, ctx)
 
 async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
@@ -9686,9 +10270,9 @@ async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 
 MAIN_ACTIONS: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]] = {
-    "video": video_command,
-    "image": image_command,
-    "music": suno_command,
+    "video": on_video,
+    "image": on_image,
+    "music": on_music,
     "prompt": prompt_master_command,
     "chat": chat_command,
     "balance": my_balance_command,
@@ -11449,6 +12033,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     user = update.effective_user
     user_id = user.id if user else None
+    if user_id is not None and get_wait(user_id):
+        touch_wait(user_id)
+        return
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
@@ -12594,26 +13181,26 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("start",), safe_handler(on_start)),
     (("menu",), safe_handler(on_menu)),
     (("cancel",), safe_handler(cancel_command)),
-    (("faq",), safe_handler(faq_command_entry)),
+    (("faq",), safe_handler(on_faq)),
     (("prompt_master",), safe_handler(prompt_master_command)),
     (("pm_reset",), safe_handler(prompt_master_reset_command)),
     (("chat",), safe_handler(chat_command)),
     (("reset",), safe_handler(chat_reset_command)),
     (("history",), safe_handler(chat_history_command)),
-    (("image", "mj"), safe_handler(image_command)),
-    (("video", "veo"), safe_handler(video_command)),
-    (("music", "suno"), safe_handler(suno_command)),
+    (("image", "mj"), safe_handler(on_image)),
+    (("video", "veo"), safe_handler(on_video)),
+    (("music", "suno"), safe_handler(on_music)),
     (("balance",), safe_handler(balance_command)),
-    (("help",), safe_handler(help_command)),
+    (("help",), safe_handler(on_help)),
     (("support",), safe_handler(support_command)),
 ]
 
 ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("buy",), safe_handler(buy_command)),
+    (("buy",), safe_handler(on_buy)),
     (("suno_last",), safe_handler(suno_last_command)),
     (("suno_task",), safe_handler(suno_task_command)),
     (("suno_retry",), safe_handler(suno_retry_command)),
-    (("lang",), safe_handler(lang_command)),
+    (("lang",), safe_handler(on_lang)),
     (("health",), safe_handler(health)),
     (("topup",), safe_handler(topup)),
     (("promo",), safe_handler(promo_command)),
@@ -12629,13 +13216,20 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (r"^(act|lang):", safe_handler(on_action)),
+    (r"^menu:", safe_handler(cb_menu)),
+    (r"^video:", safe_handler(cb_video)),
+    (r"^img:", safe_handler(cb_image)),
+    (r"^music:", safe_handler(cb_music)),
+    (r"^buy:", safe_handler(cb_buy)),
+    (r"^lang:", safe_handler(cb_lang)),
+    (r"^help:", safe_handler(cb_help)),
+    (r"^faq:", safe_handler(cb_faq)),
+    (r"^act:", safe_handler(on_action)),
     (r"^pm:insert:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_insert_callback_entry)),
     (r"^pm:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
     (r"^pm:(back|menu|switch)$", safe_handler(prompt_master_callback_entry)),
     (r"^pm:copy:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
     (rf"^{CB_PM_PREFIX}", safe_handler(prompt_master_callback_entry)),
-    (rf"^{CB_FAQ_PREFIX}", safe_handler(faq_callback_entry)),
     (r"^support:new$", safe_handler(support_new_callback)),
     (r"^support_reply:\d+$", safe_handler(support_reply_callback)),
     (r"^hub:", safe_handler(hub_router)),
