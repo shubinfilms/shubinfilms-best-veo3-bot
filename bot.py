@@ -17,7 +17,23 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random, copy, functools
+import asyncio
+import copy
+import functools
+import hashlib
+import html
+import io
+import json
+import math
+import random
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
 import threading
 import atexit
 from pathlib import Path
@@ -185,6 +201,7 @@ from redis_utils import (
     set_user_preferred_language,
     set_wait_flag,
     cleanup_stale_waits,
+    reset_user_state_safely,
 )
 
 from ledger import (
@@ -271,6 +288,7 @@ from telegram_utils import (
     run_ffmpeg,
     md2_escape,
     mask_tokens,
+    safe_dispatch,
     with_state_reset,
 )
 from utils.api_client import request_with_retries
@@ -13164,49 +13182,177 @@ class RedisRunnerLock:
             pass
         self._redis = None
 
-def _reset_handler(callback: Any) -> Any:
-    if getattr(callback, "__with_state_reset__", False):
-        return safe_handler(callback)
-    return safe_handler(with_state_reset(callback))
-
-
-PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("start",), _reset_handler(on_start)),
-    (("menu",), _reset_handler(on_menu)),
-    (("cancel",), safe_handler(cancel_command)),
-    (("faq",), _reset_handler(on_faq)),
-    (("prompt_master",), safe_handler(prompt_master_command)),
-    (("pm_reset",), safe_handler(prompt_master_reset_command)),
-    (("chat",), _reset_handler(chat_command)),
-    (("reset",), _reset_handler(chat_reset_command)),
-    (("history",), _reset_handler(chat_history_command)),
-    (("image", "mj"), _reset_handler(on_image)),
-    (("video", "veo"), _reset_handler(on_video)),
-    (("music", "suno"), _reset_handler(on_music)),
-    (("balance",), _reset_handler(balance_command)),
-    (("help",), _reset_handler(on_help)),
-    (("support",), safe_handler(support_command)),
+COMMAND_CATALOG: List[tuple[str, Dict[str, str]]] = [
+    ("menu", {"ru": "Главное меню", "en": "Main menu"}),
+    ("image", {"ru": "Генерация изображений", "en": "Generate images"}),
+    ("video", {"ru": "Генерация видео", "en": "Generate video"}),
+    ("music", {"ru": "Генерация музыки (Suno)", "en": "Generate music (Suno)"}),
+    ("my_balance", {"ru": "Баланс", "en": "Balance"}),
+    ("buy", {"ru": "Купить генерации", "en": "Buy generations"}),
+    ("lang", {"ru": "Изменить язык", "en": "Change language"}),
+    ("help", {"ru": "Поддержка", "en": "Support"}),
+    ("faq", {"ru": "FAQ", "en": "FAQ"}),
+    ("ping", {"ru": "Проверка доступности", "en": "Health check"}),
 ]
 
-ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("buy",), _reset_handler(on_buy)),
-    (("suno_last",), safe_handler(suno_last_command)),
-    (("suno_task",), safe_handler(suno_task_command)),
-    (("suno_retry",), safe_handler(suno_retry_command)),
-    (("lang",), _reset_handler(on_lang)),
-    (("health",), safe_handler(health)),
-    (("topup",), safe_handler(topup)),
-    (("promo",), safe_handler(promo_command)),
-    (("users_count",), safe_handler(users_count_command)),
-    (("whoami",), safe_handler(whoami_command)),
-    (("suno_debug",), safe_handler(suno_debug_command)),
-    (("broadcast",), safe_handler(broadcast_command)),
-    (("my_balance",), _reset_handler(my_balance_command)),
-    (("add_balance",), safe_handler(add_balance_command)),
-    (("sub_balance",), safe_handler(sub_balance_command)),
-    (("transactions",), safe_handler(transactions_command)),
-    (("balance_recalc",), safe_handler(balance_recalc)),
+
+async def pre_command_reset(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    application = getattr(context, "application", None) if context else None
+    logger = getattr(application, "logger", log)
+
+    message = getattr(update, "effective_message", None)
+    token = _extract_command_token(message)
+    command_name = None
+    if token:
+        command_name = token[1:] if token.startswith("/") else token
+        if command_name:
+            command_name = command_name.split("@", 1)[0]
+            logger.info("command.dispatch: %s", command_name)
+
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    user_id = getattr(user, "id", None)
+    chat_id = getattr(chat, "id", None)
+
+    if context is not None:
+        setattr(context, "_veo_pre_command_reset", True)
+
+    if user_id is None and chat_id is None:
+        return
+
+    try:
+        deleted = await reset_user_state_safely(user_id=user_id, chat_id=chat_id)
+        if deleted:
+            logger.debug(
+                "pre_command_reset.deleted | user=%s chat=%s count=%s",
+                user_id,
+                chat_id,
+                deleted,
+            )
+    except Exception as exc:
+        logger.warning("pre_command_reset failed: %s", exc)
+
+
+def wrap_cmd(
+    handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]
+) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]:
+    @functools.wraps(handler)
+    async def _wrapped(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        await pre_command_reset(update, context)
+        return await safe_dispatch(handler, update, context, *args, **kwargs)
+
+    setattr(_wrapped, "__pre_command_reset__", True)
+    setattr(_wrapped, "__wrapped_handler__", handler)
+    return _wrapped
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+    await message.reply_text("pong")
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await pre_command_reset(update, context)
+    message = getattr(update, "effective_message", None)
+    token = _extract_command_token(message)
+    logger = getattr(getattr(context, "application", None), "logger", log)
+    if token:
+        logger.info("unknown_command: %s", token)
+    elif message is not None and message.text:
+        logger.info("unknown_command: %s", message.text)
+    if message is None:
+        return
+    await message.reply_text("Неизвестная команда. Нажмите /menu")
+
+
+COMMAND_HANDLER_SPECS: List[
+    tuple[tuple[str, ...], Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]
+] = [
+    (("start",), on_start),
+    (("menu",), on_menu),
+    (("cancel",), cancel_command),
+    (("faq",), on_faq),
+    (("prompt_master",), prompt_master_command),
+    (("pm_reset",), prompt_master_reset_command),
+    (("chat",), chat_command),
+    (("reset",), chat_reset_command),
+    (("history",), chat_history_command),
+    (("image", "mj"), on_image),
+    (("video", "veo"), on_video),
+    (("music", "suno"), on_music),
+    (("balance",), balance_command),
+    (("help",), on_help),
+    (("support",), support_command),
+    (("buy",), on_buy),
+    (("suno_last",), suno_last_command),
+    (("suno_task",), suno_task_command),
+    (("suno_retry",), suno_retry_command),
+    (("lang",), on_lang),
+    (("health",), health),
+    (("topup",), topup),
+    (("promo",), promo_command),
+    (("users_count",), users_count_command),
+    (("whoami",), whoami_command),
+    (("suno_debug",), suno_debug_command),
+    (("broadcast",), broadcast_command),
+    (("my_balance",), my_balance_command),
+    (("add_balance",), add_balance_command),
+    (("sub_balance",), sub_balance_command),
+    (("transactions",), transactions_command),
+    (("balance_recalc",), balance_recalc),
+    (("ping",), cmd_ping),
 ]
+
+
+def _command_names_for_log() -> List[str]:
+    seen: List[str] = []
+    for names, _ in COMMAND_HANDLER_SPECS:
+        for name in names:
+            if name not in seen:
+                seen.append(name)
+    return seen
+
+
+async def set_my_commands(app: "Application") -> None:
+    commands_ru = [
+        BotCommand(name, mapping.get("ru") or mapping.get("en") or name)
+        for name, mapping in COMMAND_CATALOG
+    ]
+    commands_en = [
+        BotCommand(name, mapping.get("en") or mapping.get("ru") or name)
+        for name, mapping in COMMAND_CATALOG
+    ]
+    await app.bot.set_my_commands(commands_ru)
+    await app.bot.set_my_commands(commands_ru, language_code="ru")
+    await app.bot.set_my_commands(commands_en, language_code="en")
+
+
+async def on_startup(app: "Application") -> None:
+    logger = getattr(app, "logger", log)
+    try:
+        await set_my_commands(app)
+        logger.info("Commands set: %s", _command_names_for_log())
+    except Exception as exc:
+        logger.warning("Failed to set bot commands: %s", exc)
+    version = getattr(app.bot, "_framework_version", None)
+    if not version:
+        try:
+            import telegram as _tg  # type: ignore
+
+            version = getattr(_tg, "__version__", None)
+        except Exception:
+            version = None
+    logger.info("PTB version: %s", version or "unknown")
+
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^hub:.*", safe_handler(with_state_reset(hub_router))),
@@ -13287,11 +13433,16 @@ def register_handlers(application: Any) -> None:
     card_input_handler.block = False
     application.add_handler(card_input_handler, group=10)
 
-    for names, callback in PRIORITY_COMMAND_SPECS:
-        application.add_handler(CommandHandler(list(names), callback), group=0)
+    command_names = _command_names_for_log()
+    application.logger.info("Registering handlers for commands: %s", command_names)
+    for names, callback in COMMAND_HANDLER_SPECS:
+        application.add_handler(
+            CommandHandler(list(names), wrap_cmd(callback)),
+            group=0,
+        )
 
-    for names, callback in ADDITIONAL_COMMAND_SPECS:
-        application.add_handler(CommandHandler(list(names), callback), group=0)
+    unknown_handler = MessageHandler(filters.COMMAND, unknown_command)
+    application.add_handler(unknown_handler, group=0)
 
     for pattern, callback in CALLBACK_HANDLER_SPECS:
         if pattern is None:
@@ -13359,6 +13510,7 @@ async def run_bot_async() -> None:
     except Exception:
         log.exception("handler registration failed")
         raise
+    application.post_init = on_startup
     application.add_error_handler(error_handler)
 
     lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
@@ -13427,35 +13579,6 @@ async def run_bot_async() -> None:
 
             # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
             await application.initialize()
-
-            try:
-                commands_ru = [
-                    BotCommand("menu", "Главное меню"),
-                    BotCommand("image", "Генерация изображений"),
-                    BotCommand("video", "Генерация видео"),
-                    BotCommand("music", "Генерация музыки (Suno)"),
-                    BotCommand("my_balance", "Баланс"),
-                    BotCommand("buy", "Купить генерации"),
-                    BotCommand("lang", "Изменить язык"),
-                    BotCommand("help", "Поддержка"),
-                    BotCommand("faq", "FAQ"),
-                ]
-                commands_en = [
-                    BotCommand("menu", "Main menu"),
-                    BotCommand("image", "Generate images"),
-                    BotCommand("video", "Generate video"),
-                    BotCommand("music", "Generate music (Suno)"),
-                    BotCommand("my_balance", "Balance"),
-                    BotCommand("buy", "Buy generations"),
-                    BotCommand("lang", "Change language"),
-                    BotCommand("help", "Support"),
-                    BotCommand("faq", "FAQ"),
-                ]
-                await application.bot.set_my_commands(commands_ru)
-                await application.bot.set_my_commands(commands_ru, language_code="ru")
-                await application.bot.set_my_commands(commands_en, language_code="en")
-            except Exception as exc:
-                log.warning("Failed to set bot commands: %s", exc)
 
             try:
                 try:
