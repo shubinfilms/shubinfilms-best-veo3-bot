@@ -32,18 +32,14 @@ SUNO_RU = {
     "suno.lyrics_source.ai": "✨ Сгенерировать ИИ",
     "suno.prompt.mode_select": "Выберите режим генерации",
     "suno.prompt.step.title": (
-        "Шаг {index}/{total} (название): Введите короткое название трека. "
-        "Отправьте /cancel, чтобы остановить.\n"
+        "Введите короткое название трека. Отправьте /cancel, чтобы остановить.\n"
         "Сейчас: “{current}”"
     ),
     "suno.prompt.step.style": (
-        "Шаг {index}/{total} (стиль): Опишите стиль/теги (например, „эмбиент, мягкие барабаны“). "
-        "Отправьте /cancel, чтобы остановить.\n"
-        "Сейчас: “{current}”"
+        "Шаг {index}/{total} (стиль): Опишите стиль/теги (например, «эмбиент, мягкие барабаны»). "
+        "Отправьте /cancel, чтобы остановить."
     ),
-    "suno.prompt.step.lyrics": (
-        "Шаг {index}/{total} (текст): Пришлите текст песни сообщением."
-    ),
+    "suno.prompt.step.lyrics": "Пришлите текст песни одним сообщением.",
     "suno.prompt.step.source": (
         f"Шаг {{index}}/{{total}} (источник): Пришлите аудио-файл (mp3/wav, до {MAX_AUDIO_MB} МБ) "
         "или ссылку на аудио (http/https)."
@@ -52,8 +48,12 @@ SUNO_RU = {
     "suno.prompt.fill": "Заполните: {fields}",
     "suno.prompt.ready": "Все обязательные поля заполнены. Можно запускать генерацию.",
     "suno.prompt.starting": "Запускаю генерацию…",
-    "suno.error.upload_client": "⚠️ Не удалось загрузить источник. Проверьте файл/ссылку и попробуйте ещё раз.",
-    "suno.error.upload_service": "⚠️ Сервис загрузки недоступен. Попробуйте позже.",
+    "suno.error.upload_client": (
+        "⚠️ Не удалось принять аудио. Пришлите mp3/wav (до {MAX_AUDIO_MB} МБ) или ссылку http/https."
+    ),
+    "suno.error.upload_service": (
+        "⚠️ Не удалось принять аудио. Пришлите mp3/wav (до {MAX_AUDIO_MB} МБ) или ссылку http/https."
+    ),
 }
 
 
