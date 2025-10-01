@@ -185,6 +185,7 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
+from roles import SUPPORT_USER_ID, is_support
 from settings import (
     REDIS_PREFIX,
     SUNO_CALLBACK_URL as SETTINGS_SUNO_CALLBACK_URL,
@@ -628,6 +629,9 @@ def _env_int(k: str, default: int) -> int:
 
 START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
+
+WELCOME_BONUS_GEMS = max(0, _env_int("WELCOME_BONUS_GEMS", 10))
+SUPPORT_PUBLIC_URL = _env("SUPPORT_PUBLIC_URL", "https://t.me/BestVeo3_Support") or "https://t.me/BestVeo3_Support"
 
 
 SUNO_PER_USER_COOLDOWN_SEC = max(0, _env_int("SUNO_PER_USER_COOLDOWN_SEC", 0))
@@ -2702,6 +2706,7 @@ _WAIT_LIMITS = {
     WaitKind.VEO_PROMPT: 3000,
     WaitKind.MJ_PROMPT: 2000,
     WaitKind.BANANA_PROMPT: 2000,
+    WaitKind.SUPPORT_TICKET: 2000,
 }
 
 _WAIT_ALLOW_NEWLINES = {
@@ -2710,6 +2715,7 @@ _WAIT_ALLOW_NEWLINES = {
     WaitKind.VEO_PROMPT,
     WaitKind.MJ_PROMPT,
     WaitKind.BANANA_PROMPT,
+    WaitKind.SUPPORT_TICKET,
 }
 
 _WAIT_CLEAR_VALUES = {"-", "—"}
@@ -2950,9 +2956,12 @@ def is_command_or_button(message: Message) -> bool:
     return not should_capture_to_prompt(text)
 
 
-async def _wait_acknowledge(message: Message) -> None:
+async def _wait_acknowledge(message: Message, ack_text: Optional[str] = None) -> None:
+    if ack_text == "":
+        return
+    text = ack_text or "✅ Принято"
     try:
-        await message.reply_text("✅ Принято")
+        await message.reply_text(text)
     except Exception:
         _wait_log.debug(
             "WAIT_ACK_FAILED",
@@ -2969,17 +2978,17 @@ async def _apply_wait_state_input(
     wait_state: WaitInputState,
     *,
     user_id: Optional[int],
-) -> bool:
+) -> Tuple[bool, Optional[str]]:
     raw_text = message.text
     if raw_text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
-        return True
+        return True, ""
     allowed, reason = classify_wait_input(raw_text)
     if not allowed and reason == "command_label":
         _wait_log.info(
             "WAIT_INPUT_IGNORE kind=%s reason=%s", wait_state.kind.value, reason
         )
-        return False
+        return False, None
     stripped = raw_text.strip()
     if stripped in _WAIT_CLEAR_VALUES:
         normalized = ""
@@ -2999,6 +3008,7 @@ async def _apply_wait_state_input(
     )
 
     handled = False
+    ack_text: Optional[str] = None
 
     if wait_state.kind in {WaitKind.SUNO_TITLE, WaitKind.SUNO_STYLE, WaitKind.SUNO_LYRICS}:
         suno_state_obj = load_suno_state(ctx)
@@ -3075,8 +3085,58 @@ async def _apply_wait_state_input(
             if isinstance(card_id, int):
                 refresh_card_pointer(user_id, card_id)
         handled = True
+    elif wait_state.kind == WaitKind.SUPPORT_TICKET:
+        handled = True
+        ticket_text = cleaned.strip()
+        if not ticket_text:
+            await message.reply_text("⚠️ Опишите проблему текстом.")
+            ack_text = ""
+        elif user_id is None:
+            ack_text = ""
+        else:
+            support_id = SUPPORT_USER_ID
+            if support_id <= 0:
+                await message.reply_text("⚠️ Поддержка временно недоступна. Попробуйте позже.")
+                clear_wait(user_id, reason="support_unavailable")
+                ack_text = ""
+            else:
+                user = message.from_user
+                username = user.username if user and user.username else "none"
+                header = f"[TICKET] user_id={user_id} @{username}"
+                payload = f"{header}\n\n{ticket_text}"
+                reply_markup = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Ответить пользователю",
+                                callback_data=f"support_reply:{user_id}",
+                            )
+                        ]
+                    ]
+                )
+                try:
+                    sent = await ctx.bot.send_message(
+                        support_id,
+                        payload,
+                        reply_markup=reply_markup,
+                    )
+                except Exception as exc:
+                    log.exception("support.forward_failed | user_id=%s err=%s", user_id, exc)
+                    await message.reply_text(
+                        "⚠️ Не удалось отправить сообщение в поддержку. Попробуйте позже."
+                    )
+                    ack_text = ""
+                else:
+                    log_evt(
+                        "ticket_forwarded",
+                        user_id=user_id,
+                        support_id=support_id,
+                        ticket_message_id=getattr(sent, "message_id", None),
+                    )
+                    ack_text = "✅ Передал сообщение в поддержку. Ответим здесь."
+                clear_wait(user_id, reason="support_forwarded")
 
-    return handled
+    return handled, ack_text
 
 
 async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3101,7 +3161,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         touch_wait(user_id)
         raise ApplicationHandlerStop
 
-    handled = await _apply_wait_state_input(
+    handled, ack_text = await _apply_wait_state_input(
         ctx,
         message,
         wait_state,
@@ -3110,7 +3170,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     if handled:
         touch_wait(user_id)
-        await _wait_acknowledge(message)
+        await _wait_acknowledge(message, ack_text=ack_text)
         raise ApplicationHandlerStop
 
 async def _handle_suno_waiting_input(
@@ -3720,6 +3780,12 @@ WELCOME = (
 
 
 MAIN_MENU_TEXT = "📋 *Главное меню*\nВыберите, что хотите сделать:"
+
+
+HELP_TEXT = (
+    "🆘 Поддержка.\n"
+    "Выберите, как связаться с командой."
+)
 
 
 MENU_BTN_VIDEO = "🎬 ГЕНЕРАЦИЯ ВИДЕО"
@@ -8628,20 +8694,80 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+async def _process_welcome_bonus(
+    update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
+) -> Optional[LedgerOpResult]:
+    if update is None:
+        return None
+    user = update.effective_user
+    if user is None:
+        return None
+    uid = user.id
+
+    cached: Optional[LedgerOpResult] = getattr(update, "_welcome_bonus_result", None)
+    if getattr(update, "_welcome_bonus_checked", False):
+        return cached
+
+    setattr(update, "_welcome_bonus_checked", True)
+
+    try:
+        result = ledger_storage.grant_signup_bonus(uid, WELCOME_BONUS_GEMS)
+    except Exception as exc:
+        log.exception("signup_bonus_failed | user_id=%s err=%s", uid, exc)
+        return cached
+
+    setattr(update, "_welcome_bonus_result", result)
+
+    balance_after = result.balance
+    _set_cached_balance(ctx, balance_after)
+
+    if result.applied and WELCOME_BONUS_GEMS > 0:
+        log_evt("bonus_granted", user_id=uid, amount=WELCOME_BONUS_GEMS)
+        message = update.effective_message
+        if message is not None:
+            try:
+                await message.reply_text(
+                    f"🎁 Добро пожаловать! Начислил +{WELCOME_BONUS_GEMS}💎 на баланс."
+                )
+            except Exception as exc:
+                log.warning("welcome_bonus_notify_failed | user_id=%s err=%s", uid, exc)
+            try:
+                await message.reply_text(f"💎 Ваш баланс: {balance_after}")
+            except Exception as exc:
+                log.warning("welcome_balance_notify_failed | user_id=%s err=%s", uid, exc)
+            else:
+                setattr(update, "_welcome_bonus_announced", True)
+    return result
+
+
+async def welcome_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await _process_welcome_bonus(update, ctx)
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     uid = update.effective_user.id if update.effective_user else None
 
+    bonus_result = await _process_welcome_bonus(update, ctx)
+
     await _handle_referral_deeplink(update, ctx)
 
     if uid is not None:
-        try:
-            bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
-            _set_cached_balance(ctx, bonus_result.balance)
-            if bonus_result.applied and update.message is not None:
-                await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
-        except Exception as exc:
-            log.exception("Signup bonus failed for %s: %s", uid, exc)
+        balance_to_show: Optional[int]
+        if bonus_result is not None:
+            balance_to_show = bonus_result.balance
+        else:
+            balance_to_show = None
+        if not getattr(update, "_welcome_bonus_announced", False):
+            if balance_to_show is None:
+                balance_to_show = _safe_get_balance(uid)
+            if update.message is not None and balance_to_show is not None:
+                try:
+                    await update.message.reply_text(f"💎 Ваш баланс: {balance_to_show}")
+                except Exception as exc:
+                    log.warning("welcome_balance_notify_failed | user_id=%s err=%s", uid, exc)
+            _set_cached_balance(ctx, balance_to_show or 0)
 
     await handle_menu(update, ctx)
 
@@ -8866,17 +8992,180 @@ async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("🌍 Переключение языка будет доступно в ближайшее время.")
 
 
+def _support_contact_url() -> str:
+    if SUPPORT_USER_ID > 0:
+        return f"tg://user?id={SUPPORT_USER_ID}"
+    return SUPPORT_PUBLIC_URL
+
+
+def support_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✉️ Написать в Telegram", url=_support_contact_url())],
+            [InlineKeyboardButton("Создать тикет", callback_data="support:new")],
+        ]
+    )
+
+
+async def _prompt_support_ticket(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    source: str,
+) -> None:
+    user = update.effective_user
+    message = update.effective_message or (update.callback_query.message if update.callback_query else None)
+    if user is None or message is None:
+        return
+    user_id = user.id
+    chat_id = message.chat_id
+
+    clear_wait(user_id, reason="support_start")
+    try:
+        prompt_message = await message.reply_text("Опишите проблему одним сообщением.")
+    except Exception as exc:
+        log.warning("support.prompt_failed | user_id=%s err=%s", user_id, exc)
+        return
+
+    meta = {"source": source}
+    set_wait(
+        user_id,
+        WaitKind.SUPPORT_TICKET.value,
+        getattr(prompt_message, "message_id", 0),
+        chat_id=chat_id,
+        meta=meta,
+    )
+    log_evt("ticket_opened", user_id=user_id, source=source)
+
+
+async def support_new_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if query is None:
+        return
+    await _process_welcome_bonus(update, ctx)
+    with suppress(BadRequest):
+        await query.answer()
+    await _prompt_support_ticket(update, ctx, source="callback")
+
+
+async def support_reply_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if query is None:
+        return
+    data = query.data or ""
+    try:
+        _, raw_user_id = data.split(":", 1)
+        target_user_id = int(raw_user_id)
+    except (ValueError, IndexError):
+        with suppress(BadRequest):
+            await query.answer()
+        return
+
+    actor = update.effective_user
+    if actor is None or not is_support(actor.id):
+        with suppress(BadRequest):
+            await query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    ctx.user_data["support_reply_to"] = target_user_id
+    with suppress(BadRequest):
+        await query.answer("Введите сообщение для пользователя")
+    try:
+        await query.message.reply_text("✍️ Напишите ответ пользователю одним сообщением.")
+    except Exception as exc:
+        log.warning("support.reply_prompt_failed | support_id=%s err=%s", actor.id, exc)
+
+
+async def handle_support_reply_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None or not is_support(actor.id):
+        return
+
+    target_raw = ctx.user_data.get("support_reply_to")
+    try:
+        target_user_id = int(target_raw)
+    except (TypeError, ValueError):
+        ctx.user_data.pop("support_reply_to", None)
+        return
+
+    forwarded = False
+    try:
+        if message.text:
+            await ctx.bot.send_message(target_user_id, f"Поддержка: {message.text}")
+            forwarded = True
+        else:
+            caption = message.caption
+            if caption is not None:
+                try:
+                    await ctx.bot.copy_message(
+                        target_user_id,
+                        message.chat_id,
+                        message.message_id,
+                        caption=f"Поддержка: {caption}",
+                    )
+                    forwarded = True
+                except TelegramError:
+                    await ctx.bot.copy_message(
+                        target_user_id,
+                        message.chat_id,
+                        message.message_id,
+                    )
+                    await ctx.bot.send_message(
+                        target_user_id,
+                        "Поддержка: смотрите сообщение выше.",
+                    )
+                    forwarded = True
+            else:
+                await ctx.bot.send_message(target_user_id, "Поддержка:")
+                await ctx.bot.copy_message(
+                    target_user_id,
+                    message.chat_id,
+                    message.message_id,
+                )
+                forwarded = True
+    except Exception as exc:
+        log.exception(
+            "support.reply_failed | support_id=%s target=%s err=%s",
+            actor.id,
+            target_user_id,
+            exc,
+        )
+        try:
+            await message.reply_text("⚠️ Не удалось доставить сообщение пользователю.")
+        except Exception:
+            pass
+        return
+
+    if forwarded:
+        ctx.user_data.pop("support_reply_to", None)
+        log_evt("ticket_replied", user_id=target_user_id, support_id=actor.id)
+        try:
+            await message.reply_text("✅ Ответ отправлен пользователю.")
+        except Exception:
+            pass
+
+
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     message = update.effective_message
     if message is None:
         return
-    await message.reply_text("🆘 Поддержка появится скоро. Напишите сюда свой вопрос, и мы ответим позже.")
+    await _process_welcome_bonus(update, ctx)
+    await message.reply_text(HELP_TEXT, reply_markup=support_keyboard())
 
 
 async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     await faq_command(update, ctx)
+
+
+async def support_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await _process_welcome_bonus(update, ctx)
+    await _prompt_support_ticket(update, ctx, source="command")
 
 
 async def faq_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -11741,6 +12030,7 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("music", "suno"), suno_command),
     (("balance",), balance_command),
     (("help",), help_command),
+    (("support",), support_command),
 ]
 
 ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
@@ -11770,6 +12060,8 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^pm:copy:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
+    (r"^support:new$", support_new_callback),
+    (r"^support_reply:\d+$", support_reply_callback),
     (r"^hub:", hub_router),
     (r"^go:", main_suggest_router),
     (None, on_callback),
@@ -11793,6 +12085,21 @@ LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Aw
 
 
 def register_handlers(application: Any) -> None:
+    welcome_handler = MessageHandler(
+        filters.ALL,
+        welcome_entry,
+    )
+    welcome_handler.block = False
+    application.add_handler(welcome_handler, group=0)
+
+    if SUPPORT_USER_ID > 0:
+        support_reply_handler = MessageHandler(
+            filters.User(SUPPORT_USER_ID),
+            handle_support_reply_message,
+        )
+        support_reply_handler.block = False
+        application.add_handler(support_reply_handler, group=0)
+
     card_input_handler = MessageHandler(
         filters.TEXT,
         handle_card_input,
