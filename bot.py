@@ -16,7 +16,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random, copy
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random, copy, functools
 import threading
 import atexit
 from pathlib import Path
@@ -950,6 +950,90 @@ KIE_STRICT_POLLING = _env("KIE_STRICT_POLLING", "false").lower() == "true"
 logging.getLogger("kie").setLevel(logging.INFO)
 log = logging.getLogger("veo3-bot")
 singleton_log = logging.getLogger("veo3-bot.singleton")
+
+_SAFE_HANDLER_ERROR_TEXT = "⚠️ Системная ошибка. Попробуйте ещё раз."
+
+
+def _extract_update_entities(update: Optional[Update]) -> tuple[Optional[int], Optional[int]]:
+    if update is None:
+        return (None, None)
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id if chat else (user.id if user else None)
+    user_id = user.id if user else None
+    return (chat_id, user_id)
+
+
+async def _notify_safe_handler_error(
+    update: Optional[Update], ctx: Optional[ContextTypes.DEFAULT_TYPE]
+) -> None:
+    if update is None or ctx is None:
+        return
+
+    error_text = _SAFE_HANDLER_ERROR_TEXT
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        with suppress(Exception):
+            await query.answer(error_text, show_alert=True)
+
+    message = update.effective_message
+    if message is not None:
+        with suppress(Exception):
+            await message.reply_text(error_text)
+        return
+
+    chat_id, user_id = _extract_update_entities(update)
+    target_id = chat_id or user_id
+    if target_id is None:
+        return
+    bot = getattr(ctx, "bot", None)
+    if bot is None:
+        return
+    with suppress(Exception):
+        await safe_send_text(bot, target_id, error_text, parse_mode=None)
+
+
+async def _handle_safe_handler_exception(
+    callback: Callable[..., Any],
+    exc: BaseException,
+    update: Optional[Update],
+    ctx: Optional[ContextTypes.DEFAULT_TYPE],
+) -> None:
+    handler_name = getattr(callback, "__name__", repr(callback))
+    chat_id, user_id = _extract_update_entities(update)
+    log.exception(
+        "handler_failed",
+        extra={"handler": handler_name, "chat_id": chat_id, "user_id": user_id},
+    )
+    await _notify_safe_handler_error(update, ctx)
+
+
+def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
+    if getattr(callback, "__safe_handler_wrapped__", False):
+        return callback  # type: ignore[return-value]
+
+    async def _execute(
+        update: Optional[Update],
+        ctx: Optional[ContextTypes.DEFAULT_TYPE],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            result = callback(update, ctx, *args, **kwargs)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        except ApplicationHandlerStop:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            await _handle_safe_handler_exception(callback, exc, update, ctx)
+            return None
+
+    wrapped = functools.wraps(callback)(_execute)
+    setattr(wrapped, "__safe_handler_wrapped__", True)
+    return wrapped
 
 try:
     import telegram as _tg
@@ -2775,6 +2859,54 @@ def _persist_suno_state(
     _sync_suno_snapshot(state_dict, suno_state_obj)
 
 
+def _ensure_suno_user_store(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    create: bool = False,
+) -> Optional[MutableMapping[str, Any]]:
+    user_data = getattr(ctx, "user_data", None)
+    if not isinstance(user_data, MutableMapping):
+        return None
+    bucket = user_data.get("suno")
+    if not isinstance(bucket, MutableMapping):
+        if not create:
+            return None
+        bucket = {}
+        user_data["suno"] = bucket
+    data = bucket.get("data")
+    if not isinstance(data, MutableMapping):
+        if not create:
+            return None
+        data = {}
+        bucket["data"] = data
+    return data
+
+
+def _store_suno_user_lyrics(ctx: ContextTypes.DEFAULT_TYPE, value: Optional[str]) -> None:
+    store = _ensure_suno_user_store(ctx, create=bool(value))
+    if store is None:
+        return
+    if value:
+        store["lyrics_text"] = value
+    else:
+        store.pop("lyrics_text", None)
+
+
+def _load_suno_user_lyrics(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    store = _ensure_suno_user_store(ctx)
+    if not store:
+        return None
+    text = store.get("lyrics_text")
+    return str(text) if isinstance(text, str) else None
+
+
+def _clear_suno_user_storage(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    store = _ensure_suno_user_store(ctx)
+    if not store:
+        return
+    store.pop("lyrics_text", None)
+
+
 DEFAULT_STATE = {
     "mode": None, "aspect": "16:9", "model": None,
     "last_prompt": None, "last_image_url": None,
@@ -2894,14 +3026,6 @@ _SUNO_WAIT_TO_FIELD = {
     WAIT_SUNO_REFERENCE: "cover",
 }
 
-_SUNO_PROMPTS = {
-    "title": "Введите короткое название трека. Отправьте /cancel, чтобы остановить.",
-    "style": "Опишите стиль/теги (например, „эмбиент, мягкие барабаны“). Отправьте /cancel, чтобы остановить.",
-    "lyrics": "Пришлите текст песни сообщением.",
-    "cover": f"Пришлите аудио-файл (mp3/wav, до {COVER_MAX_AUDIO_MB} МБ) или ссылку на аудио (http/https).",
-}
-
-
 def _suno_inline_preview(value: Optional[str], *, limit: int = 50) -> str:
     if not value:
         return "—"
@@ -2942,11 +3066,22 @@ def _suno_field_preview(state: SunoState, field: str) -> str:
 
 
 def _suno_prompt_text(field: str, suno_state_obj: SunoState) -> str:
-    base = _SUNO_PROMPTS.get(field, "Введите значение.")
+    flow = "cover" if field == "cover" else suno_state_obj.mode
+    step_alias = "source" if field in {"lyrics", "cover"} else field
+    order = _music_flow_steps(flow)
+    steps_for_count = [item for item in order if item != "ready"]
+    total = len(steps_for_count) or 1
+    if step_alias in steps_for_count:
+        index = steps_for_count.index(step_alias) + 1
+    else:
+        index = 1
+
+    prompt = _music_step_prompt_text(flow, step_alias, index, total, suno_state_obj)
     current = _suno_field_preview(suno_state_obj, field)
     if field == "cover" and current == "—":
-        return base
-    return f"{base}\nСейчас: “{current}”"
+        return prompt
+    display_current = current if current and current != "—" else "—"
+    return f"{prompt}\nСейчас: “{display_current}”"
 
 
 def _suno_preview_for_log(value: Optional[str]) -> str:
@@ -3088,8 +3223,10 @@ async def _apply_wait_state_input(
             if cleaned:
                 set_suno_lyrics(suno_state_obj, cleaned)
                 suno_state_obj.mode = "lyrics"
+                _store_suno_user_lyrics(ctx, suno_state_obj.lyrics)
             else:
                 clear_suno_lyrics(suno_state_obj)
+                _store_suno_user_lyrics(ctx, None)
         s = state(ctx)
         _persist_suno_state(ctx, s, suno_state_obj)
         s["suno_waiting_state"] = IDLE_SUNO
@@ -3341,12 +3478,14 @@ async def _handle_suno_waiting_input(
             state_dict["suno_auto_lyrics_generated"] = False
             state_dict["suno_lyrics_confirmed"] = False
             custom_reply = "🤖 Сгенерирую короткий текст через Prompt-Master."
+            _store_suno_user_lyrics(ctx, None)
         else:
             set_suno_lyrics(suno_state_obj, cleaned_value)
             set_suno_lyrics_source(suno_state_obj, LyricsSource.USER)
             state_dict["suno_auto_lyrics_pending"] = False
             state_dict["suno_auto_lyrics_generated"] = False
             state_dict["suno_lyrics_confirmed"] = True
+            _store_suno_user_lyrics(ctx, suno_state_obj.lyrics)
 
     after_value = getattr(suno_state_obj, field, None)
     changed = (before_value or "") != (after_value or "")
@@ -5203,8 +5342,8 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
 def _music_flow_steps(flow: str) -> list[str]:
     mapping = {
         "instrumental": ["title", "style", "ready"],
-        "lyrics": ["title", "source", "style", "ready"],
-        "cover": ["title", "source", "style", "ready"],
+        "lyrics": ["title", "style", "source", "ready"],
+        "cover": ["title", "style", "source", "ready"],
     }
     return mapping.get(flow, [])
 
@@ -5282,7 +5421,11 @@ def _music_step_prompt_text(
                 index=prompt_index,
                 total=prompt_total,
             )
-        return t("suno.prompt.step.lyrics")
+        return t(
+            "suno.prompt.step.lyrics",
+            index=prompt_index,
+            total=prompt_total,
+        )
     if step == "ready":
         return SUNO_START_READY_MESSAGE
     return t("suno.prompt.step.generic")
@@ -5371,16 +5514,14 @@ async def sync_suno_prompt(
     state_dict["suno_step_order"] = order
     current_step = _music_update_step(state_dict, suno_state_obj, flow=flow_key)
 
-    display_order = [item for item in order if item != "title"]
-    if current_step in display_order and display_order:
-        display_index = display_order.index(current_step) + 1
-        display_total = len(display_order)
-    elif current_step in order and order:
-        display_index = order.index(current_step) + 1
-        display_total = len(order)
+    steps_for_count = [item for item in order if item != "ready"]
+    display_total = len(steps_for_count) or 1
+    if current_step in steps_for_count:
+        display_index = steps_for_count.index(current_step) + 1
+    elif current_step == "ready":
+        display_index = display_total
     else:
         display_index = 1
-        display_total = max(1, len(display_order) or len(order) or 1)
 
     waiting_value, wait_kind = _music_waiting_payload(flow_key, current_step)
     state_dict["suno_waiting_state"] = waiting_value
@@ -5453,6 +5594,14 @@ async def _music_begin_flow(
         card_message_id=card_msg_id,
         card_chat_id=effective_chat_id if isinstance(effective_chat_id, int) else None,
     )
+    if flow == "lyrics":
+        stored_lyrics = _load_suno_user_lyrics(ctx)
+        if stored_lyrics:
+            set_suno_lyrics(suno_state_obj, stored_lyrics)
+            set_suno_lyrics_source(suno_state_obj, LyricsSource.USER)
+            state_dict["suno_auto_lyrics_pending"] = False
+            state_dict["suno_auto_lyrics_generated"] = False
+            state_dict["suno_lyrics_confirmed"] = True
     state_dict["suno_cover_source_label"] = None
     _persist_suno_state(ctx, state_dict, suno_state_obj)
     state_dict["suno_flow"] = flow
@@ -8911,6 +9060,7 @@ async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     if user:
         clear_wait(user.id)
+    _clear_suno_user_storage(ctx)
     await handle_menu(update, ctx)
 
 
@@ -10519,6 +10669,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             clear_suno_title(suno_state_obj)
             clear_suno_style(suno_state_obj)
             clear_suno_lyrics(suno_state_obj)
+            _store_suno_user_lyrics(ctx, None)
             clear_suno_cover_source(suno_state_obj)
             _persist_suno_state(ctx, s, suno_state_obj)
             s["suno_flow"] = None
@@ -10539,6 +10690,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 current_source = suno_state_obj.lyrics_source
                 new_source = LyricsSource.USER if current_source != LyricsSource.USER else LyricsSource.AI
                 set_suno_lyrics_source(suno_state_obj, new_source)
+                if new_source == LyricsSource.USER and suno_state_obj.lyrics:
+                    _store_suno_user_lyrics(ctx, suno_state_obj.lyrics)
+                elif new_source != LyricsSource.USER:
+                    _store_suno_user_lyrics(ctx, None)
                 _persist_suno_state(ctx, s, suno_state_obj)
                 s["suno_waiting_state"] = IDLE_SUNO
                 s["suno_last_prompt_step"] = None
@@ -12222,64 +12377,64 @@ class RedisRunnerLock:
         self._redis = None
 
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("start",), start),
-    (("menu",), menu_command),
-    (("cancel",), cancel_command),
-    (("faq",), faq_command_entry),
-    (("prompt_master",), prompt_master_command),
-    (("pm_reset",), prompt_master_reset_command),
-    (("chat",), chat_command),
-    (("reset",), chat_reset_command),
-    (("history",), chat_history_command),
-    (("image", "mj"), image_command),
-    (("video", "veo"), video_command),
-    (("music", "suno"), suno_command),
-    (("balance",), balance_command),
-    (("help",), help_command),
-    (("support",), support_command),
+    (("start",), safe_handler(start)),
+    (("menu",), safe_handler(menu_command)),
+    (("cancel",), safe_handler(cancel_command)),
+    (("faq",), safe_handler(faq_command_entry)),
+    (("prompt_master",), safe_handler(prompt_master_command)),
+    (("pm_reset",), safe_handler(prompt_master_reset_command)),
+    (("chat",), safe_handler(chat_command)),
+    (("reset",), safe_handler(chat_reset_command)),
+    (("history",), safe_handler(chat_history_command)),
+    (("image", "mj"), safe_handler(image_command)),
+    (("video", "veo"), safe_handler(video_command)),
+    (("music", "suno"), safe_handler(suno_command)),
+    (("balance",), safe_handler(balance_command)),
+    (("help",), safe_handler(help_command)),
+    (("support",), safe_handler(support_command)),
 ]
 
 ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
-    (("buy",), buy_command),
-    (("suno_last",), suno_last_command),
-    (("suno_task",), suno_task_command),
-    (("suno_retry",), suno_retry_command),
-    (("lang",), lang_command),
-    (("health",), health),
-    (("topup",), topup),
-    (("promo",), promo_command),
-    (("users_count",), users_count_command),
-    (("whoami",), whoami_command),
-    (("suno_debug",), suno_debug_command),
-    (("broadcast",), broadcast_command),
-    (("my_balance",), my_balance_command),
-    (("add_balance",), add_balance_command),
-    (("sub_balance",), sub_balance_command),
-    (("transactions",), transactions_command),
-    (("balance_recalc",), balance_recalc),
+    (("buy",), safe_handler(buy_command)),
+    (("suno_last",), safe_handler(suno_last_command)),
+    (("suno_task",), safe_handler(suno_task_command)),
+    (("suno_retry",), safe_handler(suno_retry_command)),
+    (("lang",), safe_handler(lang_command)),
+    (("health",), safe_handler(health)),
+    (("topup",), safe_handler(topup)),
+    (("promo",), safe_handler(promo_command)),
+    (("users_count",), safe_handler(users_count_command)),
+    (("whoami",), safe_handler(whoami_command)),
+    (("suno_debug",), safe_handler(suno_debug_command)),
+    (("broadcast",), safe_handler(broadcast_command)),
+    (("my_balance",), safe_handler(my_balance_command)),
+    (("add_balance",), safe_handler(add_balance_command)),
+    (("sub_balance",), safe_handler(sub_balance_command)),
+    (("transactions",), safe_handler(transactions_command)),
+    (("balance_recalc",), safe_handler(balance_recalc)),
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (r"^pm:insert:(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
-    (r"^pm:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
-    (r"^pm:(back|menu|switch)$", prompt_master_callback_entry),
-    (r"^pm:copy:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
-    (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
-    (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
-    (r"^support:new$", support_new_callback),
-    (r"^support_reply:\d+$", support_reply_callback),
-    (r"^hub:", hub_router),
-    (r"^go:", main_suggest_router),
-    (None, on_callback),
+    (r"^pm:insert:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_insert_callback_entry)),
+    (r"^pm:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
+    (r"^pm:(back|menu|switch)$", safe_handler(prompt_master_callback_entry)),
+    (r"^pm:copy:(veo|mj|banana|animate|suno)$", safe_handler(prompt_master_callback_entry)),
+    (rf"^{CB_PM_PREFIX}", safe_handler(prompt_master_callback_entry)),
+    (rf"^{CB_FAQ_PREFIX}", safe_handler(faq_callback_entry)),
+    (r"^support:new$", safe_handler(support_new_callback)),
+    (r"^support_reply:\d+$", safe_handler(support_reply_callback)),
+    (r"^hub:", safe_handler(hub_router)),
+    (r"^go:", safe_handler(main_suggest_router)),
+    (None, safe_handler(on_callback)),
 ]
 
 REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
-    (MENU_BTN_VIDEO, handle_video_entry),
-    (MENU_BTN_IMAGE, handle_image_entry),
-    (MENU_BTN_SUNO, handle_music_entry),
-    (MENU_BTN_PM, prompt_master_command),
-    (MENU_BTN_CHAT, handle_chat_entry),
-    (MENU_BTN_BALANCE, handle_balance_entry),
+    (MENU_BTN_VIDEO, safe_handler(handle_video_entry)),
+    (MENU_BTN_IMAGE, safe_handler(handle_image_entry)),
+    (MENU_BTN_SUNO, safe_handler(handle_music_entry)),
+    (MENU_BTN_PM, safe_handler(prompt_master_command)),
+    (MENU_BTN_CHAT, safe_handler(handle_chat_entry)),
+    (MENU_BTN_BALANCE, safe_handler(handle_balance_entry)),
 ]
 
 
@@ -12293,7 +12448,7 @@ LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Aw
 def register_handlers(application: Any) -> None:
     welcome_handler = MessageHandler(
         filters.ALL,
-        welcome_entry,
+        safe_handler(welcome_entry),
     )
     welcome_handler.block = False
     application.add_handler(welcome_handler, group=0)
@@ -12301,21 +12456,21 @@ def register_handlers(application: Any) -> None:
     if SUPPORT_USER_ID > 0:
         support_reply_handler = MessageHandler(
             filters.User(SUPPORT_USER_ID),
-            handle_support_reply_message,
+            safe_handler(handle_support_reply_message),
         )
         support_reply_handler.block = False
         application.add_handler(support_reply_handler, group=0)
 
     command_gate_handler = MessageHandler(
         filters.COMMAND,
-        command_gate,
+        safe_handler(command_gate),
     )
     command_gate_handler.block = False
     application.add_handler(command_gate_handler, group=0)
 
     card_input_handler = MessageHandler(
         filters.TEXT,
-        handle_card_input,
+        safe_handler(handle_card_input),
     )
     card_input_handler.block = False
     application.add_handler(card_input_handler, group=1)
@@ -12332,10 +12487,10 @@ def register_handlers(application: Any) -> None:
         else:
             application.add_handler(CallbackQueryHandler(callback, pattern=pattern))
 
-    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    application.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    application.add_handler(PreCheckoutQueryHandler(safe_handler(precheckout_callback)))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, safe_handler(successful_payment_handler)))
+    application.add_handler(MessageHandler(filters.PHOTO, safe_handler(on_photo)))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, safe_handler(handle_voice)))
 
     for text, handler in REPLY_BUTTON_ROUTES:
         pattern = rf"^{re.escape(text)}$"
@@ -12346,11 +12501,11 @@ def register_handlers(application: Any) -> None:
             )
         )
 
-    pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
+    pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(prompt_master_handle_text))
     pm_handler.block = False
     application.add_handler(pm_handler, group=2)
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=10)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(on_text)), group=10)
 
 
 # ==========================

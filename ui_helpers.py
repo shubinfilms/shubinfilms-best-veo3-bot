@@ -237,7 +237,7 @@ def render_suno_card(
     style_preview = _safe_style_preview(suno_state.style, limit=160)
     style_value = html.escape(style_preview) if style_preview else "—"
 
-    lyrics_preview_value = suno_lyrics_preview(suno_state.lyrics)
+    lyrics_preview_value = suno_lyrics_preview(suno_state.lyrics, limit=140)
     lyrics_value = html.escape(lyrics_preview_value) if lyrics_preview_value else "—"
 
     if suno_state.source_file_id:
