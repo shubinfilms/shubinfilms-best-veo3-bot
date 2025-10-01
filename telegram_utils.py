@@ -29,6 +29,7 @@ from settings import REDIS_PREFIX
 
 log = logging.getLogger("telegram.utils")
 BOT_LOG = logging.getLogger("bot")
+SYSTEM_ERROR_TEXT = "⚠️ Системная ошибка. Попробуйте ещё раз."
 
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
@@ -168,10 +169,14 @@ def with_state_reset(
                     logger.debug("callback.answer_failed", exc_info=True)
 
         cleared = 0
-        try:
-            cleared = await reset_user_state(update, context)
-        except Exception:
-            logger.warning("state_reset_failed", exc_info=True)
+        skip_reset = bool(getattr(context, "_veo_pre_command_reset", False))
+        if skip_reset:
+            _purge_wait_hints(context)
+        else:
+            try:
+                cleared = await reset_user_state(update, context)
+            except Exception:
+                logger.warning("state_reset_failed", exc_info=True)
 
         user_id = extract_user_id(update, context)
         if cleared > 0:
@@ -207,6 +212,53 @@ def with_state_reset(
 
     setattr(wrapped, "__with_state_reset__", True)
     return wrapped
+
+
+async def reply_system_error(update: Any, context: Any) -> None:
+    message = getattr(update, "effective_message", None)
+    if message is not None:
+        with suppress(Exception):
+            await message.reply_text(SYSTEM_ERROR_TEXT)
+        return
+
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    target = chat_id or user_id
+    if target is None:
+        return
+    bot = getattr(context, "bot", None)
+    if bot is None:
+        return
+    with suppress(Exception):
+        await bot.send_message(chat_id=target, text=SYSTEM_ERROR_TEXT)
+
+
+async def safe_dispatch(
+    fn: Callable[..., Awaitable[Any] | Any],
+    update: Any,
+    context: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    try:
+        result = fn(update, context, *args, **kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        message = getattr(update, "effective_message", None)
+        command_text = ""
+        if message is not None:
+            command_text = (getattr(message, "text", "") or "").strip()
+        logger = _context_logger(context)
+        if command_text:
+            logger.exception("command failed: %s", command_text)
+        else:
+            logger.exception("command failed")
+        await reply_system_error(update, context)
+        return None
 
 _ALLOWED_HTML_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "blockquote", "tg-spoiler"}
 _ALLOWED_HTML_ATTRS = {"a": {"href"}}

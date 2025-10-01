@@ -19,6 +19,12 @@ else:  # pragma: no cover - fallback alias to avoid runtime dependency
     TelegramUser = Any
 
 import redis
+from contextlib import suppress
+
+try:  # pragma: no cover - optional async redis client
+    import redis.asyncio as redis_asyncio  # type: ignore
+except Exception:  # pragma: no cover - fallback when redis.asyncio unavailable
+    redis_asyncio = None
 
 from settings import REDIS_PREFIX
 
@@ -77,6 +83,78 @@ _user_profile_memory: Dict[int, Dict[str, str]] = {}
 _wait_lock = Lock()
 _wait_memory: Dict[str, float] = {}
 _WAIT_TTL_DEFAULT = 15 * 60
+
+WAIT_PREFIXES = ("wait", "fsm")
+
+
+async def reset_user_state_safely(
+    *, user_id: int | str | None = None, chat_id: int | str | None = None
+) -> int:
+    """Remove wait/fsm keys for ``user_id``/``chat_id`` using a standalone client."""
+
+    redis_url = _redis_url or os.getenv("REDIS_URL")
+    if not redis_url:
+        return 0
+
+    patterns: list[str] = []
+
+    def _normalize(value: int | str | None) -> int | None:
+        if value is None:
+            return None
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if numeric != 0 else None
+
+    normalized_user = _normalize(user_id)
+    normalized_chat = _normalize(chat_id)
+
+    if normalized_user is not None:
+        patterns.extend(
+            f"{_PFX}:{prefix}:{normalized_user}:*" for prefix in WAIT_PREFIXES
+        )
+    if normalized_chat is not None:
+        patterns.extend(
+            f"{_PFX}:{prefix}:chat:{normalized_chat}:*" for prefix in WAIT_PREFIXES
+        )
+
+    if not patterns:
+        return 0
+
+    client: Any = None
+    deleted = 0
+    try:
+        if redis_asyncio is not None:
+            client = redis_asyncio.from_url(
+                redis_url, encoding="utf-8", decode_responses=True
+            )
+        else:
+            client = redis.from_url(redis_url, decode_responses=True)
+        deleted = await redis_delete_keys(client, patterns)
+        if deleted:
+            _logger.debug(
+                "reset_user_state_safely | patterns=%s deleted=%s",
+                patterns,
+                deleted,
+            )
+        return deleted
+    except Exception:  # pragma: no cover - defensive logging
+        _logger.warning(
+            "reset_user_state_safely.failed | user=%s chat=%s", user_id, chat_id, exc_info=True
+        )
+        return 0
+    finally:
+        if client is not None:
+            close = getattr(client, "aclose", None)
+            if callable(close):
+                with suppress(Exception):
+                    await close()
+            else:
+                close_sync = getattr(client, "close", None)
+                if callable(close_sync):
+                    with suppress(Exception):
+                        close_sync()
 
 
 async def _gather_keys(r: Any, pattern: str) -> list[str]:
