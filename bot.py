@@ -10,7 +10,13 @@ import logging
 import os
 import warnings
 
-from logging_utils import build_log_extra, configure_logging, get_logger, log_environment
+from logging_utils import (
+    build_log_extra,
+    configure_logging,
+    get_context_logger,
+    get_logger,
+    log_environment,
+)
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -4704,6 +4710,12 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or not query.data:
         return
+
+    log = get_context_logger(ctx)
+    try:
+        await query.answer()
+    except Exception as exc:
+        log.warning("cbq.answer.fail", **build_log_extra({"error": repr(exc)}, update=update))
 
     data = (query.data or "").strip()
     if not data.startswith(HUB_CALLBACK_PREFIX):
@@ -13365,13 +13377,25 @@ def wrap_cmd(
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = getattr(update, "effective_message", None)
-    if message is None:
+    chat = getattr(update, "effective_chat", None)
+    if chat is None:
         return
-    await message.reply_text("pong")
+    result = await safe_send_text(context, chat.id, "pong", parse_mode=None, update=update)
+    if not result.ok:
+        log = get_context_logger(context)
+        log.warning(
+            "ping.send_failed",
+            **build_log_extra({"error": repr(result.error)}, update=update),
+        )
 
 
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+try:  # Preserve handler identity across module reloads
+    _UNKNOWN_COMMAND_PREV = unknown_command  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - first import
+    _UNKNOWN_COMMAND_PREV = None
+
+
+async def _unknown_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await pre_command_reset(update, context)
     message = getattr(update, "effective_message", None)
     token = _extract_command_token(message)
@@ -13383,6 +13407,19 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if message is None:
         return
     await message.reply_text("Неизвестная команда. Нажмите /menu")
+
+
+if _UNKNOWN_COMMAND_PREV is not None:
+    _UNKNOWN_COMMAND_PREV.__code__ = _unknown_command_impl.__code__
+    _UNKNOWN_COMMAND_PREV.__defaults__ = _unknown_command_impl.__defaults__
+    _UNKNOWN_COMMAND_PREV.__kwdefaults__ = _unknown_command_impl.__kwdefaults__
+    _UNKNOWN_COMMAND_PREV.__doc__ = _unknown_command_impl.__doc__
+    _UNKNOWN_COMMAND_PREV.__dict__.update(_unknown_command_impl.__dict__)
+    unknown_command = _UNKNOWN_COMMAND_PREV
+else:
+    unknown_command = _unknown_command_impl
+
+del _UNKNOWN_COMMAND_PREV
 
 
 COMMAND_HANDLER_SPECS: List[
@@ -13624,7 +13661,7 @@ async def run_bot_async() -> None:
         .rate_limiter(AIORateLimiter())
         .build()
     )
-    application.bot_data["logger"] = logging.getLogger("veo3-bot")
+    application.bot_data["logger"] = get_logger("veo3-bot")
 
     try:
         register_handlers(application)

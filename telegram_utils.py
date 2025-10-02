@@ -14,7 +14,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from functools import wraps
-from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence, NamedTuple
 
 import requests
 from requests import Response
@@ -26,7 +26,7 @@ from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, Tele
 from metrics import telegram_send_total
 from redis_utils import reset_user_state as redis_reset_user_state
 from settings import REDIS_PREFIX
-from logging_utils import build_log_extra
+from logging_utils import build_log_extra, get_context_logger
 
 log = logging.getLogger("telegram.utils")
 BOT_LOG = logging.getLogger("bot")
@@ -966,14 +966,36 @@ async def safe_edit_text(bot: Any, chat_id: int, message_id: int, text: str) -> 
     return await safe_edit_markdown_v2(bot, chat_id, message_id, text)
 
 
+class SafeSendResult(NamedTuple):
+    ok: bool
+    message: Optional[Any]
+    error: Optional[BaseException]
+
+
+def _resolve_bot(target: Any) -> tuple[Any, Any]:
+    context = None
+    bot = getattr(target, "bot", None)
+    if bot is None:
+        bot = target
+    else:
+        context = target
+    return bot, context
+
+
 async def safe_send_text(
-    bot: Any,
+    target: Any,
     chat_id: int,
     text: str,
     *,
     parse_mode: Optional[str] = ParseMode.MARKDOWN_V2,
     disable_web_page_preview: bool = True,
-) -> Optional[Any]:
+    update: Any = None,
+    **kwargs: Any,
+) -> SafeSendResult:
+    bot, context = _resolve_bot(target)
+    if bot is None:
+        raise RuntimeError("Bot instance is required for safe_send_text")
+    logger = get_context_logger(context, fallback="veo3-bot")
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
@@ -981,7 +1003,28 @@ async def safe_send_text(
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
-    return await bot.send_message(**payload)
+    payload.update(kwargs)
+    try:
+        message = await bot.send_message(**payload)
+    except Exception as exc:  # pragma: no cover - network errors
+        logger.warning(
+            "send.fail",
+            **build_log_extra(
+                {"kind": "text", "chat_id": chat_id, "error": repr(exc)},
+                update=update,
+            ),
+        )
+        return SafeSendResult(False, None, exc)
+
+    message_id = getattr(message, "message_id", None)
+    logger.info(
+        "send.ok",
+        **build_log_extra(
+            {"kind": "text", "chat_id": chat_id, "message_id": message_id},
+            update=update,
+        ),
+    )
+    return SafeSendResult(True, message, None)
 
 
 async def safe_send_placeholder(bot: Any, chat_id: int, text: str) -> Optional[Message]:
@@ -1138,6 +1181,7 @@ def is_remote_file_error(status: Optional[int], reason: Optional[str]) -> bool:
 
 __all__ = [
     "safe_send",
+    "SafeSendResult",
     "safe_send_text",
     "safe_send_placeholder",
     "safe_send_sticker",

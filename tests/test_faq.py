@@ -28,8 +28,13 @@ def setup_function():
 
 def test_faq_command_sends_intro_and_keyboard():
     bot = FakeBot()
-    message = SimpleNamespace(chat=SimpleNamespace(id=101), chat_id=101)
-    update = SimpleNamespace(effective_message=message)
+    chat = SimpleNamespace(id=101)
+    message = SimpleNamespace(chat=chat, chat_id=101)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=chat,
+    )
     ctx = SimpleNamespace(bot=bot)
 
     root_calls = []
@@ -55,13 +60,18 @@ def test_faq_callback_sends_section_text():
     section_calls = []
     configure_faq(on_section_view=lambda key: section_calls.append(key))
 
+    chat = SimpleNamespace(id=202)
     query = SimpleNamespace(
         data=f"{CB_FAQ_PREFIX}veo",
         answer=fake_answer,
-        message=SimpleNamespace(chat=SimpleNamespace(id=202), message_id=55),
+        message=SimpleNamespace(chat=chat, message_id=55),
         bot=bot,
     )
-    update = SimpleNamespace(callback_query=query, effective_user=None)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=2),
+        effective_chat=chat,
+    )
     ctx = SimpleNamespace(bot=bot)
 
     asyncio.run(faq_callback(update, ctx))
@@ -86,13 +96,18 @@ def test_faq_callback_back_calls_main_menu():
     async def fake_answer():
         pass
 
+    chat = SimpleNamespace(id=303)
     query = SimpleNamespace(
         data=f"{CB_FAQ_PREFIX}back",
         answer=fake_answer,
         edit_message_text=None,
-        message=SimpleNamespace(chat=SimpleNamespace(id=303), message_id=10),
+        message=SimpleNamespace(chat=chat, message_id=10),
     )
-    update = SimpleNamespace(callback_query=query, effective_user=None)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=3),
+        effective_chat=chat,
+    )
     ctx = SimpleNamespace(bot=bot)
 
     asyncio.run(faq_callback(update, ctx))
@@ -115,12 +130,17 @@ def test_faq_callback_unknown_section_returns_fallback():
     async def fake_answer():
         pass
 
+    chat = SimpleNamespace(id=404)
     query = SimpleNamespace(
         data=f"{CB_FAQ_PREFIX}unknown",
         answer=fake_answer,
-        message=SimpleNamespace(chat=SimpleNamespace(id=404), message_id=77),
+        message=SimpleNamespace(chat=chat, message_id=77),
     )
-    update = SimpleNamespace(callback_query=query, effective_user=None)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=4),
+        effective_chat=chat,
+    )
     ctx = SimpleNamespace(bot=bot)
 
     asyncio.run(faq_callback(update, ctx))

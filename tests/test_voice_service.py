@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 import voice_service
 from voice_service import VoiceTranscribeError, transcribe
+from telegram_utils import SafeSendResult
 
 
 class _FakeRateLimitError(Exception):
@@ -122,6 +123,7 @@ def test_handle_voice_success(monkeypatch, bot_module):
 
     async def fake_safe_send_text(bot, chat_id, text, **kwargs):
         sends.append(text)
+        return SafeSendResult(True, None, None)
 
     async def fake_run_ffmpeg(data, args):
         ffmpeg_calls.append(args)
@@ -245,7 +247,10 @@ def test_handle_voice_transcribe_error(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "ensure_user_record", fake_ensure_user_record)
     monkeypatch.setattr(bot_module, "safe_send_placeholder", fake_safe_send_placeholder)
     monkeypatch.setattr(bot_module, "safe_edit_markdown_v2", fake_safe_edit)
-    monkeypatch.setattr(bot_module, "safe_send_text", MagicMock())
+    async def fake_safe_send_text(*args, **kwargs):
+        return SafeSendResult(True, None, None)
+
+    monkeypatch.setattr(bot_module, "safe_send_text", fake_safe_send_text)
     monkeypatch.setattr(bot_module, "run_ffmpeg", fake_run_ffmpeg)
     monkeypatch.setattr(bot_module, "_download_telegram_file", fake_download)
     monkeypatch.setattr(bot_module, "voice_transcribe", fake_voice_transcribe)
