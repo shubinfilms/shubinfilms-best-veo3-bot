@@ -50,6 +50,15 @@ MAX_TG_VIDEO_MB=48
 POLL_INTERVAL_SECS=6
 POLL_TIMEOUT_SECS=1200
 
+# Image delivery
+BANANA_SEND_AS_DOCUMENT=true    # отправлять результат Banana вторым сообщением как документ
+MJ_SEND_AS_ALBUM=true           # группировать 4 изображения Midjourney в альбом sendMediaGroup
+
+- `BANANA_SEND_AS_DOCUMENT`: при включении бот сначала отправляет предпросмотр Banana как фото, а затем тот же файл как документ
+  без сжатия Telegram.
+- `MJ_SEND_AS_ALBUM`: при включении четыре кадра Midjourney отправляются одним вызовом `sendMediaGroup`; при сбоях или меньшем
+  количестве изображений бот возвращается к одиночной отправке.
+
 # Logging
 LOG_LEVEL=INFO
 
