@@ -84,6 +84,7 @@ from handlers import (
     configure_faq,
     faq_callback,
     faq_command,
+    help_command,
     get_pm_prompt,
     prompt_master_callback,
     prompt_master_handle_text,
@@ -231,6 +232,7 @@ from settings import (
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
+    SUPPORT_USERNAME,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -698,7 +700,8 @@ def _env_int(k: str, default: int) -> int:
 START_EMOJI_STICKER_ID = _env("START_EMOJI_STICKER_ID", "5188621441926438751")
 START_EMOJI_FALLBACK = _env("START_EMOJI_FALLBACK", "🎬") or "🎬"
 
-SUPPORT_PUBLIC_URL = _env("SUPPORT_PUBLIC_URL", "https://t.me/BestVeo3_Support") or "https://t.me/BestVeo3_Support"
+_DEFAULT_SUPPORT_URL = f"https://t.me/{SUPPORT_USERNAME}"
+SUPPORT_PUBLIC_URL = _env("SUPPORT_PUBLIC_URL", _DEFAULT_SUPPORT_URL) or _DEFAULT_SUPPORT_URL
 
 
 SUNO_PER_USER_COOLDOWN_SEC = max(0, _env_int("SUNO_PER_USER_COOLDOWN_SEC", 0))
@@ -4594,7 +4597,7 @@ WELCOME = (
 
 HELP_TEXT = (
     "<b>🆘 Поддержка</b>\n"
-    f"Свяжитесь с нами: <a href=\"{html.escape(SUPPORT_PUBLIC_URL, quote=True)}\">@BestVeo3_Support</a>\n"
+    f"Свяжитесь с нами: <a href=\"{html.escape(SUPPORT_PUBLIC_URL, quote=True)}\">@{SUPPORT_USERNAME}</a>\n"
     "Создайте тикет или напишите напрямую — ответим в течение нескольких минут."
 )
 
@@ -4834,7 +4837,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if route == "help":
-        await render_help_card(chat_id, ctx, message=message, edit=bool(message))
+        await help_command(update, ctx)
         return
 
     if route == "faq":
@@ -9805,7 +9808,7 @@ async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reset_user_context(update, ctx, reason="help:ticket")
         await _prompt_support_ticket(update, ctx, source="menu")
     else:
-        await render_help_card(chat_id, ctx, message=query.message, edit=True)
+        await help_command(update, ctx)
 
 
 async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10238,27 +10241,13 @@ async def handle_support_reply_message(update: Update, ctx: ContextTypes.DEFAULT
             pass
 
 
-async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    message = update.effective_message
-    if message is None:
-        return
-    await message.reply_text(
-        HELP_TEXT,
-        reply_markup=support_keyboard(),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-
-
 async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     await faq_command(update, ctx)
 
 
 async def support_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ensure_user_record(update)
-    await _prompt_support_ticket(update, ctx, source="command")
+    await help_command(update, ctx)
 
 
 async def faq_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -13540,8 +13529,7 @@ COMMAND_HANDLER_SPECS: List[
     (("video", "veo"), on_video),
     (("music", "suno"), on_music),
     (("balance",), balance_command),
-    (("help",), on_help),
-    (("support",), support_command),
+    (("help", "support"), help_command),
     (("buy",), on_buy),
     (("suno_last",), suno_last_command),
     (("suno_task",), suno_task_command),

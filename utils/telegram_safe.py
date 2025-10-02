@@ -7,12 +7,15 @@ from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
-from telegram import Message, ReplyMarkup, Update
+import telegram
+from telegram import Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from logging_utils import build_log_extra
+
+ReplyMarkup = getattr(telegram, "ReplyMarkup", Any)
 
 
 log = logging.getLogger("bot.send")

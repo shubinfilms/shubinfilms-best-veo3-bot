@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- Add localized `/help` and `/support` handler with support chat button and telemetry.
+- Document `SUPPORT_USERNAME` and `SUPPORT_USER_ID` environment variables.
+
 ## v0.7.1-suno-stable
 - Prefix Suno request IDs with the initiating user ID for idempotent reuse.
 - Expand enqueue retry jitter to ±30% and align max delay with 15s budget.

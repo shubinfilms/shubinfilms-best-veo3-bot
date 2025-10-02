@@ -7,6 +7,8 @@ PROMPTS_CHANNEL_URL=https://t.me/bestveo3promts
 STARS_BUY_URL=https://t.me/PremiumBot
 PROMO_ENABLED=true
 DEV_MODE=false
+SUPPORT_USERNAME=BestAi_Support
+SUPPORT_USER_ID=7223448532
 
 # OpenAI / Prompt Master (optional)
 OPENAI_API_KEY=
