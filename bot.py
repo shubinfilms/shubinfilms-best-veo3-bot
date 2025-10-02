@@ -139,7 +139,7 @@ from utils.input_state import (
     set_wait,
     touch_wait,
 )
-from utils.telegram_utils import label_to_command, should_capture_to_prompt
+from utils.telegram_utils import build_photo_album_media, label_to_command, should_capture_to_prompt
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import (
@@ -950,6 +950,7 @@ KIE_STRICT_POLLING = _env("KIE_STRICT_POLLING", "false").lower() == "true"
 
 logging.getLogger("kie").setLevel(logging.INFO)
 log = logging.getLogger("veo3-bot")
+mj_log = logging.getLogger("mj_handler")
 singleton_log = logging.getLogger("veo3-bot.singleton")
 
 try:
@@ -2524,6 +2525,20 @@ def _coerce_url_list(value) -> List[str]:
 
 _MJ_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
+_MJ_UI_TEXTS = {
+    "gallery_ready": {"ru": "Галерея сгенерирована.", "en": "Gallery generated."},
+    "repeat": {"ru": "Повторить", "en": "Repeat"},
+    "back": {"ru": "Назад в меню", "en": "Back to menu"},
+}
+
+
+def _mj_ui_text(key: str, locale: str) -> str:
+    data = _MJ_UI_TEXTS.get(key, {})
+    normalized = (locale or "ru").lower()
+    if normalized.startswith("en"):
+        return data.get("en", data.get("ru", ""))
+    return data.get("ru", "")
+
 
 def _mj_content_type_extension(content_type: Optional[str]) -> Optional[str]:
     if not content_type:
@@ -2554,14 +2569,25 @@ def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str]
     try:
         resp = requests.get(url, timeout=60)
     except requests.RequestException as exc:
-        log.warning("MJ image download failed (%s): %s", url, exc)
+        mj_log.warning(
+            "mj.album.download_fail",
+            extra={"meta": {"url": url, "index": index, "error": str(exc)}},
+        )
         return None
     if resp.status_code != 200:
-        log.warning("MJ image download status %s for %s", resp.status_code, url)
+        mj_log.warning(
+            "mj.album.download_fail",
+            extra={
+                "meta": {"url": url, "index": index, "status": resp.status_code},
+            },
+        )
         return None
     data = resp.content
     if not data:
-        log.warning("MJ image download empty response for %s", url)
+        mj_log.warning(
+            "mj.album.download_fail",
+            extra={"meta": {"url": url, "index": index, "reason": "empty"}},
+        )
         return None
     filename = _mj_guess_filename(url, index, resp.headers.get("Content-Type"))
     return data, filename
@@ -2572,6 +2598,17 @@ def _make_input_photo(data: bytes, filename: str) -> InputFile:
     buffer.name = filename
     buffer.seek(0)
     return InputFile(buffer, filename=filename)
+
+
+def _trim_caption_text(text: str, limit: int = 1024) -> str:
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    ellipsis = "…"
+    if limit <= len(ellipsis):
+        return ellipsis[:limit]
+    return text[: limit - len(ellipsis)] + ellipsis
 
 
 def _banana_caption(prompt: str) -> str:
@@ -2765,6 +2802,7 @@ async def _deliver_banana_media(
     return sent_any or doc_sent
 
 
+
 async def _deliver_mj_media(
     bot: Any,
     *,
@@ -2773,30 +2811,94 @@ async def _deliver_mj_media(
     caption: str,
     items: Sequence[tuple[bytes, str]],
     send_as_album: bool,
+    task_id: Optional[str] = None,
 ) -> bool:
-    prepared: list[tuple[bytes, str, int]] = []
+    prepared: list[dict[str, Any]] = []
     for data, filename in items:
         if not data:
             continue
-        prepared.append((data, filename, len(data)))
+        prepared.append({"data": data, "filename": filename, "size": len(data)})
 
     if not prepared:
         return False
 
-    album_candidates = prepared[:4]
-    album_sizes = [size for _, _, size in album_candidates]
-    fallback_reason: Optional[str] = None
+    total = len(prepared)
+    trimmed_caption = _trim_caption_text(caption)
+    caption_sent = False
+    sent_any = False
 
-    if send_as_album:
-        if len(album_candidates) == 4:
-            media_group = [
-                InputMediaPhoto(
-                    media=_make_input_photo(data, filename),
-                    caption=caption if index == 0 else None,
+    async def _send_single_items(
+        payload: Sequence[dict[str, Any]], *, allow_caption: bool
+    ) -> None:
+        nonlocal caption_sent, sent_any
+        for offset, item in enumerate(payload):
+            photo_caption = (
+                trimmed_caption if allow_caption and not caption_sent and offset == 0 else None
+            )
+            photo_start = time.monotonic()
+            try:
+                message = await safe_send_photo(
+                    bot,
+                    chat_id=chat_id,
+                    photo=_make_input_photo(item["data"], item["filename"]),
+                    caption=photo_caption,
+                    kind="mj_photo",
                 )
-                for index, (data, filename, _) in enumerate(album_candidates)
-            ]
-            start = time.monotonic()
+            except Exception as exc:
+                duration_ms = int((time.monotonic() - photo_start) * 1000)
+                mj_log.warning(
+                    "mj.send.photo.fail",
+                    extra={
+                        "meta": {
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "size": item["size"],
+                            "duration_ms": duration_ms,
+                            "error": str(exc),
+                            "task_id": task_id,
+                        }
+                    },
+                )
+                continue
+
+            duration_ms = int((time.monotonic() - photo_start) * 1000)
+            message_id = getattr(message, "message_id", None)
+            caption_sent = caption_sent or photo_caption is not None
+            sent_any = True
+            mj_log.info(
+                "mj.send.photo.ok",
+                extra={
+                    "meta": {
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "size": item["size"],
+                        "duration_ms": duration_ms,
+                        "task_id": task_id,
+                    }
+                },
+            )
+
+    def _chunk_album(items_list: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        chunks = [list(items_list[i : i + 10]) for i in range(0, len(items_list), 10)]
+        if len(chunks) >= 2 and len(chunks[-1]) == 1:
+            donor = chunks[-2]
+            if len(donor) >= 2:
+                last_item = chunks[-1][0]
+                moved = donor.pop()
+                chunks[-1] = [moved, last_item]
+        return chunks
+
+    if send_as_album and total >= 2:
+        chunks = _chunk_album(prepared)
+        album_message_ids: list[int] = []
+        for chunk_index, chunk in enumerate(chunks):
+            chunk_caption = trimmed_caption if not caption_sent else None
+            media_group = build_photo_album_media(
+                [_make_input_photo(item["data"], item["filename"]) for item in chunk],
+                caption=chunk_caption,
+            )
+            start_ts = time.monotonic()
             try:
                 messages = await safe_send_media_group(
                     bot,
@@ -2804,176 +2906,67 @@ async def _deliver_mj_media(
                     media=media_group,
                     kind="mj_media_group",
                 )
-                duration_ms = int((time.monotonic() - start) * 1000)
-                message_ids = [getattr(msg, "message_id", None) for msg in (messages or [])]
-                log.info(
-                    "send.media_group",
-                    extra={
-                        "meta": {
-                            "ctx_user_id": user_id,
-                            "chat_id": chat_id,
-                            "count": len(media_group),
-                            "file_bytes": album_sizes,
-                            "media_group_fallback": False,
-                            "message_ids": message_ids,
-                        }
-                    },
-                )
-                log.info(
-                    "mj.media_group.ok",
-                    extra={
-                        "meta": {
-                            "user_id": user_id,
-                            "chat_id": chat_id,
-                            "count": len(media_group),
-                            "sizes": album_sizes,
-                            "duration_ms": duration_ms,
-                            "message_ids": message_ids,
-                        }
-                    },
-                )
-                return True
             except Exception as exc:
-                duration_ms = int((time.monotonic() - start) * 1000)
-                log.info(
-                    "send.media_group",
-                    extra={
-                        "meta": {
-                            "ctx_user_id": user_id,
-                            "chat_id": chat_id,
-                            "count": len(album_candidates),
-                            "file_bytes": album_sizes,
-                            "media_group_fallback": True,
-                            "error": str(exc),
-                        }
-                    },
+                error_code = (
+                    getattr(exc, "error_code", None)
+                    or getattr(exc, "code", None)
+                    or getattr(exc, "status_code", None)
                 )
-                log.warning(
-                    "mj.media_group.fail",
+                mj_log.warning(
+                    "mj.album.fallback_single",
                     extra={
                         "meta": {
                             "user_id": user_id,
                             "chat_id": chat_id,
-                            "count": len(album_candidates),
-                            "sizes": album_sizes,
-                            "duration_ms": duration_ms,
-                            "error": str(exc),
+                            "task_id": task_id,
+                            "count": total,
+                            "chunks": len(chunks),
+                            "error_code": error_code,
+                            "error_desc": str(exc),
                         }
                     },
                 )
-                fallback_reason = "send_error"
-        else:
-            log.info(
-                "send.media_group",
-                extra={
-                    "meta": {
-                        "ctx_user_id": user_id,
-                        "chat_id": chat_id,
-                        "count": len(album_candidates),
-                        "file_bytes": album_sizes,
-                        "media_group_fallback": True,
-                        "reason": "insufficient_media",
-                    }
-                },
-            )
-            log.info(
-                "mj.media_group.fail",
-                extra={
-                    "meta": {
-                        "user_id": user_id,
-                        "chat_id": chat_id,
-                        "count": len(album_candidates),
-                        "sizes": album_sizes,
-                        "reason": "insufficient_media",
-                    }
-                },
-            )
-            fallback_reason = "insufficient_media"
-    else:
-        log.info(
-            "send.media_group",
-            extra={
-                "meta": {
-                    "ctx_user_id": user_id,
-                    "chat_id": chat_id,
-                    "count": len(album_candidates),
-                    "file_bytes": album_sizes,
-                    "media_group_fallback": True,
-                    "reason": "disabled",
-                }
-            },
-        )
-        log.info(
-            "mj.media_group.fail",
-            extra={
-                "meta": {
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                    "count": len(album_candidates),
-                    "sizes": album_sizes,
-                    "reason": "disabled",
-                }
-            },
-        )
-        fallback_reason = "disabled"
+                remaining = [item for part in chunks[chunk_index:] for item in part]
+                if remaining:
+                    await _send_single_items(remaining, allow_caption=not caption_sent)
+                return sent_any
 
-    if fallback_reason:
-        log.info(
-            "mj.single_photo.fallback",
-            extra={
-                "meta": {
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                    "reason": fallback_reason,
-                    "count": len(prepared),
-                    "sizes": [size for _, _, size in prepared],
-                }
-            },
-        )
-
-    sent_any = False
-    for index, (data, filename, size) in enumerate(prepared):
-        photo_start = time.monotonic()
-        try:
-            message = await safe_send_photo(
-                bot,
-                chat_id=chat_id,
-                photo=_make_input_photo(data, filename),
-                caption=caption if index == 0 else None,
-                kind="mj_photo",
-            )
-            duration_ms = int((time.monotonic() - photo_start) * 1000)
-            message_id = getattr(message, "message_id", None)
+            duration_ms = int((time.monotonic() - start_ts) * 1000)
+            caption_sent = caption_sent or chunk_caption is not None
             sent_any = True
-            log.info(
-                "mj.send.photo.ok",
+            message_ids = [getattr(msg, "message_id", None) for msg in (messages or [])]
+            album_message_ids.extend(message_ids)
+            mj_log.info(
+                "mj.album.chunk",
                 extra={
                     "meta": {
                         "user_id": user_id,
                         "chat_id": chat_id,
-                        "message_id": message_id,
-                        "index": index,
-                        "size": size,
+                        "task_id": task_id,
+                        "chunk_index": chunk_index,
+                        "chunk_size": len(chunk),
                         "duration_ms": duration_ms,
-                    }
-                },
-            )
-        except Exception as exc:
-            duration_ms = int((time.monotonic() - photo_start) * 1000)
-            log.warning(
-                "mj.send.photo.fail",
-                extra={
-                    "meta": {
-                        "user_id": user_id,
-                        "chat_id": chat_id,
-                        "index": index,
-                        "size": size,
-                        "duration_ms": duration_ms,
-                        "error": str(exc),
                     }
                 },
             )
 
+        mj_log.info(
+            "mj.album.sent",
+            extra={
+                "meta": {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "task_id": task_id,
+                    "count": total,
+                    "chunks": len(chunks),
+                    "caption_len": len(trimmed_caption),
+                    "message_ids": album_message_ids,
+                }
+            },
+        )
+        return True
+
+    await _send_single_items(prepared, allow_caption=True)
     return sent_any
 
 
@@ -3163,6 +3156,7 @@ DEFAULT_STATE = {
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
     "mj_generating": False, "last_mj_task_id": None,
+    "mj_locale": None,
     "active_generation_op": None,
     "mj_active_op_key": None,
     "banana_active_op_key": None,
@@ -8882,12 +8876,15 @@ async def poll_mj_and_send_photos(
                 caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
 
                 downloaded: List[Tuple[bytes, str]] = []
-                for idx, u in enumerate(urls[:10]):
+                for idx, u in enumerate(urls):
                     result = await asyncio.to_thread(_download_mj_image_bytes, u, idx)
                     if result:
                         downloaded.append(result)
                     else:
-                        log.warning("MJ skip image due to download failure: %s", u)
+                        mj_log.warning(
+                            "mj.album.download_fail",
+                            extra={"meta": {"url": u, "index": idx, "reason": "skipped"}},
+                        )
 
                 if not downloaded:
                     await _refund("download_failed")
@@ -8904,6 +8901,7 @@ async def poll_mj_and_send_photos(
                     caption=caption,
                     items=downloaded,
                     send_as_album=MJ_SEND_AS_ALBUM,
+                    task_id=task_id,
                 )
 
                 if not sent_successfully:
@@ -8914,11 +8912,23 @@ async def poll_mj_and_send_photos(
                     )
                     return
 
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Повторить", callback_data="mj:repeat")],
-                    [InlineKeyboardButton("Назад в меню", callback_data="back")],
-                ])
-                await ctx.bot.send_message(chat_id, "Галерея сгенерирована.", reply_markup=keyboard)
+                locale = s.get("mj_locale") or "ru"
+                ready_text = _mj_ui_text("gallery_ready", locale)
+                keyboard = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                _mj_ui_text("repeat", locale), callback_data="mj:repeat"
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                _mj_ui_text("back", locale), callback_data="back"
+                            )
+                        ],
+                    ]
+                )
+                await ctx.bot.send_message(chat_id, ready_text, reply_markup=keyboard)
 
                 success = True
                 return
@@ -8935,6 +8945,7 @@ async def poll_mj_and_send_photos(
         s["last_mj_task_id"] = None
         s["mj_last_wait_ts"] = 0.0
         s["last_prompt"] = None
+        s["mj_locale"] = None
         mid = s.get("last_ui_msg_id_mj")
         if mid:
             final_text = "✅ Midjourney: изображение обработано." if success else "ℹ️ Midjourney: поток завершён."
@@ -9321,6 +9332,9 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     message = update.effective_message
     if message is None:
         return
+    chat = update.effective_chat
+    if chat is None:
+        return
 
     user = update.effective_user
     user_id = user.id if user else None
@@ -9332,10 +9346,15 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     s = state(ctx)
     s["mode"] = None
 
-    await message.reply_text(
-        "🎬 Выберите тип генерации видео:",
-        reply_markup=video_menu_kb(),
-    )
+    if message is not None:
+        reply_method = getattr(message, "reply_text", None)
+        if callable(reply_method):
+            await reply_method(
+                "🎬 Выберите тип генерации видео:",
+                reply_markup=video_menu_kb(),
+            )
+
+    await veo_entry(chat.id, ctx)
 
 
 async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10234,6 +10253,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not uid:
                 await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
                 return
+            mj_locale = "ru"
+            if user and isinstance(user.language_code, str):
+                lowered_lang = user.language_code.lower()
+                if lowered_lang.startswith("en"):
+                    mj_locale = "en"
+            s["mj_locale"] = mj_locale
             try:
                 ensure_user(uid)
             except Exception as exc:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 import unicodedata
 from time import time
-from typing import Any, Optional, Set
+from typing import Any, Optional, Sequence, Set
 
+from telegram import InputMediaPhoto
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 
@@ -167,6 +169,26 @@ _register_label("🧠", prefix=True)
 _register_label("🧩 Banana")
 _register_label("🎵 Suno (текст песни)")
 
+
+def build_photo_album_media(
+    media_sources: Sequence[Any],
+    *,
+    caption: Optional[str] = None,
+    parse_mode: Optional[ParseMode] = None,
+) -> list[InputMediaPhoto]:
+    album: list[InputMediaPhoto] = []
+    for index, media in enumerate(media_sources):
+        if index == 0:
+            kwargs: dict[str, Any] = {"media": media}
+            if caption is not None:
+                kwargs["caption"] = caption
+                if parse_mode is not None:
+                    kwargs["parse_mode"] = parse_mode
+            album.append(InputMediaPhoto(**kwargs))
+        else:
+            album.append(InputMediaPhoto(media=media))
+    return album
+
 MENU_LABELS = tuple(sorted(_MENU_LABELS))
 
 _LABEL_PATTERN_PARTS: list[str] = []
@@ -294,5 +316,6 @@ __all__ = [
     "is_button_label",
     "should_capture_to_prompt",
     "safe_edit",
+    "build_photo_album_media",
 ]
 

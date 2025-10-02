@@ -124,6 +124,7 @@ def test_mj_deliver_as_album(bot_module):
             caption="MJ",
             items=items,
             send_as_album=True,
+            task_id="task-1",
         )
     )
 
@@ -152,10 +153,14 @@ def test_mj_album_fallback_on_error(bot_module, monkeypatch):
 
     log_records = []
 
-    def _fake_info(msg, *, extra=None):
-        log_records.append((msg, extra))
+    class _MJLog:
+        def info(self, msg, *, extra=None):  # type: ignore[override]
+            log_records.append(("info", msg, extra))
 
-    monkeypatch.setattr(bot_module, "log", SimpleNamespace(info=_fake_info, warning=lambda *a, **k: None))
+        def warning(self, msg, *, extra=None):  # type: ignore[override]
+            log_records.append(("warning", msg, extra))
+
+    monkeypatch.setattr(bot_module, "mj_log", _MJLog())
 
     bot = _Bot()
     items = [(b"a", "1.png"), (b"b", "2.png"), (b"c", "3.png"), (b"d", "4.png")]
@@ -167,16 +172,14 @@ def test_mj_album_fallback_on_error(bot_module, monkeypatch):
             caption="MJ",
             items=items,
             send_as_album=True,
+            task_id="task-2",
         )
     )
 
     assert delivered is True
     assert len(bot.media_calls) == 1
     assert len(bot.photo_calls) == 4
-    assert any(
-        msg == "send.media_group" and extra and extra.get("meta", {}).get("media_group_fallback")
-        for msg, extra in log_records
-    )
+    assert any(name == "warning" and msg == "mj.album.fallback_single" for name, msg, _ in log_records)
 
 
 def test_mj_fallback_to_single_photo(bot_module):
@@ -203,6 +206,7 @@ def test_mj_fallback_to_single_photo(bot_module):
             caption="MJ",
             items=items,
             send_as_album=True,
+            task_id="task-3",
         )
     )
 
