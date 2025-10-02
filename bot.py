@@ -3726,8 +3726,8 @@ WELCOME = (
 MAIN_MENU_TEXT = "📋 *Главное меню*\nВыберите, что хотите сделать:"
 
 
-MENU_BTN_VIDEO = "🎬 ГЕНЕРАЦИЯ ВИДЕО"
-MENU_BTN_IMAGE = "🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ"
+MENU_BTN_VIDEO = "🎬 Генерация видео"
+MENU_BTN_IMAGE = "🎨 Генерация изображений"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
 MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
@@ -8924,7 +8924,25 @@ async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await video_command(update, ctx)
+    await ensure_user_record(update)
+    message = update.effective_message
+    if message is None:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is not None:
+        input_state.clear(user_id, reason="video_menu")
+        set_mode(user_id, False)
+        clear_wait(user_id, reason="video_menu")
+
+    s = state(ctx)
+    s["mode"] = None
+
+    await message.reply_text(
+        "🎬 Выберите тип генерации видео:",
+        reply_markup=video_menu_kb(),
+    )
 
 
 async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

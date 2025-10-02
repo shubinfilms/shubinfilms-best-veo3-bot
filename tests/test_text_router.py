@@ -41,10 +41,24 @@ class DummyMessage:
     def __init__(self, chat_id: int, text: str) -> None:
         self.chat_id = chat_id
         self.text = text
+        self.message_id = 1
         self.replies: list[str] = []
+        self.reply_kwargs: list[dict[str, object]] = []
 
     async def reply_text(self, text: str, **_: object) -> None:  # type: ignore[override]
         self.replies.append(text)
+        self.reply_kwargs.append(_)
+
+
+class DummyCallbackQuery:
+    def __init__(self, data: str, message: DummyMessage, *, user_id: int) -> None:
+        self.data = data
+        self.message = message
+        self.from_user = SimpleNamespace(id=user_id)
+        self._answer_calls: list[dict[str, object]] = []
+
+    async def answer(self, **kwargs: object) -> None:  # type: ignore[override]
+        self._answer_calls.append(kwargs)
 
 
 class NeutralBot:
@@ -368,28 +382,44 @@ def test_big_balance_button_routes_balance_no_chat() -> None:
     assert chat_calls == []
 
 
-def test_video_button_routes_veo_card() -> None:
+def test_video_button_opens_mode_selector() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
-    calls: list[str] = []
-    chat_calls: list[object] = []
-
-    async def fake_video(update, context):  # type: ignore[override]
-        calls.append(update.effective_message.text)  # type: ignore[attr-defined]
-
-    async def fake_chat_handler(**kwargs):  # type: ignore[override]
-        chat_calls.append(kwargs)
+    set_mode_calls: list[tuple[int, bool]] = []
+    clear_wait_calls: list[tuple[int, str]] = []
+    input_clear_calls: list[tuple[int, str]] = []
+    replies: list[str] = []
+    reply_markups: list[object] = []
 
     async def fake_ensure(update_param):
         return None
 
-    original_route = bot_module.LABEL_COMMAND_ROUTES["veo.card"]
-    original_chat = bot_module._handle_chat_message
+    def fake_set_mode(user_id: int, flag: bool) -> None:
+        set_mode_calls.append((user_id, flag))
+
+    def fake_clear_wait(user_id: int, *, reason: str = "manual") -> None:
+        clear_wait_calls.append((user_id, reason))
+
+    def fake_input_clear(user_id: int, *, reason: str = "manual") -> None:
+        input_clear_calls.append((user_id, reason))
+
+    sentinel_markup = object()
+
+    def fake_video_menu_kb() -> object:
+        return sentinel_markup
+
     original_ensure = bot_module.ensure_user_record
+    original_set_mode = bot_module.set_mode
+    original_clear_wait = bot_module.clear_wait
+    original_input_clear = bot_module.input_state.clear
+    original_video_menu_kb = bot_module.video_menu_kb
 
     try:
-        bot_module.LABEL_COMMAND_ROUTES["veo.card"] = fake_video
-        bot_module._handle_chat_message = fake_chat_handler  # type: ignore[assignment]
         bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+        bot_module.set_mode = fake_set_mode  # type: ignore[assignment]
+        bot_module.clear_wait = fake_clear_wait  # type: ignore[assignment]
+        bot_module.input_state.clear = fake_input_clear  # type: ignore[assignment]
+        bot_module.video_menu_kb = fake_video_menu_kb  # type: ignore[assignment]
+
         for sample in ("🎬 Генерация видео", "ГЕНЕРАЦИЯ ВИДЕО"):
             message = DummyMessage(chat_id=303, text=sample)
             update = SimpleNamespace(
@@ -399,13 +429,100 @@ def test_video_button_routes_veo_card() -> None:
                 effective_chat=SimpleNamespace(id=303),
             )
             _run(bot_module.on_text(update, ctx))
+            replies.append(message.replies[-1])
+            reply_markups.append(message.reply_kwargs[-1].get("reply_markup"))
     finally:
-        bot_module.LABEL_COMMAND_ROUTES["veo.card"] = original_route
-        bot_module._handle_chat_message = original_chat  # type: ignore[assignment]
         bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+        bot_module.set_mode = original_set_mode  # type: ignore[assignment]
+        bot_module.clear_wait = original_clear_wait  # type: ignore[assignment]
+        bot_module.input_state.clear = original_input_clear  # type: ignore[assignment]
+        bot_module.video_menu_kb = original_video_menu_kb  # type: ignore[assignment]
 
-    assert calls == ["🎬 Генерация видео", "ГЕНЕРАЦИЯ ВИДЕО"]
-    assert chat_calls == []
+    assert replies == [
+        "🎬 Выберите тип генерации видео:",
+        "🎬 Выберите тип генерации видео:",
+    ]
+    assert reply_markups == [sentinel_markup, sentinel_markup]
+    assert set_mode_calls == [(303, False), (303, False)]
+    assert clear_wait_calls == [(303, "video_menu"), (303, "video_menu")]
+    assert input_clear_calls == [(303, "video_menu"), (303, "video_menu")]
+    assert bot_module.state(ctx)["mode"] is None
+
+
+def test_video_mode_callback_opens_card() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    state_dict = bot_module.state(ctx)
+    state_dict["last_ui_msg_id_veo"] = None
+    state_dict["mode"] = None
+
+    message = DummyMessage(chat_id=505, text="")
+    callback = DummyCallbackQuery("mode:veo_text_fast", message, user_id=505)
+
+    veo_calls: list[int] = []
+    wait_activations: list[dict[str, object]] = []
+    wait_clears: list[tuple[int, str]] = []
+
+    async def fake_veo_entry(chat_id: int, ctx_param) -> None:
+        veo_calls.append(chat_id)
+        state_dict["last_ui_msg_id_veo"] = 999
+
+    def fake_activate_wait_state(
+        *,
+        user_id: Optional[int],
+        chat_id: Optional[int],
+        card_msg_id: Optional[int],
+        kind: WaitKind,
+        meta: Optional[dict[str, object]] = None,
+    ) -> None:
+        wait_activations.append(
+            {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "card_msg_id": card_msg_id,
+                "kind": kind,
+                "meta": meta,
+            }
+        )
+
+    def fake_clear_wait_state(user_id: int, *, reason: str = "manual") -> None:
+        wait_clears.append((user_id, reason))
+
+    original_veo_entry = bot_module.veo_entry
+    original_activate = bot_module._activate_wait_state
+    original_clear_wait_state = bot_module.clear_wait_state
+
+    try:
+        bot_module.veo_entry = fake_veo_entry  # type: ignore[assignment]
+        bot_module._activate_wait_state = fake_activate_wait_state  # type: ignore[assignment]
+        bot_module.clear_wait_state = fake_clear_wait_state  # type: ignore[assignment]
+
+        update = SimpleNamespace(
+            callback_query=callback,
+            effective_chat=SimpleNamespace(id=505),
+            effective_user=SimpleNamespace(id=505),
+        )
+
+        _run(bot_module.on_callback(update, ctx))
+    finally:
+        bot_module.veo_entry = original_veo_entry  # type: ignore[assignment]
+        bot_module._activate_wait_state = original_activate  # type: ignore[assignment]
+        bot_module.clear_wait_state = original_clear_wait_state  # type: ignore[assignment]
+
+    assert state_dict["mode"] == "veo_text_fast"
+    assert veo_calls == [505]
+    assert wait_clears == [(505, "mode_switch")]
+    assert wait_activations == [
+        {
+            "user_id": 505,
+            "chat_id": 505,
+            "card_msg_id": 999,
+            "kind": WaitKind.VEO_PROMPT,
+            "meta": {"mode": "veo_text_fast"},
+        }
+    ]
+    assert message.replies == [
+        "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически."
+    ]
 
 
 def test_image_button_routes_mj_card() -> None:
