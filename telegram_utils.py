@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
 
+from pathlib import Path
+from io import BytesIO
+from typing import Literal
+
+from PIL import Image
+
 import requests
 from requests import Response
 
@@ -34,6 +40,13 @@ _BOT_LABELS = {"env": _ENV, "service": "bot"}
 _RETRY_SCHEDULE = (0.6, 1.0, 1.6)
 _TEMP_ERROR_CODES = {409, 420, 429}
 _PERM_ERROR_CODES = {400, 403, 404}
+
+_ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
+_ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+_IMAGE_FORMAT_TO_MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+_MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
+_MAX_IMAGE_DIMENSION = 12000
+_MAX_IMAGE_PIXELS = 12000 * 12000
 
 
 def mask_tokens(text: Any) -> str:
@@ -224,6 +237,130 @@ def _should_retry(exc: BaseException, status: Optional[int]) -> bool:
 def _retry_delay(attempt: int) -> float:
     base = _RETRY_SCHEDULE[min(attempt - 1, len(_RETRY_SCHEDULE) - 1)]
     return base * random.uniform(0.6, 1.6)
+
+
+def _memory_filename(file_path: str, fallback: str, ext: str) -> str:
+    candidate = Path(file_path or "").name
+    if candidate:
+        return candidate
+    suffix = ext if ext.startswith(".") else f".{ext}" if ext else ""
+    return f"{fallback}{suffix}"
+
+
+def _validate_image_bytes(data: bytes) -> tuple[int, int, str]:
+    try:
+        with Image.open(BytesIO(data)) as im:
+            im.verify()
+        with Image.open(BytesIO(data)) as im2:
+            width, height = im2.size
+            fmt = (im2.format or "").upper()
+    except Exception as exc:
+        raise TelegramImageError("invalid_image", "invalid image data") from exc
+
+    if width <= 0 or height <= 0:
+        raise TelegramImageError("invalid_image", "invalid dimensions")
+    if width > _MAX_IMAGE_DIMENSION or height > _MAX_IMAGE_DIMENSION or (width * height) > _MAX_IMAGE_PIXELS:
+        raise TelegramImageError("too_large", "image dimensions are too large")
+
+    return width, height, fmt
+
+
+async def _download_file_bytes(file: Any) -> tuple[bytes, str]:
+    downloader = getattr(file, "download_as_bytearray", None)
+    if callable(downloader):
+        data = await downloader()
+        return bytes(data or b""), getattr(file, "file_path", "")
+
+    downloader = getattr(file, "download_as_bytes", None)
+    if callable(downloader):
+        data = await downloader()
+        return bytes(data or b""), getattr(file, "file_path", "")
+
+    downloader = getattr(file, "download_to_memory", None)
+    if callable(downloader):
+        buffer = await downloader()
+        if hasattr(buffer, "read"):
+            return buffer.read(), getattr(file, "file_path", "")
+        if isinstance(buffer, (bytes, bytearray)):
+            return bytes(buffer), getattr(file, "file_path", "")
+
+    downloader = getattr(file, "download", None)
+    if callable(downloader):
+        stream = BytesIO()
+        result = downloader(out=stream)
+        if asyncio.iscoroutine(result):
+            await result
+        return stream.getvalue(), getattr(file, "file_path", "")
+
+    raise TelegramImageError("download_failed", "no download method available")
+
+
+async def download_image_from_update(update: Any, bot: Any) -> TelegramImage:
+    """Return raw bytes and metadata for a Telegram photo/document update."""
+
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if message is None:
+        raise TelegramImageError("no_message", "update has no message")
+
+    document = getattr(message, "document", None)
+    photos = list(getattr(message, "photo", []) or [])
+
+    if document is not None:
+        mime_type = (getattr(document, "mime_type", "") or "").lower()
+        file_name = getattr(document, "file_name", "") or ""
+        extension = Path(file_name).suffix.lower()
+        if mime_type not in _ALLOWED_IMAGE_MIME and extension not in _ALLOWED_IMAGE_EXT:
+            raise TelegramImageError("invalid_type", "unsupported document type")
+        file_size = getattr(document, "file_size", None)
+        if isinstance(file_size, int) and file_size > _MAX_DOCUMENT_BYTES:
+            raise TelegramImageError("too_large", "document too large")
+        try:
+            file = await bot.get_file(document.file_id)
+        except Exception as exc:
+            raise TelegramImageError("download_failed", "failed to fetch document") from exc
+        data, file_path = await _download_file_bytes(file)
+        if not data:
+            raise TelegramImageError("download_failed", "empty document")
+        width, height, fmt = _validate_image_bytes(data)
+        detected_mime = _IMAGE_FORMAT_TO_MIME.get(fmt, mime_type or "image/octet-stream")
+        ext = _ALLOWED_IMAGE_EXT.intersection({Path(file_path or "").suffix.lower()})
+        ext_value = next(iter(ext), f".{fmt.lower()}" if fmt else "")
+        filename = _memory_filename(file_path, Path(file_name or "telegram_document").stem or "document", ext_value)
+        return TelegramImage(
+            data=data,
+            file_path=file_path,
+            mime_type=detected_mime,
+            filename=filename,
+            source="document",
+            width=width,
+            height=height,
+        )
+
+    if photos:
+        photo = photos[-1]
+        try:
+            file = await bot.get_file(photo.file_id)
+        except Exception as exc:
+            raise TelegramImageError("download_failed", "failed to fetch photo") from exc
+        data, file_path = await _download_file_bytes(file)
+        if not data:
+            raise TelegramImageError("download_failed", "empty photo")
+        width, height, fmt = _validate_image_bytes(data)
+        detected_mime = _IMAGE_FORMAT_TO_MIME.get(fmt, "image/jpeg")
+        ext_value = Path(file_path or "").suffix or f".{fmt.lower()}" if fmt else ".jpg"
+        fallback = getattr(photo, "file_unique_id", None) or "photo"
+        filename = _memory_filename(file_path, fallback, ext_value)
+        return TelegramImage(
+            data=data,
+            file_path=file_path,
+            mime_type=detected_mime,
+            filename=filename,
+            source="photo",
+            width=width,
+            height=height,
+        )
+
+    raise TelegramImageError("no_image", "message has no photo or document")
 
 
 async def _call_telegram(method: Callable[..., Awaitable[Any]], **kwargs: Any) -> Any:
@@ -1034,3 +1171,23 @@ __all__ = [
     "send_audio_request",
     "is_remote_file_error",
 ]
+class TelegramImageError(RuntimeError):
+    """Raised when Telegram image download fails."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+@dataclass(slots=True)
+class TelegramImage:
+    """Container for Telegram photo/document payload."""
+
+    data: bytes
+    file_path: str
+    mime_type: str
+    filename: str
+    source: Literal["photo", "document"]
+    width: Optional[int]
+    height: Optional[int]
+

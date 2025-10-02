@@ -95,6 +95,12 @@ def _memory_set(key: str, value: str) -> None:
         _memory_store[key] = (expires_at, value)
 
 
+def _memory_set_with_ttl(key: str, value: str, ttl: int) -> None:
+    expires_at = time.time() + max(ttl, 1)
+    with _memory_lock:
+        _memory_store[key] = (expires_at, value)
+
+
 def _memory_get(key: str) -> Optional[str]:
     now = time.time()
     with _memory_lock:
@@ -208,6 +214,43 @@ def release_mj_upscale_lock(user_id: int, task_id: str, index: int) -> None:
             _logger.warning("mj_upscale_lock.release_error | key=%s err=%s", key, exc)
     else:
         _memory_delete(key)
+
+
+def cache_get(name: str) -> Optional[str]:
+    key = f"{_PFX}:{name}"
+    if _r:
+        try:
+            raw = _r.get(key)
+        except Exception as exc:
+            _logger.warning("cache.get.error | key=%s err=%s", key, exc)
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", "ignore")
+        return str(raw)
+    return _memory_get(key)
+
+
+def cache_set(name: str, value: str, ttl: int) -> None:
+    key = f"{_PFX}:{name}"
+    if _r:
+        try:
+            _r.setex(key, max(ttl, 1), value)
+            return
+        except Exception as exc:
+            _logger.warning("cache.set.error | key=%s err=%s", key, exc)
+    _memory_set_with_ttl(key, value, ttl)
+
+
+def acquire_ttl_lock(name: str, ttl: int) -> bool:
+    key = f"{_PFX}:{name}"
+    if _r:
+        try:
+            return bool(_r.set(key, "1", nx=True, ex=max(ttl, 1)))
+        except Exception as exc:
+            _logger.warning("lock.acquire.error | key=%s err=%s", key, exc)
+    return _memory_set_if_absent(key, "1", ttl)
 
 
 def save_task_meta(
