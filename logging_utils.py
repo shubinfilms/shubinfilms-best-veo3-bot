@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 _DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 _DEFAULT_LOG_JSON = os.getenv("LOG_JSON", "1").lower() not in {"0", "false", "no"}
@@ -42,30 +42,59 @@ RESERVED = {
 }
 
 
-def build_log_extra(raw: dict | None = None, **ctx) -> dict:
-    raw = dict(raw or {})
-    for key in list(raw.keys()):
-        if key in RESERVED:
-            raw[f"ctx_{key}"] = raw.pop(key)
+def build_log_extra(raw: dict | None = None, *, update: Any = None, **ctx: Any) -> dict:
+    """Assemble a logging ``extra`` payload with contextual fields.
 
-    add: dict[str, Any] = {}
-    if "user_id" in ctx and ctx["user_id"] is not None:
-        add["ctx_user_id"] = ctx["user_id"]
-    if "chat_id" in ctx and ctx["chat_id"] is not None:
-        add["ctx_chat_id"] = ctx["chat_id"]
-    if "command" in ctx and ctx["command"]:
-        add["ctx_command"] = ctx["command"]
-    if "update_type" in ctx and ctx["update_type"]:
-        add["ctx_update_type"] = ctx["update_type"]
-    if "env" in ctx and ctx["env"]:
-        add["ctx_env"] = ctx["env"]
+    ``raw`` is treated as the base ``meta`` dictionary. Additional keyword
+    arguments and ``update``-derived values are merged on top while ensuring
+    there are no collisions with standard :class:`logging.LogRecord` fields.
+    """
 
-    for key in list(add.keys()):
-        if key in RESERVED:
-            add[f"ctx_{key}"] = add.pop(key)
+    def _assign(target: dict[str, Any], key: str, value: Any) -> None:
+        if value is None:
+            return
+        safe_key = key if key not in RESERVED else f"ctx_{key}"
+        target[safe_key] = _sanitize(value)
 
-    raw.update(add)
-    return {"extra": raw}
+    key_mapping = {
+        "user": "ctx_user",
+        "user_id": "ctx_user_id",
+        "chat": "ctx_chat",
+        "chat_id": "ctx_chat_id",
+        "command": "ctx_command",
+        "update_type": "ctx_update_type",
+        "callback_data": "ctx_callback_data",
+        "env": "ctx_env",
+    }
+    base: dict[str, Any] = {}
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            if key == "meta" and isinstance(value, Mapping):
+                for meta_key, meta_value in value.items():
+                    target_key = key_mapping.get(str(meta_key), str(meta_key))
+                    _assign(base, target_key, meta_value)
+            else:
+                target_key = key_mapping.get(str(key), str(key))
+                _assign(base, target_key, value)
+
+    if update is not None:
+        user = getattr(update, "effective_user", None)
+        if user is not None:
+            _assign(base, "ctx_user_id", getattr(user, "id", None))
+            _assign(base, "ctx_username", getattr(user, "username", None))
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None:
+            _assign(base, "ctx_chat_id", getattr(chat, "id", None))
+            _assign(base, "ctx_chat_type", getattr(chat, "type", None))
+        _assign(base, "ctx_update_type", type(update).__name__)
+        query = getattr(update, "callback_query", None)
+        if query is not None:
+            _assign(base, "ctx_callback_data", getattr(query, "data", None))
+    for key, value in ctx.items():
+        target_key = key_mapping.get(key, key)
+        _assign(base, target_key, value)
+
+    return {"extra": {"meta": base}}
 
 _SECRET_ENV_KEYS = {
     "DATABASE_URL",
@@ -374,6 +403,26 @@ def get_logger(name: str = "veo3-bot", *, extra: Optional[Mapping[str, Any]] = N
     return CtxLogger(logging.getLogger(name), base_extra)
 
 
+def get_context_logger(
+    context: Any | None = None,
+    *,
+    application: Any | None = None,
+    fallback: str = "veo3-bot",
+) -> logging.Logger:
+    """Return the logger stored inside ``application.bot_data`` if available."""
+
+    app = application or getattr(context, "application", None)
+    if app is not None:
+        bot_data = getattr(app, "bot_data", None)
+        if isinstance(bot_data, MutableMapping):
+            stored = bot_data.get("logger")
+            if isinstance(stored, logging.Logger):
+                return stored
+            if isinstance(stored, CtxLogger):
+                return stored
+    return get_logger(fallback)
+
+
 def configure_logging(app_name: str) -> None:
     """Configure root logging to emit JSON logs with secret redaction."""
 
@@ -411,6 +460,7 @@ __all__ = [
     "SafeLoggerAdapter",
     "build_log_extra",
     "configure_logging",
+    "get_context_logger",
     "get_logger",
     "log_environment",
     "refresh_secret_cache",

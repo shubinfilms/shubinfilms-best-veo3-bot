@@ -3,13 +3,13 @@
 import html
 import logging
 import re
-from typing import Awaitable, Callable, Optional, MutableMapping
+from typing import Awaitable, Callable, Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from logging_utils import build_log_extra
+from logging_utils import build_log_extra, get_context_logger
 
 from keyboards import CB_FAQ_PREFIX, faq_keyboard
 from texts import FAQ_INTRO, FAQ_SECTIONS
@@ -45,19 +45,15 @@ def configure_faq(
 async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the FAQ root menu."""
 
-    log = context.bot_data.get("logger") if isinstance(context.bot_data, MutableMapping) else None
-    if not isinstance(log, logging.Logger):
-        log = logging.getLogger("veo3-bot")
+    log = get_context_logger(context)
     user = update.effective_user
     chat = update.effective_chat
     log.info(
         "update.received",
         **build_log_extra(
             {},
-            user_id=user.id if user else None,
-            chat_id=chat.id if chat else None,
+            update=update,
             command="/faq",
-            update_type=type(update).__name__,
         ),
     )
 
@@ -101,17 +97,17 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    log = context.bot_data.get("logger") if isinstance(context.bot_data, MutableMapping) else None
-    if not isinstance(log, logging.Logger):
-        log = logging.getLogger("veo3-bot")
+    log = get_context_logger(context)
+    try:
+        await query.answer()
+    except Exception as exc:
+        log.warning("cbq.answer.fail", **build_log_extra({"error": repr(exc)}, update=update))
     log.info(
         "update.received",
         **build_log_extra(
-            {"meta": {"callback_data": query.data}},
-            user_id=user_id,
-            chat_id=update.effective_chat.id if update.effective_chat else None,
+            {"callback_data": query.data},
+            update=update,
             command="/faq",
-            update_type=type(update).__name__,
         ),
     )
 
@@ -119,7 +115,6 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     key = data.removeprefix(CB_FAQ_PREFIX)
 
     if key == "back":
-        await query.answer()
         if callable(_show_main_menu):
             await _show_main_menu(update, context)
             return
@@ -143,7 +138,6 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:  # pragma: no cover - metrics should not break flow
             logger.exception("faq.section_metric_failed | section=%s", key)
 
-    await query.answer()
     message = query.message
     if message is None:
         return
