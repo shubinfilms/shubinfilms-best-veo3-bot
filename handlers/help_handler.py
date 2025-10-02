@@ -60,7 +60,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         disable_web_page_preview=True,
     )
 
-    payload: dict[str, object] = {}
+    payload: dict[str, object] = {
+        "message_type": "text",
+        "text_length": len(text),
+        "reply_markup_type": type(markup).__name__,
+    }
     if result.message_id is not None:
         payload["message_id"] = result.message_id
     if result.description:
