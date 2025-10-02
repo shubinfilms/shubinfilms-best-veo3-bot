@@ -30,6 +30,8 @@ class _AppSettings(BaseModel):
     LOG_LEVEL: str = Field(default="INFO")
     LOG_JSON: bool = Field(default=True)
     MAX_IN_LOG_BODY: int = Field(default=2048, ge=256, le=65536)
+    SUPPORT_USERNAME: str = Field(default="BestAi_Support")
+    SUPPORT_USER_ID: int = Field(default=7223448532)
 
     HTTP_TIMEOUT_CONNECT: float = Field(default=10.0, ge=0.1, le=300.0)
     HTTP_TIMEOUT_READ: float = Field(default=60.0, ge=1.0, le=600.0)
@@ -158,6 +160,12 @@ class _AppSettings(BaseModel):
                 )
         return self
 
+    @field_validator("SUPPORT_USERNAME", mode="before")
+    def _normalize_support_username(cls, value: object) -> str:
+        text = str(value or "BestAi_Support").strip()
+        text = text.lstrip("@")
+        return text or "BestAi_Support"
+
 
 def _load_settings() -> _AppSettings:
     values: dict[str, str] = {}
@@ -198,6 +206,8 @@ TMP_CLEANUP_HOURS = int(_APP_SETTINGS.TMP_CLEANUP_HOURS)
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
+SUPPORT_USERNAME = _APP_SETTINGS.SUPPORT_USERNAME
+SUPPORT_USER_ID = int(_APP_SETTINGS.SUPPORT_USER_ID)
 
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:

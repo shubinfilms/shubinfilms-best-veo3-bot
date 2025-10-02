@@ -7,9 +7,16 @@ PROMPTS_CHANNEL_URL=https://t.me/bestveo3promts
 STARS_BUY_URL=https://t.me/PremiumBot
 PROMO_ENABLED=true
 DEV_MODE=false
+SUPPORT_USERNAME=BestAi_Support
+SUPPORT_USER_ID=7223448532
 
 # OpenAI / Prompt Master (optional)
 OPENAI_API_KEY=
+
+## Support
+
+- Команды `/help` и `/support` отправляют локализованное сообщение с кнопкой, которая ведёт в чат поддержки `https://t.me/BestAi_Support` (значение формируется из `SUPPORT_USERNAME`).
+- Переменные окружения `SUPPORT_USERNAME` и `SUPPORT_USER_ID` позволяют быстро сменить контакт поддержки без изменений в кодовой базе.
 
 # KIE API configuration
 KIE_API_KEY=
