@@ -3,11 +3,13 @@
 import html
 import logging
 import re
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, MutableMapping
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
+
+from logging_utils import build_log_extra
 
 from keyboards import CB_FAQ_PREFIX, faq_keyboard
 from texts import FAQ_INTRO, FAQ_SECTIONS
@@ -43,6 +45,22 @@ def configure_faq(
 async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the FAQ root menu."""
 
+    log = context.bot_data.get("logger") if isinstance(context.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    user = update.effective_user
+    chat = update.effective_chat
+    log.info(
+        "update.received",
+        **build_log_extra(
+            {},
+            user_id=user.id if user else None,
+            chat_id=chat.id if chat else None,
+            command="/faq",
+            update_type=type(update).__name__,
+        ),
+    )
+
     message = update.effective_message
     if message is None or message.chat is None:
         return
@@ -51,16 +69,28 @@ async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _on_root_view()
         except Exception:  # pragma: no cover - metrics should not break flow
             logger.exception("faq.root_metric_failed")
-    await safe_send(
-        context.bot.send_message,
-        method_name="send_message",
-        kind="faq",
-        chat_id=message.chat_id,
-        text=_markdown_to_html(FAQ_INTRO),
-        reply_markup=faq_keyboard(),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    try:
+        await safe_send(
+            context.bot.send_message,
+            method_name="send_message",
+            kind="faq",
+            chat_id=message.chat_id,
+            text=_markdown_to_html(FAQ_INTRO),
+            reply_markup=faq_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        log.warning(
+            "faq.command.failed",
+            **build_log_extra(
+                {"error": repr(exc)},
+                user_id=user.id if user else None,
+                chat_id=chat.id if chat else None,
+                command="/faq",
+                update_type=type(update).__name__,
+            ),
+        )
 
 
 async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -71,7 +101,19 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logger.info("faq.callback | user_id=%s data=%s", user_id, query.data)
+    log = context.bot_data.get("logger") if isinstance(context.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    log.info(
+        "update.received",
+        **build_log_extra(
+            {"meta": {"callback_data": query.data}},
+            user_id=user_id,
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+            command="/faq",
+            update_type=type(update).__name__,
+        ),
+    )
 
     data = query.data
     key = data.removeprefix(CB_FAQ_PREFIX)

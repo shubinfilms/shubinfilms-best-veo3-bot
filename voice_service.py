@@ -8,6 +8,8 @@ import random
 import time
 from typing import Optional
 
+from logging_utils import build_log_extra
+
 try:  # pragma: no cover - optional runtime dependency
     import openai  # type: ignore
 except Exception:  # pragma: no cover - library might be unavailable
@@ -85,13 +87,13 @@ def transcribe(audio_bytes: bytes, mime: Optional[str], lang_hint: Optional[str]
             elapsed = time.time() - started
             log.info(
                 "voice.transcribe.success",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "attempt": attempt,
                         "elapsed_ms": int(elapsed * 1000),
                         "lang": lang_hint,
                     }
-                },
+                }),
             )
             if isinstance(response, dict):
                 text = str(response.get("text", ""))
@@ -106,13 +108,13 @@ def transcribe(audio_bytes: bytes, mime: Optional[str], lang_hint: Optional[str]
             should_retry = attempt < _MAX_ATTEMPTS and _should_retry(exc)
             log.warning(
                 "voice.transcribe.error",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "attempt": attempt,
                         "will_retry": should_retry,
                         "error_type": type(exc).__name__,
                     }
-                },
+                }),
             )
             if not should_retry:
                 break

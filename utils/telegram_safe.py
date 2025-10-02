@@ -7,6 +7,7 @@ from typing import Any, Optional, Tuple
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
+from logging_utils import build_log_extra
 
 
 _logger = logging.getLogger("telegram-safe")
@@ -65,7 +66,7 @@ async def safe_edit_message(
     if _MessageHashes.get(key) == new_hashes:
         _logger.info(
             "card_edit_noop",
-            extra={"chat_id": chat_id, "message_id": message_id},
+            **build_log_extra({"chat_id": chat_id, "message_id": message_id}),
         )
         return False
 
@@ -85,7 +86,7 @@ async def safe_edit_message(
         if "message is not modified" in lowered:
             _logger.info(
                 "card_edit_ignored_same_content",
-                extra={"chat_id": chat_id, "message_id": message_id},
+                **build_log_extra({"chat_id": chat_id, "message_id": message_id}),
             )
             _store_hashes(key, new_hashes)
             return False

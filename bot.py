@@ -306,6 +306,32 @@ try:
 except Exception:  # pragma: no cover - fallback if asyncio interface unavailable
     redis_asyncio = None
 
+def _build_update_extra(
+    update: Optional[Update],
+    *,
+    payload: Optional[Mapping[str, Any]] = None,
+    command: Optional[str] = None,
+    update_type: Optional[str] = None,
+) -> dict:
+    data = dict(payload or {})
+    user_id: Optional[int] = None
+    chat_id: Optional[int] = None
+    if update is not None:
+        if update_type is None:
+            update_type = type(update).__name__
+        user = getattr(update, "effective_user", None)
+        chat = getattr(update, "effective_chat", None)
+        if user is not None:
+            user_id = getattr(user, "id", None)
+        if chat is not None:
+            chat_id = getattr(chat, "id", None)
+    return build_log_extra(
+        data,
+        user_id=user_id,
+        chat_id=chat_id,
+        command=command,
+        update_type=update_type,
+    )
 # ==========================
 #   ENV / INIT
 # ==========================
@@ -819,7 +845,7 @@ def _load_suno_config() -> SunoConfig:
     if enabled:
         log.info(
             "suno configuration",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "base": base,
                     "gen_path": gen_path,
@@ -827,7 +853,7 @@ def _load_suno_config() -> SunoConfig:
                     "callback_url": SETTINGS_SUNO_CALLBACK_URL,
                     "enabled": enabled,
                 }
-            },
+            }),
         )
     return config
 
@@ -1033,11 +1059,9 @@ async def _handle_safe_handler_exception(
     handler_name = getattr(callback, "__name__", repr(callback))
     log.exception(
         "handler_failed",
-        extra=build_log_extra(
+        **_build_update_extra(
             update,
-            ctx,
-            handler=handler_name,
-            meta={"exc": repr(exc)},
+            payload={"handler": handler_name, "meta": {"exc": repr(exc)}},
         ),
     )
     await _notify_safe_handler_error(update, ctx)
@@ -1054,24 +1078,23 @@ def safe_handler(callback: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
         **kwargs: Any,
     ) -> Any:
         if update is not None:
-            update_log.debug("update.received", extra=build_log_extra(update, ctx))
+            update_log.debug("update.received", **_build_update_extra(update))
 
             message = getattr(update, "effective_message", None)
             text = getattr(message, "text", None)
             if isinstance(text, str) and text.startswith("/"):
                 log.debug(
                     "command.dispatch",
-                    extra=build_log_extra(update, ctx, command=text.split()[0]),
+                    **_build_update_extra(update, command=text.split()[0]),
                 )
 
             query = getattr(update, "callback_query", None)
             if query is not None and getattr(query, "data", None):
                 update_log.debug(
                     "callback.dispatch",
-                    extra=build_log_extra(
+                    **_build_update_extra(
                         update,
-                        ctx,
-                        meta={"callback_data": str(query.data)[:64]},
+                        payload={"meta": {"callback_data": str(query.data)[:64]}},
                     ),
                 )
 
@@ -3231,10 +3254,10 @@ async def _wait_acknowledge(message: Message, ack_text: Optional[str] = None) ->
     except Exception:
         _wait_log.debug(
             "WAIT_ACK_FAILED",
-            extra={
+            **build_log_extra({
                 "user_id": getattr(message.from_user, "id", None),
                 "chat_id": getattr(message, "chat_id", None),
-            },
+            }),
         )
 
 
@@ -4301,7 +4324,7 @@ async def _handle_chat_message(
             with suppress(Exception):
                 await safe_send_text(ctx.bot, chat_id, error_payload)
         app_logger = getattr(getattr(ctx, "application", None), "logger", log)
-        app_logger.exception("chat error", extra={"user_id": user_id})
+        app_logger.exception("chat error", **build_log_extra({"user_id": user_id}))
 async def safe_send(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -5412,7 +5435,7 @@ def _suno_log(
             http_status,
             request_url,
             snippet,
-            extra={"meta": {"req_id": req_id}},
+            **build_log_extra({"meta": {"req_id": req_id}}),
         )
     else:
         log.info(
@@ -5422,7 +5445,7 @@ def _suno_log(
             http_status,
             request_url,
             snippet,
-            extra={"meta": {"req_id": req_id}},
+            **build_log_extra({"meta": {"req_id": req_id}}),
         )
     if not rds:
         return
@@ -6200,26 +6223,26 @@ async def _cover_process_audio_input(
     except CoverSourceValidationError:
         log.warning(
             "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "file", "reason": "validation"},
+            **build_log_extra({"request_id": request_id, "kind": "file", "reason": "validation"}),
         )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
 
     log.info(
         "cover_source_received",
-        extra={
+        **build_log_extra({
             "request_id": request_id,
             "kind": "file",
             "size": int(file_size),
             "mime": mime_type,
             "file_name": file_name,
-        },
+        }),
     )
 
     try:
         telegram_file = await ctx.bot.get_file(audio_obj.file_id)
     except TelegramError as exc:
-        log.warning("cover_upload_fail", extra={"request_id": request_id, "kind": "file", "reason": f"get_file:{exc}"})
+        log.warning("cover_upload_fail", **build_log_extra({"request_id": request_id, "kind": "file", "reason": f"get_file:{exc}"}))
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
@@ -6227,7 +6250,7 @@ async def _cover_process_audio_input(
     if not file_path:
         log.warning(
             "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "file", "reason": "file_path_missing"},
+            **build_log_extra({"request_id": request_id, "kind": "file", "reason": "file_path_missing"}),
         )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
@@ -6270,24 +6293,24 @@ async def _cover_process_audio_input(
             mock_base = base_url or env_base or "mock"
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"download:{download_error}",
                     "base": mock_base,
                     "mock": True,
-                },
+                }),
             )
             audio_bytes = b"mock-telegram-audio"
         else:
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"download:{download_error}",
                     "base": base_url,
-                },
+                }),
             )
             await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
             return True
@@ -6311,19 +6334,19 @@ async def _cover_process_audio_input(
     except CoverSourceValidationError:
         log.warning(
             "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "file", "reason": "validation", "stage": "stream"},
+            **build_log_extra({"request_id": request_id, "kind": "file", "reason": "validation", "stage": "stream"}),
         )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
     except CoverSourceClientError as exc:
         log.warning(
             "cover_upload_fail",
-            extra={
+            **build_log_extra({
                 "request_id": request_id,
                 "kind": "file",
                 "reason": f"client:{exc}",
                 "stage": "stream",
-            },
+            }),
         )
         await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
         return True
@@ -6331,24 +6354,24 @@ async def _cover_process_audio_input(
         last_error = exc
         log.warning(
             "cover_upload_fail",
-            extra={
+            **build_log_extra({
                 "request_id": request_id,
                 "kind": "file",
                 "reason": f"service:{exc}",
                 "stage": "stream",
-            },
+            }),
         )
         kie_file_id = None
     except Exception as exc:  # pragma: no cover - defensive guard
         last_error = exc
         log.warning(
             "cover_upload_fail",
-            extra={
+            **build_log_extra({
                 "request_id": request_id,
                 "kind": "file",
                 "reason": f"exception:{exc}",
                 "stage": "stream",
-            },
+            }),
         )
         kie_file_id = None
     else:
@@ -6364,12 +6387,12 @@ async def _cover_process_audio_input(
         except CoverSourceClientError as exc:
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"client:{exc}",
                     "stage": "url",
-                },
+                }),
             )
             await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
             return True
@@ -6377,31 +6400,31 @@ async def _cover_process_audio_input(
             last_error = exc
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"service:{exc}",
                     "stage": "url",
-                },
+                }),
             )
             kie_file_id = None
         except Exception as exc:  # pragma: no cover - defensive guard
             last_error = exc
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"exception:{exc}",
                     "stage": "url",
-                },
+                }),
             )
             kie_file_id = None
         else:
             upload_method = "url"
             log.info(
                 "cover_upload_fallback",
-                extra={"request_id": request_id, "from": "stream", "to": "url"},
+                **build_log_extra({"request_id": request_id, "from": "stream", "to": "url"}),
             )
 
     if kie_file_id is None:
@@ -6416,12 +6439,12 @@ async def _cover_process_audio_input(
         except CoverSourceClientError as exc:
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"client:{exc}",
                     "stage": "base64",
-                },
+                }),
             )
             await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
             return True
@@ -6429,31 +6452,31 @@ async def _cover_process_audio_input(
             last_error = exc
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"service:{exc}",
                     "stage": "base64",
-                },
+                }),
             )
             kie_file_id = None
         except Exception as exc:  # pragma: no cover - defensive guard
             last_error = exc
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"exception:{exc}",
                     "stage": "base64",
-                },
+                }),
             )
             kie_file_id = None
         else:
             upload_method = "base64"
             log.info(
                 "cover_upload_fallback",
-                extra={"request_id": request_id, "from": "url", "to": "base64"},
+                **build_log_extra({"request_id": request_id, "from": "url", "to": "base64"}),
             )
 
     if kie_file_id is None:
@@ -6467,33 +6490,33 @@ async def _cover_process_audio_input(
             mock_base = base_url or env_base or "mock"
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"service:{error_label}",
                     "base": mock_base,
                     "mock": True,
-                },
+                }),
             )
         else:
             log.warning(
                 "cover_upload_fail",
-                extra={
+                **build_log_extra({
                     "request_id": request_id,
                     "kind": "file",
                     "reason": f"service:{error_label}",
-                },
+                }),
             )
             await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
             return True
 
     log.info(
         "cover_upload_ok",
-        extra={
+        **build_log_extra({
             "request_id": request_id,
             "kie_file_id": kie_file_id,
             "method": upload_method or "mock",
-        },
+        }),
     )
 
     label = _cover_sanitize_label(getattr(audio_obj, "file_name", None)) or "Загруженный файл"
@@ -6539,7 +6562,7 @@ async def _cover_process_url_input(
     except CoverSourceValidationError:
         log.warning(
             "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "url", "reason": "validation"},
+            **build_log_extra({"request_id": request_id, "kind": "url", "reason": "validation"}),
         )
         await message.reply_text(_COVER_INVALID_INPUT_MESSAGE)
         return True
@@ -6547,12 +6570,12 @@ async def _cover_process_url_input(
     parsed = urlparse(validated_url)
     log.info(
         "cover_source_received",
-        extra={
+        **build_log_extra({
             "request_id": request_id,
             "kind": "url",
             "host": parsed.netloc,
             "url": validated_url,
-        },
+        }),
     )
     try:
         kie_file_id = await upload_cover_url(
@@ -6563,36 +6586,36 @@ async def _cover_process_url_input(
     except CoverSourceClientError as exc:
         log.warning(
             "cover_upload_fail",
-            extra={
+            **build_log_extra({
                 "request_id": request_id,
                 "kind": "url",
                 "reason": f"client:{exc}",
-            },
+            }),
         )
         await message.reply_text(_COVER_UPLOAD_CLIENT_ERROR_MESSAGE)
         return True
     except CoverSourceUnavailableError as exc:
         log.warning(
             "cover_upload_fail",
-            extra={
+            **build_log_extra({
                 "request_id": request_id,
                 "kind": "url",
                 "reason": f"service:{exc}",
-            },
+            }),
         )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
     except Exception as exc:  # pragma: no cover - defensive guard
         log.warning(
             "cover_upload_fail",
-            extra={"request_id": request_id, "kind": "url", "reason": f"exception:{exc}"},
+            **build_log_extra({"request_id": request_id, "kind": "url", "reason": f"exception:{exc}"}),
         )
         await message.reply_text(_COVER_UPLOAD_SERVICE_ERROR_MESSAGE)
         return True
 
     log.info(
         "cover_upload_ok",
-        extra={"request_id": request_id, "kie_file_id": kie_file_id},
+        **build_log_extra({"request_id": request_id, "kie_file_id": kie_file_id}),
     )
 
     label = _cover_sanitize_label(validated_url)
@@ -6810,14 +6833,14 @@ async def _suno_issue_refund(
 
     log.info(
         "Suno refund status",
-        extra={
+        **build_log_extra({
             "meta": {
                 "refund": status,
                 "task_id": task_id,
                 "user_id": user_id,
                 "req_id": req_id,
             }
-        },
+        }),
     )
 
     s = state(ctx)
@@ -7036,12 +7059,12 @@ async def _launch_suno_generation(
     payload_preview = sanitize_payload_for_log(payload)
     log.info(
         "suno launch",
-        extra={
+        **build_log_extra({
             "payload_preview": payload_preview,
             "user_id": user_id,
             "chat_id": chat_id,
             "trigger": trigger,
-        },
+        }),
     )
 
     existing_pending = _suno_pending_load(req_id)
@@ -7081,7 +7104,7 @@ async def _launch_suno_generation(
     except SunoAPIError as exc:
         log.warning(
             "[SUNO] build payload failed | user_id=%s err=%s", user_id, exc,
-            extra={"meta": {"status": exc.status, "payload": payload}},
+            **build_log_extra({"meta": {"status": exc.status, "payload": payload}}),
         )
         await _suno_notify(
             ctx,
@@ -7159,7 +7182,7 @@ async def _launch_suno_generation(
 
     log.info(
         "suno launch meta",
-        extra={
+        **build_log_extra({
             "meta": {
                 "chat_id": chat_id,
                 "user_id": user_id,
@@ -7168,7 +7191,7 @@ async def _launch_suno_generation(
                 "has_lyrics": suno_payload_state.has_lyrics,
                 "trigger": trigger,
             }
-        },
+        }),
     )
 
     already_charged = bool(existing_pending and existing_pending.get("charged"))
@@ -7455,7 +7478,7 @@ async def _launch_suno_generation(
                 _suno_refund_pending_mark(req_id, pending_meta)
                 log.info(
                     "suno.enqueue.blocked_policy",
-                    extra={"meta": {"status": exc.status, "reason": reason_text or ""}},
+                    **build_log_extra({"meta": {"status": exc.status, "reason": reason_text or ""}}),
                 )
                 await _update_status_message(policy_message, fallback=True)
                 await _suno_issue_refund(
@@ -7580,13 +7603,13 @@ async def _launch_suno_generation(
         )
         log.info(
             "[SUNO] enqueue payload",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "taskId": task_id,
                     "title": title,
                     "tags": style,
                 }
-            },
+            }),
         )
 
         title_hint = (title or "").strip()
@@ -7731,30 +7754,30 @@ async def _suno_poll_record_info(
             meta["message"] = result.message
 
         if result.state == "retry":
-            log.warning("[SUNO] poll retry", extra={"meta": meta})
+            log.warning("[SUNO] poll retry", **build_log_extra({"meta": meta}))
         elif result.state != "pending":
-            log.info("[SUNO] poll step", extra={"meta": meta})
+            log.info("[SUNO] poll step", **build_log_extra({"meta": meta}))
 
         if result.state == "ready":
             tracks = SunoService._tracks_from_payload(result.payload)
             durations = SunoService._durations_from_tracks(tracks)
             log.info(
                 "[SUNO] poll ready",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "taskId": task_id,
                         "takes": len(tracks),
                         "durations": durations,
                         "http_status": result.status_code,
                     }
-                },
+                }),
             )
             return result
 
         if result.state == "hard_error":
             log.error(
                 "[SUNO] poll hard failure",
-                extra={"meta": meta},
+                **build_log_extra({"meta": meta}),
             )
             return result
 
@@ -7765,13 +7788,13 @@ async def _suno_poll_record_info(
         if result.elapsed >= SUNO_POLL_TIMEOUT:
             log.warning(
                 "[SUNO] poll timeout",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "taskId": task_id,
                         "attempts": attempt,
                         "elapsed": result.elapsed,
                     }
-                },
+                }),
             )
             result.state = "timeout"
             return result
@@ -7941,14 +7964,14 @@ async def _poll_suno_and_send(
                 audio_url_preview = str(preview_candidate)
         log.info(
             "[SUNO] poll success",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "taskId": task_id,
                     "duration": duration_value,
                     "audioUrl": mask_tokens(audio_url_preview) if audio_url_preview else "",
                     "tags": _poll_tags(details),
                 }
-            },
+            }),
         )
 
         try:
@@ -9440,7 +9463,7 @@ async def wait_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if removed:
         log.info(
             "wait_watchdog.cleaned",
-            extra={"deleted": removed, "prefix": redis_prefix},
+            **build_log_extra({"deleted": removed, "prefix": redis_prefix}),
         )
 
 
@@ -9470,6 +9493,10 @@ def _resolve_chat_id(update: Update) -> Optional[int]:
 
 
 async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log = ctx.bot_data.get("logger") if isinstance(ctx.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    log.info("update.received", **_build_update_extra(update, command="/menu"))
     await ensure_user_record(update)
 
     query = update.callback_query
@@ -9478,7 +9505,13 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer()
 
     ctx.user_data.clear()
-    await send_main_menu(update, ctx)
+    try:
+        await send_main_menu(update, ctx)
+    except Exception as exc:
+        log.warning(
+            "menu.dispatch.failed",
+            **_build_update_extra(update, payload={"error": repr(exc)}, command="/menu"),
+        )
 
 
 async def welcome_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9501,9 +9534,19 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @with_state_reset
 async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    log = ctx.bot_data.get("logger") if isinstance(ctx.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    log.info("update.received", **_build_update_extra(update, command="/menu"))
     await ensure_user_record(update)
     ctx.user_data.clear()
-    await send_main_menu(update, ctx)
+    try:
+        await send_main_menu(update, ctx)
+    except Exception as exc:
+        log.warning(
+            "menu.command.failed",
+            **_build_update_extra(update, payload={"error": repr(exc)}, command="/menu"),
+        )
 
 
 @with_state_reset
@@ -9544,20 +9587,40 @@ async def on_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @with_state_reset
 async def on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log = ctx.bot_data.get("logger") if isinstance(ctx.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    log.info("update.received", **_build_update_extra(update, command="/help"))
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
     if chat_id is None:
         return
-    await render_help_card(chat_id, ctx)
+    try:
+        await render_help_card(chat_id, ctx)
+    except Exception as exc:
+        log.warning(
+            "help.command.failed",
+            **_build_update_extra(update, payload={"error": repr(exc)}, command="/help"),
+        )
 
 
 @with_state_reset
 async def on_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log = ctx.bot_data.get("logger") if isinstance(ctx.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    log.info("update.received", **_build_update_extra(update, command="/faq"))
     await ensure_user_record(update)
     chat_id = _resolve_chat_id(update)
     if chat_id is None:
         return
-    await render_faq_card(chat_id, ctx)
+    try:
+        await render_faq_card(chat_id, ctx)
+    except Exception as exc:
+        log.warning(
+            "faq.command.failed",
+            **_build_update_extra(update, payload={"error": repr(exc)}, command="/faq"),
+        )
 
 
 @with_state_reset
@@ -10204,19 +10267,38 @@ async def promo_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # codex/fix-balance-reset-after-deploy
-async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, log_event: bool = True):
+    log = ctx.bot_data.get("logger") if isinstance(ctx.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    if log_event:
+        log.info("update.received", **_build_update_extra(update, command="/balance"))
+
     await ensure_user_record(update)
     chat = update.effective_chat
     if chat is None:
         return
-    mid = await show_balance_card(chat.id, ctx, force_new=True)
+    try:
+        mid = await show_balance_card(chat.id, ctx, force_new=True)
+    except Exception as exc:
+        log.warning(
+            "balance.render.failed",
+            **_build_update_extra(update, payload={"error": repr(exc)}, command="/balance"),
+        )
+        return
     if mid is None:
         user = update.effective_user
         if user is None or update.message is None:
             return
         balance = _safe_get_balance(user.id)
         _set_cached_balance(ctx, balance)
-        await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+        try:
+            await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+        except Exception as exc:
+            log.warning(
+                "balance.message.failed",
+                **_build_update_extra(update, payload={"error": repr(exc)}, command="/balance"),
+            )
 
 
 async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10236,7 +10318,14 @@ async def handle_chat_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await balance_command(update, ctx)
+    log = ctx.bot_data.get("logger") if isinstance(ctx.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
+    log.info(
+        "update.received",
+        **_build_update_extra(update, command="/balance", payload={"source": "button"}),
+    )
+    await balance_command(update, ctx, log_event=False)
 
 
 
@@ -10660,15 +10749,16 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await message.reply_text(final_text)
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    error_obj = getattr(context, "error", None)
-    extra_meta: Optional[dict[str, Any]] = None
-    if error_obj is not None:
-        extra_meta = {"error": repr(error_obj)}
+    log = context.bot_data.get("logger") if isinstance(context.bot_data, MutableMapping) else None
+    if not isinstance(log, logging.Logger):
+        log = logging.getLogger("veo3-bot")
 
-    log.exception(
-        "handler.error",
-        extra=build_log_extra(update, context, meta=extra_meta),
-    )
+    error_obj = getattr(context, "error", None)
+    payload: dict[str, Any] = {}
+    if error_obj is not None:
+        payload["error"] = repr(error_obj)
+
+    log.exception("handler.error", **_build_update_extra(update, payload=payload))
 
     user_id: Optional[int] = None
     chat_id: Optional[int] = None
@@ -10698,7 +10788,17 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-        except Exception:
+        except Exception as exc:
+            log.warning(
+                "handler.error.notify_failed",
+                **build_log_extra(
+                    {"error": repr(exc), "target": target},
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    command=None,
+                    update_type=type(update).__name__ if update else None,
+                ),
+            )
             continue
         else:
             break
@@ -11583,13 +11683,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             if field == "title":
                 waiting_state = WAIT_SUNO_TITLE
-                log.info("suno wait input", extra={"field": "title", "user_id": uid})
+                log.info("suno wait input", **build_log_extra({"field": "title", "user_id": uid}))
             elif field == "style":
                 waiting_state = WAIT_SUNO_STYLE
-                log.info("suno wait input", extra={"field": "style", "user_id": uid})
+                log.info("suno wait input", **build_log_extra({"field": "style", "user_id": uid}))
             else:
                 waiting_state = WAIT_SUNO_LYRICS
-                log.info("suno wait input", extra={"field": "lyrics", "user_id": uid})
+                log.info("suno wait input", **build_log_extra({"field": "lyrics", "user_id": uid}))
             s["suno_waiting_state"] = waiting_state
             await q.answer()
             target_chat = chat_id
@@ -12092,7 +12192,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["suno_last_prompt_step"] = None
         _music_update_step(s, suno_state_obj, flow=s.get("suno_flow"))
         _reset_suno_card_cache(s)
-        log.info("suno input cleared", extra={"field": "reset", "user_id": user_id})
+        log.info("suno input cleared", **build_log_extra({"field": "reset", "user_id": user_id}))
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await sync_suno_prompt(
             ctx,
@@ -12623,7 +12723,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (time.time() - start_time) * 1000.0
         )
         app_logger = getattr(getattr(ctx, "application", None), "logger", log)
-        app_logger.exception("chat voice error", extra={"user_id": user_id})
+        app_logger.exception("chat voice error", **build_log_extra({"user_id": user_id}))
 
 # ---------- Payments: Stars (XTR) ----------
 async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -13348,12 +13448,19 @@ async def set_my_commands(app: "Application") -> None:
 
 
 async def on_startup(app: "Application") -> None:
-    logger = getattr(app, "logger", log)
+    bot_logger = None
+    bot_data = getattr(app, "bot_data", None)
+    if isinstance(bot_data, MutableMapping):
+        maybe_logger = bot_data.get("logger")
+        if isinstance(maybe_logger, logging.Logger):
+            bot_logger = maybe_logger
+    if bot_logger is None:
+        bot_logger = logging.getLogger("veo3-bot")
     try:
         await set_my_commands(app)
-        logger.info("Commands set: %s", _command_names_for_log())
+        bot_logger.info("Commands set: %s", _command_names_for_log())
     except Exception as exc:
-        logger.warning("Failed to set bot commands: %s", exc)
+        bot_logger.warning("Failed to set bot commands: %s", exc)
     version = getattr(app.bot, "_framework_version", None)
     if not version:
         try:
@@ -13362,7 +13469,7 @@ async def on_startup(app: "Application") -> None:
             version = getattr(_tg, "__version__", None)
         except Exception:
             version = None
-    logger.info("PTB version: %s", version or "unknown")
+    bot_logger.info("PTB version: %s", version or "unknown")
 
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
@@ -13517,11 +13624,7 @@ async def run_bot_async() -> None:
         .rate_limiter(AIORateLimiter())
         .build()
     )
-
-    # python-telegram-bot v20+ no longer exposes a built-in ``logger``
-    # attribute on :class:`Application`. Downstream helpers expect it, so we
-    # provide a compatible adapter that points to the main bot logger.
-    setattr(application, "logger", log)
+    application.bot_data["logger"] = logging.getLogger("veo3-bot")
 
     try:
         register_handlers(application)
@@ -13568,8 +13671,9 @@ async def run_bot_async() -> None:
                 else:
                     log.info("Stop requested (%s). Triggering shutdown.", reason)
                 SHUTDOWN_EVENT.set()
-                if application.updater:
-                    loop.create_task(application.updater.stop())
+                upd = getattr(application, "updater", None)
+                if upd and getattr(upd, "running", False):
+                    loop.create_task(upd.stop())
                 if graceful_task is None or graceful_task.done():
                     graceful_task = loop.create_task(_await_active_tasks())
 
@@ -13608,10 +13712,12 @@ async def run_bot_async() -> None:
                     log.warning("Delete webhook failed: %s", exc)
 
                 await application.start()
-                await application.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                )
+                upd = getattr(application, "updater", None)
+                if upd:
+                    await upd.start_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True,
+                    )
 
                 log.info("Application started")
 
@@ -13627,9 +13733,10 @@ async def run_bot_async() -> None:
                     except (NotImplementedError, RuntimeError):
                         pass
 
-                if application.updater:
+                upd = getattr(application, "updater", None)
+                if upd and getattr(upd, "running", False):
                     try:
-                        await application.updater.stop()
+                        await upd.stop()
                     except RuntimeError as exc:
                         log.warning("Updater stop failed: %s", exc)
                     except Exception as exc:

@@ -13,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 from utils.html_render import html_to_plain
+from logging_utils import build_log_extra
 
 logger = logging.getLogger(__name__)
 
@@ -190,18 +191,18 @@ async def safe_delete_message(bot: Bot, chat_id: int, message_id: int) -> bool:
         if "message to delete not found" in message or "message can't be deleted" in message:
             logger.debug(
                 "safe_delete.skip",
-                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+                **build_log_extra({"chat_id": chat_id, "message_id": message_id, "error": str(exc)}),
             )
             return False
         logger.debug(
             "safe_delete.bad_request",
-            extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            **build_log_extra({"chat_id": chat_id, "message_id": message_id, "error": str(exc)}),
         )
         return False
     except Exception as exc:  # pragma: no cover - network issues
         logger.warning(
             "safe_delete.error",
-            extra={"chat_id": chat_id, "message_id": message_id, "error": repr(exc)},
+            **build_log_extra({"chat_id": chat_id, "message_id": message_id, "error": repr(exc)}),
         )
         return False
 
@@ -229,7 +230,7 @@ async def send_html_with_fallback(
         message = str(exc).lower()
         if "can't parse entities" not in message and "parse entities" not in message:
             raise
-        logger.warning("pm.html_fallback", extra={"exc": repr(exc)})
+        logger.warning("pm.html_fallback", **build_log_extra({"exc": repr(exc)}))
         logger.info("pm.render.fallback")
         plain = html_to_plain(sanitized)
         if not plain:

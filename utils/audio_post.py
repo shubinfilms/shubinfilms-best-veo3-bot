@@ -17,6 +17,7 @@ from aiohttp import ClientError, ClientTimeout
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TIT2, TPE1
 
 from utils.image_detect import detect_image_ext, is_image
+from logging_utils import build_log_extra
 
 log = logging.getLogger("audio.post")
 
@@ -77,7 +78,7 @@ async def _fetch_bytes(url: str, *, timeout: ClientTimeout = _DEFAULT_TIMEOUT) -
                 data = await response.read()
                 return data, content_type
         except (ClientError, asyncio.TimeoutError) as exc:
-            log.warning("audio.fetch_failed", extra={"meta": {"url": url, "err": str(exc)}})
+            log.warning("audio.fetch_failed", **build_log_extra({"meta": {"url": url, "err": str(exc)}}))
             raise
 
 
@@ -118,7 +119,7 @@ def _guess_cover_mime(data: bytes, declared: Optional[str]) -> Optional[str]:
     if not ext:
         log.warning(
             "audio.cover.detect_failed",
-            extra={"meta": {"declared": declared}},
+            **build_log_extra({"meta": {"declared": declared}}),
         )
         return None
 
@@ -128,7 +129,7 @@ def _guess_cover_mime(data: bytes, declared: Optional[str]) -> Optional[str]:
         if lowered and lowered not in {mime, "image/jpg"}:
             log.debug(
                 "audio.cover.mime_mismatch",
-                extra={"meta": {"declared": lowered, "detected": mime}},
+                **build_log_extra({"meta": {"declared": lowered, "detected": mime}}),
             )
     return mime
 
@@ -152,7 +153,7 @@ def _apply_id3_tags(
         if not is_image(cover[0]):
             log.warning(
                 "audio.cover.invalid_image",
-                extra={"meta": {"declared": cover[1]}},
+                **build_log_extra({"meta": {"declared": cover[1]}}),
             )
         else:
             mime = _guess_cover_mime(cover[0], cover[1])
@@ -170,7 +171,7 @@ def _apply_id3_tags(
             else:
                 log.warning(
                     "audio.cover.unsupported_format",
-                    extra={"meta": {"declared": cover[1]}},
+                    **build_log_extra({"meta": {"declared": cover[1]}}),
                 )
     tags.save(path, v2_version=3)
 
@@ -208,7 +209,7 @@ async def prepare_audio_file(
                 log.warning(
                     "audio.cover.fetch_failed",
                     exc_info=True,
-                    extra={"meta": {"url": cover_url, "err": str(exc)}},
+                    **build_log_extra({"meta": {"url": cover_url, "err": str(exc)}}),
                 )
                 cover_data = None
         try:
@@ -223,7 +224,7 @@ async def prepare_audio_file(
             log.warning(
                 "audio.id3.write_failed",
                 exc_info=True,
-                extra={"meta": {"path": str(target_path), "err": str(exc)}},
+                **build_log_extra({"meta": {"path": str(target_path), "err": str(exc)}}),
             )
     return str(target_path), meta
 

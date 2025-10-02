@@ -7,6 +7,8 @@ import logging
 import random
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
+from logging_utils import build_log_extra
+
 T = TypeVar("T")
 
 
@@ -78,13 +80,13 @@ async def request_with_retries(
             if logger:
                 logger.warning(
                     "api.retry",  # noqa: TRY400 - structured logging key
-                    extra={
+                    **build_log_extra({
                         **log_extra,
                         "attempt": attempt,
                         "max_attempts": attempts,
                         "delay": round(delay, 3),
                         "error": str(exc),
-                    },
+                    }),
                 )
             total_delay += delay
             if delay > 0:
