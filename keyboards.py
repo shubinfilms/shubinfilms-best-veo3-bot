@@ -3,6 +3,18 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 CB_FAQ_PREFIX = "faq:"
 CB_PM_PREFIX = "pm:"
 
+CB_PM_BACK = f"{CB_PM_PREFIX}back"
+CB_PM_MENU = f"{CB_PM_PREFIX}menu"
+CB_PM_SWITCH = f"{CB_PM_PREFIX}switch"
+CB_PM_COPY_PREFIX = f"{CB_PM_PREFIX}copy:"
+CB_PM_INSERT_PREFIX = f"{CB_PM_PREFIX}insert:"
+
+CB_VIDEO_MENU = "video_menu"
+CB_VIDEO_MODE_FAST = "mode:veo_text_fast"
+CB_VIDEO_MODE_QUALITY = "mode:veo_text_quality"
+CB_VIDEO_MODE_PHOTO = "mode:veo_photo"
+CB_VIDEO_BACK = "video:back"
+
 
 _PM_LABELS = {
     "veo": {"ru": "🎬 Видеопромпт (VEO)", "en": "🎬 Video prompt (VEO)"},
@@ -34,7 +46,7 @@ def prompt_master_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
         [InlineKeyboardButton(_label("animate", lang), callback_data=f"{CB_PM_PREFIX}animate")],
         [InlineKeyboardButton(_label("banana", lang), callback_data=f"{CB_PM_PREFIX}banana")],
         [InlineKeyboardButton(_label("suno", lang), callback_data=f"{CB_PM_PREFIX}suno")],
-        [InlineKeyboardButton(_label("back", lang), callback_data=f"{CB_PM_PREFIX}back")],
+        [InlineKeyboardButton(_label("back", lang), callback_data=CB_PM_BACK)],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -43,8 +55,8 @@ def prompt_master_mode_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
     back = _label("back", lang)
     switch = "🔁 Сменить движок" if lang == "ru" else "🔁 Switch engine"
     rows = [
-        [InlineKeyboardButton(back, callback_data=f"{CB_PM_PREFIX}back")],
-        [InlineKeyboardButton(switch, callback_data=f"{CB_PM_PREFIX}switch")],
+        [InlineKeyboardButton(back, callback_data=CB_PM_BACK)],
+        [InlineKeyboardButton(switch, callback_data=CB_PM_SWITCH)],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -61,12 +73,12 @@ def prompt_master_result_keyboard(engine: str, lang: str = "ru") -> InlineKeyboa
     switch = "🔁 Сменить движок" if lang == "ru" else "🔁 Switch engine"
     rows = [
         [
-            InlineKeyboardButton(copy_text, callback_data=f"{CB_PM_PREFIX}copy:{engine}"),
-            InlineKeyboardButton(insert_text, callback_data=f"{CB_PM_PREFIX}insert:{engine}"),
+            InlineKeyboardButton(copy_text, callback_data=f"{CB_PM_COPY_PREFIX}{engine}"),
+            InlineKeyboardButton(insert_text, callback_data=f"{CB_PM_INSERT_PREFIX}{engine}"),
         ],
         [
-            InlineKeyboardButton(back, callback_data=f"{CB_PM_PREFIX}back"),
-            InlineKeyboardButton(switch, callback_data=f"{CB_PM_PREFIX}switch"),
+            InlineKeyboardButton(back, callback_data=CB_PM_BACK),
+            InlineKeyboardButton(switch, callback_data=CB_PM_SWITCH),
         ],
     ]
     return InlineKeyboardMarkup(rows)

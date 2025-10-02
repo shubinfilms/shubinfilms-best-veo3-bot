@@ -15,7 +15,12 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from keyboards import (
+    CB_PM_BACK,
+    CB_PM_COPY_PREFIX,
+    CB_PM_INSERT_PREFIX,
+    CB_PM_MENU,
     CB_PM_PREFIX,
+    CB_PM_SWITCH,
     prompt_master_keyboard,
     prompt_master_mode_keyboard,
     prompt_master_result_keyboard,
@@ -322,6 +327,10 @@ async def prompt_master_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state.update({"engine": None, "prompt": None, "card_msg_id": None})
     lang = _resolve_ui_lang(update, context)
     text = PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT["en"])
+    chat_obj = getattr(update, "effective_chat", None)
+    logger.debug(
+        "pm.open", extra={"chat_id": getattr(chat_obj, "id", None)}
+    )
 
     message = update.effective_message
     if message is not None and message.chat:
@@ -443,19 +452,29 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     data = query.data
+    message = getattr(query, "message", None)
+    from_user = getattr(query, "from_user", None)
+    logger.debug(
+        "pm.callback",
+        extra={
+            "data": data,
+            "chat_id": getattr(message, "chat_id", None),
+            "user_id": getattr(from_user, "id", None),
+        },
+    )
     lang = _resolve_ui_lang(update, context)
 
-    if data.startswith(f"{CB_PM_PREFIX}copy:"):
+    if data.startswith(CB_PM_COPY_PREFIX):
         engine = data.split(":", 2)[2]
         await _handle_copy(update, context, engine, lang)
         return
 
-    if data.startswith(f"{CB_PM_PREFIX}insert:"):
+    if data.startswith(CB_PM_INSERT_PREFIX):
         engine = data.split(":", 2)[2]
         await _handle_insert(update, context, engine, lang)
         return
 
-    if data in {f"{CB_PM_PREFIX}back", f"{CB_PM_PREFIX}menu"}:
+    if data in {CB_PM_BACK, CB_PM_MENU}:
         state = _ensure_state(context)
         chat = query.message.chat if query.message else update.effective_chat
         chat_id = chat.id if chat else None
@@ -471,7 +490,7 @@ async def prompt_master_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    if data == f"{CB_PM_PREFIX}switch":
+    if data == CB_PM_SWITCH:
         await query.answer()
         await _set_engine(update, context, None)
         await query.edit_message_text(

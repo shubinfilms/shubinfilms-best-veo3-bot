@@ -3,7 +3,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop
@@ -523,6 +523,145 @@ def test_video_mode_callback_opens_card() -> None:
     assert message.replies == [
         "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически."
     ]
+
+
+def test_video_menu_callback_sends_once() -> None:
+    async def dummy_send_message(**kwargs):
+        return SimpleNamespace(message_id=kwargs.get("message_id", 200))
+
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_message=dummy_send_message), user_data={})
+    state_dict = bot_module.state(ctx)
+    state_dict["mode"] = "veo_text_fast"
+
+    calls: list[tuple[Any, dict[str, object]]] = []
+    answer_calls: list[dict[str, object]] = []
+    set_mode_calls: list[tuple[int, bool]] = []
+    clear_wait_calls: list[tuple[int, str]] = []
+    input_clear_calls: list[tuple[int, str]] = []
+
+    async def fake_ensure(update_param):
+        return None
+
+    async def fake_safe_send(method, **kwargs):
+        calls.append((method, kwargs))
+        return SimpleNamespace(message_id=kwargs.get("message_id", 100))
+
+    def fake_set_mode(user_id: int, flag: bool) -> None:
+        set_mode_calls.append((user_id, flag))
+
+    def fake_clear_wait(user_id: int, *, reason: str = "manual") -> None:
+        clear_wait_calls.append((user_id, reason))
+
+    def fake_input_clear(user_id: int, *, reason: str = "manual") -> None:
+        input_clear_calls.append((user_id, reason))
+
+    original_ensure = bot_module.ensure_user_record
+    original_safe = bot_module.tg_safe_send
+    original_set_mode = bot_module.set_mode
+    original_clear_wait = bot_module.clear_wait
+    original_input_clear = bot_module.input_state.clear
+
+    message = DummyMessage(chat_id=606, text="")
+    callback = DummyCallbackQuery(bot_module.CB_VIDEO_MENU, message, user_id=606)
+
+    async def fake_answer(**kwargs):
+        answer_calls.append(kwargs)
+
+    callback.answer = fake_answer  # type: ignore[assignment]
+
+    update = SimpleNamespace(
+        callback_query=callback,
+        effective_chat=SimpleNamespace(id=606),
+        effective_user=SimpleNamespace(id=606),
+    )
+
+    try:
+        bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+        bot_module.tg_safe_send = fake_safe_send  # type: ignore[assignment]
+        bot_module.set_mode = fake_set_mode  # type: ignore[assignment]
+        bot_module.clear_wait = fake_clear_wait  # type: ignore[assignment]
+        bot_module.input_state.clear = fake_input_clear  # type: ignore[assignment]
+
+        _run(bot_module.video_menu_callback(update, ctx))
+    finally:
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+        bot_module.tg_safe_send = original_safe  # type: ignore[assignment]
+        bot_module.set_mode = original_set_mode  # type: ignore[assignment]
+        bot_module.clear_wait = original_clear_wait  # type: ignore[assignment]
+        bot_module.input_state.clear = original_input_clear  # type: ignore[assignment]
+
+    assert len(calls) == 1
+    method, payload = calls[0]
+    assert method is None or callable(method)
+    assert payload["text"] == bot_module.VIDEO_MENU_TEXT
+    assert answer_calls == [{}]
+    assert set_mode_calls == [(606, False)]
+    assert clear_wait_calls == [(606, "video_menu")]
+    assert input_clear_calls == [(606, "video_menu")]
+    assert state_dict["mode"] is None
+
+
+def test_prompt_master_button_skips_chat_fallback() -> None:
+    ctx = SimpleNamespace(bot=None, user_data={})
+    pm_calls: list[str] = []
+    chat_calls: list[dict[str, object]] = []
+
+    async def fake_pm(update, context):  # type: ignore[override]
+        pm_calls.append(update.effective_message.text)  # type: ignore[attr-defined]
+
+    async def fake_chat_handler(
+        *,
+        ctx: object,
+        chat_id: int,
+        user_id: int,
+        state_dict: dict[str, object],
+        raw_text: str,
+        text: str,
+        send_typing_action: bool,
+        send_hint: bool,
+        inline_keyboard: object | None = None,
+    ) -> None:
+        chat_calls.append(
+            {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "raw": raw_text,
+                "text": text,
+                "hint": send_hint,
+            }
+        )
+
+    async def fake_ensure(update_param):
+        return None
+
+    original_route = bot_module.LABEL_COMMAND_ROUTES["pm.open"]
+    original_chat = bot_module._handle_chat_message
+    original_pm = bot_module.prompt_master_command
+    original_ensure = bot_module.ensure_user_record
+
+    try:
+        bot_module.LABEL_COMMAND_ROUTES["pm.open"] = fake_pm  # type: ignore[assignment]
+        bot_module._handle_chat_message = fake_chat_handler  # type: ignore[assignment]
+        bot_module.prompt_master_command = fake_pm  # type: ignore[assignment]
+        bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
+
+        message = DummyMessage(chat_id=707, text="🧠 Prompt-Master")
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_user=SimpleNamespace(id=707),
+            effective_chat=SimpleNamespace(id=707),
+        )
+
+        _run(bot_module.on_text(update, ctx))
+    finally:
+        bot_module.LABEL_COMMAND_ROUTES["pm.open"] = original_route
+        bot_module._handle_chat_message = original_chat  # type: ignore[assignment]
+        bot_module.prompt_master_command = original_pm  # type: ignore[assignment]
+        bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
+
+    assert pm_calls == ["🧠 Prompt-Master"]
+    assert chat_calls == []
 
 
 def test_image_button_routes_mj_card() -> None:
