@@ -59,6 +59,7 @@ CALLBACK_URL = SUNO_CALLBACK_URL
 
 _POLL_DEFAULT_TIMEOUT = 420.0
 _POLL_DELIVERED_TTL = 15 * 60
+_DELIVERY_DEDUP_TTL_DEFAULT = 6 * 60 * 60
 
 
 def _env_float(name: str, default: float) -> float:
@@ -362,6 +363,13 @@ class SunoService:
         raw_fallback = (os.getenv("TELEGRAM_DOWNLOAD_FALLBACK") or "true").strip().lower()
         self._telegram_download_fallback = raw_fallback not in {"0", "false", "no"}
         self._delivery_seen_limit = 200
+        ttl_env = os.getenv("SUNO_DELIVERY_DEDUP_TTL", str(_DELIVERY_DEDUP_TTL_DEFAULT))
+        try:
+            ttl_value = int(float(ttl_env))
+        except (TypeError, ValueError):
+            ttl_value = _DELIVERY_DEDUP_TTL_DEFAULT
+        self._delivery_store_ttl = max(300, ttl_value)
+        self._delivery_store_prefix = f"{REDIS_PREFIX}:suno:posted"
         self._poll_first_delay = max(0.1, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 5.0))
         backoff_raw = os.getenv("SUNO_POLL_BACKOFF_SERIES", "5,8,13,21,34") or ""
         parsed_backoff = _parse_backoff_series(backoff_raw)
@@ -1591,6 +1599,28 @@ class SunoService:
             return True
         key = self._delivery_key(task_id, take_id)
         seen = self._delivery_seen
+        stored = None
+        if self.redis is not None:
+            redis_key = f"{self._delivery_store_prefix}:{key}"
+            try:
+                stored = self.redis.set(redis_key, "1", nx=True, ex=self._delivery_store_ttl)
+            except Exception:  # pragma: no cover - Redis failure
+                log.warning(
+                    "SunoService redis.set delivery failed",
+                    extra={"meta": {"task_id": task_id, "take_id": take_id}},
+                    exc_info=True,
+                )
+                stored = None
+            else:
+                if stored:
+                    seen[key] = time.time()
+                    while len(seen) > self._delivery_seen_limit:
+                        seen.popitem(last=False)
+                    return True
+                # stored is False -> already seen in redis
+                if stored is False:
+                    seen[key] = time.time()
+                    return False
         if key in seen:
             seen.move_to_end(key)
             return False
@@ -1611,8 +1641,8 @@ class SunoService:
         user_title: Optional[str],
     ) -> str:
         for candidate in (
-            track.title,
             user_title,
+            track.title,
             meta_title,
             "Untitled",
         ):
@@ -1815,16 +1845,18 @@ class SunoService:
                     extra=audio_extra,
                     file_name=file_name,
                 )
-                document_sent = send_file(
-                    "sendDocument",
-                    "document",
-                    chat_id,
-                    prepared_path,
-                    caption=caption,
-                    reply_to=reply_to,
-                    extra=None,
-                    file_name=file_name,
-                )
+                document_sent = False
+                if not audio_sent:
+                    document_sent = send_file(
+                        "sendDocument",
+                        "document",
+                        chat_id,
+                        prepared_path,
+                        caption=caption,
+                        reply_to=reply_to,
+                        extra=None,
+                        file_name=file_name,
+                    )
                 if audio_sent or document_sent:
                     return True, None
                 last_reason = "upload_failed"
@@ -1893,16 +1925,18 @@ class SunoService:
                 extra=extra,
                 file_name=file_name,
             )
-            document_sent = send_file(
-                "sendDocument",
-                "document",
-                chat_id,
-                local_path,
-                caption=caption,
-                reply_to=reply_to,
-                extra=None,
-                file_name=file_name,
-            )
+            document_sent = False
+            if not audio_sent:
+                document_sent = send_file(
+                    "sendDocument",
+                    "document",
+                    chat_id,
+                    local_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    extra=None,
+                    file_name=file_name,
+                )
         finally:
             schedule_unlink(local_path)
         if audio_sent or document_sent:
@@ -2008,6 +2042,8 @@ class SunoService:
                 negative_tags=negative_tags,
                 preset=preset,
             )
+        if title and not final_payload.get("title"):
+            final_payload["title"] = title
         if lyrics_source:
             final_payload.setdefault("lyrics_source", lyrics_source)
         resolved_title = str(final_payload.get("title") or title or prompt_text)

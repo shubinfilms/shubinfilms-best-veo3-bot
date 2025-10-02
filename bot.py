@@ -5010,6 +5010,14 @@ def banana_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def banana_result_keyboard() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("🔁 Повторить")],
+        [KeyboardButton("⬅️ Назад в меню")],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 # --------- Suno Helpers ----------
 
 
@@ -10392,7 +10400,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             clear_wait_state(uid, reason="banana_confirm")
             chat_id = update.effective_chat.id
             await show_banana_card(chat_id, ctx)
-            await show_main_menu(chat_id, ctx)
             await show_balance_notification(
                 chat_id,
                 ctx,
@@ -11174,7 +11181,6 @@ async def _banana_run_and_send(
         s["banana_balance"] = new_balance
         s["_last_text_banana"] = None
         await show_banana_card(chat_id, ctx)
-        await show_main_menu(chat_id, ctx)
         await show_balance_notification(
             chat_id,
             ctx,
@@ -11216,7 +11222,19 @@ async def _banana_run_and_send(
             reply_markup=None,
             send_document=BANANA_SEND_AS_DOCUMENT,
         )
-        if not delivered:
+        if delivered:
+            try:
+                await ctx.bot.send_message(
+                    chat_id,
+                    "Галерея сгенерирована.",
+                    reply_markup=banana_result_keyboard(),
+                )
+            except Exception as exc:
+                log.warning(
+                    "banana.result.keyboard_fail",
+                    extra={"meta": {"chat_id": chat_id, "error": str(exc)}},
+                )
+        else:
             await ctx.bot.send_message(
                 chat_id,
                 "❌ Не удалось отправить изображение Banana. Попробуйте позже.",
