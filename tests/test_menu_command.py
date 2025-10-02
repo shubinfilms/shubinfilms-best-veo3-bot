@@ -47,6 +47,29 @@ def test_main_menu_keyboard_layout():
     assert bot_module.MENU_BTN_SUPPORT not in flattened
 
 
+def test_video_menu_keyboard_options():
+    markup = bot_module.video_menu_kb()
+    rows = markup.inline_keyboard
+
+    assert rows[0][0].text == (
+        f"🎬 Генерация видео (Veo Fast) — 💎 {bot_module.TOKEN_COSTS['veo_fast']}"
+    )
+    assert rows[0][0].callback_data == "mode:veo_text_fast"
+
+    assert rows[1][0].text == (
+        f"🎬 Генерация видео (Veo Quality) — 💎 {bot_module.TOKEN_COSTS['veo_quality']}"
+    )
+    assert rows[1][0].callback_data == "mode:veo_text_quality"
+
+    assert rows[2][0].text == (
+        f"🖼️ Оживить изображение (Veo) — 💎 {bot_module.TOKEN_COSTS['veo_photo']}"
+    )
+    assert rows[2][0].callback_data == "mode:veo_photo"
+
+    assert rows[3][0].text == "⬅️ Назад"
+    assert rows[3][0].callback_data == "back"
+
+
 def test_menu_command_always_sends_welcome_block(monkeypatch):
     bot = FakeBot()
     ctx = SimpleNamespace(bot=bot, user_data={})
