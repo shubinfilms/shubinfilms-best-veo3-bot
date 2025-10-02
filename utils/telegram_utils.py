@@ -101,7 +101,7 @@ _register_label(
     command="mj.card",
 )
 _register_label("🎵 Генерация музыки", "🎵 Музыка", "🎵 Музыка (Suno)", "🎵 Track (Suno)", "🎵 Suno", prefix=True)
-_register_label("🧠 Prompt-Master", "🧠", prefix=True)
+_register_label("🧠 Prompt-Master", "🧠", prefix=True, command="pm.open")
 _register_label(
     "💎 Баланс",
     "Баланс",

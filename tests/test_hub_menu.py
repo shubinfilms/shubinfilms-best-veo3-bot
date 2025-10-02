@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from keyboards import CB_VIDEO_MENU
 from telegram_utils import build_hub_keyboard, build_hub_text
 
 
@@ -16,7 +17,7 @@ def test_build_hub_keyboard_layout():
     assert all(len(row) == 3 for row in rows)
 
     expected = [
-        ("🎬", "hub:video"),
+        ("🎬", CB_VIDEO_MENU),
         ("🎨", "hub:image"),
         ("🎵", "hub:music"),
         ("🧠", "hub:prompt"),

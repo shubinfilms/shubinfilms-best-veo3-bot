@@ -50,23 +50,14 @@ def _run(coro):
 
 def test_veo_card_opens_with_empty_prompt() -> None:
     ctx = SimpleNamespace(bot=None, user_data={})
-    captured: list[str] = []
+    replies: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_upsert(
-        ctx_param,
-        chat_id: int,
-        state_dict: dict,
-        state_key: str,
-        text: str,
-        reply_markup,
-        *,
-        force_new: bool = False,
-        parse_mode=None,
-        disable_web_page_preview: bool = True,
-    ) -> int:
-        captured.append(text)
-        state_dict[state_key] = 123
-        return 123
+    class CaptureMessage:
+        def __init__(self, chat_id: int) -> None:
+            self.chat_id = chat_id
+
+        async def reply_text(self, text: str, **kwargs: object) -> None:  # type: ignore[override]
+            replies.append((text, kwargs))
 
     async def fake_ensure(update_param):
         return None
@@ -74,29 +65,29 @@ def test_veo_card_opens_with_empty_prompt() -> None:
     def fake_set_mode(user_id: int, on: bool) -> None:  # type: ignore[override]
         return None
 
-    original_upsert = bot_module.upsert_card
     original_ensure = bot_module.ensure_user_record
     original_set_mode = bot_module.set_mode
 
+    message = CaptureMessage(chat_id=555)
     update = SimpleNamespace(
         effective_chat=SimpleNamespace(id=555),
         effective_user=SimpleNamespace(id=555),
-        message=SimpleNamespace(),
-        effective_message=SimpleNamespace(),
+        message=message,
+        effective_message=message,
     )
 
     try:
-        bot_module.upsert_card = fake_upsert  # type: ignore[assignment]
         bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
         bot_module.set_mode = fake_set_mode  # type: ignore[assignment]
         _run(bot_module.handle_video_entry(update, ctx))
     finally:
-        bot_module.upsert_card = original_upsert  # type: ignore[assignment]
         bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
         bot_module.set_mode = original_set_mode  # type: ignore[assignment]
 
-    assert captured, "card render not captured"
-    assert "<code> </code>" in captured[-1]
+    assert replies, "video menu not sent"
+    text, kwargs = replies[-1]
+    assert text == bot_module.VIDEO_MENU_TEXT
+    assert kwargs.get("reply_markup") == bot_module.video_menu_kb()
 
 
 def test_mj_card_opens_with_empty_prompt() -> None:

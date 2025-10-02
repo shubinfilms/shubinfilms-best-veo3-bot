@@ -54,20 +54,20 @@ def test_video_menu_keyboard_options():
     assert rows[0][0].text == (
         f"🎬 Генерация видео (Veo Fast) — 💎 {bot_module.TOKEN_COSTS['veo_fast']}"
     )
-    assert rows[0][0].callback_data == "mode:veo_text_fast"
+    assert rows[0][0].callback_data == bot_module.CB_VIDEO_MODE_FAST
 
     assert rows[1][0].text == (
         f"🎬 Генерация видео (Veo Quality) — 💎 {bot_module.TOKEN_COSTS['veo_quality']}"
     )
-    assert rows[1][0].callback_data == "mode:veo_text_quality"
+    assert rows[1][0].callback_data == bot_module.CB_VIDEO_MODE_QUALITY
 
     assert rows[2][0].text == (
         f"🖼️ Оживить изображение (Veo) — 💎 {bot_module.TOKEN_COSTS['veo_photo']}"
     )
-    assert rows[2][0].callback_data == "mode:veo_photo"
+    assert rows[2][0].callback_data == bot_module.CB_VIDEO_MODE_PHOTO
 
     assert rows[3][0].text == "⬅️ Назад"
-    assert rows[3][0].callback_data == "back"
+    assert rows[3][0].callback_data == bot_module.CB_VIDEO_BACK
 
 
 def test_menu_command_always_sends_welcome_block(monkeypatch):
@@ -104,3 +104,8 @@ def test_menu_command_always_sends_welcome_block(monkeypatch):
     assert bot.deleted
     deleted_ids = {payload.get("message_id") for payload in bot.deleted}
     assert first_hub_id in deleted_ids
+
+
+def test_callback_handler_patterns_unique():
+    patterns = [pattern if pattern is not None else "<default>" for pattern, _ in bot_module.CALLBACK_HANDLER_SPECS]
+    assert len(patterns) == len(set(patterns))

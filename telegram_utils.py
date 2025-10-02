@@ -24,6 +24,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
+from keyboards import CB_VIDEO_MENU
 
 log = logging.getLogger("telegram.utils")
 
@@ -179,7 +180,7 @@ def build_hub_keyboard() -> InlineKeyboardMarkup:
 
     rows = [
         [
-            InlineKeyboardButton("🎬", callback_data="hub:video"),
+            InlineKeyboardButton("🎬", callback_data=CB_VIDEO_MENU),
             InlineKeyboardButton("🎨", callback_data="hub:image"),
             InlineKeyboardButton("🎵", callback_data="hub:music"),
         ],

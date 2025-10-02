@@ -144,7 +144,13 @@ from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import (
     CB_FAQ_PREFIX,
+    CB_PM_INSERT_PREFIX,
     CB_PM_PREFIX,
+    CB_VIDEO_BACK,
+    CB_VIDEO_MENU,
+    CB_VIDEO_MODE_FAST,
+    CB_VIDEO_MODE_PHOTO,
+    CB_VIDEO_MODE_QUALITY,
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
 )
@@ -4139,6 +4145,8 @@ MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
+VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
+
 def _safe_get_balance(user_id: int) -> int:
     try:
         return get_balance(user_id)
@@ -4289,19 +4297,16 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
 
     if action == "video":
+        log.debug(
+            "hub.video.clicked",
+            extra={"chat_id": chat_id, "user_id": user_id},
+        )
         if user_id:
             set_mode(user_id, False)
         s["mode"] = None
         await query.answer()
         try:
-            await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
-                chat_id=chat_id,
-                text="🎬 Выберите тип генерации видео:",
-                reply_markup=video_menu_kb(),
-            )
+            await _send_video_menu(ctx, chat_id=chat_id)
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.video_send_failed | chat=%s err=%s", chat_id, exc)
         return
@@ -4410,19 +4415,54 @@ def video_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton(
             f"🎬 Генерация видео (Veo Fast) — 💎 {TOKEN_COSTS['veo_fast']}",
-            callback_data="mode:veo_text_fast",
+            callback_data=CB_VIDEO_MODE_FAST,
         )],
         [InlineKeyboardButton(
             f"🎬 Генерация видео (Veo Quality) — 💎 {TOKEN_COSTS['veo_quality']}",
-            callback_data="mode:veo_text_quality",
+            callback_data=CB_VIDEO_MODE_QUALITY,
         )],
         [InlineKeyboardButton(
             f"🖼️ Оживить изображение (Veo) — 💎 {TOKEN_COSTS['veo_photo']}",
-            callback_data="mode:veo_photo",
+            callback_data=CB_VIDEO_MODE_PHOTO,
         )],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=CB_VIDEO_BACK)],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+async def _send_video_menu(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int] = None,
+    message: Optional[Message] = None,
+) -> None:
+    target_chat = chat_id or (getattr(message, "chat_id", None))
+    log.debug("video.menu.render", extra={"chat_id": target_chat})
+    if message is not None:
+        reply_method = getattr(message, "reply_text", None)
+        if callable(reply_method):
+            await reply_method(VIDEO_MENU_TEXT, reply_markup=video_menu_kb())
+            return
+        if target_chat is not None:
+            await tg_safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=target_chat,
+                text=VIDEO_MENU_TEXT,
+                reply_markup=video_menu_kb(),
+            )
+        return
+    if target_chat is None:
+        return
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=target_chat,
+        text=VIDEO_MENU_TEXT,
+        reply_markup=video_menu_kb(),
+    )
 
 
 def image_menu_kb() -> InlineKeyboardMarkup:
@@ -9179,30 +9219,23 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     user_id = user.id if user else None
+    log.debug(
+        "video.command",
+        extra={"chat_id": chat.id, "user_id": user_id},
+    )
     if user_id:
-        input_state.clear(user_id, reason="card_opened")
+        input_state.clear(user_id, reason="video_menu")
         set_mode(user_id, False)
-        clear_wait(user_id)
+        clear_wait(user_id, reason="video_menu")
 
     s = state(ctx)
-    s["mode"] = "veo_text_fast"
-    s["model"] = "veo3_fast"
-    if s.get("aspect") not in {"16:9", "9:16"}:
-        s["aspect"] = "16:9"
-    await veo_entry(chat.id, ctx)
-
-    if user_id is not None:
-        card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
-        try:
-            set_wait(
-                user_id,
-                WaitKind.VEO_PROMPT.value,
-                card_id,
-                chat_id=chat.id,
-                meta={"trigger": "command", "mode": s.get("mode")},
-            )
-        except ValueError:
-            pass
+    s["mode"] = None
+    s.pop("model", None)
+    message = update.effective_message
+    if message is not None:
+        await _send_video_menu(ctx, message=message)
+    else:
+        await _send_video_menu(ctx, chat_id=chat.id)
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -9346,16 +9379,62 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     s = state(ctx)
     s["mode"] = None
 
-    if message is not None:
-        reply_method = getattr(message, "reply_text", None)
-        if callable(reply_method):
-            await reply_method(
-                "🎬 Выберите тип генерации видео:",
-                reply_markup=video_menu_kb(),
+    log.debug(
+        "video.menu.reply",
+        extra={"chat_id": chat.id, "user_id": user_id},
+    )
+    await _send_video_menu(ctx, message=message)
+
+
+async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    data = query.data
+    message = getattr(query, "message", None)
+    chat_obj = getattr(message, "chat", None)
+    if chat_obj is None:
+        chat_obj = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    user = getattr(query, "from_user", None) or update.effective_user
+    user_id = user.id if user else None
+
+    log.debug(
+        "video.callback",
+        extra={"chat_id": chat_id, "user_id": user_id, "data": data},
+    )
+
+    s = state(ctx)
+    if user_id is not None:
+        input_state.clear(user_id, reason="video_menu")
+        set_mode(user_id, False)
+        clear_wait(user_id, reason="video_menu")
+    s["mode"] = None
+
+    if data == CB_VIDEO_BACK:
+        await query.answer()
+        target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
+        if target_chat is not None:
+            await show_emoji_hub_for_chat(
+                target_chat,
+                ctx,
+                user_id=user_id,
+                replace=True,
             )
+        return
 
-    await veo_entry(chat.id, ctx)
+    if data == CB_VIDEO_MENU:
+        await query.answer()
+        if chat_id is None:
+            return
+        await _send_video_menu(ctx, chat_id=chat_id)
+        return
 
+    await query.answer()
 
 async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await image_command(update, ctx)
@@ -12206,12 +12285,11 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (r"^pm:insert:(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
-    (r"^pm:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
-    (r"^pm:(back|menu|switch)$", prompt_master_callback_entry),
-    (r"^pm:copy:(veo|mj|banana|animate|suno)$", prompt_master_callback_entry),
+    (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
+    (rf"^{CB_VIDEO_MENU}$", video_menu_callback),
+    (r"^video:", video_menu_callback),
     (r"^hub:", hub_router),
     (r"^go:", main_suggest_router),
     (None, on_callback),
@@ -12233,6 +12311,7 @@ LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Aw
     "mj.card": handle_image_entry,
     "balance.show": handle_balance_entry,
     "help.open": help_command_entry,
+    "pm.open": prompt_master_command,
 }
 
 
