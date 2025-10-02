@@ -1845,18 +1845,16 @@ class SunoService:
                     extra=audio_extra,
                     file_name=file_name,
                 )
-                document_sent = False
-                if not audio_sent:
-                    document_sent = send_file(
-                        "sendDocument",
-                        "document",
-                        chat_id,
-                        prepared_path,
-                        caption=caption,
-                        reply_to=reply_to,
-                        extra=None,
-                        file_name=file_name,
-                    )
+                document_sent = send_file(
+                    "sendDocument",
+                    "document",
+                    chat_id,
+                    prepared_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    extra=None,
+                    file_name=file_name,
+                )
                 if audio_sent or document_sent:
                     return True, None
                 last_reason = "upload_failed"
@@ -1925,18 +1923,16 @@ class SunoService:
                 extra=extra,
                 file_name=file_name,
             )
-            document_sent = False
-            if not audio_sent:
-                document_sent = send_file(
-                    "sendDocument",
-                    "document",
-                    chat_id,
-                    local_path,
-                    caption=caption,
-                    reply_to=reply_to,
-                    extra=None,
-                    file_name=file_name,
-                )
+            document_sent = send_file(
+                "sendDocument",
+                "document",
+                chat_id,
+                local_path,
+                caption=caption,
+                reply_to=reply_to,
+                extra=None,
+                file_name=file_name,
+            )
         finally:
             schedule_unlink(local_path)
         if audio_sent or document_sent:
