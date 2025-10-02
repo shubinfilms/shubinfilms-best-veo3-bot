@@ -30,6 +30,8 @@ class _AppSettings(BaseModel):
     LOG_LEVEL: str = Field(default="INFO")
     LOG_JSON: bool = Field(default=True)
     MAX_IN_LOG_BODY: int = Field(default=2048, ge=256, le=65536)
+    SUPPORT_USERNAME: str = Field(default="BestAi_Support")
+    SUPPORT_USER_ID: int = Field(default=7223448532)
 
     HTTP_TIMEOUT_CONNECT: float = Field(default=10.0, ge=0.1, le=300.0)
     HTTP_TIMEOUT_READ: float = Field(default=60.0, ge=1.0, le=600.0)
@@ -199,6 +201,15 @@ REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "suno:prod").strip() or "suno:prod"
 SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
 
+_support_username_raw = str(_APP_SETTINGS.SUPPORT_USERNAME or "").strip()
+if not _support_username_raw:
+    _support_username_raw = "BestAi_Support"
+SUPPORT_USERNAME = _support_username_raw.lstrip("@") or "BestAi_Support"
+try:
+    SUPPORT_USER_ID = int(_APP_SETTINGS.SUPPORT_USER_ID)
+except (TypeError, ValueError):
+    SUPPORT_USER_ID = 7223448532
+
 
 # Feature toggles
 WELCOME_BONUS_ENABLED = False
@@ -349,6 +360,8 @@ __all__ = [
     "UPLOAD_STREAM_PATH",
     "UPLOAD_URL_PATH",
     "UPLOAD_BASE64_PATH",
+    "SUPPORT_USERNAME",
+    "SUPPORT_USER_ID",
     "resolve_outbound_ip",
     "token_tail",
 ]

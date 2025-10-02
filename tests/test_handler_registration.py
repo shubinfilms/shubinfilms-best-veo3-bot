@@ -19,6 +19,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 import bot
 
+from handlers.help_handler import help_command as help_handler_command
+
 from bot import (  # noqa: E402
     MENU_BTN_BALANCE,
     MENU_BTN_CHAT,
@@ -156,10 +158,17 @@ def test_reply_button_routes_match_expected() -> None:
 
 
 def _find_command_handler(application, command: str) -> CommandHandler:
+    fallback = None
     for handlers in application.handlers.values():
         for handler in handlers:
             if isinstance(handler, CommandHandler) and command in handler.commands:
-                return handler
+                wrapped = getattr(handler.callback, "__wrapped_handler__", None)
+                if wrapped is not None:
+                    return handler
+                if fallback is None:
+                    fallback = handler
+    if fallback is not None:
+        return fallback
     raise AssertionError(f"handler not found for /{command}")
 
 
@@ -192,7 +201,7 @@ def test_help_command_dispatches_and_resets(monkeypatch) -> None:
     asyncio.run(handler.callback(update, context))
 
     reset_mock.assert_awaited_once_with(user_id=111, chat_id=222)
-    assert dispatched == [bot.on_help]
+    assert dispatched == [help_handler_command]
 
 
 def test_unknown_command_replies_with_menu(monkeypatch) -> None:
