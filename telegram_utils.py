@@ -26,6 +26,7 @@ from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, Tele
 from metrics import telegram_send_total
 from redis_utils import reset_user_state as redis_reset_user_state
 from settings import REDIS_PREFIX
+from logging_utils import build_log_extra
 
 log = logging.getLogger("telegram.utils")
 BOT_LOG = logging.getLogger("bot")
@@ -521,13 +522,13 @@ async def safe_send(
             if attempt > 1:
                 log.info(
                     "telegram send succeeded",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "attempt": attempt,
                             "req_id": req_id,
                         }
-                    },
+                    }),
                 )
             return result
         except BadRequest as exc:
@@ -535,14 +536,14 @@ async def safe_send(
                 telegram_send_total.labels(kind=kind, result="ok", **_BOT_LABELS).inc()
                 log.info(
                     "telegram send noop",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "attempt": attempt,
                             "req_id": req_id,
                             "reason": "message_not_modified",
                         }
-                    },
+                    }),
                 )
                 return None
             status = 400
@@ -551,7 +552,7 @@ async def safe_send(
                 delay = _retry_delay(attempt)
                 log.warning(
                     "telegram retry",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "attempt": attempt,
@@ -559,14 +560,14 @@ async def safe_send(
                             "status": status,
                             "req_id": req_id,
                         }
-                    },
+                    }),
                 )
                 await asyncio.sleep(delay)
                 continue
             telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
             log.warning(
                 "telegram send permanent failure",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "method": method_name,
                         "status": status,
@@ -574,7 +575,7 @@ async def safe_send(
                         "req_id": req_id,
                         "error": str(exc),
                     }
-                },
+                }),
             )
             raise
         except Forbidden as exc:
@@ -582,7 +583,7 @@ async def safe_send(
             telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
             log.warning(
                 "telegram forbidden",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "method": method_name,
                         "status": status,
@@ -590,7 +591,7 @@ async def safe_send(
                         "req_id": req_id,
                         "error": str(exc),
                     }
-                },
+                }),
             )
             raise
         except RetryAfter as exc:
@@ -603,7 +604,7 @@ async def safe_send(
                 telegram_send_total.labels(kind=kind, result="retry", **_BOT_LABELS).inc()
                 log.warning(
                     "telegram retry",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "attempt": attempt,
@@ -611,14 +612,14 @@ async def safe_send(
                             "status": getattr(exc, "status_code", 429),
                             "req_id": req_id,
                         }
-                    },
+                    }),
                 )
                 await asyncio.sleep(delay)
                 continue
             telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
             log.warning(
                 "telegram send failure",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "method": method_name,
                         "status": getattr(exc, "status_code", 429),
@@ -626,7 +627,7 @@ async def safe_send(
                         "req_id": req_id,
                         "error": str(exc),
                     }
-                },
+                }),
             )
             raise
         except TelegramError as exc:
@@ -635,7 +636,7 @@ async def safe_send(
                 telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
                 log.warning(
                     "telegram send permanent failure",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "status": status,
@@ -643,7 +644,7 @@ async def safe_send(
                             "req_id": req_id,
                             "error": str(exc),
                         }
-                    },
+                    }),
                 )
                 raise
             if _should_retry(exc, status) and attempt < max_attempts:
@@ -651,7 +652,7 @@ async def safe_send(
                 delay = _retry_delay(attempt)
                 log.warning(
                     "telegram retry",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "attempt": attempt,
@@ -659,14 +660,14 @@ async def safe_send(
                             "status": status,
                             "req_id": req_id,
                         }
-                    },
+                    }),
                 )
                 await asyncio.sleep(delay)
                 continue
             telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
             log.warning(
                 "telegram send failure",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "method": method_name,
                         "status": status,
@@ -674,7 +675,7 @@ async def safe_send(
                         "req_id": req_id,
                         "error": str(exc),
                     }
-                },
+                }),
             )
             raise
         except (TimedOut, NetworkError) as exc:
@@ -683,7 +684,7 @@ async def safe_send(
                 delay = _retry_delay(attempt)
                 log.warning(
                     "telegram retry",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "method": method_name,
                             "attempt": attempt,
@@ -691,21 +692,21 @@ async def safe_send(
                             "req_id": req_id,
                             "error": str(exc),
                         }
-                    },
+                    }),
                 )
                 await asyncio.sleep(delay)
                 continue
             telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
             log.warning(
                 "telegram send failure",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "method": method_name,
                         "attempt": attempt,
                         "req_id": req_id,
                         "error": str(exc),
                     }
-                },
+                }),
             )
             raise
     telegram_send_total.labels(kind=kind, result="fail", **_BOT_LABELS).inc()
@@ -807,7 +808,7 @@ async def safe_edit(
     ):
         log.info(
             "safe_edit.skipped",
-            extra={"meta": {"chat_id": chat_id, "message_id": message_id}},
+            **build_log_extra({"meta": {"chat_id": chat_id, "message_id": message_id}}),
         )
         state_obj["last_text_hash"] = text_hash
         state_obj["last_markup_hash"] = markup_hash
@@ -854,16 +855,18 @@ async def safe_edit(
             log_func = log.warning if resend_on_not_modified else log.info
             log_func(
                 "safe_edit.noop",
-                extra={
-                    "meta": {
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "last_text_hash": state_obj.get("last_text_hash"),
-                        "new_text_hash": text_hash,
-                        "last_markup_hash": state_obj.get("last_markup_hash"),
-                        "new_markup_hash": markup_hash,
+                **build_log_extra(
+                    {
+                        "meta": {
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "last_text_hash": state_obj.get("last_text_hash"),
+                            "new_text_hash": text_hash,
+                            "last_markup_hash": state_obj.get("last_markup_hash"),
+                            "new_markup_hash": markup_hash,
+                        }
                     }
-                },
+                ),
             )
             state_obj["last_text_hash"] = text_hash
             state_obj["last_markup_hash"] = markup_hash
@@ -887,13 +890,13 @@ async def safe_edit(
                     except Exception as delete_exc:  # pragma: no cover - network issues
                         log.warning(
                             "safe_edit.delete_failed",
-                            extra={
+                            **build_log_extra({
                                 "meta": {
                                     "chat_id": chat_id,
                                     "message_id": message_id,
                                     "error": str(delete_exc),
                                 }
-                            },
+                            }),
                         )
                     if isinstance(state_obj, MutableMapping):
                         state_obj["msg_id"] = None
@@ -918,7 +921,7 @@ async def safe_edit(
         if "message to edit not found" in lowered:
             log.info(
                 "safe_edit.missing_message",
-                extra={"meta": {"chat_id": chat_id, "message_id": message_id}},
+                **build_log_extra({"meta": {"chat_id": chat_id, "message_id": message_id}}),
             )
             if isinstance(state_obj, MutableMapping):
                 state_obj["msg_id"] = None
@@ -1035,7 +1038,7 @@ async def run_ffmpeg(input_bytes: bytes, args: list[str], timeout: float = 40.0)
         err_text = (stderr or b"").decode("utf-8", "ignore")
         log.warning(
             "ffmpeg failed",
-            extra={"meta": {"code": proc.returncode, "stderr": err_text[:400]}},
+            **build_log_extra({"meta": {"code": proc.returncode, "stderr": err_text[:400]}}),
         )
         raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
     return stdout

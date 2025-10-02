@@ -10,6 +10,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Literal
 import time
 
 from settings import REDIS_PREFIX
+from logging_utils import build_log_extra
 
 from utils.telegram_utils import should_capture_to_prompt
 
@@ -148,7 +149,7 @@ def set_wait_state(user_id: int, state: WaitInputState, *, ttl_seconds: int = _D
         try:
             _redis.set(storage_key, payload, ex=ttl_seconds)
         except Exception:  # pragma: no cover - redis connectivity issues
-            _logger.exception("Failed to save wait-state to redis", extra={"user_id": user_id})
+            _logger.exception("Failed to save wait-state to redis", **build_log_extra({"user_id": user_id}))
             _memory_store[int(user_id)] = state_with_expiry.to_dict()
     else:
         _memory_store[int(user_id)] = state_with_expiry.to_dict()
@@ -167,14 +168,14 @@ def _load_wait_state(user_id: int) -> Optional[WaitInputState]:
         try:
             raw = _redis.get(storage_key)
         except Exception:  # pragma: no cover - redis connectivity issues
-            _logger.exception("Failed to load wait-state from redis", extra={"user_id": user_id})
+            _logger.exception("Failed to load wait-state from redis", **build_log_extra({"user_id": user_id}))
             raw = None
         if raw:
             try:
                 text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
                 doc = json.loads(text)
             except Exception:  # pragma: no cover - invalid payload
-                _logger.exception("Failed to parse wait-state payload", extra={"user_id": user_id})
+                _logger.exception("Failed to parse wait-state payload", **build_log_extra({"user_id": user_id}))
                 doc = None
     if doc is None:
         doc = _memory_store.get(int(user_id))
@@ -201,7 +202,7 @@ def clear_wait_state(user_id: int, *, reason: str = "manual") -> None:
         try:
             _redis.delete(storage_key)
         except Exception:  # pragma: no cover - redis connectivity issues
-            _logger.exception("Failed to clear wait-state in redis", extra={"user_id": user_id})
+            _logger.exception("Failed to clear wait-state in redis", **build_log_extra({"user_id": user_id}))
     _memory_store.pop(int(user_id), None)
     _logger.info("WAIT_CLEAR user_id=%s reason=%s", user_id, reason)
 
@@ -305,7 +306,7 @@ class InputRegistry:
         if state.expires_at > time.time():
             return state
         self._by_chat.pop(chat_id, None)
-        self._log.info("registry.expired", extra={"chat_id": chat_id})
+        self._log.info("registry.expired", **build_log_extra({"chat_id": chat_id}))
         return None
 
     def get(self, chat_id: int) -> Optional[WaitState]:
@@ -315,7 +316,7 @@ class InputRegistry:
     def set(self, chat_id: int, state: WaitState, *, reason: str = "set") -> None:
         state.touch()
         self._by_chat[int(chat_id)] = state
-        self._log.info("registry.set", extra={"chat_id": int(chat_id), "kind": state.kind, "reason": reason})
+        self._log.info("registry.set", **build_log_extra({"chat_id": int(chat_id), "kind": state.kind, "reason": reason}))
 
     def touch(self, chat_id: int, *, reason: str = "refresh") -> Optional[WaitState]:
         state = self.get(chat_id)
@@ -323,13 +324,13 @@ class InputRegistry:
             return None
         state.touch()
         self._by_chat[int(chat_id)] = state
-        self._log.info("registry.touch", extra={"chat_id": int(chat_id), "kind": state.kind, "reason": reason})
+        self._log.info("registry.touch", **build_log_extra({"chat_id": int(chat_id), "kind": state.kind, "reason": reason}))
         return state
 
     def clear(self, chat_id: int, *, reason: str = "manual") -> None:
         removed = self._by_chat.pop(int(chat_id), None)
         if removed:
-            self._log.info("registry.clear", extra={"chat_id": int(chat_id), "kind": removed.kind, "reason": reason})
+            self._log.info("registry.clear", **build_log_extra({"chat_id": int(chat_id), "kind": removed.kind, "reason": reason}))
 
 
 input_state = InputRegistry()

@@ -22,6 +22,7 @@ from settings import (
     UPLOAD_STREAM_PATH,
     UPLOAD_URL_PATH,
 )
+from logging_utils import build_log_extra
 
 MAX_AUDIO_MB = 50
 _ALLOWED_EXTENSIONS = {".mp3", ".wav"}
@@ -122,7 +123,7 @@ def _log_try(
     payload = {"request_id": request_id, "kind": kind, "host": host, "path": path, "attempt": attempt}
     if extra:
         payload.update(extra)
-    logger.info("cover_upload_try", extra=payload)
+    logger.info("cover_upload_try", **build_log_extra(payload))
 
 
 def _log_fail(
@@ -152,7 +153,7 @@ def _log_fail(
         payload["reason"] = reason
     if body:
         payload["body"] = body
-    logger.warning("cover_upload_fail", extra=payload)
+    logger.warning("cover_upload_fail", **build_log_extra(payload))
 
 
 def _log_ok(
@@ -167,7 +168,7 @@ def _log_ok(
         return
     logger.info(
         "cover_upload_ok",
-        extra={"request_id": request_id, "kind": kind, "host": host, "kie_file_id": kie_file_id},
+        **build_log_extra({"request_id": request_id, "kind": kind, "host": host, "kie_file_id": kie_file_id}),
     )
 
 

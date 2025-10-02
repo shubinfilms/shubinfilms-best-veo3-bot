@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from settings import TMP_CLEANUP_HOURS
+from logging_utils import build_log_extra
 
 log = logging.getLogger("suno.tempfiles")
 
@@ -50,7 +51,7 @@ def cleanup_old_directories(now: Optional[float] = None) -> None:
         try:
             shutil.rmtree(entry, ignore_errors=True)
         except Exception:  # pragma: no cover - defensive
-            log.warning("failed to cleanup directory", extra={"meta": {"path": str(entry)}})
+            log.warning("failed to cleanup directory", **build_log_extra({"meta": {"path": str(entry)}}))
 
 
 def schedule_unlink(path: Path, delay: float = _CLEAN_DELAY) -> None:
@@ -62,7 +63,7 @@ def schedule_unlink(path: Path, delay: float = _CLEAN_DELAY) -> None:
         except FileNotFoundError:
             return
         except Exception:  # pragma: no cover - defensive
-            log.debug("unable to delete file", extra={"meta": {"path": str(path)}})
+            log.debug("unable to delete file", **build_log_extra({"meta": {"path": str(path)}}))
         parent = path.parent
         try:
             if parent != BASE_DIR and parent.exists() and not any(parent.iterdir()):

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, Response
 from requests.adapters import HTTPAdapter
 from urllib3.util import Timeout
 
-from logging_utils import configure_logging, log_environment
+from logging_utils import build_log_extra, configure_logging, log_environment
 from metrics import (
     render_metrics,
     suno_callback_download_fail_total,
@@ -168,7 +168,7 @@ def _active_count() -> int:
 
 
 def _handle_sigterm(signum: int, frame: Optional[object]) -> None:  # pragma: no cover - signal handling
-    log.warning("sigterm received", extra={"meta": {"active_requests": _active_count()}})
+    log.warning("sigterm received", **build_log_extra({"meta": {"active_requests": _active_count()}}))
     _SHUTDOWN.set()
     deadline = time.time() + 10.0
     while time.time() < deadline:
@@ -200,16 +200,16 @@ async def _startup_event() -> None:
         "callback_configured": bool(SUNO_CALLBACK_URL),
         "tmp_cleanup_hours": TMP_CLEANUP_HOURS,
     }
-    log.info("configuration summary", extra={"meta": summary})
+    log.info("configuration summary", **build_log_extra({"meta": summary}))
     if SUNO_ENABLED and SUNO_CALLBACK_URL and SUNO_CALLBACK_URL.rstrip("/") != _EXPECTED_CALLBACK_URL:
         log.warning(
             "suno callback url mismatch",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "configured": SUNO_CALLBACK_URL,
                     "expected": _EXPECTED_CALLBACK_URL,
                 }
-            },
+            }),
         )
 
 
@@ -247,6 +247,7 @@ async def _middleware(request: Request, call_next):  # type: ignore[override]
 
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 def root() -> JSONResponse:
+    log.debug("health.root", **build_log_extra({"service": "veo3-bot"}, env=_ENV))
     return JSONResponse({"ok": True, "service": "veo3-bot"})
 
 
@@ -302,7 +303,7 @@ def _register_once(key: str) -> bool:
                 return True
             return False
         except Exception as exc:  # pragma: no cover - Redis failure fallback
-            log.warning("idempotency redis error", extra={"meta": {"key": key, "err": str(exc)}})
+            log.warning("idempotency redis error", **build_log_extra({"meta": {"key": key, "err": str(exc)}}))
     now = time.time()
     expires_at = now + 24 * 60 * 60
     current = _memory_idempotency.get(key)
@@ -329,7 +330,7 @@ def _apply_extension(base: Path, url: str) -> Path:
 
 def _record_download_failure(reason: str, url: str) -> None:
     suno_callback_download_fail_total.labels(reason=reason).inc()
-    log.warning("asset download failed", extra={"meta": {"reason": reason, "url": url}})
+    log.warning("asset download failed", **build_log_extra({"meta": {"reason": reason, "url": url}}))
 
 
 def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
@@ -401,16 +402,16 @@ async def suno_callback(
     provided = (x_callback_secret or "").strip() or None
     if expected_secret:
         if provided != expected_secret:
-            log.warning("suno.webhook.secret", extra={"meta": {"mode": "rejected"}})
+            log.warning("suno.webhook.secret", **build_log_extra({"meta": {"mode": "rejected"}}))
             suno_callback_total.labels(status="forbidden", **_WEB_LABELS).inc()
             return Response(status_code=403)
-        log.info("suno.webhook.secret", extra={"meta": {"mode": "accepted"}})
+        log.info("suno.webhook.secret", **build_log_extra({"meta": {"mode": "accepted"}}))
     else:
-        log.info("suno.webhook.secret", extra={"meta": {"mode": "not-required"}})
+        log.info("suno.webhook.secret", **build_log_extra({"meta": {"mode": "not-required"}}))
 
     body = await request.body()
     if len(body) > _MAX_JSON_BYTES:
-        log.warning("payload too large", extra={"meta": {"size": len(body)}})
+        log.warning("payload too large", **build_log_extra({"meta": {"size": len(body)}}))
         raise HTTPException(status_code=413, detail="payload too large")
 
     try:
@@ -418,19 +419,19 @@ async def suno_callback(
     except json.JSONDecodeError:
         log.error(
             "invalid json payload",
-            extra={"meta": {"preview": body[:200].decode("utf-8", errors="replace")}},
+            **build_log_extra({"meta": {"preview": body[:200].decode("utf-8", errors="replace")}}),
         )
         return JSONResponse({"status": "ignored"}, status_code=400)
 
     log.info(
         "Received SUNO callback",
-        extra={
+        **build_log_extra({
             "meta": {
                 "phase": "callback",
                 "content_length": len(body),
                 "path": str(request.url.path),
             }
-        },
+        }),
     )
 
     normalized_payload, flat_payload, key_list = _normalize_callback_payload(payload)
@@ -458,14 +459,14 @@ async def suno_callback(
     if not initial_req_id or status_hint == "unknown":
         log.warning(
             "Suno callback missing identifiers",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "phase": "callback",
                     "status": status_hint,
                     "req_id": initial_req_id,
                     "preview": preview,
                 }
-            },
+            }),
         )
     if not task.task_id and initial_req_id:
         mapped_task = service.get_task_id_by_request(initial_req_id)
@@ -490,7 +491,7 @@ async def suno_callback(
         "items": items_count,
         "type": callback_type,
     }
-    log.info("suno callback", extra={"meta": summary_meta})
+    log.info("suno callback", **build_log_extra({"meta": summary_meta}))
     start_ts = service.get_start_timestamp(task.task_id)
     if start_ts:
         started_at = _parse_iso8601(start_ts)
@@ -501,14 +502,14 @@ async def suno_callback(
     if not _register_once(key):
         log.info(
             "duplicate callback ignored",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "phase": "callback",
                     "key": key,
                     "task_id": task.task_id,
                     "req_id": req_id,
                 }
-            },
+            }),
         )
         suno_callback_total.labels(status="skipped", **_WEB_LABELS).inc()
         return {"ok": True, "duplicate": True}
@@ -520,7 +521,7 @@ async def suno_callback(
         process_status = "error"
         log.exception(
             "suno callback asset prep failed",
-            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}},
+            **build_log_extra({"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}}),
         )
     try:
         service.handle_callback(task, req_id=req_id, delivery_via="webhook")
@@ -528,7 +529,7 @@ async def suno_callback(
         process_status = "error"
         log.exception(
             "suno callback handler failed",
-            extra={"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}},
+            **build_log_extra({"meta": {"task_id": task.task_id, "req_id": req_id, "err": str(exc)}}),
         )
     else:
         meta = {
@@ -540,7 +541,7 @@ async def suno_callback(
             "items": items_count,
             "type": callback_type,
         }
-        log.info("suno callback processed", extra={"meta": meta})
+        log.info("suno callback processed", **build_log_extra({"meta": meta}))
     suno_callback_total.labels(status=process_status, **_WEB_LABELS).inc()
     return {"ok": process_status == "ok"}
 

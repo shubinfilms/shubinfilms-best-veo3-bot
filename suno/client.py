@@ -42,6 +42,7 @@ from settings import (
     KIE_BASE_URL,
     resolve_outbound_ip,
 )
+from logging_utils import build_log_extra
 
 log = logging.getLogger("suno.client")
 
@@ -407,7 +408,7 @@ class SunoClient:
                 if value is not None and key not in fields:
                     fields[key] = value
         message = " ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
-        log.log(level, "[SUNO][%s] %s", op, message, extra={"meta": {"op": op, **fields}})
+        log.log(level, "[SUNO][%s] %s", op, message, **build_log_extra({"meta": {"op": op, **fields}}))
 
     @staticmethod
     def _task_payload(task_id: str, extra: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
@@ -431,7 +432,7 @@ class SunoClient:
     ) -> None:
         log.warning(
             "suno.http retry",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "code": code or "error",
                     "attempt": attempt,
@@ -439,7 +440,7 @@ class SunoClient:
                     "req_id": req_id,
                     "path": path,
                 }
-            },
+            }),
         )
 
     def _request(
@@ -543,7 +544,7 @@ class SunoClient:
                     log.error(
                         "401 KIE. OutboundIP=%s Add this IP to the KIE whitelist.",
                         outbound_ip,
-                        extra={"meta": {"outbound_ip": outbound_ip, "base": self.base_url}},
+                        **build_log_extra({"meta": {"outbound_ip": outbound_ip, "base": self.base_url}}),
                     )
                     message = "Suno: invalid credentials or IP not whitelisted"
                 elif status == 404:
@@ -553,7 +554,7 @@ class SunoClient:
                         "Suno endpoint not found base=%s path=%s",
                         self.base_url,
                         path_hint,
-                        extra={"meta": {"base": self.base_url, "path": path_hint}},
+                        **build_log_extra({"meta": {"base": self.base_url, "path": path_hint}}),
                     )
                     message = "Suno endpoint not found (check paths)"
                 elif status == 422:
@@ -754,7 +755,7 @@ class SunoClient:
         if "callBackUrl" in safe_payload:
             safe_payload["callBackUrl"] = str(safe_payload["callBackUrl"])
         log.info(
-            "Suno enqueue payload", extra={"meta": {"payload": safe_payload, "path": path, "req_id": req_id}}
+            "Suno enqueue payload", **build_log_extra({"meta": {"payload": safe_payload, "path": path, "req_id": req_id}})
         )
         try:
             response = self._request(
@@ -775,14 +776,14 @@ class SunoClient:
         status_url = f"{self._url(self._primary_status_path)}?taskId={task_identifier}"
         log.info(
             "Suno enqueue success",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "taskId": task_identifier,
                     "status_url": status_url,
                     "path": path,
                     "req_id": req_id or task_identifier,
                 }
-            },
+            }),
         )
         return task_identifier
 

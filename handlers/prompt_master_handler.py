@@ -31,6 +31,7 @@ from prompt_master import (
 )
 from utils.html_render import html_to_plain, render_pm_html, safe_lines
 from utils.safe_send import sanitize_html, safe_send, send_html_with_fallback
+from logging_utils import build_log_extra
 from utils.input_state import get_wait_state
 
 logger = logging.getLogger(__name__)
@@ -259,7 +260,7 @@ async def _edit_with_fallback(
         message = str(exc).lower()
         if "can't parse entities" not in message and "parse entities" not in message:
             raise
-        logger.warning("pm.html_fallback", extra={"exc": repr(exc)})
+        logger.warning("pm.html_fallback", **build_log_extra({"exc": repr(exc)}))
         logger.info("pm.render.fallback")
         plain = html_to_plain(safe_html)
         await context.bot.edit_message_text(
@@ -301,7 +302,7 @@ async def _handle_render_failure(
                 reply_markup=keyboard,
             )
         except Exception:
-            logger.exception("pm.card.fail", extra={"engine": engine})
+            logger.exception("pm.card.fail", **build_log_extra({"engine": engine}))
     elif chat_id is not None:
         await send_html_with_fallback(context.bot, chat_id, safe_error, reply_markup=keyboard)
 
@@ -428,11 +429,11 @@ async def _handle_insert(
     await _upsert_card(update, context, engine=engine, state=state, lang=lang)
     logger.info(
         "pm.insert.success",
-        extra={
+        **build_log_extra({
             "engine": engine,
             "duration_hint": raw_payload.get("duration_hint"),
             "lip_sync": raw_payload.get("lip_sync_required"),
-        },
+        }),
     )
     await query.answer("Вставлено" if lang == "ru" else "Inserted")
 
@@ -528,7 +529,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
     chat = update.effective_chat
     chat_id = chat.id if chat else None
     build_started = time.monotonic()
-    logger.info("pm.start", extra={"engine": engine, "lang": lang})
+    logger.info("pm.start", **build_log_extra({"engine": engine, "lang": lang}))
     status_keyboard = prompt_master_mode_keyboard(lang)
     status_text = _status_message(engine, lang)
     status = (
@@ -568,7 +569,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
     try:
         result_payload = builder(text, lang) if builder else None
     except Exception:
-        logger.exception("prompt_master.build_failed", extra={"engine": engine})
+        logger.exception("prompt_master.build_failed", **build_log_extra({"engine": engine}))
 
     if result_payload is None:
         slow_state["done"] = True
@@ -592,7 +593,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
 
     result_html = result_payload.get("body_html", "")
     if not result_html:
-        logger.error("pm.render.empty", extra={"engine": engine})
+        logger.error("pm.render.empty", **build_log_extra({"engine": engine}))
         slow_state["done"] = True
         if slow_task:
             slow_task.cancel()
@@ -616,13 +617,13 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
     duration = time.monotonic() - build_started
     logger.info(
         "pm.build.success",
-        extra={
+        **build_log_extra({
             "engine": engine,
             "duration": round(duration, 3),
             "lang": lang,
             "voiceover_origin": meta.get("voiceover_origin"),
             "voiceover_requested": meta.get("voiceover_requested"),
-        },
+        }),
     )
     markup = prompt_master_result_keyboard(engine, lang)
     if status is not None:
@@ -634,11 +635,11 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                 result_html,
                 markup,
             )
-            logger.info("pm.card.sent", extra={"engine": engine})
+            logger.info("pm.card.sent", **build_log_extra({"engine": engine}))
             if state.get("autodelete", True):
                 await _safe_delete(message)
         except Exception:
-            logger.exception("pm.card.fail", extra={"engine": engine})
+            logger.exception("pm.card.fail", **build_log_extra({"engine": engine}))
             await _notify_failure(context, chat_id, lang)
         return
     if chat_id is not None:
@@ -650,15 +651,15 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                 reply_markup=markup,
             )
         except Exception:
-            logger.exception("pm.card.fail", extra={"engine": engine})
+            logger.exception("pm.card.fail", **build_log_extra({"engine": engine}))
             await _notify_failure(context, chat_id, lang)
             return
         if sent is not None:
-            logger.info("pm.card.sent", extra={"engine": engine})
+            logger.info("pm.card.sent", **build_log_extra({"engine": engine}))
             if state.get("autodelete", True):
                 await _safe_delete(message)
         else:
-            logger.error("pm.card.fail", extra={"engine": engine})
+            logger.error("pm.card.fail", **build_log_extra({"engine": engine}))
             await _notify_failure(context, chat_id, lang)
 
 

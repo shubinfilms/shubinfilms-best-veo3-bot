@@ -10,18 +10,18 @@ from logging_utils import build_log_extra, get_logger
 
 
 def test_build_log_extra_wraps_fields() -> None:
-    payload = build_log_extra(None, None, command="/menu", meta={"foo": "bar"}, name="test")
-    assert set(payload.keys()) == {"ctx"}
-    ctx = payload["ctx"]
-    assert ctx["command"] == "menu"
-    assert ctx["meta"] == {"foo": "bar"}
-    assert ctx["ctx_name"] == "test"
+    payload = build_log_extra({"name": "x"}, user_id=1)
+    assert set(payload.keys()) == {"extra"}
+    extra = payload["extra"]
+    assert "name" not in extra
+    assert extra["ctx_name"] == "x"
+    assert extra["ctx_user_id"] == 1
 
 
 def test_logging_extra_name_not_crash(caplog) -> None:
     logger = get_logger("veo3-bot-test")
     with caplog.at_level(logging.DEBUG, logger="veo3-bot-test"):
-        logger.debug("check", extra={"name": "menu", "user": 123})
+        logger.debug("check", **build_log_extra({"name": "menu", "user": 123}))
 
     target = next((record for record in caplog.records if record.message == "check"), None)
     assert target is not None

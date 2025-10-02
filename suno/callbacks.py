@@ -10,6 +10,7 @@ from flask import Blueprint, Response, current_app, jsonify, request
 
 from .service import SunoService
 from .store import InMemoryTaskStore, TaskStore
+from logging_utils import build_log_extra
 
 logger = logging.getLogger("suno.callbacks")
 
@@ -239,7 +240,7 @@ def music_callback() -> Response:
     log_level = logging.INFO
     if not callback.task_id or callback.type == "error" or (callback.code and callback.code != 200):
         log_level = logging.WARNING
-    logger.log(log_level, "suno music callback received", extra={"meta": meta})
+    logger.log(log_level, "suno music callback received", **build_log_extra({"meta": meta}))
     return _handle("handle_music_callback", callback)
 
 

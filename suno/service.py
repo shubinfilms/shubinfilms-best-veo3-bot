@@ -38,6 +38,7 @@ from settings import (
     SUNO_ENABLED,
 )
 from telegram_utils import mask_tokens
+from logging_utils import build_log_extra
 from utils.audio_post import prepare_audio_file_sync
 
 try:  # pragma: no cover - optional runtime dependency
@@ -377,7 +378,7 @@ class SunoService:
             "api_base": SUNO_API_BASE,
             "callback_configured": bool(SUNO_CALLBACK_URL and SUNO_CALLBACK_SECRET),
         }
-        log.info("configuration summary", extra={"meta": summary})
+        log.info("configuration summary", **build_log_extra({"meta": summary}))
         cleanup_old_directories()
 
     # ------------------------------------------------------------------ storage
@@ -535,7 +536,7 @@ class SunoService:
         except requests.RequestException as exc:
             log.warning(
                 "Suno record-info network error",
-                extra={"meta": {"taskId": task_id, "error": str(exc)}},
+                **build_log_extra({"meta": {"taskId": task_id, "error": str(exc)}}),
             )
             return RecordInfoPollResult(state="retry", status_code=0, payload={}, error=str(exc))
         try:
@@ -584,14 +585,14 @@ class SunoService:
         if self._recently_delivered(task_id):
             log.info(
                 "Suno poll delivered via webhook",
-                extra={"meta": {"taskId": task_id, "via": "webhook"}},
+                **build_log_extra({"meta": {"taskId": task_id, "via": "webhook"}}),
             )
             return RecordInfoPollResult(state="delivered", status_code=200, payload={}, attempts=0, elapsed=0.0)
         for delay in self._iter_poll_delays():
             if self._recently_delivered(task_id):
                 log.info(
                     "Suno poll delivered via webhook",
-                    extra={"meta": {"taskId": task_id, "via": "webhook"}},
+                    **build_log_extra({"meta": {"taskId": task_id, "via": "webhook"}}),
                 )
                 return RecordInfoPollResult(
                     state="delivered",
@@ -617,28 +618,28 @@ class SunoService:
             if result.error:
                 meta["error_code"] = result.error
             if result.state == "retry":
-                log.warning("Suno poll retry", extra={"meta": meta})
+                log.warning("Suno poll retry", **build_log_extra({"meta": meta}))
             else:
-                log.info("Suno poll step", extra={"meta": meta})
+                log.info("Suno poll step", **build_log_extra({"meta": meta}))
             if result.state == "ready":
                 tracks = self._tracks_from_payload(result.payload)
                 durations = self._durations_from_tracks(tracks)
                 log.info(
                     "Suno poll ready",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "taskId": task_id,
                             "takes": len(tracks),
                             "durations": durations,
                             "http_status": result.status_code,
                         }
-                    },
+                    }),
                 )
                 return result
             if result.state == "hard_error":
                 log.error(
                     "Suno poll hard failure",
-                    extra={"meta": {**meta, "message": result.message}},
+                    **build_log_extra({"meta": {**meta, "message": result.message}}),
                 )
                 return result
             if result.elapsed >= self._poll_timeout:
@@ -646,7 +647,7 @@ class SunoService:
         if self._recently_delivered(task_id):
             log.info(
                 "Suno poll delivered via webhook",
-                extra={"meta": {"taskId": task_id, "via": "webhook"}},
+                **build_log_extra({"meta": {"taskId": task_id, "via": "webhook"}}),
             )
             return RecordInfoPollResult(
                 state="delivered",
@@ -663,38 +664,38 @@ class SunoService:
             durations = self._durations_from_tracks(tracks)
             log.info(
                 "Suno poll ready",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "taskId": task_id,
                         "takes": len(tracks),
                         "durations": durations,
                         "http_status": final_attempt.status_code,
                     }
-                },
+                }),
             )
             return final_attempt
         if final_attempt.state == "hard_error":
             log.error(
                 "Suno poll hard failure",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "taskId": task_id,
                         "attempt": final_attempt.attempts,
                         "http_status": final_attempt.status_code,
                         "message": final_attempt.message,
                     }
-                },
+                }),
             )
             return final_attempt
         log.warning(
             "Suno poll timeout",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "taskId": task_id,
                     "attempts": final_attempt.attempts,
                     "elapsed": final_attempt.elapsed,
                 }
-            },
+            }),
         )
         final_attempt.state = "timeout"
         return final_attempt
@@ -773,7 +774,7 @@ class SunoService:
         except SunoAPIError as exc:
             log.warning(
                 "Suno strict lyrics fetch failed",
-                extra={"meta": {"task_id": task_id, "status": exc.status, "message": str(exc)}},
+                **build_log_extra({"meta": {"task_id": task_id, "status": exc.status, "message": str(exc)}}),
             )
             return None
         except Exception:
@@ -837,7 +838,7 @@ class SunoService:
         except SunoAPIError as exc:
             log.warning(
                 "Suno strict retry enqueue failed",
-                extra={"meta": {"task_id": task.task_id, "status": exc.status, "message": str(exc)}},
+                **build_log_extra({"meta": {"task_id": task.task_id, "status": exc.status, "message": str(exc)}}),
             )
             return False
         except Exception:
@@ -1361,7 +1362,7 @@ class SunoService:
         except Exception as exc:
             log.debug(
                 "audio.rename_failed",
-                extra={"meta": {"from": str(path), "to": str(target), "err": str(exc)}},
+                **build_log_extra({"meta": {"from": str(path), "to": str(target), "err": str(exc)}}),
             )
             return path
 
@@ -1601,7 +1602,7 @@ class SunoService:
 
     @staticmethod
     def _log_delivery(event: str, **meta: Any) -> None:
-        log.info(event, extra={"meta": meta})
+        log.info(event, **build_log_extra({"meta": meta}))
 
     def _normalize_take_title(
         self,
@@ -1783,7 +1784,7 @@ class SunoService:
         except Exception:
             log.warning(
                 "suno.audio.postprocess_failed",
-                extra={"meta": {"url": mask_tokens(audio_url), "take": take_id}},
+                **build_log_extra({"meta": {"url": mask_tokens(audio_url), "take": take_id}}),
                 exc_info=True,
             )
         else:
@@ -1917,18 +1918,18 @@ class SunoService:
         except requests.RequestException as exc:
             log.warning(
                 "suno.audio.download.failed",
-                extra={"meta": {"url": mask_tokens(url), "err": str(exc)}},
+                **build_log_extra({"meta": {"url": mask_tokens(url), "err": str(exc)}}),
             )
             return None
         if not response.ok:
             log.warning(
                 "suno.audio.download.failed",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "url": mask_tokens(url),
                         "status": response.status_code,
                     }
-                },
+                }),
             )
             return None
         suffix = Path(urlparse(url).path).suffix or ".mp3"
@@ -1942,7 +1943,7 @@ class SunoService:
         except Exception as exc:
             log.warning(
                 "suno.audio.download.write_failed",
-                extra={"meta": {"path": str(target), "err": str(exc)}},
+                **build_log_extra({"meta": {"path": str(target), "err": str(exc)}}),
             )
             with suppress(Exception):
                 target.unlink(missing_ok=True)  # type: ignore[arg-type]
@@ -2106,7 +2107,7 @@ class SunoService:
         self._save_task_record(task.task_id, record)
         log.info(
             "Suno task stored",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "task_id": task.task_id,
                     "chat_id": chat_id,
@@ -2114,7 +2115,7 @@ class SunoService:
                     "user_id": user_id,
                     "req_id": req_id,
                 }
-            },
+            }),
         )
         return task
 
@@ -2218,14 +2219,14 @@ class SunoService:
             self._store_req_id(task.task_id, req_id)
         log.info(
             "Suno callback received",
-            extra={
+            **build_log_extra({
                 "meta": {
                     "task_id": task.task_id,
                     "callback_type": task.callback_type,
                     "chat_id": chat_id,
                     "req_id": req_id,
                 }
-            },
+            }),
         )
         if chat_id is None:
             log.info("No chat mapping for task %s", task.task_id)
@@ -2246,25 +2247,25 @@ class SunoService:
         if incoming_status in final_states and self._recently_delivered(task.task_id):
             log.info(
                 "Suno callback duplicate final",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "task_id": task.task_id,
                         "status": incoming_status,
                         "reason": "delivered_cache",
                     }
-                },
+                }),
             )
             return
         if incoming_status in final_states and existing_status in final_states and existing_record.get("tracks"):
             log.info(
                 "Suno callback duplicate final state",
-                extra={
+                **build_log_extra({
                     "meta": {
                         "task_id": task.task_id,
                         "status": incoming_status,
                         "existing_status": existing_status,
                     }
-                },
+                }),
             )
             return
 
@@ -2515,13 +2516,13 @@ class SunoService:
                 self._mark_delivered(task.task_id)
                 log.info(
                     "Suno ready",
-                    extra={
+                    **build_log_extra({
                         "meta": {
                             "task_id": task.task_id,
                             "takes": len(task.items),
                             "durations": durations,
                         }
-                    },
+                    }),
                 )
                 if strict_warning:
                     try:
@@ -2534,14 +2535,14 @@ class SunoService:
                 if self._should_log_once(task.task_id, task.callback_type):
                     log.info(
                         "processed | suno.callback",
-                        extra={
+                        **build_log_extra({
                             "meta": {
                                 "task_id": task.task_id,
                                 "type": task.callback_type,
                                 "code": task.code,
                                 "tracks": len(task.items),
                             }
-                        },
+                        }),
                     )
         finally:
             if (task.callback_type or "").lower() == "complete":

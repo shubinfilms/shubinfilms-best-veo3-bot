@@ -17,6 +17,56 @@ LOG_LEVEL: str = _DEFAULT_LOG_LEVEL
 LOG_JSON: bool = _DEFAULT_LOG_JSON
 MAX_IN_LOG_BODY: int = _DEFAULT_MAX_BODY
 
+RESERVED = {
+    "name",
+    "msg",
+    "args",
+    "levelname",
+    "levelno",
+    "pathname",
+    "filename",
+    "module",
+    "exc_info",
+    "exc_text",
+    "stack_info",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "processName",
+    "process",
+    "message",
+}
+
+
+def build_log_extra(raw: dict | None = None, **ctx) -> dict:
+    raw = dict(raw or {})
+    for key in list(raw.keys()):
+        if key in RESERVED:
+            raw[f"ctx_{key}"] = raw.pop(key)
+
+    add: dict[str, Any] = {}
+    if "user_id" in ctx and ctx["user_id"] is not None:
+        add["ctx_user_id"] = ctx["user_id"]
+    if "chat_id" in ctx and ctx["chat_id"] is not None:
+        add["ctx_chat_id"] = ctx["chat_id"]
+    if "command" in ctx and ctx["command"]:
+        add["ctx_command"] = ctx["command"]
+    if "update_type" in ctx and ctx["update_type"]:
+        add["ctx_update_type"] = ctx["update_type"]
+    if "env" in ctx and ctx["env"]:
+        add["ctx_env"] = ctx["env"]
+
+    for key in list(add.keys()):
+        if key in RESERVED:
+            add[f"ctx_{key}"] = add.pop(key)
+
+    raw.update(add)
+    return {"extra": raw}
+
 _SECRET_ENV_KEYS = {
     "DATABASE_URL",
     "REDIS_URL",
@@ -201,7 +251,7 @@ def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
             continue
         safe_env[name] = _redact_text(value) if redact else value
 
-    logger.info("environment", extra=build_log_extra(meta={"env": safe_env}))
+    logger.info("environment", **build_log_extra({"env": safe_env}))
 
 
 def _normalize_extra(extra: Optional[Mapping[str, Any]]) -> dict[str, Any]:
@@ -303,65 +353,6 @@ try:  # Late import to avoid creating ``Logger`` instances before patching
 except Exception:
     # ``settings`` may fail to import in some unit tests. Fall back to env defaults.
     pass
-
-
-def build_log_extra(
-    update: Optional[Any] = None,
-    context: Optional[Any] = None,
-    *,
-    command: Optional[str] = None,
-    meta: Optional[Mapping[str, Any]] = None,
-    **fields: Any,
-) -> dict[str, Any]:
-    """Construct a safe ``extra`` payload for logging.
-
-    The resulting mapping always contains a single top-level key ``ctx`` and never
-    attempts to overwrite reserved :class:`logging.LogRecord` attributes.
-    """
-
-    ctx_payload: dict[str, Any] = {}
-
-    env_name = os.getenv("ENV", os.getenv("ENVIRONMENT", "prod"))
-    if env_name:
-        ctx_payload.setdefault("env", env_name)
-
-    if update is not None:
-        user = getattr(update, "effective_user", None)
-        chat = getattr(update, "effective_chat", None)
-        if user is not None:
-            ctx_payload["user_id"] = getattr(user, "id", None)
-        if chat is not None:
-            ctx_payload["chat_id"] = getattr(chat, "id", None)
-
-        ctx_payload["update_type"] = type(update).__name__
-
-        if command is None:
-            message = getattr(update, "effective_message", None)
-            text = getattr(message, "text", None)
-            if isinstance(text, str) and text.startswith("/"):
-                command = text.split()[0]
-
-    if command:
-        ctx_payload["command"] = command.lstrip("/")
-
-    if context is not None:
-        try:
-            current_state = getattr(context, "chat_data", {}).get("state")  # type: ignore[assignment]
-        except Exception:
-            current_state = None
-        if current_state is not None:
-            ctx_payload.setdefault("state", current_state)
-
-    if meta is not None:
-        if isinstance(meta, Mapping):
-            ctx_payload["meta"] = dict(meta)
-        else:
-            ctx_payload["meta"] = meta
-
-    for key, value in fields.items():
-        _add_ctx_value(ctx_payload, str(key), value)
-
-    return {"ctx": ctx_payload}
 
 
 def _install_record_factory_defaults() -> None:
