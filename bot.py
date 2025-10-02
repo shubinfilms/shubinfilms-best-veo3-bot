@@ -22,7 +22,7 @@ import atexit
 from pathlib import Path
 # main
 from collections.abc import Mapping
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping, Sequence
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode
@@ -187,12 +187,14 @@ from ledger import (
     InsufficientBalance,
 )
 from settings import (
+    BANANA_SEND_AS_DOCUMENT,
     REDIS_PREFIX,
     SUNO_CALLBACK_URL as SETTINGS_SUNO_CALLBACK_URL,
     SUNO_ENABLED as SETTINGS_SUNO_ENABLED,
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
+    MJ_SEND_AS_ALBUM,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -253,6 +255,9 @@ from telegram_utils import (
     safe_send as tg_safe_send,
     safe_edit,
     safe_edit_text,
+    safe_send_document,
+    safe_send_media_group,
+    safe_send_photo,
     safe_send_text,
     safe_send_placeholder,
     safe_edit_markdown_v2,
@@ -264,6 +269,7 @@ from telegram_utils import (
 from utils.api_client import request_with_retries
 from utils.safe_send import safe_delete_message
 from utils.telegram_safe import safe_edit_message
+from utils.tempfiles import cleanup_temp, save_bytes_to_temp
 from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
@@ -2566,6 +2572,331 @@ def _make_input_photo(data: bytes, filename: str) -> InputFile:
     buffer.name = filename
     buffer.seek(0)
     return InputFile(buffer, filename=filename)
+
+
+def _banana_caption(prompt: str) -> str:
+    normalized = re.sub(r"\s+", " ", (prompt or "")).strip()
+    if not normalized:
+        snippet = "—"
+    else:
+        snippet = normalized[:120]
+        if len(normalized) > 120:
+            snippet = snippet[:117].rstrip() + "…"
+    return f"🍌 Banana\n• Промпт: \"{snippet}\""
+
+
+def _banana_guess_suffix(url: str, content_type: Optional[str]) -> str:
+    path = urlparse(url or "").path.lower()
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        if path.endswith(ext):
+            return ext
+    if content_type:
+        lowered = content_type.lower()
+        if "png" in lowered:
+            return ".png"
+        if "jpeg" in lowered or "jpg" in lowered:
+            return ".jpg"
+        if "webp" in lowered:
+            return ".webp"
+    return ".png"
+
+
+def _download_binary(url: str, *, timeout: int = 180) -> tuple[bytes, Optional[str]]:
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.content, response.headers.get("Content-Type")
+
+
+async def _deliver_banana_media(
+    bot: Any,
+    *,
+    chat_id: int,
+    user_id: int,
+    file_path: Path,
+    caption: str,
+    reply_markup: Optional[Any] = None,
+    send_document: bool = True,
+) -> bool:
+    try:
+        file_size = file_path.stat().st_size
+    except OSError:
+        file_size = 0
+
+    log.info(
+        "banana.result.saved",
+        extra={
+            "meta": {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "file_size": file_size,
+                "path": str(file_path),
+            }
+        },
+    )
+
+    sent_any = False
+    photo_start = time.monotonic()
+    photo_message_id: Optional[int] = None
+    try:
+        with file_path.open("rb") as handle:
+            message = await safe_send_photo(
+                bot,
+                chat_id=chat_id,
+                photo=InputFile(handle, filename=file_path.name),
+                caption=caption,
+                reply_markup=reply_markup,
+                kind="banana_photo",
+            )
+        duration_ms = int((time.monotonic() - photo_start) * 1000)
+        photo_message_id = getattr(message, "message_id", None)
+        sent_any = True
+        log.info(
+            "banana.send.photo.ok",
+            extra={
+                "meta": {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "message_id": photo_message_id,
+                    "file_size": file_size,
+                    "duration_ms": duration_ms,
+                }
+            },
+        )
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - photo_start) * 1000)
+        log.warning(
+            "banana.send.photo.fail",
+            extra={
+                "meta": {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "file_size": file_size,
+                    "duration_ms": duration_ms,
+                    "error": str(exc),
+                }
+            },
+        )
+
+    doc_sent = False
+    if send_document:
+        doc_caption = f"{caption}\n(оригинал, без сжатия Telegram)"
+        doc_start = time.monotonic()
+        try:
+            with file_path.open("rb") as handle:
+                message = await safe_send_document(
+                    bot,
+                    chat_id=chat_id,
+                    document=InputFile(handle, filename=file_path.name),
+                    caption=doc_caption,
+                    reply_markup=reply_markup,
+                    kind="banana_document",
+                )
+            duration_ms = int((time.monotonic() - doc_start) * 1000)
+            doc_message_id = getattr(message, "message_id", None)
+            doc_sent = True
+            sent_any = True
+            log.info(
+                "banana.send.document.ok",
+                extra={
+                    "meta": {
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "message_id": doc_message_id,
+                        "file_size": file_size,
+                        "duration_ms": duration_ms,
+                    }
+                },
+            )
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - doc_start) * 1000)
+            log.warning(
+                "banana.send.document.fail",
+                extra={
+                    "meta": {
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "file_size": file_size,
+                        "duration_ms": duration_ms,
+                        "error": str(exc),
+                        "photo_message_id": photo_message_id,
+                    }
+                },
+            )
+    else:
+        log.info(
+            "banana.send.document.skip",
+            extra={
+                "meta": {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "file_size": file_size,
+                    "photo_message_id": photo_message_id,
+                }
+            },
+        )
+
+    cleanup_temp([file_path])
+    return sent_any or doc_sent
+
+
+async def _deliver_mj_media(
+    bot: Any,
+    *,
+    chat_id: int,
+    user_id: int,
+    caption: str,
+    items: Sequence[tuple[bytes, str]],
+    send_as_album: bool,
+) -> bool:
+    prepared: list[tuple[bytes, str, int]] = []
+    for data, filename in items:
+        if not data:
+            continue
+        prepared.append((data, filename, len(data)))
+
+    if not prepared:
+        return False
+
+    album_candidates = prepared[:4]
+    album_sizes = [size for _, _, size in album_candidates]
+    fallback_reason: Optional[str] = None
+
+    if send_as_album:
+        if len(album_candidates) == 4:
+            media_group = [
+                InputMediaPhoto(
+                    media=_make_input_photo(data, filename),
+                    caption=caption if index == 0 else None,
+                )
+                for index, (data, filename, _) in enumerate(album_candidates)
+            ]
+            start = time.monotonic()
+            try:
+                messages = await safe_send_media_group(
+                    bot,
+                    chat_id=chat_id,
+                    media=media_group,
+                    kind="mj_media_group",
+                )
+                duration_ms = int((time.monotonic() - start) * 1000)
+                message_ids = [getattr(msg, "message_id", None) for msg in (messages or [])]
+                log.info(
+                    "mj.media_group.ok",
+                    extra={
+                        "meta": {
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "count": len(media_group),
+                            "sizes": album_sizes,
+                            "duration_ms": duration_ms,
+                            "message_ids": message_ids,
+                        }
+                    },
+                )
+                return True
+            except Exception as exc:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                log.warning(
+                    "mj.media_group.fail",
+                    extra={
+                        "meta": {
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "count": len(album_candidates),
+                            "sizes": album_sizes,
+                            "duration_ms": duration_ms,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                fallback_reason = "send_error"
+        else:
+            log.info(
+                "mj.media_group.fail",
+                extra={
+                    "meta": {
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "count": len(album_candidates),
+                        "sizes": album_sizes,
+                        "reason": "insufficient_media",
+                    }
+                },
+            )
+            fallback_reason = "insufficient_media"
+    else:
+        log.info(
+            "mj.media_group.fail",
+            extra={
+                "meta": {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "count": len(album_candidates),
+                    "sizes": album_sizes,
+                    "reason": "disabled",
+                }
+            },
+        )
+        fallback_reason = "disabled"
+
+    if fallback_reason:
+        log.info(
+            "mj.single_photo.fallback",
+            extra={
+                "meta": {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": fallback_reason,
+                    "count": len(prepared),
+                    "sizes": [size for _, _, size in prepared],
+                }
+            },
+        )
+
+    sent_any = False
+    for index, (data, filename, size) in enumerate(prepared):
+        photo_start = time.monotonic()
+        try:
+            message = await safe_send_photo(
+                bot,
+                chat_id=chat_id,
+                photo=_make_input_photo(data, filename),
+                caption=caption if index == 0 else None,
+                kind="mj_photo",
+            )
+            duration_ms = int((time.monotonic() - photo_start) * 1000)
+            message_id = getattr(message, "message_id", None)
+            sent_any = True
+            log.info(
+                "mj.send.photo.ok",
+                extra={
+                    "meta": {
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "index": index,
+                        "size": size,
+                        "duration_ms": duration_ms,
+                    }
+                },
+            )
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - photo_start) * 1000)
+            log.warning(
+                "mj.send.photo.fail",
+                extra={
+                    "meta": {
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "index": index,
+                        "size": size,
+                        "duration_ms": duration_ms,
+                        "error": str(exc),
+                    }
+                },
+            )
+
+    return sent_any
 
 
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
@@ -8480,38 +8811,14 @@ async def poll_mj_and_send_photos(
                     )
                     return
 
-                async def _send_photos_one_by_one() -> bool:
-                    sent_any = False
-                    for idx, (data, filename) in enumerate(downloaded):
-                        try:
-                            await ctx.bot.send_photo(
-                                chat_id=chat_id,
-                                photo=_make_input_photo(data, filename),
-                                caption=caption if idx == 0 else None,
-                            )
-                            sent_any = True
-                        except Exception as send_exc:
-                            log.warning("MJ send_photo #%s failed: %s", idx, send_exc)
-                    return sent_any
-
-                sent_successfully = False
-                if len(downloaded) >= 2:
-                    media: List[InputMediaPhoto] = []
-                    for idx, (data, filename) in enumerate(downloaded):
-                        media.append(
-                            InputMediaPhoto(
-                                media=_make_input_photo(data, filename),
-                                caption=caption if idx == 0 else None,
-                            )
-                        )
-                    try:
-                        await ctx.bot.send_media_group(chat_id=chat_id, media=media)
-                        sent_successfully = True
-                    except Exception as e:
-                        log.warning("MJ send_media_group failed: %s", e)
-                        sent_successfully = await _send_photos_one_by_one()
-                else:
-                    sent_successfully = await _send_photos_one_by_one()
+                sent_successfully = await _deliver_mj_media(
+                    ctx.bot,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    caption=caption,
+                    items=downloaded,
+                    send_as_album=MJ_SEND_AS_ALBUM,
+                )
 
                 if not sent_successfully:
                     await _refund("send_failed")
@@ -10816,24 +11123,26 @@ async def _banana_run_and_send(
             await ctx.bot.send_message(chat_id, msg)
             return
         u0 = urls[0]
-        try:
-            await ctx.bot.send_photo(chat_id=chat_id, photo=u0, caption="✅ Banana готово")
-        except Exception:
-            r = requests.get(u0, timeout=180)
-            r.raise_for_status()
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                f.write(r.content)
-                path = f.name
-            with open(path, "rb") as f:
-                await ctx.bot.send_document(
-                    chat_id=chat_id,
-                    document=InputFile(f, filename="banana.png"),
-                    caption="✅ Banana готово",
-                )
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+        data, content_type = await asyncio.to_thread(_download_binary, u0)
+        if not data:
+            raise RuntimeError("banana returned empty file")
+        suffix = _banana_guess_suffix(u0, content_type)
+        temp_path = save_bytes_to_temp(data, suffix=suffix)
+        caption = _banana_caption(prompt)
+        delivered = await _deliver_banana_media(
+            ctx.bot,
+            chat_id=chat_id,
+            user_id=user_id,
+            file_path=temp_path,
+            caption=caption,
+            reply_markup=None,
+            send_document=BANANA_SEND_AS_DOCUMENT,
+        )
+        if not delivered:
+            await ctx.bot.send_message(
+                chat_id,
+                "❌ Не удалось отправить изображение Banana. Попробуйте позже.",
+            )
     except KieBananaError as e:
         new_balance = await _refund("error", str(e))
         msg = f"❌ Banana ошибка: {e}\nПроизошла ошибка, 5💎 возвращены."

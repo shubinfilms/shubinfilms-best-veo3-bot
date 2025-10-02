@@ -40,6 +40,9 @@ class _AppSettings(BaseModel):
     HTTP_POOL_CONNECTIONS: int = Field(default=50, ge=1, le=200)
     HTTP_POOL_PER_HOST: int = Field(default=10, ge=1, le=100)
 
+    BANANA_SEND_AS_DOCUMENT: bool = Field(default=True)
+    MJ_SEND_AS_ALBUM: bool = Field(default=True)
+
     TMP_CLEANUP_HOURS: int = Field(default=24, ge=1, le=240)
 
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
@@ -254,6 +257,9 @@ SUNO_READY = bool(
     SUNO_ENABLED and SUNO_API_TOKEN and SUNO_CALLBACK_SECRET and SUNO_CALLBACK_URL
 )
 
+BANANA_SEND_AS_DOCUMENT = bool(_APP_SETTINGS.BANANA_SEND_AS_DOCUMENT)
+MJ_SEND_AS_ALBUM = bool(_APP_SETTINGS.MJ_SEND_AS_ALBUM)
+
 
 def _emit_warnings() -> None:
     if not KIE_API_KEY:
@@ -354,6 +360,8 @@ __all__ = [
     "UPLOAD_STREAM_PATH",
     "UPLOAD_URL_PATH",
     "UPLOAD_BASE64_PATH",
+    "BANANA_SEND_AS_DOCUMENT",
+    "MJ_SEND_AS_ALBUM",
     "resolve_outbound_ip",
     "token_tail",
 ]

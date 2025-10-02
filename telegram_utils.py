@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import html
 import json
@@ -704,6 +705,135 @@ async def safe_send_text(bot: Any, chat_id: int, text: str) -> Optional[Any]:
     )
 
 
+def _sanitize_caption_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    parse_mode = payload.get("parse_mode")
+    caption = payload.get("caption")
+    if caption is None or not _should_sanitize(parse_mode):
+        return dict(payload)
+    sanitized = dict(payload)
+    sanitized["caption"] = sanitize_html(str(caption))
+    return sanitized
+
+
+def _sanitize_media_group_payload(
+    media_items: Sequence[Any],
+    parse_mode: Any,
+) -> list[Any]:
+    if not _should_sanitize(parse_mode):
+        return list(media_items)
+    sanitized: list[Any] = []
+    for item in media_items:
+        caption = getattr(item, "caption", None)
+        if caption is None:
+            sanitized.append(item)
+            continue
+        sanitized_caption = sanitize_html(str(caption))
+        item_kwargs: dict[str, Any] = {"media": getattr(item, "media", None), "caption": sanitized_caption}
+        parse_mode = getattr(item, "parse_mode", None)
+        if parse_mode is not None:
+            item_kwargs["parse_mode"] = parse_mode
+        caption_entities = getattr(item, "caption_entities", None)
+        if caption_entities is not None:
+            item_kwargs["caption_entities"] = caption_entities
+        has_spoiler = getattr(item, "has_spoiler", None)
+        if has_spoiler:
+            item_kwargs["has_spoiler"] = has_spoiler
+        sanitized.append(type(item)(**item_kwargs))
+    return sanitized
+
+
+async def safe_send_photo(
+    bot: Any,
+    *,
+    chat_id: int,
+    photo: Any,
+    caption: Optional[str] = None,
+    reply_markup: Optional[Any] = None,
+    parse_mode: Optional[ParseMode] = None,
+    kind: str = "photo",
+    req_id: Optional[str] = None,
+    max_attempts: int = 4,
+    **kwargs: Any,
+) -> Any:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "photo": photo,
+        "caption": caption,
+        "reply_markup": reply_markup,
+        "parse_mode": parse_mode,
+    }
+    payload.update(kwargs)
+    sanitized = _sanitize_caption_payload(payload)
+    return await safe_send(
+        bot.send_photo,
+        method_name="send_photo",
+        kind=kind,
+        req_id=req_id,
+        max_attempts=max_attempts,
+        **sanitized,
+    )
+
+
+async def safe_send_document(
+    bot: Any,
+    *,
+    chat_id: int,
+    document: Any,
+    caption: Optional[str] = None,
+    reply_markup: Optional[Any] = None,
+    parse_mode: Optional[ParseMode] = None,
+    kind: str = "document",
+    req_id: Optional[str] = None,
+    max_attempts: int = 4,
+    **kwargs: Any,
+) -> Any:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "document": document,
+        "caption": caption,
+        "reply_markup": reply_markup,
+        "parse_mode": parse_mode,
+    }
+    payload.update(kwargs)
+    sanitized = _sanitize_caption_payload(payload)
+    return await safe_send(
+        bot.send_document,
+        method_name="send_document",
+        kind=kind,
+        req_id=req_id,
+        max_attempts=max_attempts,
+        **sanitized,
+    )
+
+
+async def safe_send_media_group(
+    bot: Any,
+    *,
+    chat_id: int,
+    media: Sequence[Any],
+    parse_mode: Optional[ParseMode] = None,
+    kind: str = "media_group",
+    req_id: Optional[str] = None,
+    max_attempts: int = 4,
+    **kwargs: Any,
+) -> Any:
+    media_items = _sanitize_media_group_payload(media, parse_mode)
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "media": media_items,
+        "parse_mode": parse_mode,
+    }
+    payload.update(kwargs)
+    return await safe_send(
+        bot.send_media_group,
+        method_name="send_media_group",
+        kind=kind,
+        req_id=req_id,
+        max_attempts=max_attempts,
+        **payload,
+    )
+
+
 async def safe_send_placeholder(bot: Any, chat_id: int, text: str) -> Optional[Message]:
     return await safe_send(
         bot.send_message,
@@ -859,6 +989,9 @@ def is_remote_file_error(status: Optional[int], reason: Optional[str]) -> bool:
 __all__ = [
     "safe_send",
     "safe_send_text",
+    "safe_send_photo",
+    "safe_send_document",
+    "safe_send_media_group",
     "safe_send_placeholder",
     "safe_send_sticker",
     "safe_edit_text",
