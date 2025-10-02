@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 from telegram.constants import ParseMode
@@ -13,6 +14,19 @@ _logger = logging.getLogger("telegram-safe")
 
 _MessageKey = Tuple[int, int]
 _MessageHashes: dict[_MessageKey, Tuple[str, str]] = {}
+
+
+@dataclass(slots=True)
+class SafeSendResult:
+    """Result wrapper for safe send attempts."""
+
+    ok: bool
+    message: Any = None
+    error: Optional[BaseException] = None
+    message_id: Optional[int] = None
+
+    def __bool__(self) -> bool:  # pragma: no cover - convenience
+        return self.ok
 
 
 def _serialize_markup(markup: Any) -> str:
@@ -90,3 +104,33 @@ async def safe_edit_message(
             _store_hashes(key, new_hashes)
             return False
         raise
+
+
+async def safe_send_text(
+    ctx: Any,
+    *,
+    chat_id: int,
+    text: str,
+    reply_markup: Any = None,
+    parse_mode: ParseMode = ParseMode.MARKDOWN_V2,
+    disable_web_page_preview: bool = True,
+) -> SafeSendResult:
+    """Safely send a text message without propagating Telegram errors."""
+
+    bot = getattr(ctx, "bot", None)
+    if bot is None:
+        raise RuntimeError("Context has no bot instance")
+
+    try:
+        message = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except Exception as exc:  # pragma: no cover - exercised via tests
+        return SafeSendResult(ok=False, message=None, error=exc, message_id=None)
+
+    message_id = getattr(message, "message_id", None)
+    return SafeSendResult(ok=True, message=message, error=None, message_id=message_id)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from suno.cover_source import MAX_AUDIO_MB
 
@@ -16,6 +16,29 @@ FAQ_SECTIONS = {
     "chat": "💬 *Обычный чат*\n• /chat включает режим, /reset очищает контекст.\n• Поддерживаются голосовые — бот расшифрует.",
     "pm": "🧠 *Prompt-Master*\n• Помогает быстро получить качественный промпт.\n• Кнопки категорий в самом Prompt-Master.",
     "common": "ℹ️ *Общие вопросы*\n• Куда приходят клипы/изображения: прямо в чат.\n• Если бот «молчит»: проверьте баланс и повторите запрос.",
+}
+
+HELP_I18N = {
+    "ru": {
+        "title": "🆘 Поддержка",
+        "body": (
+            "Напишите нам, если что-то не работает, есть идея или нужен совет.\n"
+            "Ответим как можно скорее.\n\n"
+            "• Чат поддержки: @{support_username}\n"
+            "• Язык: автоматически — по языку профиля Telegram"
+        ),
+        "button": "Написать в поддержку",
+    },
+    "en": {
+        "title": "🆘 Support",
+        "body": (
+            "Message us if something breaks, you have an idea, or need guidance.\n"
+            "We’ll reply as soon as possible.\n\n"
+            "• Support chat: @{support_username}\n"
+            "• Language: auto — from your Telegram profile"
+        ),
+        "button": "Message Support",
+    },
 }
 
 SUNO_RU = {
@@ -67,6 +90,19 @@ def t(key: str, /, **kwargs: Any) -> str:
         except Exception:
             return value
     return value
+
+
+def help_text(language_code: Optional[str], support_username: str) -> tuple[str, str]:
+    """Return localized help message text and button label."""
+
+    locale = "ru"
+    if isinstance(language_code, str) and language_code:
+        lowered = language_code.lower()
+        if lowered.startswith("en"):
+            locale = "en"
+    data = HELP_I18N.get(locale, HELP_I18N["ru"])
+    body = data["body"].format(support_username=support_username)
+    return f"{data['title']}\n\n{body}", data["button"]
 
 
 SUNO_MODE_PROMPT = t("suno.prompt.mode_select")

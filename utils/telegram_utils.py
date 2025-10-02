@@ -109,6 +109,16 @@ _register_label(
     prefix=True,
     command="balance.show",
 )
+_register_label(
+    "🆘 ПОДДЕРЖКА",
+    "🆘 Поддержка",
+    "Поддержка",
+    "🆘 Support",
+    "Support",
+    "Help",
+    prefix=True,
+    command="help.open",
+)
 _register_label("💬 Обычный чат", "💬", prefix=True)
 _register_label("🏠 В меню", "⬅️ В меню")
 _register_label("ℹ️ FAQ", "ℹ️ Общие вопросы", "⚡ Токены и возвраты")

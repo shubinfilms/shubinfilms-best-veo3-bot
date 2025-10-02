@@ -54,6 +54,7 @@ from handlers import (
     configure_faq,
     faq_callback,
     faq_command,
+    help_command,
     get_pm_prompt,
     prompt_master_callback,
     prompt_master_handle_text,
@@ -3731,6 +3732,7 @@ MENU_BTN_SUNO = "🎵 Генерация музыки"
 MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = "💎 Баланс"
+MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
@@ -3761,6 +3763,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(MENU_BTN_PM)],
         [KeyboardButton(MENU_BTN_CHAT)],
         [KeyboardButton(MENU_BTN_BALANCE)],
+        [KeyboardButton(MENU_BTN_SUPPORT)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -8862,12 +8865,9 @@ async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("🌍 Переключение языка будет доступно в ближайшее время.")
 
 
-async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def help_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    message = update.effective_message
-    if message is None:
-        return
-    await message.reply_text("🆘 Поддержка появится скоро. Напишите сюда свой вопрос, и мы ответим позже.")
+    await help_command(update, ctx)
 
 
 async def faq_command_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -11754,7 +11754,7 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("video", "veo"), video_command),
     (("music", "suno"), suno_command),
     (("balance",), balance_command),
-    (("help",), help_command),
+    (("help", "support"), help_command_entry),
 ]
 
 ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
@@ -11796,6 +11796,7 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
     (MENU_BTN_PM, prompt_master_command),
     (MENU_BTN_CHAT, handle_chat_entry),
     (MENU_BTN_BALANCE, handle_balance_entry),
+    (MENU_BTN_SUPPORT, help_command_entry),
 ]
 
 
@@ -11803,6 +11804,7 @@ LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Aw
     "veo.card": handle_video_entry,
     "mj.card": handle_image_entry,
     "balance.show": handle_balance_entry,
+    "help.open": help_command_entry,
 }
 
 

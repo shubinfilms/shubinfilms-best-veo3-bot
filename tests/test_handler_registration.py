@@ -18,6 +18,7 @@ from bot import (  # noqa: E402
     MENU_BTN_CHAT,
     MENU_BTN_IMAGE,
     MENU_BTN_PM,
+    MENU_BTN_SUPPORT,
     MENU_BTN_SUNO,
     MENU_BTN_VIDEO,
     REPLY_BUTTON_ROUTES,
@@ -26,6 +27,7 @@ from bot import (  # noqa: E402
     handle_image_entry,
     handle_music_entry,
     handle_video_entry,
+    help_command_entry,
     prompt_master_command,
     register_handlers,
 )
@@ -72,4 +74,5 @@ def test_reply_button_routes_match_expected() -> None:
         MENU_BTN_PM: prompt_master_command,
         MENU_BTN_CHAT: handle_chat_entry,
         MENU_BTN_BALANCE: handle_balance_entry,
+        MENU_BTN_SUPPORT: help_command_entry,
     }
