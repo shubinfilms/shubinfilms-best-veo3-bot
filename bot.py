@@ -65,7 +65,7 @@ from telegram import (
     InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
     BotCommand, User, Message
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode, ChatAction, ChatType
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -3488,6 +3488,47 @@ async def command_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _clear_user_wait_states(user.id, reason=f"command_gate:{command_token}")
+
+
+async def handle_command_ack(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+
+    text = message.text or message.caption or ""
+    if not text:
+        return
+
+    chat = getattr(update, "effective_chat", None)
+    if chat is None or getattr(chat, "type", None) != ChatType.PRIVATE:
+        return
+
+    command_token = text.split()[0]
+    if not command_token.startswith("/"):
+        return
+
+    user = getattr(update, "effective_user", None)
+    log_extra = {
+        "ctx_user_id": getattr(user, "id", None),
+        "ctx_chat_id": getattr(chat, "id", None),
+        "ctx_command": command_token,
+    }
+
+    log.debug("command.dispatch", extra=log_extra)
+
+    result = await safe_send_text_logged(
+        update,
+        context,
+        f"Команда принята: {command_token}",
+    )
+
+    result_extra = dict(log_extra)
+    if not result.ok and result.description:
+        result_extra["error"] = result.description
+
+    log.info("send.ok" if result.ok else "send.fail", extra=result_extra)
 
 
 async def _handle_suno_waiting_input(
@@ -13620,20 +13661,22 @@ def register_handlers(application: Any) -> None:
             else:
                 bot_data["redis"] = redis_client
 
+    logger = getattr(application, "logger", log)
+
     welcome_handler = MessageHandler(
-        filters.ALL,
+        filters.ALL & ~filters.COMMAND,
         safe_handler(welcome_entry),
     )
     welcome_handler.block = False
-    application.add_handler(welcome_handler, group=0)
+    application.add_handler(welcome_handler, group=5)
 
     if SUPPORT_USER_ID > 0:
         support_reply_handler = MessageHandler(
-            filters.User(SUPPORT_USER_ID),
+            filters.User(SUPPORT_USER_ID) & ~filters.COMMAND,
             safe_handler(handle_support_reply_message),
         )
         support_reply_handler.block = False
-        application.add_handler(support_reply_handler, group=0)
+        application.add_handler(support_reply_handler, group=5)
 
     command_gate_handler = MessageHandler(
         filters.COMMAND,
@@ -13642,15 +13685,16 @@ def register_handlers(application: Any) -> None:
     command_gate_handler.block = False
     application.add_handler(command_gate_handler, group=0)
 
-    card_input_handler = MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        safe_handler(handle_card_input),
-    )
-    card_input_handler.block = False
-    application.add_handler(card_input_handler, group=10)
-
     command_names = _command_names_for_log()
     logger.info("Registering handlers for commands: %s", command_names)
+
+    command_ack_handler = CommandHandler(
+        command_names,
+        safe_handler(handle_command_ack),
+    )
+    command_ack_handler.block = False
+    application.add_handler(command_ack_handler, group=0)
+
     for names, callback in COMMAND_HANDLER_SPECS:
         application.add_handler(
             CommandHandler(list(names), wrap_cmd(callback, command_name=names[0])),
@@ -13658,21 +13702,28 @@ def register_handlers(application: Any) -> None:
         )
 
     unknown_handler = MessageHandler(filters.COMMAND, unknown_command)
-    application.add_handler(unknown_handler, group=0)
+    application.add_handler(unknown_handler, group=2)
 
     application.add_handler(MessageHandler(filters.COMMAND, fallback_unknown), group=999)
 
     for pattern, callback in CALLBACK_HANDLER_SPECS:
         if pattern is None:
-            application.add_handler(CallbackQueryHandler(callback), group=0)
+            application.add_handler(CallbackQueryHandler(callback), group=1)
         else:
-            application.add_handler(CallbackQueryHandler(callback, pattern=pattern), group=0)
+            application.add_handler(CallbackQueryHandler(callback, pattern=pattern), group=1)
 
     application.add_handler(PreCheckoutQueryHandler(safe_handler(precheckout_callback)), group=0)
     application.add_handler(
         MessageHandler(filters.SUCCESSFUL_PAYMENT, safe_handler(successful_payment_handler)),
         group=0,
     )
+
+    card_input_handler = MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        safe_handler(handle_card_input),
+    )
+    card_input_handler.block = False
+    application.add_handler(card_input_handler, group=10)
     application.add_handler(MessageHandler(filters.PHOTO, safe_handler(on_photo)), group=10)
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, safe_handler(handle_voice)),
@@ -13691,7 +13742,7 @@ def register_handlers(application: Any) -> None:
 
     pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(prompt_master_handle_text))
     pm_handler.block = False
-    application.add_handler(pm_handler, group=2)
+    application.add_handler(pm_handler, group=3)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(on_text)), group=10)
 
