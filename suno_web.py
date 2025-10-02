@@ -245,9 +245,9 @@ async def _middleware(request: Request, call_next):  # type: ignore[override]
     return response
 
 
-@app.get("/")
-def root() -> dict[str, bool]:
-    return {"ok": True}
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+def root() -> JSONResponse:
+    return JSONResponse({"ok": True, "service": "veo3-bot"})
 
 
 @app.get("/healthz")

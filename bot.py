@@ -13511,10 +13511,17 @@ async def run_bot_async() -> None:
     if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
 
-    application = (ApplicationBuilder()
-                   .token(TELEGRAM_TOKEN)
-                   .rate_limiter(AIORateLimiter())
-                   .build())
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .build()
+    )
+
+    # python-telegram-bot v20+ no longer exposes a built-in ``logger``
+    # attribute on :class:`Application`. Downstream helpers expect it, so we
+    # provide a compatible adapter that points to the main bot logger.
+    setattr(application, "logger", log)
 
     try:
         register_handlers(application)

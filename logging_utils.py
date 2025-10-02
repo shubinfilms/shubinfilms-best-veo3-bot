@@ -9,7 +9,13 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional
 
-from settings import LOG_JSON, LOG_LEVEL, MAX_IN_LOG_BODY
+_DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+_DEFAULT_LOG_JSON = os.getenv("LOG_JSON", "1").lower() not in {"0", "false", "no"}
+_DEFAULT_MAX_BODY = int(os.getenv("MAX_IN_LOG_BODY", "2048"))
+
+LOG_LEVEL: str = _DEFAULT_LOG_LEVEL
+LOG_JSON: bool = _DEFAULT_LOG_JSON
+MAX_IN_LOG_BODY: int = _DEFAULT_MAX_BODY
 
 _SECRET_ENV_KEYS = {
     "DATABASE_URL",
@@ -81,30 +87,61 @@ def _sanitize(value: Any) -> Any:
     return value
 
 
-RESERVED_LOG_KEYS = {
-    "name",
-    "msg",
-    "args",
-    "levelname",
-    "levelno",
-    "pathname",
-    "filename",
-    "module",
-    "exc_info",
-    "exc_text",
-    "stack_info",
-    "lineno",
-    "funcName",
-    "created",
-    "msecs",
-    "relativeCreated",
-    "thread",
-    "threadName",
-    "processName",
-    "process",
-    "message",
-    "asctime",
-}
+def _reserved_record_keys() -> set[str]:
+    sample = logging.LogRecord(
+        name="sample",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="",
+        args=(),
+        exc_info=None,
+    )
+    # ``LogRecord`` in Python 3.13 performs strict checks against any attribute
+    # already present in ``__dict__``.  To avoid ``KeyError`` we eagerly collect
+    # every known attribute and treat them as reserved.
+    reserved: set[str] = set(sample.__dict__.keys())
+    # ``ctx``/``meta`` are also used internally by our formatter and therefore
+    # need to be guarded against collision when the payload contains the same
+    # keys.
+    reserved.add("ctx")
+    return reserved
+
+
+RESERVED_LOG_KEYS = _reserved_record_keys()
+
+
+def _needs_prefix(key: str) -> bool:
+    return key in RESERVED_LOG_KEYS
+
+
+def _prefix_key(key: str) -> str:
+    candidate = f"ctx_{key}"
+    while _needs_prefix(candidate):
+        candidate = f"ctx_{candidate}"
+    return candidate
+
+
+def _sanitize_extra_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _sanitize_mapping(value)
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_extra_value(item) for item in value]
+    return value
+
+
+def _sanitize_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for raw_key, value in data.items():
+        key = str(raw_key)
+        safe_key = key if not _needs_prefix(key) else _prefix_key(key)
+        sanitized[safe_key] = _sanitize_extra_value(value)
+    return sanitized
+
+
+def _add_ctx_value(ctx_payload: Dict[str, Any], key: str, value: Any) -> None:
+    safe_key = key if not _needs_prefix(key) else _prefix_key(key)
+    ctx_payload[safe_key] = _sanitize_extra_value(value)
 
 
 class JsonFormatter(logging.Formatter):
@@ -171,24 +208,19 @@ def _normalize_extra(extra: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     if not extra:
         return {"ctx": {}}
 
-    ctx_payload: dict[str, Any] = {}
-    if "ctx" in extra and isinstance(extra["ctx"], Mapping):
-        ctx_payload.update(extra["ctx"])
+    ctx_payload: Dict[str, Any] = {}
+    base_ctx = extra.get("ctx")
+    if isinstance(base_ctx, Mapping):
+        for key, value in base_ctx.items():
+            _add_ctx_value(ctx_payload, str(key), value)
 
     for key, value in extra.items():
         if key == "ctx":
             continue
-        if key in RESERVED_LOG_KEYS:
-            safe_key = f"field_{key}"
-        else:
-            safe_key = key
-        if isinstance(value, Mapping):
-            ctx_payload[safe_key] = dict(value)
-        else:
-            ctx_payload[safe_key] = value
+        _add_ctx_value(ctx_payload, str(key), value)
 
     normalized: dict[str, Any] = {"ctx": ctx_payload}
-    meta_value = ctx_payload.get("meta")
+    meta_value = ctx_payload.get("meta") if isinstance(ctx_payload, Mapping) else None
     if meta_value is not None:
         normalized["meta"] = meta_value
     return normalized
@@ -262,6 +294,17 @@ if logging.getLoggerClass() is not SafeLogger:
     logging.setLoggerClass(SafeLogger)
 
 
+try:  # Late import to avoid creating ``Logger`` instances before patching
+    from settings import LOG_JSON as _SET_LOG_JSON, LOG_LEVEL as _SET_LOG_LEVEL, MAX_IN_LOG_BODY as _SET_MAX_BODY
+
+    LOG_JSON = _SET_LOG_JSON
+    LOG_LEVEL = _SET_LOG_LEVEL
+    MAX_IN_LOG_BODY = _SET_MAX_BODY
+except Exception:
+    # ``settings`` may fail to import in some unit tests. Fall back to env defaults.
+    pass
+
+
 def build_log_extra(
     update: Optional[Any] = None,
     context: Optional[Any] = None,
@@ -316,11 +359,7 @@ def build_log_extra(
             ctx_payload["meta"] = meta
 
     for key, value in fields.items():
-        if key in RESERVED_LOG_KEYS or key == "ctx":
-            safe_key = f"field_{key}"
-        else:
-            safe_key = key
-        ctx_payload[safe_key] = value
+        _add_ctx_value(ctx_payload, str(key), value)
 
     return {"ctx": ctx_payload}
 

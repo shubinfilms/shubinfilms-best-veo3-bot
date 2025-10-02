@@ -15,7 +15,7 @@ def test_build_log_extra_wraps_fields() -> None:
     ctx = payload["ctx"]
     assert ctx["command"] == "menu"
     assert ctx["meta"] == {"foo": "bar"}
-    assert ctx["field_name"] == "test"
+    assert ctx["ctx_name"] == "test"
 
 
 def test_logging_extra_name_not_crash(caplog) -> None:
@@ -26,5 +26,5 @@ def test_logging_extra_name_not_crash(caplog) -> None:
     target = next((record for record in caplog.records if record.message == "check"), None)
     assert target is not None
     ctx = getattr(target, "ctx")
-    assert ctx["field_name"] == "menu"
+    assert ctx["ctx_name"] == "menu"
     assert ctx["user"] == 123
