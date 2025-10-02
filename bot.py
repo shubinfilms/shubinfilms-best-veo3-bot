@@ -2679,22 +2679,36 @@ async def _deliver_banana_media(
 
     doc_sent = False
     if send_document:
-        doc_caption = f"{caption}\n(оригинал, без сжатия Telegram)"
         doc_start = time.monotonic()
+        suffix = file_path.suffix.lower() or ".jpg"
+        doc_filename = f"result{suffix}"
         try:
             with file_path.open("rb") as handle:
                 message = await safe_send_document(
                     bot,
                     chat_id=chat_id,
-                    document=InputFile(handle, filename=file_path.name),
-                    caption=doc_caption,
+                    document=InputFile(handle, filename=doc_filename),
+                    caption=None,
                     reply_markup=reply_markup,
                     kind="banana_document",
+                    disable_notification=True,
                 )
             duration_ms = int((time.monotonic() - doc_start) * 1000)
             doc_message_id = getattr(message, "message_id", None)
             doc_sent = True
             sent_any = True
+            log.info(
+                "send.document",
+                extra={
+                    "meta": {
+                        "ctx_user_id": user_id,
+                        "chat_id": chat_id,
+                        "message_id": doc_message_id,
+                        "file_bytes": file_size,
+                        "file_name": doc_filename,
+                    }
+                },
+            )
             log.info(
                 "banana.send.document.ok",
                 extra={
@@ -2709,6 +2723,18 @@ async def _deliver_banana_media(
             )
         except Exception as exc:
             duration_ms = int((time.monotonic() - doc_start) * 1000)
+            log.info(
+                "send.document",
+                extra={
+                    "meta": {
+                        "ctx_user_id": user_id,
+                        "chat_id": chat_id,
+                        "file_bytes": file_size,
+                        "file_name": doc_filename,
+                        "error": str(exc),
+                    }
+                },
+            )
             log.warning(
                 "banana.send.document.fail",
                 extra={
@@ -2781,6 +2807,19 @@ async def _deliver_mj_media(
                 duration_ms = int((time.monotonic() - start) * 1000)
                 message_ids = [getattr(msg, "message_id", None) for msg in (messages or [])]
                 log.info(
+                    "send.media_group",
+                    extra={
+                        "meta": {
+                            "ctx_user_id": user_id,
+                            "chat_id": chat_id,
+                            "count": len(media_group),
+                            "file_bytes": album_sizes,
+                            "media_group_fallback": False,
+                            "message_ids": message_ids,
+                        }
+                    },
+                )
+                log.info(
                     "mj.media_group.ok",
                     extra={
                         "meta": {
@@ -2796,6 +2835,19 @@ async def _deliver_mj_media(
                 return True
             except Exception as exc:
                 duration_ms = int((time.monotonic() - start) * 1000)
+                log.info(
+                    "send.media_group",
+                    extra={
+                        "meta": {
+                            "ctx_user_id": user_id,
+                            "chat_id": chat_id,
+                            "count": len(album_candidates),
+                            "file_bytes": album_sizes,
+                            "media_group_fallback": True,
+                            "error": str(exc),
+                        }
+                    },
+                )
                 log.warning(
                     "mj.media_group.fail",
                     extra={
@@ -2812,6 +2864,19 @@ async def _deliver_mj_media(
                 fallback_reason = "send_error"
         else:
             log.info(
+                "send.media_group",
+                extra={
+                    "meta": {
+                        "ctx_user_id": user_id,
+                        "chat_id": chat_id,
+                        "count": len(album_candidates),
+                        "file_bytes": album_sizes,
+                        "media_group_fallback": True,
+                        "reason": "insufficient_media",
+                    }
+                },
+            )
+            log.info(
                 "mj.media_group.fail",
                 extra={
                     "meta": {
@@ -2825,6 +2890,19 @@ async def _deliver_mj_media(
             )
             fallback_reason = "insufficient_media"
     else:
+        log.info(
+            "send.media_group",
+            extra={
+                "meta": {
+                    "ctx_user_id": user_id,
+                    "chat_id": chat_id,
+                    "count": len(album_candidates),
+                    "file_bytes": album_sizes,
+                    "media_group_fallback": True,
+                    "reason": "disabled",
+                }
+            },
+        )
         log.info(
             "mj.media_group.fail",
             extra={

@@ -58,8 +58,10 @@ def test_banana_deliver_photo_and_document(monkeypatch, tmp_path, bot_module):
     assert len(bot.photo_calls) == 1
     assert bot.photo_calls[0]["caption"] == caption
     assert len(bot.doc_calls) == 1
-    assert caption in bot.doc_calls[0]["caption"]
-    assert "оригинал" in bot.doc_calls[0]["caption"]
+    doc_call = bot.doc_calls[0]
+    assert doc_call["caption"] is None
+    assert doc_call["disable_notification"] is True
+    assert doc_call["document"].filename == "result.png"
 
 
 def test_banana_deliver_skips_document(monkeypatch, tmp_path, bot_module):
@@ -132,6 +134,49 @@ def test_mj_deliver_as_album(bot_module):
     assert payload["media"][0].caption == "MJ"
     assert all(item.caption is None for item in payload["media"][1:])
     assert not bot.photo_calls
+
+
+def test_mj_album_fallback_on_error(bot_module, monkeypatch):
+    class _Bot:
+        def __init__(self):
+            self.media_calls = []
+            self.photo_calls = []
+
+        async def send_media_group(self, **kwargs):
+            self.media_calls.append(kwargs)
+            raise RuntimeError("network fail")
+
+        async def send_photo(self, **kwargs):
+            self.photo_calls.append(kwargs)
+            return SimpleNamespace(message_id=len(self.photo_calls))
+
+    log_records = []
+
+    def _fake_info(msg, *, extra=None):
+        log_records.append((msg, extra))
+
+    monkeypatch.setattr(bot_module, "log", SimpleNamespace(info=_fake_info, warning=lambda *a, **k: None))
+
+    bot = _Bot()
+    items = [(b"a", "1.png"), (b"b", "2.png"), (b"c", "3.png"), (b"d", "4.png")]
+    delivered = asyncio.run(
+        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
+            bot,
+            chat_id=101,
+            user_id=202,
+            caption="MJ",
+            items=items,
+            send_as_album=True,
+        )
+    )
+
+    assert delivered is True
+    assert len(bot.media_calls) == 1
+    assert len(bot.photo_calls) == 4
+    assert any(
+        msg == "send.media_group" and extra and extra.get("meta", {}).get("media_group_fallback")
+        for msg, extra in log_records
+    )
 
 
 def test_mj_fallback_to_single_photo(bot_module):
