@@ -67,6 +67,7 @@ def test_help_command_ru_sends_localized_message(monkeypatch, caplog):
     assert isinstance(markup, InlineKeyboardMarkup)
     button = markup.inline_keyboard[0][0]
     assert button.text == expected_button
+    assert button.text == "Написать в поддержку"
     assert button.url == f"https://t.me/{SUPPORT_USERNAME}"
 
     messages = [record.msg for record in caplog.records if record.name == "bot.commands.help"]

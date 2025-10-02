@@ -3763,7 +3763,6 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(MENU_BTN_PM)],
         [KeyboardButton(MENU_BTN_CHAT)],
         [KeyboardButton(MENU_BTN_BALANCE)],
-        [KeyboardButton(MENU_BTN_SUPPORT)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -3801,31 +3800,12 @@ async def show_emoji_hub_for_chat(
 
     log.info("hub.show | user_id=%s balance=%s", resolved_uid, balance)
 
-    hub_msg_id = ctx.user_data.get("hub_msg_id")
+    hub_msg_id_val = ctx.user_data.get("hub_msg_id")
+    hub_msg_id = hub_msg_id_val if isinstance(hub_msg_id_val, int) else None
     if replace and hub_msg_id:
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=hub_msg_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-            ctx.user_data["hub_msg_id"] = hub_msg_id
-            return hub_msg_id
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                ctx.user_data["hub_msg_id"] = hub_msg_id
-                return hub_msg_id
-            log.warning("hub.edit_failed | user_id=%s err=%s", resolved_uid, exc)
-            ctx.user_data["hub_msg_id"] = None
-        except TelegramError as exc:
-            log.warning("hub.edit_failed | user_id=%s err=%s", resolved_uid, exc)
-            ctx.user_data["hub_msg_id"] = None
-        except Exception as exc:  # pragma: no cover - unexpected errors
-            log.warning("hub.edit_failed | user_id=%s err=%s", resolved_uid, exc)
-            ctx.user_data["hub_msg_id"] = None
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=hub_msg_id)
+        ctx.user_data["hub_msg_id"] = None
 
     try:
         message = await tg_safe_send(
