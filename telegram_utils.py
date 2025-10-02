@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import html
+import io
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, 
 import requests
 from requests import Response
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
@@ -804,6 +805,31 @@ async def safe_send_document(
         req_id=req_id,
         max_attempts=max_attempts,
         **sanitized,
+    )
+
+
+async def send_image_as_document(
+    bot: Any,
+    chat_id: int,
+    data: bytes,
+    filename: str,
+    *,
+    reply_markup: Optional[Any] = None,
+    caption: Optional[str] = None,
+    req_id: Optional[str] = None,
+) -> Any:
+    buffer = io.BytesIO(data)
+    buffer.name = filename
+    buffer.seek(0)
+    input_file = InputFile(buffer, filename=filename)
+    return await safe_send_document(
+        bot,
+        chat_id=chat_id,
+        document=input_file,
+        caption=caption,
+        reply_markup=reply_markup,
+        kind="image_document",
+        req_id=req_id,
     )
 
 

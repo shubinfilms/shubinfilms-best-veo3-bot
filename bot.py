@@ -184,6 +184,11 @@ from redis_utils import (
     add_ref_user,
     incr_ref_earned,
     get_ref_stats,
+    set_last_mj_grid,
+    get_last_mj_grid,
+    clear_last_mj_grid,
+    acquire_mj_upscale_lock,
+    release_mj_upscale_lock,
 )
 
 from ledger import (
@@ -271,6 +276,7 @@ from telegram_utils import (
     run_ffmpeg,
     md2_escape,
     mask_tokens,
+    send_image_as_document,
 )
 from utils.api_client import request_with_retries
 from utils.safe_send import safe_delete_message
@@ -944,6 +950,20 @@ if KIE_MJ_STATUS_PATHS:
 else:
     KIE_MJ_STATUS = _KIE_MJ_STATUS_DEFAULT
     KIE_MJ_STATUS_PATHS = [KIE_MJ_STATUS]
+
+_KIE_MJ_UPSCALE_DEFAULT = "/api/v1/mj/generateUpscale"
+_KIE_MJ_UPSCALE_RAW = _env("KIE_MJ_UPSCALE", _KIE_MJ_UPSCALE_DEFAULT)
+KIE_MJ_UPSCALE_PATHS = _normalize_endpoint_values(
+    _KIE_MJ_UPSCALE_RAW,
+    _KIE_MJ_UPSCALE_DEFAULT,
+    "/api/v1/mj/upscale",
+    "/api/v1/mj/uv",
+)
+if KIE_MJ_UPSCALE_PATHS:
+    KIE_MJ_UPSCALE = KIE_MJ_UPSCALE_PATHS[0]
+else:
+    KIE_MJ_UPSCALE = _KIE_MJ_UPSCALE_DEFAULT
+    KIE_MJ_UPSCALE_PATHS = [KIE_MJ_UPSCALE]
 
 # Видео
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
@@ -1957,6 +1977,7 @@ CB_GO_HOME = "go_home"
 #   Tokens / Pricing
 # ==========================
 PRICE_MJ = 10
+PRICE_MJ_UPSCALE = PRICE_MJ
 PRICE_BANANA = 5
 PRICE_VEO_FAST = 50
 PRICE_VEO_QUALITY = 150
@@ -1968,6 +1989,7 @@ TOKEN_COSTS = {
     "veo_quality": PRICE_VEO_QUALITY,
     "veo_photo": PRICE_VEO_ANIMATE,
     "mj": PRICE_MJ,          # 16:9 или 9:16
+    "mj_upscale": PRICE_MJ_UPSCALE,
     "banana": PRICE_BANANA,
     "suno": PRICE_SUNO,
     "chat": 0,
@@ -2535,6 +2557,30 @@ _MJ_UI_TEXTS = {
     "gallery_ready": {"ru": "Галерея сгенерирована.", "en": "Gallery generated."},
     "repeat": {"ru": "Повторить", "en": "Repeat"},
     "back": {"ru": "Назад в меню", "en": "Back to menu"},
+    "upscale_choose": {
+        "ru": "Выберите кадр для апскейла:",
+        "en": "Pick a frame to upscale:",
+    },
+    "upscale_repeat": {
+        "ru": "Повторить апскейл",
+        "en": "Upscale again",
+    },
+    "upscale_need_photo": {
+        "ru": "Пришлите фото (файлом лучше) — сделаю апскейл.",
+        "en": "Send a photo (better as a file) and I will upscale it.",
+    },
+    "upscale_ready": {
+        "ru": "Готово! Отдал файл без сжатия. Нужен другой кадр?",
+        "en": "Done! Sent the file without compression. Need another frame?",
+    },
+    "upscale_processing": {
+        "ru": "⏳ Запускаю апскейл…",
+        "en": "⏳ Starting the upscale…",
+    },
+    "upscale_in_progress": {
+        "ru": "⏳ Уже делаю апскейл этого кадра.",
+        "en": "⏳ Already working on this frame.",
+    },
 }
 
 
@@ -2557,6 +2603,92 @@ def _mj_content_type_extension(content_type: Optional[str]) -> Optional[str]:
         "image/webp": ".webp",
     }
     return mapping.get(base)
+
+
+def _determine_user_locale(user: Optional[User]) -> str:
+    if user and isinstance(user.language_code, str):
+        lowered = user.language_code.lower()
+        if lowered.startswith("en"):
+            return "en"
+    return "ru"
+
+
+def _normalize_mj_grid(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    task_id = value.get("task_id") or value.get("taskId")
+    urls = value.get("result_urls") or value.get("urls") or value.get("imageUrls")
+    if not isinstance(task_id, str):
+        return None
+    if isinstance(urls, list):
+        normalized_urls = [str(item) for item in urls if isinstance(item, str)]
+    else:
+        normalized_urls = []
+    if not normalized_urls:
+        return None
+    return {"task_id": task_id, "result_urls": normalized_urls}
+
+
+def _store_last_mj_grid(state_dict: Dict[str, Any], user_id: Optional[int], task_id: str, urls: Sequence[str]) -> None:
+    grid = {"task_id": task_id, "result_urls": list(urls)}
+    state_dict["mj_last_grid"] = grid
+    if user_id:
+        try:
+            set_last_mj_grid(int(user_id), task_id, list(urls))
+        except Exception as exc:
+            mj_log.warning("mj.grid.cache_fail | user=%s err=%s", user_id, exc)
+
+
+def _load_last_mj_grid(state_dict: Dict[str, Any], user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    cached = _normalize_mj_grid(state_dict.get("mj_last_grid"))
+    if cached:
+        return cached
+    if user_id is None:
+        return None
+    try:
+        persisted = get_last_mj_grid(int(user_id))
+    except Exception as exc:
+        mj_log.warning("mj.grid.cache_fetch_fail | user=%s err=%s", user_id, exc)
+        persisted = None
+    normalized = _normalize_mj_grid(persisted)
+    if normalized:
+        state_dict["mj_last_grid"] = normalized
+    return normalized
+
+
+def _mj_upscale_keyboard(count: int, locale: str, *, include_repeat: bool = False) -> InlineKeyboardMarkup:
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for idx in range(count):
+        row.append(InlineKeyboardButton(f"U{idx + 1}", callback_data=f"mj_upscale:select:{idx}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    if include_repeat:
+        buttons.append([InlineKeyboardButton(_mj_ui_text("upscale_repeat", locale), callback_data="mj_upscale:repeat")])
+    buttons.append([InlineKeyboardButton(_mj_ui_text("back", locale), callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _guess_aspect_ratio_from_size(width: Optional[int], height: Optional[int]) -> str:
+    if not width or not height or width <= 0 or height <= 0:
+        return "1:1"
+    ratio = width / height
+    candidates = [
+        ("1:1", 1.0),
+        ("16:9", 16 / 9),
+        ("9:16", 9 / 16),
+        ("3:2", 3 / 2),
+        ("2:3", 2 / 3),
+        ("4:5", 4 / 5),
+        ("5:4", 5 / 4),
+        ("7:4", 7 / 4),
+        ("4:7", 4 / 7),
+    ]
+    best = min(candidates, key=lambda item: abs(item[1] - ratio))
+    return best[0]
 
 
 def _mj_guess_filename(url: str, index: int, content_type: Optional[str]) -> str:
@@ -3163,6 +3295,8 @@ DEFAULT_STATE = {
     "mj_last_wait_ts": 0.0,
     "mj_generating": False, "last_mj_task_id": None,
     "mj_locale": None,
+    "mj_last_grid": None,
+    "mj_upscale_active": None,
     "active_generation_op": None,
     "mj_active_op_key": None,
     "banana_active_op_key": None,
@@ -4470,6 +4604,10 @@ def image_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             f"🖼️ Генерация изображений (MJ) — 💎 {TOKEN_COSTS['mj']}",
             callback_data="mode:mj_txt",
+        )],
+        [InlineKeyboardButton(
+            f"🪄 Улучшение качества — 💎 {TOKEN_COSTS['mj_upscale']}",
+            callback_data="mode:mj_upscale",
         )],
         [InlineKeyboardButton(
             f"🍌 Редактор изображений (Banana) — 💎 {TOKEN_COSTS['banana']}",
@@ -8260,6 +8398,91 @@ def mj_generate(prompt: str, aspect: str) -> Tuple[bool, Optional[str], str]:
         return False, None, "Ответ MJ без taskId."
     return False, None, _kie_error_message(status, resp)
 
+
+def mj_generate_img2img(
+    file_url: str,
+    *,
+    aspect_ratio: str = "1:1",
+    speed: str = "fast",
+    version: str = "7",
+    enable_translation: bool = False,
+    prompt: str = "",
+) -> Tuple[bool, Optional[str], str]:
+    aspect_value = aspect_ratio if aspect_ratio in {"16:9", "9:16", "3:2", "2:3", "4:5", "5:4", "7:4", "4:7", "1:1"} else "1:1"
+    payload = {
+        "taskType": "mj_img2img",
+        "prompt": prompt,
+        "speed": speed,
+        "aspectRatio": aspect_value,
+        "version": version,
+        "enableTranslation": enable_translation,
+        "fileUrls": [file_url],
+        "input": {
+            "prompt": prompt,
+            "aspectRatio": aspect_value,
+            "fileUrls": [file_url],
+        },
+    }
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "mj",
+        "generate",
+        "POST",
+        KIE_MJ_GENERATE_PATHS,
+        json_payload=payload,
+    )
+    code = _extract_response_code(resp, status)
+    tid = _extract_task_id(resp)
+    kie_event(
+        "MJ_IMG2IMG_SUBMIT",
+        request_id=req_id,
+        status=status,
+        code=code,
+        task_id=tid,
+        aspect=aspect_value,
+        path=path_used,
+    )
+    if status == 200 and code == 200 and tid:
+        return True, tid, "MJ img2img задача создана."
+    return False, None, _kie_error_message(status, resp)
+
+
+def mj_generate_upscale(
+    task_id: str,
+    image_index: int,
+    *,
+    callback_url: Optional[str] = None,
+    watermark: bool = False,
+) -> Tuple[bool, Optional[str], str]:
+    payload: Dict[str, Any] = {
+        "taskId": task_id,
+        "imageIndex": int(image_index),
+        "waterMark": bool(watermark),
+    }
+    if callback_url:
+        payload["callBackUrl"] = callback_url
+    status, resp, req_id, path_used = _kie_request_with_endpoint(
+        "mj",
+        "upscale",
+        "POST",
+        KIE_MJ_UPSCALE_PATHS,
+        json_payload=payload,
+    )
+    code = _extract_response_code(resp, status)
+    tid = _extract_task_id(resp)
+    kie_event(
+        "MJ_UPSCALE_SUBMIT",
+        request_id=req_id,
+        status=status,
+        code=code,
+        task_id=tid,
+        source_task_id=task_id,
+        image_index=image_index,
+        path=path_used,
+    )
+    if status == 200 and code == 200 and tid:
+        return True, tid, "MJ апскейл запущен."
+    return False, None, _kie_error_message(status, resp)
+
 def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
     status, resp, req_id, path_used = _kie_request_with_endpoint(
         "mj",
@@ -8363,6 +8586,488 @@ def _mj_should_retry(msg: Optional[str]) -> bool:
         "504",
     )
     return any(token in m for token in retry_tokens)
+
+
+def _mj_error_message(payload: Optional[Dict[str, Any]]) -> str:
+    if isinstance(payload, dict):
+        for key in ("errorMessage", "error_message", "message", "reason", "statusMsg"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+    return "No response from MidJourney Official Website after multiple attempts."
+
+
+def _make_mj_upscale_filename(task_id: str, index: int) -> str:
+    safe_task = re.sub(r"[^a-zA-Z0-9_-]", "", task_id) or "task"
+    return f"mj_upscaled_{safe_task}_{index}.png"
+
+
+async def _notify_mj_upscale_ready(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    locale: str,
+    count: int,
+) -> None:
+    buttons_hint = " ".join(f"U{i + 1}" for i in range(max(count, 0)))
+    text = _mj_ui_text("upscale_ready", locale)
+    if buttons_hint:
+        text = f"{text} {buttons_hint}"
+    markup = _mj_upscale_keyboard(max(count, 0), locale, include_repeat=True)
+    await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=text,
+        reply_markup=markup,
+    )
+
+
+async def _wait_for_mj_grid_result(
+    task_id: str,
+    *,
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    locale: str,
+    max_wait: int = 12 * 60,
+) -> Tuple[bool, Optional[List[str]], Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    start_ts = time.time()
+    delay = 12
+    while True:
+        ok, flag, data = await asyncio.to_thread(mj_status, task_id)
+        if not ok:
+            return False, None, "status_error", "MJ: сервис недоступен.", None
+        if flag == 0:
+            if time.time() - start_ts > max_wait:
+                return False, None, "timeout", "⌛ MJ долго отвечает.", None
+            await asyncio.sleep(delay)
+            delay = min(delay + 6, 30)
+            continue
+        payload = data if isinstance(data, dict) else {}
+        if flag in (2, 3) or flag is None:
+            return False, None, "error", _mj_error_message(payload), payload
+        if flag == 1:
+            urls = _extract_mj_image_urls(payload)
+            if not urls:
+                single = _extract_result_url(payload)
+                urls = [single] if single else []
+            if not urls:
+                return False, None, "empty", "MJ вернул пустой результат.", payload
+            return True, urls, None, None, payload
+
+
+async def _poll_and_send_upscaled_image(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    upscale_task_id: str,
+    origin_task_id: str,
+    image_index: int,
+    locale: str,
+    result_count: int,
+    source: str,
+) -> Dict[str, Any]:
+    start_ts = time.time()
+    delay = 10
+    max_wait = 10 * 60
+    while True:
+        ok, flag, data = await asyncio.to_thread(mj_status, upscale_task_id)
+        if not ok:
+            return {"ok": False, "reason": "status_error", "message": "MJ: сервис недоступен."}
+        if flag == 0:
+            if time.time() - start_ts > max_wait:
+                return {"ok": False, "reason": "timeout", "message": "⌛ MJ долго отвечает."}
+            await asyncio.sleep(delay)
+            delay = min(delay + 4, 30)
+            continue
+        payload = data if isinstance(data, dict) else {}
+        if flag in (2, 3) or flag is None:
+            return {"ok": False, "reason": "error", "message": _mj_error_message(payload)}
+        if flag == 1:
+            result_url = _extract_result_url(payload)
+            if not result_url:
+                urls = _extract_mj_image_urls(payload)
+                result_url = urls[0] if urls else None
+            if not result_url:
+                return {"ok": False, "reason": "empty", "message": "MJ вернул пустой результат."}
+            download = await asyncio.to_thread(_download_mj_image_bytes, result_url, image_index)
+            if not download:
+                return {"ok": False, "reason": "download_failed", "message": "Не удалось загрузить изображение."}
+            image_bytes, _ = download
+            filename = _make_mj_upscale_filename(origin_task_id, image_index)
+            await send_image_as_document(ctx.bot, chat_id, image_bytes, filename)
+            await _notify_mj_upscale_ready(chat_id, ctx, locale=locale, count=result_count)
+            duration_ms = int((time.time() - start_ts) * 1000)
+            event(
+                "MJ_UPSCALE_RESULT",
+                mode="image_upscale",
+                source=source,
+                task_id=origin_task_id,
+                upscale_task_id=upscale_task_id,
+                image_index=image_index,
+                duration_ms=duration_ms,
+                success=True,
+                user_id=user_id,
+            )
+            return {"ok": True, "duration_ms": duration_ms}
+
+
+async def _launch_mj_upscale(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    grid: Dict[str, Any],
+    image_index: int,
+    locale: str,
+    source: str,
+    charge_tokens: bool = True,
+    already_charged: bool = False,
+    balance_after: Optional[int] = None,
+) -> bool:
+    origin_task_id = grid.get("task_id")
+    result_urls = grid.get("result_urls") or []
+    if not isinstance(origin_task_id, str) or not result_urls:
+        await ctx.bot.send_message(chat_id, _mj_ui_text("upscale_need_photo", locale))
+        return False
+
+    price = PRICE_MJ_UPSCALE
+    charged_here = False
+    charged_total = already_charged
+    lock_acquired = False
+    start_time = time.time()
+
+    def _log_failure(reason: str, message: str) -> None:
+        duration_ms = int((time.time() - start_time) * 1000)
+        event(
+            "MJ_UPSCALE_RESULT",
+            mode="image_upscale",
+            source=source,
+            task_id=origin_task_id,
+            image_index=image_index,
+            duration_ms=duration_ms,
+            success=False,
+            reason=reason,
+            user_id=user_id,
+        )
+
+    try:
+        if not acquire_mj_upscale_lock(user_id, origin_task_id, image_index):
+            text = _mj_ui_text("upscale_in_progress", locale)
+            await ctx.bot.send_message(chat_id, text or "⏳ Уже выполняю апскейл этого кадра.")
+            return False
+        lock_acquired = True
+
+        if charge_tokens:
+            ok, balance_value = debit_try(
+                user_id,
+                price,
+                reason="service:start",
+                meta={
+                    "service": "MJ_UPSCALE",
+                    "task_id": origin_task_id,
+                    "image_index": image_index,
+                    "source": source,
+                },
+            )
+            if not ok:
+                current_balance = (
+                    balance_value
+                    if isinstance(balance_value, int)
+                    else get_balance(user_id)
+                )
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    user_id,
+                    f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
+                    reply_markup=inline_topup_keyboard(),
+                )
+                return False
+            charged_here = True
+            charged_total = True
+            balance_after = balance_value if isinstance(balance_value, int) else None
+            if balance_after is not None:
+                try:
+                    await show_balance_notification(
+                        chat_id,
+                        ctx,
+                        user_id,
+                        f"✅ Списано {price}💎. Баланс: {balance_after}💎 — запускаю апскейл…",
+                    )
+                except Exception:
+                    pass
+
+        processing_text = _mj_ui_text("upscale_processing", locale)
+        if processing_text:
+            try:
+                await ctx.bot.send_message(chat_id, processing_text)
+            except Exception:
+                pass
+
+        ok_submit, new_task_id, submit_msg = await asyncio.to_thread(
+            mj_generate_upscale,
+            origin_task_id,
+            image_index,
+        )
+        if not ok_submit or not new_task_id:
+            new_balance: Optional[int] = None
+            if charged_total:
+                try:
+                    new_balance = credit_balance(
+                        user_id,
+                        price,
+                        reason="service:refund",
+                        meta={
+                            "service": "MJ_UPSCALE",
+                            "task_id": origin_task_id,
+                            "image_index": image_index,
+                            "reason": "submit_failed",
+                        },
+                    )
+                except Exception as exc:
+                    log.exception("MJ upscale submit refund failed for %s: %s", user_id, exc)
+            err_text = f"❌ MJ: {submit_msg or 'Не удалось запустить апскейл.'}"
+            try:
+                await ctx.bot.send_message(chat_id, err_text)
+            except Exception:
+                pass
+            if new_balance is not None:
+                try:
+                    await show_balance_notification(
+                        chat_id,
+                        ctx,
+                        user_id,
+                        f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                    )
+                except Exception:
+                    pass
+            _log_failure("submit_failed", submit_msg or "submit_failed")
+            return False
+
+        s = state(ctx)
+        s["mj_upscale_active"] = {
+            "task_id": new_task_id,
+            "origin_task_id": origin_task_id,
+            "index": image_index,
+        }
+
+        result = await _poll_and_send_upscaled_image(
+            chat_id,
+            ctx,
+            user_id=user_id,
+            upscale_task_id=new_task_id,
+            origin_task_id=origin_task_id,
+            image_index=image_index,
+            locale=locale,
+            result_count=len(result_urls),
+            source=source,
+        )
+        if result.get("ok"):
+            return True
+
+        reason = str(result.get("reason") or "error")
+        message = str(result.get("message") or "MJ апскейл не удался.")
+        new_balance = None
+        if charged_total:
+            try:
+                new_balance = credit_balance(
+                    user_id,
+                    price,
+                    reason="service:refund",
+                    meta={
+                        "service": "MJ_UPSCALE",
+                        "task_id": origin_task_id,
+                        "image_index": image_index,
+                        "reason": reason,
+                    },
+                )
+            except Exception as exc:
+                log.exception("MJ upscale refund failed for %s: %s", user_id, exc)
+        text = f"❌ MJ: {message}"
+        if new_balance is not None:
+            text += "\n💎 Токены возвращены."
+        try:
+            await ctx.bot.send_message(chat_id, text)
+        except Exception:
+            pass
+        if new_balance is not None:
+            try:
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    user_id,
+                    f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                )
+            except Exception:
+                pass
+        _log_failure(reason, message)
+        return False
+    finally:
+        if lock_acquired:
+            release_mj_upscale_lock(user_id, origin_task_id, image_index)
+        current_state = state(ctx)
+        current_state["mj_upscale_active"] = None
+
+
+async def _handle_mj_upscale_input(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    file_url: str,
+    *,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    source: str,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if message is None or chat is None or user is None:
+        return
+
+    chat_id = chat.id
+    user_id = user.id
+    locale = state(ctx).get("mj_locale") or _determine_user_locale(user)
+    s = state(ctx)
+    s["mj_locale"] = locale
+    aspect_ratio = _guess_aspect_ratio_from_size(width, height)
+    price = PRICE_MJ_UPSCALE
+
+    ok, balance_after = debit_try(
+        user_id,
+        price,
+        reason="service:start",
+        meta={
+            "service": "MJ_UPSCALE",
+            "task_type": "img2img",
+            "source": source,
+            "aspect": aspect_ratio,
+        },
+    )
+    if not ok:
+        current_balance = (
+            balance_after if isinstance(balance_after, int) else get_balance(user_id)
+        )
+        await show_balance_notification(
+            chat_id,
+            ctx,
+            user_id,
+            f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
+            reply_markup=inline_topup_keyboard(),
+        )
+        return
+
+    if isinstance(balance_after, int):
+        try:
+            await show_balance_notification(
+                chat_id,
+                ctx,
+                user_id,
+                f"✅ Списано {price}💎. Баланс: {balance_after}💎 — готовлю апскейл…",
+            )
+        except Exception:
+            pass
+
+    ok_submit, task_id, submit_msg = await asyncio.to_thread(
+        mj_generate_img2img,
+        file_url,
+        aspect_ratio=aspect_ratio,
+        enable_translation=False,
+    )
+    if not ok_submit or not task_id:
+        new_balance = None
+        try:
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta={
+                    "service": "MJ_UPSCALE",
+                    "task_type": "img2img",
+                    "reason": "submit_failed",
+                    "source": source,
+                },
+            )
+        except Exception as exc:
+            log.exception("MJ img2img refund failed for %s: %s", user_id, exc)
+        text = f"❌ MJ: {submit_msg or 'Не удалось запустить img2img.'}"
+        try:
+            await ctx.bot.send_message(chat_id, text)
+        except Exception:
+            pass
+        if new_balance is not None:
+            try:
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    user_id,
+                    f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                )
+            except Exception:
+                pass
+        return
+
+    grid_ok, urls, fail_reason, fail_message, _ = await _wait_for_mj_grid_result(
+        task_id,
+        chat_id=chat_id,
+        ctx=ctx,
+        user_id=user_id,
+        locale=locale,
+    )
+    if not grid_ok or not urls:
+        new_balance = None
+        try:
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta={
+                    "service": "MJ_UPSCALE",
+                    "task_type": "img2img",
+                    "reason": fail_reason or "error",
+                    "source": source,
+                },
+            )
+        except Exception as exc:
+            log.exception("MJ img2img result refund failed for %s: %s", user_id, exc)
+        text = f"❌ MJ: {fail_message or 'Задача не вернула результат.'}"
+        if new_balance is not None:
+            text += "\n💎 Токены возвращены."
+        try:
+            await ctx.bot.send_message(chat_id, text)
+        except Exception:
+            pass
+        if new_balance is not None:
+            try:
+                await show_balance_notification(
+                    chat_id,
+                    ctx,
+                    user_id,
+                    f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                )
+            except Exception:
+                pass
+        return
+
+    _store_last_mj_grid(s, user_id, task_id, urls)
+
+    await _launch_mj_upscale(
+        chat_id,
+        ctx,
+        user_id=user_id,
+        grid={"task_id": task_id, "result_urls": urls},
+        image_index=0,
+        locale=locale,
+        source="from_file",
+        charge_tokens=False,
+        already_charged=True,
+        balance_after=balance_after if isinstance(balance_after, int) else None,
+    )
 
 # ==========================
 #   VEO strict polling utils
@@ -8914,6 +9619,8 @@ async def poll_mj_and_send_photos(
                 base_prompt = re.sub(r"\s+", " ", prompt_for_retry).strip()
                 snippet = base_prompt[:100] if base_prompt else "—"
                 caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
+
+                _store_last_mj_grid(s, user_id, task_id, urls)
 
                 downloaded: List[Tuple[bytes, str]] = []
                 for idx, u in enumerate(urls):
@@ -10201,6 +10908,30 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 source="mode_switch",
             )
             return
+        if selected_mode == "mj_upscale":
+            locale = _determine_user_locale(update.effective_user)
+            s["mode"] = "mj_upscale"
+            s["mj_locale"] = locale
+            s["mj_upscale_active"] = None
+            grid = _load_last_mj_grid(s, uid_val)
+            if grid:
+                await tg_safe_send(
+                    ctx.bot.send_message,
+                    method_name="sendMessage",
+                    kind="message",
+                    chat_id=chat_id_val,
+                    text=_mj_ui_text("upscale_choose", locale),
+                    reply_markup=_mj_upscale_keyboard(len(grid.get("result_urls", [])), locale),
+                )
+            else:
+                await tg_safe_send(
+                    ctx.bot.send_message,
+                    method_name="sendMessage",
+                    kind="message",
+                    chat_id=chat_id_val,
+                    text=_mj_ui_text("upscale_need_photo", locale),
+                )
+            return
         if selected_mode == "banana":
             s["banana_images"] = []
             s["last_prompt"] = None
@@ -10237,6 +10968,73 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         if choice == "banana" and q.message is not None:
             await q.message.reply_text(BANANA_MODE_HINT_MD, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data.startswith("mj_upscale:"):
+        chat = update.effective_chat
+        if not chat:
+            return
+        parts = data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        payload = parts[2] if len(parts) > 2 else ""
+        chat_id = chat.id
+        user_obj = update.effective_user
+        uid_val = user_obj.id if user_obj else None
+        locale = s.get("mj_locale") or _determine_user_locale(user_obj)
+        s["mj_locale"] = locale
+        grid = _load_last_mj_grid(s, uid_val)
+
+        if action == "select":
+            try:
+                index = int(payload)
+            except (TypeError, ValueError):
+                await ctx.bot.send_message(chat_id, _mj_ui_text("upscale_choose", locale))
+                return
+            if uid_val is None:
+                await ctx.bot.send_message(chat_id, "⚠️ Не удалось определить пользователя.")
+                return
+            if not grid or index < 0 or index >= len(grid.get("result_urls", [])):
+                await ctx.bot.send_message(chat_id, _mj_ui_text("upscale_need_photo", locale))
+                return
+            await _launch_mj_upscale(
+                chat_id,
+                ctx,
+                user_id=uid_val,
+                grid=grid,
+                image_index=index,
+                locale=locale,
+                source="from_grid",
+            )
+            return
+
+        if action == "repeat":
+            if grid:
+                await tg_safe_send(
+                    ctx.bot.send_message,
+                    method_name="sendMessage",
+                    kind="message",
+                    chat_id=chat_id,
+                    text=_mj_ui_text("upscale_choose", locale),
+                    reply_markup=_mj_upscale_keyboard(len(grid.get("result_urls", [])), locale),
+                )
+            else:
+                await tg_safe_send(
+                    ctx.bot.send_message,
+                    method_name="sendMessage",
+                    kind="message",
+                    chat_id=chat_id,
+                    text=_mj_ui_text("upscale_need_photo", locale),
+                )
+            return
+
+        await tg_safe_send(
+            ctx.bot.send_message,
+            method_name="sendMessage",
+            kind="message",
+            chat_id=chat_id,
+            text=_mj_ui_text("upscale_choose", locale),
+            reply_markup=_mj_upscale_keyboard(len(grid.get("result_urls", [])) if grid else 4, locale),
+        )
         return
 
     if data.startswith("mj:"):
@@ -11127,6 +11925,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_menu(update, ctx)
         return
 
+    if state_mode == "mj_upscale":
+        locale = s.get("mj_locale") or _determine_user_locale(user)
+        s["mj_locale"] = locale
+        await msg.reply_text(_mj_ui_text("upscale_need_photo", locale))
+        return
+
     if state_mode == "promo":
         if not PROMO_ENABLED:
             await msg.reply_text("🎟️ Промокоды временно отключены.")
@@ -11368,6 +12172,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not file.file_path:
             await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram."); return
         url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)
+        if s.get("mode") == "mj_upscale":
+            width = getattr(ph, "width", None)
+            height = getattr(ph, "height", None)
+            await _handle_mj_upscale_input(
+                update,
+                ctx,
+                url,
+                width=width,
+                height=height,
+                source="photo",
+            )
+            return
         if s.get("mode") == "banana":
             if len(s["banana_images"]) >= 4:
                 await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
@@ -11385,6 +12201,48 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Get photo failed: %s", e)
     await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    if message is None:
+        return
+    doc = message.document
+    if doc is None:
+        return
+
+    s = state(ctx)
+    if s.get("mode") != "mj_upscale":
+        return
+
+    mime_type = getattr(doc, "mime_type", "") or ""
+    if mime_type and not mime_type.lower().startswith("image/"):
+        await message.reply_text("⚠️ Пришлите изображение файлом (без сжатия).")
+        return
+
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+    except Exception as exc:
+        log.exception("Get document failed: %s", exc)
+        await message.reply_text("⚠️ Не удалось получить файл. Попробуйте снова.")
+        return
+
+    if not getattr(file, "file_path", None):
+        await message.reply_text("⚠️ Не удалось получить путь к файлу Telegram.")
+        return
+
+    url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)
+    width = getattr(doc, "width", None)
+    height = getattr(doc, "height", None)
+    await _handle_mj_upscale_input(
+        update,
+        ctx,
+        url,
+        width=width,
+        height=height,
+        source="document",
+    )
 
 # --- Voice handling -----------------------------------------------------
 
@@ -12338,6 +13196,7 @@ def register_handlers(application: Any) -> None:
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, on_document))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
     for text, handler in REPLY_BUTTON_ROUTES:

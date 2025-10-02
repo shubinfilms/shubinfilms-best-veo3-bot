@@ -71,6 +71,10 @@ _ref_users_memory: Dict[int, set[int]] = {}
 _ref_earned_memory: Dict[int, int] = {}
 _ref_joined_memory: Dict[int, float] = {}
 
+_MJ_LAST_KEY_TMPL = f"{_PFX}:mj:last:{{}}"
+_MJ_LOCK_KEY_TMPL = f"{_PFX}:mj:lock:{{}}"
+_MJ_LOCK_TTL = 15 * 60
+
 if not _redis_url:
     _logger.warning(
         "REDIS_URL is not configured; falling back to in-memory task-meta store"
@@ -107,6 +111,103 @@ def _memory_get(key: str) -> Optional[str]:
 def _memory_delete(key: str) -> None:
     with _memory_lock:
         _memory_store.pop(key, None)
+
+
+def _memory_set_if_absent(key: str, value: str, ttl: int) -> bool:
+    now = time.time()
+    expires_at = now + max(ttl, 1)
+    with _memory_lock:
+        entry = _memory_store.get(key)
+        if entry:
+            expires, _ = entry
+            if expires > now:
+                return False
+        _memory_store[key] = (expires_at, value)
+        return True
+
+
+def _mj_last_key(user_id: int) -> str:
+    return _MJ_LAST_KEY_TMPL.format(int(user_id))
+
+
+def _mj_lock_key(user_id: int, task_id: str, index: int) -> str:
+    return _MJ_LOCK_KEY_TMPL.format(f"{int(user_id)}:{task_id}:{int(index)}")
+
+
+def set_last_mj_grid(user_id: int, task_id: str, result_urls: List[str]) -> None:
+    doc = {
+        "task_id": str(task_id),
+        "result_urls": [str(url) for url in result_urls if isinstance(url, str)],
+        "created_at": _now_iso(),
+    }
+    payload = json.dumps(doc, ensure_ascii=False)
+    key = _mj_last_key(user_id)
+    if _r:
+        _r.setex(key, _TTL, payload)
+    else:
+        _memory_set(key, payload)
+
+
+def get_last_mj_grid(user_id: int) -> Optional[Dict[str, Any]]:
+    key = _mj_last_key(user_id)
+    raw: Optional[str]
+    if _r:
+        redis_raw = _r.get(key)
+        if redis_raw is None:
+            raw = None
+        elif isinstance(redis_raw, bytes):
+            raw = redis_raw.decode("utf-8", "ignore")
+        else:
+            raw = str(redis_raw)
+    else:
+        raw = _memory_get(key)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        _logger.warning("Failed to decode mj grid cache for user %s", user_id)
+        return None
+    if not isinstance(data, dict):
+        return None
+    task_id = data.get("task_id")
+    urls = data.get("result_urls")
+    if not isinstance(task_id, str) or not isinstance(urls, list):
+        return None
+    normalized_urls = [str(url) for url in urls if isinstance(url, str)]
+    if not normalized_urls:
+        return None
+    return {"task_id": task_id, "result_urls": normalized_urls}
+
+
+def clear_last_mj_grid(user_id: int) -> None:
+    key = _mj_last_key(user_id)
+    if _r:
+        _r.delete(key)
+    else:
+        _memory_delete(key)
+
+
+def acquire_mj_upscale_lock(user_id: int, task_id: str, index: int, ttl: int = _MJ_LOCK_TTL) -> bool:
+    key = _mj_lock_key(user_id, task_id, index)
+    if _r:
+        try:
+            return bool(_r.set(key, "1", nx=True, ex=max(ttl, 1)))
+        except Exception as exc:
+            _logger.warning("mj_upscale_lock.redis_error | key=%s err=%s", key, exc)
+            return False
+    return _memory_set_if_absent(key, "1", ttl)
+
+
+def release_mj_upscale_lock(user_id: int, task_id: str, index: int) -> None:
+    key = _mj_lock_key(user_id, task_id, index)
+    if _r:
+        try:
+            _r.delete(key)
+        except Exception as exc:
+            _logger.warning("mj_upscale_lock.release_error | key=%s err=%s", key, exc)
+    else:
+        _memory_delete(key)
 
 
 def save_task_meta(
@@ -626,3 +727,7 @@ def credit_balance(
         meta=meta,
         write_ledger=write_ledger,
     )
+_MJ_LAST_KEY_TMPL = f"{_PFX}:mj:last:{{}}"
+_MJ_LOCK_KEY_TMPL = f"{_PFX}:mj:lock:{{}}"
+_MJ_LOCK_TTL = 15 * 60
+
