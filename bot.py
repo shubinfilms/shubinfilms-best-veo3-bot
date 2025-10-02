@@ -22,7 +22,7 @@ import atexit
 from pathlib import Path
 # main
 from collections.abc import Mapping
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping, Sequence
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping, Sequence, Mapping
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode
@@ -189,6 +189,9 @@ from redis_utils import (
     clear_last_mj_grid,
     acquire_mj_upscale_lock,
     release_mj_upscale_lock,
+    cache_get,
+    cache_set,
+    acquire_ttl_lock,
 )
 
 from ledger import (
@@ -277,6 +280,8 @@ from telegram_utils import (
     md2_escape,
     mask_tokens,
     send_image_as_document,
+    download_image_from_update,
+    TelegramImageError,
 )
 from utils.api_client import request_with_retries
 from utils.safe_send import safe_delete_message
@@ -4280,6 +4285,10 @@ BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
 VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
+_VIDEO_MENU_LOCK_TTL = 3
+_VIDEO_MENU_CACHE_TTL = 3 * 24 * 60 * 60
+_VIDEO_MENU_LOCK_KEY_TMPL = "lock:video_menu:{chat_id}"
+_VIDEO_MENU_LAST_KEY_TMPL = "video_menu:last_menu_msg_id:{chat_id}"
 
 def _safe_get_balance(user_id: int) -> int:
     try:
@@ -4440,7 +4449,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s["mode"] = None
         await query.answer()
         try:
-            await _send_video_menu(ctx, chat_id=chat_id)
+            await show_video_menu(ctx, chat_id=chat_id)
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.video_send_failed | chat=%s err=%s", chat_id, exc)
         return
@@ -4564,39 +4573,100 @@ def video_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-async def _send_video_menu(
+async def _send_video_menu_message(
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
     chat_id: Optional[int] = None,
     message: Optional[Message] = None,
-) -> None:
+) -> Optional[int]:
     target_chat = chat_id or (getattr(message, "chat_id", None))
-    log.debug("video.menu.render", extra={"chat_id": target_chat})
+    markup = video_menu_kb()
     if message is not None:
         reply_method = getattr(message, "reply_text", None)
         if callable(reply_method):
-            await reply_method(VIDEO_MENU_TEXT, reply_markup=video_menu_kb())
-            return
-        if target_chat is not None:
-            await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
-                chat_id=target_chat,
-                text=VIDEO_MENU_TEXT,
-                reply_markup=video_menu_kb(),
-            )
-        return
+            try:
+                sent = await reply_method(VIDEO_MENU_TEXT, reply_markup=markup)
+                return getattr(sent, "message_id", None)
+            except Exception as exc:
+                log.warning(
+                    "video.menu.reply_failed",
+                    extra={"chat_id": target_chat, "error": str(exc)},
+                )
+        if target_chat is None:
+            return None
     if target_chat is None:
-        return
-    await tg_safe_send(
+        return None
+    result = await tg_safe_send(
         ctx.bot.send_message,
         method_name="sendMessage",
         kind="message",
         chat_id=target_chat,
         text=VIDEO_MENU_TEXT,
-        reply_markup=video_menu_kb(),
+        reply_markup=markup,
     )
+    if result is None:
+        return None
+    return getattr(result, "message_id", None)
+
+
+async def show_video_menu(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int] = None,
+    message: Optional[Message] = None,
+    force: bool = False,
+) -> Optional[int]:
+    target_chat = chat_id or (getattr(message, "chat_id", None))
+    if target_chat is None:
+        return None
+    lock_key = _VIDEO_MENU_LOCK_KEY_TMPL.format(chat_id=target_chat)
+    if not force and not acquire_ttl_lock(lock_key, _VIDEO_MENU_LOCK_TTL):
+        log.debug("video.menu.lock_active", extra={"chat_id": target_chat})
+        return None
+    if force:
+        acquire_ttl_lock(lock_key, _VIDEO_MENU_LOCK_TTL)
+
+    last_key = _VIDEO_MENU_LAST_KEY_TMPL.format(chat_id=target_chat)
+    log.debug("video.menu.show", extra={"chat_id": target_chat})
+    last_id_raw = cache_get(last_key)
+    last_msg_id: Optional[int] = None
+    if last_id_raw:
+        try:
+            last_msg_id = int(last_id_raw)
+        except (TypeError, ValueError):
+            last_msg_id = None
+
+    if last_msg_id is not None:
+        try:
+            await safe_edit_message(
+                ctx,
+                chat_id=target_chat,
+                message_id=last_msg_id,
+                new_text=VIDEO_MENU_TEXT,
+                reply_markup=video_menu_kb(),
+            )
+            cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
+            return last_msg_id
+        except BadRequest as exc:
+            lowered = str(exc).lower()
+            if "message is not modified" in lowered:
+                cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
+                log.debug("video.menu.not_modified", extra={"chat_id": target_chat})
+                return last_msg_id
+            log.debug(
+                "video.menu.edit_bad_request",
+                extra={"chat_id": target_chat, "error": str(exc)},
+            )
+        except TelegramError as exc:
+            log.debug(
+                "video.menu.edit_failed",
+                extra={"chat_id": target_chat, "error": str(exc)},
+            )
+
+    message_id = await _send_video_menu_message(ctx, chat_id=target_chat, message=message)
+    if message_id is not None:
+        cache_set(last_key, str(message_id), _VIDEO_MENU_CACHE_TTL)
+    return message_id
 
 
 def image_menu_kb() -> InlineKeyboardMarkup:
@@ -9940,9 +10010,9 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s.pop("model", None)
     message = update.effective_message
     if message is not None:
-        await _send_video_menu(ctx, message=message)
+        await show_video_menu(ctx, message=message)
     else:
-        await _send_video_menu(ctx, chat_id=chat.id)
+        await show_video_menu(ctx, chat_id=chat.id)
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -10090,7 +10160,7 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         "video.menu.reply",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    await _send_video_menu(ctx, message=message)
+    await show_video_menu(ctx, message=message)
 
 
 async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10110,6 +10180,11 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     user = getattr(query, "from_user", None) or update.effective_user
     user_id = user.id if user else None
 
+    try:
+        await query.answer()
+    except Exception as exc:
+        log.debug("video.menu.answer_fail", extra={"chat_id": chat_id, "error": str(exc)})
+
     log.debug(
         "video.callback",
         extra={"chat_id": chat_id, "user_id": user_id, "data": data},
@@ -10123,7 +10198,6 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     s["mode"] = None
 
     if data == CB_VIDEO_BACK:
-        await query.answer()
         target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
         if target_chat is not None:
             await show_emoji_hub_for_chat(
@@ -10135,13 +10209,12 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == CB_VIDEO_MENU:
-        await query.answer()
         if chat_id is None:
             return
-        await _send_video_menu(ctx, chat_id=chat_id)
+        await show_video_menu(ctx, chat_id=chat_id)
         return
 
-    await query.answer()
+    return
 
 async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await image_command(update, ctx)
@@ -10531,9 +10604,76 @@ async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_ne
     s["_last_text_banana"] = None
     await show_banana_card(chat_id, ctx, force_new=force_new)
 
-async def on_banana_photo_received(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+def _coerce_optional_str(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _normalize_banana_image(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, Mapping):
+        file_path = _coerce_optional_str(value.get("file_path"))
+        url = _coerce_optional_str(value.get("url"))
+        if not url and file_path:
+            url = tg_direct_file_url(TELEGRAM_TOKEN, file_path)
+        if not url:
+            return None
+        return {
+            "url": url,
+            "file_path": file_path,
+            "filename": _coerce_optional_str(value.get("filename")),
+            "mime": _coerce_optional_str(value.get("mime")),
+            "source": _coerce_optional_str(value.get("source")) or "photo",
+            "width": value.get("width"),
+            "height": value.get("height"),
+        }
+    if isinstance(value, str):
+        url = value.strip()
+        if not url:
+            return None
+        return {
+            "url": url,
+            "file_path": None,
+            "filename": None,
+            "mime": None,
+            "source": "external",
+            "width": None,
+            "height": None,
+        }
+    return None
+
+
+def _get_banana_images(state_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    images = state_dict.get("banana_images")
+    if not isinstance(images, list):
+        images = []
+        state_dict["banana_images"] = images
+        return images
+    normalized: List[Dict[str, Any]] = []
+    changed = False
+    for item in images:
+        entry = _normalize_banana_image(item)
+        if entry is None:
+            changed = True
+            continue
+        normalized.append(entry)
+        if entry is not item:
+            changed = True
+    if changed:
+        state_dict["banana_images"] = normalized
+        return normalized
+    return images
+
+
+async def on_banana_photo_received(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, file_id: Any) -> None:
     s = state(ctx)
-    s.setdefault("banana_images", []).append(file_id)
+    images = _get_banana_images(s)
+    entry = _normalize_banana_image(file_id)
+    if entry is None:
+        return
+    images.append(entry)
     s["_last_text_banana"] = None
     await show_banana_card(chat_id, ctx)
 
@@ -11261,7 +11401,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show_image_engine_selector(chat_id_val, ctx, force_new=True)
             return
         if act == "start":
-            imgs = s.get("banana_images") or []
+            imgs = list(_get_banana_images(s))
             prompt = (s.get("last_prompt") or "").strip()
             if not imgs:
                 await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото.")
@@ -11979,7 +12119,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         low.split("?")[0].endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".heic")
     ):
         if state_mode == "banana":
-            if len(s["banana_images"]) >= 4:
+            if len(_get_banana_images(s)) >= 4:
                 await msg.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
                 return
             await on_banana_photo_received(chat_id, ctx, text.strip())
@@ -12061,12 +12201,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _banana_run_and_send(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
-    src_urls: List[str],
+    src_images: Sequence[Any],
     prompt: str,
     price: int,
     user_id: int,
 ) -> None:
     s = state(ctx)
+    url_sources = [_normalize_banana_image(item) for item in src_images]
+    normalized = [entry for entry in url_sources if entry]
+    src_urls = [entry["url"] for entry in normalized if entry.get("url")]
     task_info: Dict[str, Optional[str]] = {"id": None}
 
     async def _refund(reason_tag: str, message: Optional[str] = None) -> Optional[int]:
@@ -12163,44 +12306,78 @@ async def _banana_run_and_send(
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
+    message = update.effective_message
+    if message is None:
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
     s = state(ctx)
-    photos = update.message.photo
-    if not photos: return
-    ph = photos[-1]
+
     try:
-        file = await ctx.bot.get_file(ph.file_id)
-        if not file.file_path:
-            await update.message.reply_text("⚠️ Не удалось получить путь к файлу Telegram."); return
-        url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)
-        if s.get("mode") == "mj_upscale":
-            width = getattr(ph, "width", None)
-            height = getattr(ph, "height", None)
-            await _handle_mj_upscale_input(
-                update,
-                ctx,
-                url,
-                width=width,
-                height=height,
-                source="photo",
-            )
+        image = await download_image_from_update(update, ctx.bot)
+    except TelegramImageError as exc:
+        if exc.reason == "too_large":
+            await message.reply_text("Файл слишком большой (лимит 20 MB).")
             return
-        if s.get("mode") == "banana":
-            if len(s["banana_images"]) >= 4:
-                await update.message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb()); return
-            cap = (update.message.caption or "").strip()
-            if cap:
-                s["last_prompt"] = cap
-                s["_last_text_banana"] = None
-            await on_banana_photo_received(update.effective_chat.id, ctx, url)
-            await update.message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
+        await message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+        return
+    except Exception as exc:
+        log.exception("Get photo failed: %s", exc)
+        await message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+        return
+
+    if not image.file_path:
+        await message.reply_text("⚠️ Не удалось получить путь к файлу Telegram.")
+        return
+
+    url = tg_direct_file_url(TELEGRAM_TOKEN, image.file_path)
+
+    if s.get("mode") == "mj_upscale":
+        await _handle_mj_upscale_input(
+            update,
+            ctx,
+            url,
+            width=image.width,
+            height=image.height,
+            source=image.source,
+        )
+        return
+
+    if s.get("mode") == "banana":
+        images = _get_banana_images(s)
+        if len(images) >= 4:
+            await message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
             return
-        s["last_image_url"] = url
-        await update.message.reply_text("🖼️ Фото принято как референс.")
-        if s.get("mode") in ("veo_text_fast","veo_text_quality","veo_photo"):
-            await show_veo_card(update.effective_chat.id, ctx)
-    except Exception as e:
-        log.exception("Get photo failed: %s", e)
-    await update.message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+        caption = (message.caption or "").strip()
+        if caption:
+            s["last_prompt"] = caption
+            s["_last_text_banana"] = None
+        payload = {
+            "url": url,
+            "file_path": image.file_path,
+            "filename": image.filename,
+            "mime": image.mime_type,
+            "source": image.source,
+            "width": image.width,
+            "height": image.height,
+        }
+        entry = _normalize_banana_image(payload)
+        if entry is None:
+            await message.reply_text("⚠️ Не удалось обработать фото. Пришлите публичный URL картинки текстом.")
+            return
+        if chat_id is not None:
+            await on_banana_photo_received(chat_id, ctx, entry)
+        else:
+            images.append(entry)
+            s["_last_text_banana"] = None
+        await message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
+        return
+
+    s["last_image_url"] = url
+    await message.reply_text("🖼️ Фото принято как референс.")
+    if chat_id is not None and s.get("mode") in ("veo_text_fast", "veo_text_quality", "veo_photo"):
+        await show_veo_card(chat_id, ctx)
 
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12213,35 +12390,70 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     s = state(ctx)
-    if s.get("mode") != "mj_upscale":
-        return
-
-    mime_type = getattr(doc, "mime_type", "") or ""
-    if mime_type and not mime_type.lower().startswith("image/"):
-        await message.reply_text("⚠️ Пришлите изображение файлом (без сжатия).")
-        return
-
     try:
-        file = await ctx.bot.get_file(doc.file_id)
+        image = await download_image_from_update(update, ctx.bot)
+    except TelegramImageError as exc:
+        if exc.reason == "invalid_type":
+            await message.reply_text("Нужно прислать изображение (PNG/JPG/WEBP) как файл-документ.")
+            return
+        if exc.reason == "too_large":
+            await message.reply_text("Файл слишком большой (лимит 20 MB).")
+            return
+        await message.reply_text("⚠️ Не удалось получить файл. Попробуйте снова.")
+        return
     except Exception as exc:
         log.exception("Get document failed: %s", exc)
         await message.reply_text("⚠️ Не удалось получить файл. Попробуйте снова.")
         return
 
-    if not getattr(file, "file_path", None):
+    if not image.file_path:
         await message.reply_text("⚠️ Не удалось получить путь к файлу Telegram.")
         return
 
-    url = tg_direct_file_url(TELEGRAM_TOKEN, file.file_path)
-    width = getattr(doc, "width", None)
-    height = getattr(doc, "height", None)
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    url = tg_direct_file_url(TELEGRAM_TOKEN, image.file_path)
+
+    if s.get("mode") == "banana":
+        images = _get_banana_images(s)
+        if len(images) >= 4:
+            await message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
+            return
+        caption = (message.caption or "").strip()
+        if caption:
+            s["last_prompt"] = caption
+            s["_last_text_banana"] = None
+        payload = {
+            "url": url,
+            "file_path": image.file_path,
+            "filename": image.filename,
+            "mime": image.mime_type,
+            "source": image.source,
+            "width": image.width,
+            "height": image.height,
+        }
+        entry = _normalize_banana_image(payload)
+        if entry is None:
+            await message.reply_text("⚠️ Не удалось получить файл. Попробуйте снова.")
+            return
+        if chat_id is not None:
+            await on_banana_photo_received(chat_id, ctx, entry)
+        else:
+            images.append(entry)
+            s["_last_text_banana"] = None
+        await message.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
+        return
+
+    if s.get("mode") != "mj_upscale":
+        return
+
     await _handle_mj_upscale_input(
         update,
         ctx,
         url,
-        width=width,
-        height=height,
-        source="document",
+        width=image.width,
+        height=image.height,
+        source=image.source,
     )
 
 # --- Voice handling -----------------------------------------------------
@@ -13173,7 +13385,18 @@ LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Aw
 }
 
 
+_REGISTERED_APPS: set[int] = set()
+
+
 def register_handlers(application: Any) -> None:
+    app_id = id(application)
+    if getattr(application, "_bestveo_handlers_registered", False) or app_id in _REGISTERED_APPS:
+        log.warning("handlers.duplicate_registration", extra={"application": app_id})
+        return
+
+    application._bestveo_handlers_registered = True
+    _REGISTERED_APPS.add(app_id)
+
     card_input_handler = MessageHandler(
         filters.TEXT,
         handle_card_input,

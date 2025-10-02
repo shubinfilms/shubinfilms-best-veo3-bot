@@ -412,6 +412,9 @@ def test_video_button_opens_mode_selector() -> None:
     original_clear_wait = bot_module.clear_wait
     original_input_clear = bot_module.input_state.clear
     original_video_menu_kb = bot_module.video_menu_kb
+    original_lock = bot_module.acquire_ttl_lock
+    original_cache_get = bot_module.cache_get
+    original_cache_set = bot_module.cache_set
 
     try:
         bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
@@ -419,6 +422,9 @@ def test_video_button_opens_mode_selector() -> None:
         bot_module.clear_wait = fake_clear_wait  # type: ignore[assignment]
         bot_module.input_state.clear = fake_input_clear  # type: ignore[assignment]
         bot_module.video_menu_kb = fake_video_menu_kb  # type: ignore[assignment]
+        bot_module.acquire_ttl_lock = lambda *args, **kwargs: True  # type: ignore[assignment]
+        bot_module.cache_get = lambda name: None  # type: ignore[assignment]
+        bot_module.cache_set = lambda name, value, ttl: None  # type: ignore[assignment]
 
         for sample in ("🎬 Генерация видео", "ГЕНЕРАЦИЯ ВИДЕО"):
             message = DummyMessage(chat_id=303, text=sample)
@@ -437,6 +443,9 @@ def test_video_button_opens_mode_selector() -> None:
         bot_module.clear_wait = original_clear_wait  # type: ignore[assignment]
         bot_module.input_state.clear = original_input_clear  # type: ignore[assignment]
         bot_module.video_menu_kb = original_video_menu_kb  # type: ignore[assignment]
+        bot_module.acquire_ttl_lock = original_lock  # type: ignore[assignment]
+        bot_module.cache_get = original_cache_get  # type: ignore[assignment]
+        bot_module.cache_set = original_cache_set  # type: ignore[assignment]
 
     assert replies == [
         "🎬 Выберите тип генерации видео:",
