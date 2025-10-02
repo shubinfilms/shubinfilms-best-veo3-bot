@@ -293,7 +293,7 @@ from telegram_utils import (
     safe_send as tg_safe_send,
     safe_edit,
     safe_edit_text,
-    safe_send_text,
+    safe_send_text as legacy_safe_send_text,
     safe_send_placeholder,
     safe_edit_markdown_v2,
     safe_send_sticker,
@@ -305,7 +305,7 @@ from telegram_utils import (
 )
 from utils.api_client import request_with_retries
 from utils.safe_send import safe_delete_message
-from utils.telegram_safe import safe_edit_message
+from utils.telegram_safe import safe_edit_message, safe_send_text as safe_send_text_logged
 from voice_service import VoiceTranscribeError, transcribe as voice_transcribe
 try:
     import redis.asyncio as redis_asyncio  # type: ignore
@@ -1053,7 +1053,7 @@ async def _notify_safe_handler_error(
     if bot is None:
         return
     with suppress(Exception):
-        await safe_send_text(bot, target_id, error_text, parse_mode=None)
+        await legacy_safe_send_text(bot, target_id, error_text, parse_mode=None)
 
 
 async def _handle_safe_handler_exception(
@@ -2356,7 +2356,7 @@ async def chat_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_mode(user.id, True)
     _mode_set(chat.id, MODE_CHAT)
     try:
-        await safe_send_text(
+        await legacy_safe_send_text(
             ctx.bot,
             chat.id,
             md2_escape(
@@ -2378,7 +2378,7 @@ async def chat_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_mode(user.id, True)
     _mode_set(chat.id, MODE_CHAT)
     try:
-        await safe_send_text(ctx.bot, chat.id, md2_escape("🧹 Контекст очищен."))
+        await legacy_safe_send_text(ctx.bot, chat.id, md2_escape("🧹 Контекст очищен."))
     except Exception as exc:
         log.warning("chat.reset_notify_failed | chat=%s err=%s", chat.id, exc)
 
@@ -2407,7 +2407,7 @@ async def chat_history_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         body = "_пусто_"
     header = "*История \\(последние 5\\):*"
     try:
-        await safe_send_text(ctx.bot, chat.id, f"{header}\n{body}")
+        await legacy_safe_send_text(ctx.bot, chat.id, f"{header}\n{body}")
     except Exception as exc:
         log.warning("chat.history_send_failed | chat=%s err=%s", chat.id, exc)
 
@@ -3736,16 +3736,21 @@ async def send_main_menu(target: Any, ctx: ContextTypes.DEFAULT_TYPE) -> Optiona
             log.warning("main_menu.query_edit_failed | chat=%s err=%s", chat_id, exc)
 
     try:
-        return await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
+        result = await safe_send_text_logged(
+            update if update is not None else target,
+            ctx,
+            text,
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except Exception as exc:  # pragma: no cover - network issues
+    except Exception as exc:  # pragma: no cover - unexpected errors
         log.warning("main_menu.send_failed | chat=%s err=%s", chat_id, exc)
         return None
+
+    if result.ok and result.message is not None:
+        return result.message
+    return None
 
 
 async def render_main_menu(
@@ -3817,10 +3822,22 @@ async def _render_card(
             log.warning("card.edit_failed | chat=%s err=%s", chat_id, exc)
 
     try:
-        return await send_html(chat_id, text, reply_markup=keyboard, bot=ctx.bot)
-    except Exception as exc:  # pragma: no cover - network issues
+        update_like = SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id))
+        result = await safe_send_text_logged(
+            update_like,
+            ctx,
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:  # pragma: no cover - unexpected errors
         log.warning("card.send_failed | chat=%s err=%s", chat_id, exc)
         return None
+
+    if result.ok:
+        return result.message
+    return None
 
 
 def _video_card_text() -> str:
@@ -4162,7 +4179,7 @@ async def maybe_send_chat_hint(
     if state_dict.get("chat_hint_sent"):
         return
     try:
-        await safe_send_text(ctx.bot, chat_id, md2_escape(_CHAT_HINT_TEXT))
+        await legacy_safe_send_text(ctx.bot, chat_id, md2_escape(_CHAT_HINT_TEXT))
     except Exception as exc:
         log.warning("chat.hint_failed | chat=%s err=%s", chat_id, exc)
         return
@@ -4237,13 +4254,13 @@ async def _handle_chat_message(
     inline_keyboard: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     if not text:
-        await safe_send_text(ctx.bot, chat_id, md2_escape("⚠️ Отправьте сообщение."))
+        await legacy_safe_send_text(ctx.bot, chat_id, md2_escape("⚠️ Отправьте сообщение."))
         return
 
     if rate_limit_hit(user_id):
         chat_messages_total.labels(outcome="rate_limited").inc()
         try:
-            await safe_send_text(
+            await legacy_safe_send_text(
                 ctx.bot,
                 chat_id,
                 md2_escape("⏳ Слишком быстро. Подождите секунду и повторите."),
@@ -4255,7 +4272,7 @@ async def _handle_chat_message(
     if len(raw_text) > INPUT_MAX_CHARS:
         chat_messages_total.labels(outcome="too_long").inc()
         try:
-            await safe_send_text(
+            await legacy_safe_send_text(
                 ctx.bot,
                 chat_id,
                 md2_escape(
@@ -4328,7 +4345,7 @@ async def _handle_chat_message(
             )
         if not handled:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, error_payload)
+                await legacy_safe_send_text(ctx.bot, chat_id, error_payload)
         app_logger = getattr(getattr(ctx, "application", None), "logger", log)
         app_logger.exception("chat error", **build_log_extra({"user_id": user_id}))
 async def safe_send(
@@ -10761,16 +10778,19 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await message.reply_text(final_text)
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    log = context.bot_data.get("logger") if isinstance(context.bot_data, MutableMapping) else None
-    if not isinstance(log, logging.Logger):
-        log = logging.getLogger("veo3-bot")
+    err_logger = logging.getLogger("bot.error")
+    err_logger.error("handler.error", exc_info=context.error, extra={"meta": {}})
 
-    error_obj = getattr(context, "error", None)
-    payload: dict[str, Any] = {}
-    if error_obj is not None:
-        payload["error"] = repr(error_obj)
-
-    log.exception("handler.error", **_build_update_extra(update, payload=payload))
+    if isinstance(update, Update):
+        try:
+            await safe_send_text_logged(
+                update,
+                context,
+                "💥 Сбой обработчика. Уже разбираемся.",
+                disable_web_page_preview=True,
+            )
+        except Exception:  # pragma: no cover - fallback logging already handled
+            pass
 
     user_id: Optional[int] = None
     chat_id: Optional[int] = None
@@ -10785,11 +10805,7 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
         _clear_user_wait_states(user_id, reason="error", clear_dialog_registry=True)
 
     notify_targets: List[int] = []
-    if chat_id is not None:
-        notify_targets.append(chat_id)
-    elif user_id is not None:
-        notify_targets.append(user_id)
-    elif ADMIN_IDS:
+    if ADMIN_IDS:
         notify_targets.append(ADMIN_IDS[0])
 
     for target in notify_targets:
@@ -10801,15 +10817,16 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
                 disable_web_page_preview=True,
             )
         except Exception as exc:
-            log.warning(
+            err_logger.warning(
                 "handler.error.notify_failed",
-                **build_log_extra(
-                    {"error": repr(exc), "target": target},
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    command=None,
-                    update_type=type(update).__name__ if update else None,
-                ),
+                extra={
+                    "meta": {
+                        "target": target,
+                        "error": repr(exc),
+                        "ctx_chat_id": chat_id,
+                        "ctx_user_id": user_id,
+                    }
+                },
             )
             continue
         else:
@@ -12490,7 +12507,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if file_size and file_size > VOICE_MAX_SIZE_BYTES:
         payload = md2_escape(VOICE_TOO_LARGE_TEXT)
         try:
-            await safe_send_text(ctx.bot, chat_id, payload)
+            await legacy_safe_send_text(ctx.bot, chat_id, payload)
         except Exception as exc:
             log.warning("chat.voice.too_large_notify_failed | chat=%s err=%s", chat_id, exc)
         chat_voice_total.labels(outcome="too_large", **_VOICE_METRIC_LABELS).inc()
@@ -12502,7 +12519,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if duration and duration > VOICE_MAX_DURATION_SEC:
         payload = md2_escape(VOICE_TOO_LARGE_TEXT)
         try:
-            await safe_send_text(ctx.bot, chat_id, payload)
+            await legacy_safe_send_text(ctx.bot, chat_id, payload)
         except Exception as exc:
             log.warning("chat.voice.too_long_notify_failed | chat=%s err=%s", chat_id, exc)
         chat_voice_total.labels(outcome="too_long", **_VOICE_METRIC_LABELS).inc()
@@ -12566,7 +12583,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
         if not handled:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, err_text)
+                await legacy_safe_send_text(ctx.bot, chat_id, err_text)
         chat_voice_total.labels(outcome="error", **_VOICE_METRIC_LABELS).inc()
         chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
             (time.time() - start_time) * 1000.0
@@ -12594,7 +12611,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
         if not handled:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, err_text)
+                await legacy_safe_send_text(ctx.bot, chat_id, err_text)
         chat_voice_total.labels(outcome="error", **_VOICE_METRIC_LABELS).inc()
         chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
             (time.time() - start_time) * 1000.0
@@ -12647,7 +12664,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning("chat.voice.final_edit_failed | chat=%s err=%s", chat_id, exc)
         if not delivered:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, final_text)
+                await legacy_safe_send_text(ctx.bot, chat_id, final_text)
         chat_voice_total.labels(outcome="ok", **_VOICE_METRIC_LABELS).inc()
         chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
             (time.time() - start_time) * 1000.0
@@ -12668,7 +12685,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning("chat.voice.rate_limit_edit_failed | chat=%s err=%s", chat_id, exc)
         if not handled:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, rate_text)
+                await legacy_safe_send_text(ctx.bot, chat_id, rate_text)
         chat_voice_total.labels(outcome="ok", **_VOICE_METRIC_LABELS).inc()
         chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
             (time.time() - start_time) * 1000.0
@@ -12701,7 +12718,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning("chat.voice.answer_edit_failed | chat=%s err=%s", chat_id, exc)
         if not delivered:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, final_payload)
+                await legacy_safe_send_text(ctx.bot, chat_id, final_payload)
 
         chat_messages_total.labels(outcome="ok").inc()
         chat_latency_ms.observe((time.time() - chat_start) * 1000.0)
@@ -12728,7 +12745,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
         if not handled:
             with suppress(Exception):
-                await safe_send_text(ctx.bot, chat_id, error_payload)
+                await legacy_safe_send_text(ctx.bot, chat_id, error_payload)
 
         chat_voice_total.labels(outcome="error", **_VOICE_METRIC_LABELS).inc()
         chat_voice_latency_ms.labels(**_VOICE_METRIC_LABELS).observe(
@@ -13319,6 +13336,23 @@ COMMAND_CATALOG: List[tuple[str, Dict[str, str]]] = [
 ]
 
 
+COMMAND_FALLBACK_TEXT: dict[str, str] = {
+    "start": "⚠️ Не удалось отправить меню. Попробуй ещё раз через /menu.",
+    "menu": "⚠️ Не удалось показать главное меню. Попробуй позже.",
+    "faq": "⚠️ FAQ временно недоступен. Нажми /menu, чтобы вернуться.",
+    "buy": "⚠️ Раздел оплаты временно недоступен. Попробуй позже.",
+    "music": "⚠️ Раздел музыки временно недоступен. Попробуй позже.",
+    "video": "⚠️ Раздел видео временно недоступен. Попробуй позже.",
+    "image": "⚠️ Раздел изображений временно недоступен. Попробуй позже.",
+    "balance": "⚠️ Баланс временно недоступен. Попробуй позже.",
+    "my_balance": "⚠️ Баланс временно недоступен. Попробуй позже.",
+    "help": "⚠️ Поддержка временно недоступна. Попробуй позже.",
+    "lang": "⚠️ Не удалось открыть смену языка. Попробуй позже.",
+    "support": "⚠️ Поддержка временно недоступна. Попробуй позже.",
+    "prompt_master": "⚠️ Prompt-Master недоступен. Попробуй позже.",
+}
+
+
 async def pre_command_reset(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -13341,6 +13375,9 @@ async def pre_command_reset(
 
     if context is not None:
         setattr(context, "_veo_pre_command_reset", True)
+        chat_data = getattr(context, "chat_data", None)
+        if isinstance(chat_data, MutableMapping):
+            chat_data["_last_command_reply_sent"] = False
 
     if user_id is None and chat_id is None:
         return
@@ -13359,8 +13396,12 @@ async def pre_command_reset(
 
 
 def wrap_cmd(
-    handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]
+    handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]],
+    *,
+    command_name: str,
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]:
+    fallback_text = COMMAND_FALLBACK_TEXT.get(command_name)
+
     @functools.wraps(handler)
     async def _wrapped(
         update: Update,
@@ -13369,7 +13410,23 @@ def wrap_cmd(
         **kwargs: Any,
     ) -> Any:
         await pre_command_reset(update, context)
-        return await safe_dispatch(handler, update, context, *args, **kwargs)
+        result = await safe_dispatch(handler, update, context, *args, **kwargs)
+
+        if fallback_text and isinstance(update, Update):
+            chat_data = getattr(context, "chat_data", None)
+            replied = bool(
+                isinstance(chat_data, MutableMapping)
+                and chat_data.get("_last_command_reply_sent")
+            )
+            if not replied:
+                await safe_send_text_logged(
+                    update,
+                    context,
+                    fallback_text,
+                    disable_web_page_preview=True,
+                )
+
+        return result
 
     setattr(_wrapped, "__pre_command_reset__", True)
     setattr(_wrapped, "__wrapped_handler__", handler)
@@ -13380,7 +13437,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = getattr(update, "effective_chat", None)
     if chat is None:
         return
-    result = await safe_send_text(context, chat.id, "pong", parse_mode=None, update=update)
+    result = await legacy_safe_send_text(context, chat.id, "pong", parse_mode=None, update=update)
     if not result.ok:
         log = get_context_logger(context)
         log.warning(
@@ -13420,6 +13477,10 @@ else:
     unknown_command = _unknown_command_impl
 
 del _UNKNOWN_COMMAND_PREV
+
+
+async def fallback_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_send_text_logged(update, context, "Не знаю такую команду. Нажми /menu.")
 
 
 COMMAND_HANDLER_SPECS: List[
@@ -13592,12 +13653,14 @@ def register_handlers(application: Any) -> None:
     logger.info("Registering handlers for commands: %s", command_names)
     for names, callback in COMMAND_HANDLER_SPECS:
         application.add_handler(
-            CommandHandler(list(names), wrap_cmd(callback)),
+            CommandHandler(list(names), wrap_cmd(callback, command_name=names[0])),
             group=0,
         )
 
     unknown_handler = MessageHandler(filters.COMMAND, unknown_command)
     application.add_handler(unknown_handler, group=0)
+
+    application.add_handler(MessageHandler(filters.COMMAND, fallback_unknown), group=999)
 
     for pattern, callback in CALLBACK_HANDLER_SPECS:
         if pattern is None:
