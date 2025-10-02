@@ -450,6 +450,7 @@ def configure_logging(app_name: str) -> None:
         logging.captureWarnings(True)
         for noisy in ("httpx", "urllib3", "aiogram", "telegram", "uvicorn", "gunicorn", "pydantic"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+        logging.getLogger("telegram.request").setLevel(logging.DEBUG)
         _CONFIGURED = True
         _install_record_factory_defaults()
 

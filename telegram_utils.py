@@ -216,10 +216,16 @@ def with_state_reset(
 
 
 async def reply_system_error(update: Any, context: Any) -> None:
+    def _mark_sent() -> None:
+        chat_data = getattr(context, "chat_data", None)
+        if isinstance(chat_data, MutableMapping):
+            chat_data["_last_command_reply_sent"] = True
+
     message = getattr(update, "effective_message", None)
     if message is not None:
         with suppress(Exception):
             await message.reply_text(SYSTEM_ERROR_TEXT)
+            _mark_sent()
         return
 
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
@@ -232,6 +238,7 @@ async def reply_system_error(update: Any, context: Any) -> None:
         return
     with suppress(Exception):
         await bot.send_message(chat_id=target, text=SYSTEM_ERROR_TEXT)
+        _mark_sent()
 
 
 async def safe_dispatch(
