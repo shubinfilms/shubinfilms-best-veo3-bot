@@ -1,8 +1,8 @@
 import asyncio
 import importlib
 import sys
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,157 +23,145 @@ def bot_module(monkeypatch):
     return importlib.reload(module)
 
 
-def _build_items(count: int) -> list[tuple[bytes, str]]:
-    return [(f"data-{i}".encode(), f"file{i}.png") for i in range(count)]
+def _make_ctx():
+    bot = SimpleNamespace(send_document=None, send_message=None)
+    return SimpleNamespace(bot=bot)
 
 
-def test_documents_sent_sequentially(monkeypatch, bot_module):
-    calls: list[dict[str, object]] = []
+def test_grid_delivery_sends_documents_and_menu(monkeypatch, bot_module):
+    ctx = _make_ctx()
+    monkeypatch.setattr(
+        bot_module,
+        "mj_log",
+        SimpleNamespace(info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None),
+    )
+    doc_calls: list[dict[str, object]] = []
+    menu_calls: list[dict[str, object]] = []
+    saved_snapshots: list[tuple[str, list[str], str | None]] = []
 
-    async def _fake_send_image(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
-        calls.append(
-            {
-                "chat_id": chat_id,
-                "data": data,
-                "filename": filename,
-                "caption": caption,
-            }
-        )
-        return SimpleNamespace(message_id=len(calls))
+    async def fake_send_document(chat_id, *, document, **kwargs):
+        doc_calls.append({"chat_id": chat_id, "document": document, "kwargs": kwargs})
 
-    monkeypatch.setattr(bot_module, "send_image_as_document", _fake_send_image)
+    async def fake_send_message(chat_id, text, *, reply_markup=None):
+        menu_calls.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
 
-    bot = SimpleNamespace()
+    monkeypatch.setattr(ctx.bot, "send_document", fake_send_document)
+    monkeypatch.setattr(ctx.bot, "send_message", fake_send_message)
+
+    def fake_save(grid_id, urls, *, prompt=None):
+        saved_snapshots.append((grid_id, list(urls), prompt))
+
+    monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", fake_save)
+
+    urls = [
+        "https://cdn.example.com/a.jpeg",
+        "https://cdn.example.com/b.png",
+        "https://cdn.example.com/c",
+    ]
+
     delivered = asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            bot,
+        bot_module._deliver_mj_grid_documents(
+            ctx,
             chat_id=100,
-            user_id=200,
-            caption="Caption",
-            items=_build_items(3),
-            send_as_album=True,
-            task_id="task-ABC",
+            user_id=55,
+            grid_id="grid123",
+            urls=urls,
+            prompt="prompt text",
         )
     )
 
     assert delivered is True
-    assert [call["caption"] for call in calls] == ["Caption", None, None]
-    assert [call["filename"] for call in calls] == [
-        "midjourney_task-ABC_01.png",
-        "midjourney_task-ABC_02.png",
-        "midjourney_task-ABC_03.png",
+    assert len(doc_calls) == 3
+    assert [call["document"].filename for call in doc_calls] == [
+        "midjourney_01.jpeg",
+        "midjourney_02.png",
+        "midjourney_03.jpeg",
     ]
+    assert [call["document"].input_file_content.decode() for call in doc_calls] == urls
+    assert menu_calls and menu_calls[0]["markup"].inline_keyboard[0][0].callback_data.startswith("mj.upscale.menu:")
+    assert saved_snapshots == [("grid123", urls, "prompt text")]
 
 
-def test_document_filenames_use_original_extension(monkeypatch, bot_module):
-    calls: list[dict[str, object]] = []
+def test_grid_delivery_returns_false_when_no_urls(monkeypatch, bot_module):
+    ctx = _make_ctx()
+    monkeypatch.setattr(
+        bot_module,
+        "mj_log",
+        SimpleNamespace(info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(ctx.bot, "send_document", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ctx.bot, "send_message", lambda *args, **kwargs: None)
 
-    async def _fake_send(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
-        calls.append({"filename": filename})
-        return SimpleNamespace(message_id=len(calls))
-
-    monkeypatch.setattr(bot_module, "send_image_as_document", _fake_send)
-
-    items = [(b"a", "grid.JPEG"), (b"b", "noext"), (b"c", "image.webp")]
-    asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            SimpleNamespace(),
+    delivered = asyncio.run(
+        bot_module._deliver_mj_grid_documents(
+            ctx,
             chat_id=1,
-            user_id=2,
-            caption="",
-            items=items,
-            send_as_album=False,
-            task_id="tid",
-        )
-    )
-
-    filenames = [call["filename"] for call in calls]
-    assert filenames == [
-        "midjourney_tid_01.jpeg",
-        "midjourney_tid_02.png",
-        "midjourney_tid_03.webp",
-    ]
-
-
-def test_document_delivery_handles_partial_failures(monkeypatch, bot_module):
-    calls: list[dict[str, object]] = []
-
-    async def _fake_send(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
-        if len(calls) == 0:
-            raise RuntimeError("boom")
-        calls.append({"filename": filename})
-        return SimpleNamespace(message_id=len(calls))
-
-    async def _wrapped(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
-        try:
-            return await _fake_send(bot, chat_id, data, filename, caption=caption, reply_markup=reply_markup, req_id=req_id)
-        finally:
-            if len(calls) < 1:
-                calls.append({"filename": filename, "failed": True})
-
-    monkeypatch.setattr(bot_module, "send_image_as_document", _wrapped)
-
-    delivered = asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            SimpleNamespace(),
-            chat_id=5,
-            user_id=6,
-            caption="hi",
-            items=_build_items(2),
-            send_as_album=False,
-            task_id="tid",
-        )
-    )
-
-    assert delivered is True
-    assert any(call.get("failed") for call in calls)
-
-
-def test_document_delivery_returns_false_if_all_fail(monkeypatch, bot_module):
-    async def _fail(*args, **kwargs):
-        raise RuntimeError("nope")
-
-    monkeypatch.setattr(bot_module, "send_image_as_document", _fail)
-
-    delivered = asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            SimpleNamespace(),
-            chat_id=7,
-            user_id=8,
-            caption="",
-            items=_build_items(2),
-            send_as_album=False,
-            task_id="tid",
+            user_id=None,
+            grid_id="grid",
+            urls=[],
         )
     )
 
     assert delivered is False
 
 
-def test_document_caption_trimmed(monkeypatch, bot_module):
-    captured: list[str | None] = []
+def test_grid_delivery_handles_failed_documents(monkeypatch, bot_module):
+    ctx = _make_ctx()
+    monkeypatch.setattr(
+        bot_module,
+        "mj_log",
+        SimpleNamespace(info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None),
+    )
+    attempts = {"count": 0}
 
-    async def _fake_send(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
-        captured.append(caption)
-        return SimpleNamespace(message_id=len(captured))
+    async def flaky_send(chat_id, *, document, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("boom")
 
-    monkeypatch.setattr(bot_module, "send_image_as_document", _fake_send)
+    monkeypatch.setattr(ctx.bot, "send_document", flaky_send)
 
-    long_caption = "A" * 1100
-    asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            SimpleNamespace(),
-            chat_id=9,
-            user_id=10,
-            caption=long_caption,
-            items=_build_items(2),
-            send_as_album=True,
-            task_id="tid",
+    async def noop_message(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(ctx.bot, "send_message", noop_message)
+    monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", lambda *args, **kwargs: None)
+
+    delivered = asyncio.run(
+        bot_module._deliver_mj_grid_documents(
+            ctx,
+            chat_id=10,
+            user_id=3,
+            grid_id="grid",
+            urls=["https://cdn/x.png", "https://cdn/y.png"],
         )
     )
 
-    assert captured
-    assert isinstance(captured[0], str)
-    assert len(captured[0]) == 1024
-    assert captured[0].endswith("…")
-    assert captured[1] is None
+    assert delivered is True
+    assert attempts["count"] == 2
+
+
+def test_grid_delivery_returns_false_when_menu_fails(monkeypatch, bot_module):
+    ctx = _make_ctx()
+
+    async def fake_send_document(chat_id, *, document, **kwargs):
+        return None
+
+    async def failing_menu(*args, **kwargs):
+        raise RuntimeError("fail")
+
+    monkeypatch.setattr(ctx.bot, "send_document", fake_send_document)
+    monkeypatch.setattr(ctx.bot, "send_message", failing_menu)
+    monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", lambda *args, **kwargs: None)
+
+    delivered = asyncio.run(
+        bot_module._deliver_mj_grid_documents(
+            ctx,
+            chat_id=1,
+            user_id=2,
+            grid_id="grid",
+            urls=["https://cdn/a.png"],
+        )
+    )
+
+    assert delivered is False

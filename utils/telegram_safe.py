@@ -65,6 +65,7 @@ async def safe_edit_message(
     *,
     parse_mode: ParseMode = ParseMode.HTML,
     disable_web_page_preview: bool = True,
+    log_on_noop: Optional[str] = None,
 ) -> bool:
     """Safely edit a Telegram message without triggering noisy errors."""
 
@@ -77,8 +78,9 @@ async def safe_edit_message(
     new_hashes = _hash_payload(text_payload, reply_markup)
 
     if _MessageHashes.get(key) == new_hashes:
+        log_label = log_on_noop or "card_edit_noop"
         _logger.info(
-            "card_edit_noop",
+            log_label,
             extra={"chat_id": chat_id, "message_id": message_id},
         )
         return False
@@ -97,8 +99,9 @@ async def safe_edit_message(
     except BadRequest as exc:
         lowered = str(exc).lower()
         if "message is not modified" in lowered:
+            log_label = log_on_noop or "card_edit_ignored_same_content"
             _logger.info(
-                "card_edit_ignored_same_content",
+                log_label,
                 extra={"chat_id": chat_id, "message_id": message_id},
             )
             _store_hashes(key, new_hashes)
