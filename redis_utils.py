@@ -268,6 +268,17 @@ def acquire_ttl_lock(name: str, ttl: int) -> bool:
     return _memory_set_if_absent(key, "1", ttl)
 
 
+def release_ttl_lock(name: str) -> None:
+    key = f"{_PFX}:{name}"
+    if _r:
+        try:
+            _r.delete(key)
+            return
+        except Exception as exc:
+            _logger.warning("lock.release.error | key=%s err=%s", key, exc)
+    _memory_delete(key)
+
+
 def save_task_meta(
     task_id: str,
     chat_id: int,

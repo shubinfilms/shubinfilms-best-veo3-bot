@@ -1,5 +1,4 @@
 import asyncio
-import asyncio
 import importlib
 import sys
 from pathlib import Path
@@ -25,128 +24,108 @@ def bot_module(monkeypatch):
 
 
 def _make_ctx(bot=None):
-    return SimpleNamespace(bot=bot, user_data={}, application=None)
+    return SimpleNamespace(bot=bot or SimpleNamespace(), user_data={}, application=None)
 
 
-def test_show_video_menu_uses_lock(monkeypatch, bot_module):
-    calls: list[tuple[int | None, object | None]] = []
-    lock_calls: list[str] = []
+def test_start_video_mode_deduplicates_card(monkeypatch, bot_module):
     cache: dict[str, str] = {}
+    send_calls: list[tuple[int | None, object | None]] = []
+    edit_calls: list[tuple[int, int]] = []
+    release_calls: list[str] = []
 
-    def fake_lock(name: str, ttl: int) -> bool:
-        lock_calls.append(name)
-        return len(lock_calls) == 1
-
-    monkeypatch.setattr(bot_module, "acquire_ttl_lock", fake_lock)
+    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda name, ttl: True)
+    monkeypatch.setattr(bot_module, "release_ttl_lock", lambda name: release_calls.append(name))
     monkeypatch.setattr(bot_module, "cache_get", lambda name: cache.get(name))
     monkeypatch.setattr(bot_module, "cache_set", lambda name, value, ttl: cache.update({name: value}))
 
     async def fake_send(ctx, *, chat_id=None, message=None):  # type: ignore[override]
-        calls.append((chat_id, message))
-        return 111
-
-    monkeypatch.setattr(bot_module, "_send_video_menu_message", fake_send)
-
-    ctx = _make_ctx()
-    asyncio.run(bot_module.show_video_menu(ctx, chat_id=42))
-    asyncio.run(bot_module.show_video_menu(ctx, chat_id=42))
-    asyncio.run(bot_module.show_video_menu(ctx, chat_id=42))
-
-    assert calls == [(42, None)]
-    assert cache == {"video_menu:last_menu_msg_id:42": "111"}
-    assert lock_calls == ["lock:video_menu:42", "lock:video_menu:42", "lock:video_menu:42"]
-
-
-def test_callback_deduplicated(monkeypatch, bot_module):
-    send_calls: list[tuple[int | None, object | None]] = []
-    answers: list[int] = []
-    lock_state = {"count": 0}
-
-    def fake_lock(name: str, ttl: int) -> bool:
-        lock_state["count"] += 1
-        return lock_state["count"] == 1
-
-    monkeypatch.setattr(bot_module, "acquire_ttl_lock", fake_lock)
-    monkeypatch.setattr(bot_module, "cache_get", lambda name: None)
-    monkeypatch.setattr(bot_module, "cache_set", lambda name, value, ttl: None)
-
-    async def fake_send(ctx, *, chat_id=None, message=None):  # type: ignore[override]
         send_calls.append((chat_id, message))
-        return 321
+        return 777
+
+    async def fake_edit(ctx, chat_id, message_id, **kwargs):  # type: ignore[override]
+        edit_calls.append((chat_id, message_id))
+        return True
 
     monkeypatch.setattr(bot_module, "_send_video_menu_message", fake_send)
-
-    class _Query:
-        def __init__(self):
-            self.data = bot_module.CB_VIDEO_MENU
-            self.message = SimpleNamespace(chat=SimpleNamespace(id=9))
-            self.from_user = SimpleNamespace(id=1)
-
-        async def answer(self):  # type: ignore[override]
-            answers.append(1)
-
-    ctx = _make_ctx()
+    monkeypatch.setattr(bot_module, "safe_edit_message", fake_edit)
+    monkeypatch.setattr(bot_module, "input_state", SimpleNamespace(clear=lambda *args, **kwargs: None))
+    monkeypatch.setattr(bot_module, "set_mode", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "clear_wait", lambda *args, **kwargs: None)
 
     update = SimpleNamespace(
-        callback_query=_Query(),
-        effective_chat=SimpleNamespace(id=9),
-        effective_user=SimpleNamespace(id=1),
+        effective_message=SimpleNamespace(chat_id=42, reply_text=lambda *args, **kwargs: SimpleNamespace(message_id=999)),
+        effective_chat=SimpleNamespace(id=42),
+        effective_user=SimpleNamespace(id=9),
+        callback_query=None,
     )
-    asyncio.run(bot_module.video_menu_callback(update, ctx))
+    ctx = _make_ctx()
 
-    update.callback_query = _Query()
-    asyncio.run(bot_module.video_menu_callback(update, ctx))
+    asyncio.run(bot_module.start_video_mode(update, ctx))
+    assert send_calls == [(42, update.effective_message)]
+    assert cache == {"video:last_msg:42": "777"}
 
-    assert len(send_calls) == 1
-    assert answers == [1, 1]
+    asyncio.run(bot_module.start_video_mode(update, ctx))
+    assert send_calls == [(42, update.effective_message)]
+    assert edit_calls == [(42, 777)]
+    assert release_calls == ["lock:video_menu:9", "lock:video_menu:9"]
 
 
-def test_command_and_callback_share_lock(monkeypatch, bot_module):
-    send_calls: list[tuple[int | None, object | None]] = []
-    cache: dict[str, str] = {}
-    lock_sequence = iter([True, False])
+def test_start_video_mode_respects_lock(monkeypatch, bot_module):
+    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bot_module, "input_state", SimpleNamespace(clear=lambda *args, **kwargs: None))
+    monkeypatch.setattr(bot_module, "set_mode", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "clear_wait", lambda *args, **kwargs: None)
 
-    def fake_lock(name: str, ttl: int) -> bool:
-        return next(lock_sequence, False)
-
-    monkeypatch.setattr(bot_module, "acquire_ttl_lock", fake_lock)
-    monkeypatch.setattr(bot_module, "cache_get", lambda name: cache.get(name))
-    monkeypatch.setattr(bot_module, "cache_set", lambda name, value, ttl: cache.update({name: value}))
-
-    async def fake_send(ctx, *, chat_id=None, message=None):  # type: ignore[override]
-        send_calls.append((chat_id, message))
-        return 555
+    async def fake_send(*args, **kwargs):  # type: ignore[override]
+        raise AssertionError("send should not be called when lock is active")
 
     monkeypatch.setattr(bot_module, "_send_video_menu_message", fake_send)
+    monkeypatch.setattr(bot_module, "safe_edit_message", fake_send)
 
-    ctx = _make_ctx()
-    message = SimpleNamespace(chat_id=7, reply_text=lambda *args, **kwargs: asyncio.sleep(0))
-    update_command = SimpleNamespace(
+    update = SimpleNamespace(
+        effective_message=SimpleNamespace(chat_id=7),
         effective_chat=SimpleNamespace(id=7),
-        effective_user=SimpleNamespace(id=2),
-        effective_message=message,
+        effective_user=SimpleNamespace(id=12),
+        callback_query=None,
     )
 
-    asyncio.run(bot_module.video_command(update_command, ctx))
+    asyncio.run(bot_module.start_video_mode(update, _make_ctx()))
+
+
+def test_video_menu_callback_delegates_to_start(monkeypatch, bot_module):
+    calls: list[tuple[object, object]] = []
+
+    async def fake_start(update, ctx):  # type: ignore[override]
+        calls.append((update, ctx))
+
+    monkeypatch.setattr(bot_module, "start_video_mode", fake_start)
+
+    async def fake_ensure(update):
+        return None
+
+    monkeypatch.setattr(bot_module, "ensure_user_record", fake_ensure)
+    monkeypatch.setattr(bot_module, "input_state", SimpleNamespace(clear=lambda *args, **kwargs: None))
+    monkeypatch.setattr(bot_module, "set_mode", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "clear_wait", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "clear_wait_state", lambda *args, **kwargs: None)
 
     class _Query:
         def __init__(self):
             self.data = bot_module.CB_VIDEO_MENU
-            self.message = SimpleNamespace(chat=SimpleNamespace(id=7))
-            self.from_user = SimpleNamespace(id=2)
+            self.message = SimpleNamespace(chat=SimpleNamespace(id=5))
+            self.from_user = SimpleNamespace(id=3)
 
         async def answer(self):  # type: ignore[override]
             return None
 
-    update_callback = SimpleNamespace(
+    update = SimpleNamespace(
         callback_query=_Query(),
-        effective_chat=SimpleNamespace(id=7),
-        effective_user=SimpleNamespace(id=2),
+        effective_chat=SimpleNamespace(id=5),
+        effective_user=SimpleNamespace(id=3),
     )
-    asyncio.run(bot_module.video_menu_callback(update_callback, ctx))
 
-    assert len(send_calls) == 1
-    assert cache == {"video_menu:last_menu_msg_id:7": "555"}
+    asyncio.run(bot_module.video_menu_callback(update, _make_ctx()))
+    assert len(calls) == 1
 
 
 def test_video_mode_button_creates_card(monkeypatch, bot_module):
@@ -187,4 +166,3 @@ def test_video_mode_button_creates_card(monkeypatch, bot_module):
     assert state_dict["mode"] == "veo_text_fast"
     assert veo_calls == [606]
     assert wait_calls and wait_calls[0]["kind"] == bot_module.WaitKind.VEO_PROMPT
-

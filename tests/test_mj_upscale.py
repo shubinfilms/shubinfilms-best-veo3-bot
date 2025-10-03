@@ -1,288 +1,146 @@
 import asyncio
-import base64
+import importlib
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.suno_test_utils import FakeBot, bot_module
 
-PNG_BYTES = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
-)
-
-
-def _run(coro):
-    return asyncio.run(coro)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 @pytest.fixture
-def ctx():
-    return SimpleNamespace(bot=FakeBot(), user_data={})
+def bot_module(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "test-token")
+    monkeypatch.setenv("SUNO_API_BASE", "https://example.com")
+    monkeypatch.setenv("SUNO_API_TOKEN", "dummy-token")
+    monkeypatch.setenv("LEDGER_BACKEND", "memory")
+    monkeypatch.setenv("DATABASE_URL", "postgres://test")
+    module = importlib.import_module("bot")
+    return importlib.reload(module)
 
 
-@pytest.fixture
-def state(ctx):
-    return bot_module.state(ctx)
-
-
-def test_mj_upscale_from_grid_ok(monkeypatch, ctx, state):
-    chat_id = 101
-    user_id = 505
-    state["mode"] = "mj_upscale"
-    state["mj_locale"] = "ru"
-    state["mj_last_grid"] = {"task_id": "grid123", "result_urls": ["url1", "url2", "url3", "url4"]}
-
-    submissions = {}
-
-    async def fake_show_balance(*_args, **_kwargs):
+def _make_update(data: str, chat_id: int = 10, user_id: int = 20, markup=None):
+    async def answer():
         return None
 
-    monkeypatch.setattr(bot_module, "show_balance_notification", fake_show_balance)
-
-    def fake_debit(uid, price, **_):
-        assert price == bot_module.PRICE_MJ_UPSCALE
-        return True, 90
-
-    monkeypatch.setattr(bot_module, "debit_try", fake_debit)
-    monkeypatch.setattr(bot_module, "credit_balance", lambda *args, **kwargs: None)
-
-    calls_status = []
-
-    def fake_status(task_id):
-        calls_status.append(task_id)
-        return True, 1, {"resultUrl": "https://img/upscaled.png"}
-
-    monkeypatch.setattr(bot_module, "mj_status", fake_status)
-
-    def fake_generate_upscale(task_id, index, **kwargs):
-        submissions[(task_id, index)] = kwargs.get("prompt")
-        assert kwargs.get("prompt") == bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER
-        return True, "upscale-1", "ok"
-
-    monkeypatch.setattr(bot_module, "mj_generate_upscale", fake_generate_upscale)
-
-    monkeypatch.setattr(bot_module, "_download_mj_image_bytes", lambda url, idx: (b"image-bytes", "name.png"))
-
-    sent_docs = {}
-
-    async def fake_send_image(bot, chat_id_arg, data, filename, **_):
-        sent_docs[chat_id_arg] = (data, filename)
-
-    monkeypatch.setattr(bot_module, "send_image_as_document", fake_send_image)
-    monkeypatch.setattr(bot_module, "acquire_mj_upscale_lock", lambda *args, **kwargs: True)
-    monkeypatch.setattr(bot_module, "release_mj_upscale_lock", lambda *args, **kwargs: None)
-
-    message = SimpleNamespace(chat_id=chat_id, replies=[])
-
-    async def reply_text(text, **_):
-        message.replies.append(text)
-
-    message.reply_text = reply_text
-
-    async def answer(*_args, **_kwargs):
-        return None
+    async def edit_message_reply_markup(*, reply_markup=None):
+        edit_calls.append(reply_markup)
 
     query = SimpleNamespace(
-        data="mj_upscale:select:1",
-        message=message,
+        data=data,
+        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), reply_markup=markup),
         answer=answer,
+        edit_message_reply_markup=edit_message_reply_markup,
+        from_user=SimpleNamespace(id=user_id, language_code="ru"),
     )
-
-    update = SimpleNamespace(
+    return SimpleNamespace(
+        callback_query=query,
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id, language_code="ru"),
-        callback_query=query,
     )
 
-    _run(bot_module.on_callback(update, ctx))
 
-    assert submissions == {("grid123", 1): bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER}
-    assert sent_docs[chat_id][1] == "mj_upscaled_grid123_1.png"
-    assert calls_status[-1] == "upscale-1"
+def test_handle_mj_upscale_menu_shows_select(monkeypatch, bot_module):
+    grid = {"task_id": "grid", "result_urls": ["a", "b", "c"]}
+    monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda grid_id: grid)
+
+    global edit_calls
+    edit_calls = []
+
+    update = _make_update(
+        data="mj.upscale.menu:grid",
+        markup=bot_module.mj_upscale_root_keyboard("grid"),
+    )
+
+    asyncio.run(bot_module.handle_mj_upscale_menu(update, SimpleNamespace()))
+
+    assert edit_calls
+    keyboard = edit_calls[0]
+    assert len(keyboard.inline_keyboard) == len(grid["result_urls"]) + 1
+    assert keyboard.inline_keyboard[-1][0].text == "⬅️ Назад"
 
 
-def test_mj_upscale_from_file_ok(monkeypatch, ctx, state):
-    chat_id = 303
-    user_id = 606
-    state["mode"] = "mj_upscale"
+def test_handle_mj_upscale_menu_back_to_root(monkeypatch, bot_module):
+    grid = {"task_id": "grid", "result_urls": ["a", "b"]}
+    monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda grid_id: grid)
 
-    async def fake_show_balance(*_args, **_kwargs):
-        return None
+    global edit_calls
+    edit_calls = []
 
-    monkeypatch.setattr(bot_module, "show_balance_notification", fake_show_balance)
+    select_markup = bot_module.mj_upscale_select_keyboard("grid", count=2)
+    update = _make_update(data="mj.upscale.menu:grid", markup=select_markup)
 
-    def fake_debit(uid, price, **_):
-        assert price == bot_module.PRICE_MJ_UPSCALE
-        return True, 80
+    asyncio.run(bot_module.handle_mj_upscale_menu(update, SimpleNamespace()))
 
-    monkeypatch.setattr(bot_module, "debit_try", fake_debit)
-    refund_calls = []
-    monkeypatch.setattr(bot_module, "credit_balance", lambda *args, **kwargs: refund_calls.append(args))
+    assert edit_calls
+    keyboard = edit_calls[0]
+    assert len(keyboard.inline_keyboard) == 1
+    assert keyboard.inline_keyboard[0][0].text == "Улучшить качество"
 
-    status_calls = []
 
-    def fake_status(task_id):
-        status_calls.append(task_id)
-        if task_id == "grid-task":
-            return True, 1, {
-                "resultUrls": [
-                    "https://img.example/a.png",
-                    "https://img.example/b.png",
-                    "https://img.example/c.png",
-                    "https://img.example/d.png",
-                ]
+def test_handle_mj_upscale_choice_launches_task(monkeypatch, bot_module):
+    grid = {"task_id": "grid", "result_urls": ["a", "b", "c"]}
+    monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda grid_id: grid)
+    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda name, ttl: True)
+    release_calls: list[str] = []
+    monkeypatch.setattr(bot_module, "release_ttl_lock", lambda name: release_calls.append(name))
+
+    launch_calls: list[dict[str, object]] = []
+
+    async def fake_launch(chat_id, ctx, *, user_id, grid, image_index, locale, source, **kwargs):
+        launch_calls.append(
+            {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "grid": grid,
+                "index": image_index,
+                "locale": locale,
+                "source": source,
             }
-        return True, 1, {"resultUrl": "https://img/upscaled.png"}
+        )
+        return True
 
-    monkeypatch.setattr(bot_module, "mj_status", fake_status)
-    monkeypatch.setattr(bot_module, "mj_generate_img2img", lambda *_args, **_kwargs: (True, "grid-task", "ok"))
-    def fake_generate_upscale(*_args, **kwargs):
-        assert kwargs.get("prompt") == bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER
-        return True, "upscale-task", "ok"
+    monkeypatch.setattr(bot_module, "_launch_mj_upscale", fake_launch)
+    monkeypatch.setattr(bot_module, "state", lambda ctx: {})
 
-    monkeypatch.setattr(bot_module, "mj_generate_upscale", fake_generate_upscale)
-    monkeypatch.setattr(bot_module, "_download_mj_image_bytes", lambda url, idx: (b"image", "name.png"))
-    monkeypatch.setattr(bot_module, "acquire_mj_upscale_lock", lambda *args, **kwargs: True)
-    monkeypatch.setattr(bot_module, "release_mj_upscale_lock", lambda *args, **kwargs: None)
+    update = _make_update(data="mj.upscale:grid:2")
 
-    sent_docs = {}
-    called = False
+    asyncio.run(bot_module.handle_mj_upscale_choice(update, SimpleNamespace()))
 
-    async def fake_send_image(bot, chat_id_arg, data, filename, **_):
-        nonlocal called
-        called = True
-        sent_docs[chat_id_arg] = filename
-
-    monkeypatch.setattr(bot_module, "send_image_as_document", fake_send_image)
-
-    class FakeFile:
-        file_path = "photos/file.jpg"
-
-        async def download_as_bytearray(self):
-            return PNG_BYTES
-
-        async def download_as_bytes(self):
-            return PNG_BYTES
-
-    async def fake_get_file(_file_id):
-        return FakeFile()
-
-    ctx.bot.get_file = fake_get_file  # type: ignore[assignment]
-
-    document = SimpleNamespace(file_id="doc1", mime_type="image/png", width=512, height=512)
-
-    async def reply_text(*args, **kwargs):
-        return None
-
-    message = SimpleNamespace(document=document, reply_text=reply_text)
-    update = SimpleNamespace(
-        effective_message=message,
-        effective_chat=SimpleNamespace(id=chat_id),
-        effective_user=SimpleNamespace(id=user_id, language_code="ru"),
-    )
-
-    _run(bot_module.on_document(update, ctx))
-
-    assert called
-    assert sent_docs[chat_id] == "mj_upscaled_grid-task_0.png"
-    assert not refund_calls
+    assert launch_calls
+    call = launch_calls[0]
+    assert call["index"] == 1
+    assert call["grid"] == grid
+    assert release_calls == ["lock:mj:upscale:grid:2"]
 
 
-def test_mj_upscale_bad_status(monkeypatch, ctx, state):
-    chat_id = 404
-    user_id = 808
-    state["mode"] = "mj_upscale"
-    state["mj_last_grid"] = {"task_id": "grid-bad", "result_urls": ["a", "b"]}
-
-    async def fake_show_balance(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(bot_module, "show_balance_notification", fake_show_balance)
-    monkeypatch.setattr(bot_module, "debit_try", lambda *_args, **_kwargs: (True, 70))
-
-    refunds = []
-
-    def fake_credit(uid, price, **kwargs):
-        refunds.append((uid, price))
-        return 100
-
-    monkeypatch.setattr(bot_module, "credit_balance", fake_credit)
-    monkeypatch.setattr(bot_module, "acquire_mj_upscale_lock", lambda *args, **kwargs: True)
-    monkeypatch.setattr(bot_module, "release_mj_upscale_lock", lambda *args, **kwargs: None)
-
-    def fake_generate_upscale(*_args, **kwargs):
-        assert kwargs.get("prompt") == bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER
-        return True, "upscale-bad", "ok"
-
-    monkeypatch.setattr(bot_module, "mj_generate_upscale", fake_generate_upscale)
-
-    def fake_status(task_id):
-        return True, 3, {"errorMessage": "failure"}
-
-    monkeypatch.setattr(bot_module, "mj_status", fake_status)
-    monkeypatch.setattr(bot_module, "_download_mj_image_bytes", lambda *_args, **_kwargs: (b"", ""))
-    monkeypatch.setattr(bot_module, "send_image_as_document", lambda *args, **kwargs: None)
-
-    async def bad_answer(*_args, **_kwargs):
-        return None
-
-    async def bad_reply(*_args, **_kwargs):
-        return None
-
-    query = SimpleNamespace(
-        data="mj_upscale:select:0",
-        message=SimpleNamespace(chat_id=chat_id, reply_text=bad_reply),
-        answer=bad_answer,
-    )
-
-    update = SimpleNamespace(
-        effective_chat=SimpleNamespace(id=chat_id),
-        effective_user=SimpleNamespace(id=user_id, language_code="ru"),
-        callback_query=query,
-    )
-
-    _run(bot_module.on_callback(update, ctx))
-
-    assert refunds == [(user_id, bot_module.PRICE_MJ_UPSCALE)]
+def test_handle_mj_upscale_choice_respects_lock(monkeypatch, bot_module):
+    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bot_module, "_launch_mj_upscale", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError))
+    update = _make_update(data="mj.upscale:grid:1")
+    asyncio.run(bot_module.handle_mj_upscale_choice(update, SimpleNamespace()))
 
 
-def test_mj_upscale_no_context(monkeypatch, ctx, state):
-    chat_id = 505
-    user_id = 909
-    state["mode"] = "mj_upscale"
-    state["mj_last_grid"] = None
+def test_handle_mj_upscale_choice_grid_missing(monkeypatch, bot_module):
+    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda *args, **kwargs: True)
+    monkeypatch.setattr(bot_module, "release_ttl_lock", lambda *args: None)
+    monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda *_: None)
 
-    sent_messages = []
+    sent_messages: list[tuple[int, str]] = []
 
-    async def fake_send_message(*args, **kwargs):
-        text = kwargs.get("text")
-        if text is None and args:
-            if len(args) >= 2:
-                text = args[1]
-            else:
-                text = args[0]
-        sent_messages.append(text or "")
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_message=None))
 
-    ctx.bot.send_message = fake_send_message  # type: ignore[assignment]
+    async def fake_send_message(chat_id, text):
+        sent_messages.append((chat_id, text))
 
-    async def answer_up(*_args, **_kwargs):
-        return None
+    monkeypatch.setattr(ctx.bot, "send_message", fake_send_message)
 
-    async def reply_up(*_args, **_kwargs):
-        return None
+    update = _make_update(data="mj.upscale:grid:1")
 
-    query = SimpleNamespace(
-        data="mj_upscale:select:0",
-        message=SimpleNamespace(chat_id=chat_id, reply_text=reply_up),
-        answer=answer_up,
-    )
+    asyncio.run(bot_module.handle_mj_upscale_choice(update, ctx))
 
-    update = SimpleNamespace(
-        effective_chat=SimpleNamespace(id=chat_id),
-        effective_user=SimpleNamespace(id=user_id, language_code="ru"),
-        callback_query=query,
-    )
-
-    _run(bot_module.on_callback(update, ctx))
-
-    assert any("Пришлите фото" in text for text in sent_messages)
+    assert sent_messages

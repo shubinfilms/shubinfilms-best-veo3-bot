@@ -127,3 +127,29 @@ def suno_start_keyboard() -> InlineKeyboardMarkup:
 def suno_start_disabled_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("⏳ Идёт генерация…")]]
     return InlineKeyboardMarkup(rows)
+
+
+def mj_upscale_root_keyboard(grid_id: str) -> InlineKeyboardMarkup:
+    button = InlineKeyboardButton(
+        "Улучшить качество",
+        callback_data=f"mj.upscale.menu:{grid_id}",
+    )
+    return InlineKeyboardMarkup([[button]])
+
+
+def mj_upscale_select_keyboard(grid_id: str, *, count: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    safe_count = max(int(count), 0)
+    for idx in range(1, safe_count + 1):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{idx}-я фотка",
+                    callback_data=f"mj.upscale:{grid_id}:{idx}",
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"mj.upscale.menu:{grid_id}")]
+    )
+    return InlineKeyboardMarkup(rows)

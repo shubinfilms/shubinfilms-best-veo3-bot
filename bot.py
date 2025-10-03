@@ -151,6 +151,8 @@ from keyboards import (
     CB_VIDEO_MODE_FAST,
     CB_VIDEO_MODE_PHOTO,
     CB_VIDEO_MODE_QUALITY,
+    mj_upscale_root_keyboard,
+    mj_upscale_select_keyboard,
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
 )
@@ -192,6 +194,7 @@ from redis_utils import (
     cache_get,
     cache_set,
     acquire_ttl_lock,
+    release_ttl_lock,
 )
 
 from ledger import (
@@ -208,7 +211,6 @@ from settings import (
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
-    MJ_SEND_AS_ALBUM,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -2677,6 +2679,77 @@ def _load_last_mj_grid(state_dict: Dict[str, Any], user_id: Optional[int]) -> Op
     return normalized
 
 
+def _save_mj_grid_snapshot(grid_id: str, urls: Sequence[str], *, prompt: Optional[str] = None) -> None:
+    normalized = [str(u) for u in urls if isinstance(u, str) and u]
+    if not normalized:
+        return
+    payload: Dict[str, Any] = {
+        "task_id": str(grid_id),
+        "result_urls": normalized,
+    }
+    prompt_clean = prompt.strip() if isinstance(prompt, str) else None
+    if prompt_clean:
+        payload["prompt"] = prompt_clean
+    key = _MJ_GRID_CACHE_KEY_TMPL.format(grid_id=grid_id)
+    try:
+        cache_set(key, json.dumps(payload, ensure_ascii=False), _MJ_GRID_CACHE_TTL)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        mj_log.warning("mj.grid.redis_save_fail | grid=%s err=%s", grid_id, exc)
+
+
+def _load_mj_grid_snapshot(grid_id: str) -> Optional[Dict[str, Any]]:
+    grid_key = str(grid_id or "").strip()
+    if not grid_key:
+        return None
+    key = _MJ_GRID_CACHE_KEY_TMPL.format(grid_id=grid_key)
+    raw = cache_get(key)
+    if not raw:
+        return None
+    try:
+        doc = json.loads(raw)
+    except Exception:
+        mj_log.warning("mj.grid.redis_parse_fail | grid=%s", grid_key)
+        return None
+    if not isinstance(doc, dict):
+        return None
+    urls_raw = doc.get("result_urls") or doc.get("urls")
+    if not isinstance(urls_raw, list):
+        return None
+    normalized = [str(u) for u in urls_raw if isinstance(u, str) and u]
+    if not normalized:
+        return None
+    task_id = doc.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        task_id = grid_key
+    result: Dict[str, Any] = {
+        "task_id": task_id,
+        "result_urls": normalized,
+    }
+    prompt_raw = doc.get("prompt")
+    if isinstance(prompt_raw, str) and prompt_raw.strip():
+        result["prompt"] = prompt_raw.strip()
+    return result
+
+
+def _mj_guess_extension(url: str, default: str = ".jpeg") -> str:
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return default
+    for ext in (".jpeg", ".jpg", ".png", ".webp"):
+        if path.endswith(ext):
+            return ".jpeg" if ext == ".jpg" else ext
+    return default
+
+
+def _mj_document_filename(index: int, url: Optional[str] = None, *, suffix: str = "") -> str:
+    ext = _mj_guess_extension(url or "")
+    base = f"midjourney_{index:02d}"
+    if suffix:
+        base = f"{base}_{suffix}"
+    return f"{base}{ext}"
+
+
 def _mj_upscale_keyboard(count: int, locale: str, *, include_repeat: bool = False) -> InlineKeyboardMarkup:
     buttons: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
@@ -2722,27 +2795,6 @@ def _mj_guess_filename(url: str, index: int, content_type: Optional[str]) -> str
     if ext not in _MJ_ALLOWED_EXTENSIONS:
         ext = _mj_content_type_extension(content_type) or ".jpg"
     return f"midjourney_{index + 1:02d}{ext}"
-
-
-def _mj_sanitize_task_id(task_id: Optional[str]) -> str:
-    if not isinstance(task_id, str):
-        return "task"
-    cleaned = re.sub(r"[^0-9a-zA-Z_-]+", "_", task_id.strip())
-    cleaned = cleaned.strip("_")
-    if not cleaned:
-        return "task"
-    return cleaned[:60]
-
-
-def _mj_document_filename(
-    task_id: Optional[str], index: int, original_filename: str
-) -> str:
-    safe_task = _mj_sanitize_task_id(task_id)
-    _, ext = os.path.splitext(original_filename or "")
-    ext = ext.lower()
-    if ext not in _MJ_ALLOWED_EXTENSIONS:
-        ext = ".png"
-    return f"midjourney_{safe_task}_{index:02d}{ext}"
 
 
 def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str]]:
@@ -2977,53 +3029,52 @@ async def _deliver_banana_media(
 
 
 
-async def _deliver_mj_media(
-    bot: Any,
+async def _deliver_mj_grid_documents(
+    ctx: ContextTypes.DEFAULT_TYPE,
     *,
     chat_id: int,
-    user_id: int,
-    caption: str,
-    items: Sequence[tuple[bytes, str]],
-    send_as_album: bool,
-    task_id: Optional[str] = None,
+    user_id: Optional[int],
+    grid_id: str,
+    urls: Sequence[str],
+    prompt: Optional[str] = None,
 ) -> bool:
-    prepared: list[dict[str, Any]] = []
-    _ = send_as_album
-    for data, filename in items:
-        if not data:
-            continue
-        prepared.append({"data": data, "filename": filename, "size": len(data)})
-
-    if not prepared:
+    normalized = [str(u) for u in urls if isinstance(u, str) and u]
+    if not normalized:
         return False
 
-    trimmed_caption = _trim_caption_text(caption)
-    caption_sent = False
-    sent_any = False
+    mj_log.info(
+        "mj.grid.delivery_start",
+        extra={
+            "meta": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "grid_id": grid_id,
+                "count": len(normalized),
+            }
+        },
+    )
 
-    for index, item in enumerate(prepared, start=1):
-        doc_caption = trimmed_caption if not caption_sent else None
+    sent_count = 0
+    for index, url in enumerate(normalized, start=1):
+        filename = _mj_document_filename(index, url)
         start_ts = time.monotonic()
-        document_name = _mj_document_filename(task_id, index, item["filename"])
         try:
-            message = await send_image_as_document(
-                bot,
+            document = InputFile(url, filename)
+            await ctx.bot.send_document(
                 chat_id,
-                item["data"],
-                document_name,
-                caption=doc_caption,
+                document=document,
             )
         except Exception as exc:
             duration_ms = int((time.monotonic() - start_ts) * 1000)
             mj_log.warning(
-                "mj.send.document.fail",
+                "mj.grid.document_fail",
                 extra={
                     "meta": {
-                        "user_id": user_id,
                         "chat_id": chat_id,
-                        "task_id": task_id,
-                        "filename": document_name,
-                        "size": item["size"],
+                        "user_id": user_id,
+                        "grid_id": grid_id,
+                        "index": index,
+                        "filename": filename,
                         "duration_ms": duration_ms,
                         "error": str(exc),
                     }
@@ -3031,26 +3082,60 @@ async def _deliver_mj_media(
             )
             continue
 
+        sent_count += 1
         duration_ms = int((time.monotonic() - start_ts) * 1000)
-        message_id = getattr(message, "message_id", None)
-        caption_sent = caption_sent or doc_caption is not None
-        sent_any = True
         mj_log.info(
-            "mj.send.document.ok",
+            "mj.grid.document_sent",
             extra={
                 "meta": {
-                    "user_id": user_id,
                     "chat_id": chat_id,
-                    "task_id": task_id,
-                    "message_id": message_id,
-                    "filename": document_name,
-                    "size": item["size"],
+                    "user_id": user_id,
+                    "grid_id": grid_id,
+                    "index": index,
+                    "filename": filename,
                     "duration_ms": duration_ms,
                 }
             },
         )
 
-    return sent_any
+    if sent_count == 0:
+        return False
+
+    keyboard = mj_upscale_root_keyboard(grid_id)
+    try:
+        await ctx.bot.send_message(
+            chat_id,
+            "Выберите изображение для улучшения качества:",
+            reply_markup=keyboard,
+        )
+    except Exception as exc:
+        mj_log.warning(
+            "mj.grid.menu_send_fail",
+            extra={
+                "meta": {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "grid_id": grid_id,
+                    "error": str(exc),
+                }
+            },
+        )
+        return False
+
+    _save_mj_grid_snapshot(grid_id, normalized, prompt=prompt)
+
+    mj_log.info(
+        "mj.grid.delivery_done",
+        extra={
+            "meta": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "grid_id": grid_id,
+                "sent": sent_count,
+            }
+        },
+    )
+    return True
 
 
 def _extract_result_url(data: Dict[str, Any]) -> Optional[str]:
@@ -4237,16 +4322,21 @@ BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
 VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
-_VIDEO_MENU_LOCK_TTL = 3
-_VIDEO_MENU_CACHE_TTL = 3 * 24 * 60 * 60
-_VIDEO_MENU_LOCK_KEY_TMPL = "lock:video_menu:{chat_id}"
-_VIDEO_MENU_LAST_KEY_TMPL = "video_menu:last_menu_msg_id:{chat_id}"
+_VIDEO_MENU_LOCK_TTL = 5
+_VIDEO_MENU_CACHE_TTL = 60 * 60
+_VIDEO_MENU_LOCK_KEY_TMPL = "lock:video_menu:{user_id}"
+_VIDEO_MENU_LAST_KEY_TMPL = "video:last_msg:{chat_id}"
 
 _VIDEO_MODE_HINTS: Dict[str, str] = {
     "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
     "veo_text_quality": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
     "veo_photo": "📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.",
 }
+
+_MJ_GRID_CACHE_KEY_TMPL = "mj:grid:{grid_id}"
+_MJ_GRID_CACHE_TTL = 24 * 60 * 60
+_MJ_UPSCALE_LOCK_KEY_TMPL = "lock:mj:upscale:{grid_id}:{index}"
+_MJ_UPSCALE_LOCK_TTL = 60
 
 def _safe_get_balance(user_id: int) -> int:
     try:
@@ -4407,7 +4497,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s["mode"] = None
         await query.answer()
         try:
-            await show_video_menu(ctx, chat_id=chat_id)
+            await start_video_mode(update, ctx)
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.video_send_failed | chat=%s err=%s", chat_id, exc)
         return
@@ -4567,64 +4657,122 @@ async def _send_video_menu_message(
     return getattr(result, "message_id", None)
 
 
-async def show_video_menu(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    *,
-    chat_id: Optional[int] = None,
-    message: Optional[Message] = None,
-    force: bool = False,
-) -> Optional[int]:
-    target_chat = chat_id or (getattr(message, "chat_id", None))
-    if target_chat is None:
-        return None
-    lock_key = _VIDEO_MENU_LOCK_KEY_TMPL.format(chat_id=target_chat)
-    if not force and not acquire_ttl_lock(lock_key, _VIDEO_MENU_LOCK_TTL):
-        log.debug("video.menu.lock_active", extra={"chat_id": target_chat})
-        return None
-    if force:
-        acquire_ttl_lock(lock_key, _VIDEO_MENU_LOCK_TTL)
+async def start_video_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None) or (
+        getattr(message, "chat", None) if message else None
+    )
+    query = getattr(update, "callback_query", None)
+    user = getattr(update, "effective_user", None)
 
-    last_key = _VIDEO_MENU_LAST_KEY_TMPL.format(chat_id=target_chat)
-    log.debug("video.menu.show", extra={"chat_id": target_chat})
-    last_id_raw = cache_get(last_key)
-    last_msg_id: Optional[int] = None
-    if last_id_raw:
-        try:
-            last_msg_id = int(last_id_raw)
-        except (TypeError, ValueError):
-            last_msg_id = None
+    chat_id = chat.id if chat else (message.chat_id if message else None)
+    if chat_id is None:
+        return None
 
-    if last_msg_id is not None:
+    if query is not None and not getattr(query, "_answered", False):
         try:
-            await safe_edit_message(
-                ctx,
-                chat_id=target_chat,
-                message_id=last_msg_id,
-                new_text=VIDEO_MENU_TEXT,
-                reply_markup=video_menu_kb(),
+            await query.answer()
+            setattr(query, "_answered", True)
+        except Exception as exc:  # pragma: no cover - network issues
+            log.debug(
+                "video.menu.answer_fail",
+                extra={"chat_id": chat_id, "error": str(exc)},
             )
-            cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
-            return last_msg_id
-        except BadRequest as exc:
-            lowered = str(exc).lower()
-            if "message is not modified" in lowered:
+
+    user_id = user.id if user else None
+    if user_id is not None:
+        input_state.clear(user_id, reason="video_menu")
+        set_mode(user_id, False)
+        clear_wait(user_id, reason="video_menu")
+        try:
+            clear_wait_state(user_id, reason="video_menu")
+        except TypeError:
+            clear_wait_state(user_id)
+
+    s = state(ctx)
+    s["mode"] = None
+    s.pop("model", None)
+
+    lock_owner = user_id if user_id is not None else chat_id
+    lock_key = _VIDEO_MENU_LOCK_KEY_TMPL.format(user_id=lock_owner)
+    if not acquire_ttl_lock(lock_key, _VIDEO_MENU_LOCK_TTL):
+        log.debug(
+            "video.menu.lock_active",
+            extra={"chat_id": chat_id, "user_id": user_id},
+        )
+        return None
+
+    log.info(
+        "video.menu.lock_acquired",
+        extra={"chat_id": chat_id, "user_id": user_id},
+    )
+
+    try:
+        keyboard = video_menu_kb()
+        last_key = _VIDEO_MENU_LAST_KEY_TMPL.format(chat_id=chat_id)
+        last_id_raw = cache_get(last_key)
+        last_msg_id: Optional[int] = None
+        if last_id_raw:
+            try:
+                last_msg_id = int(last_id_raw)
+            except (TypeError, ValueError):
+                last_msg_id = None
+
+        if last_msg_id is not None:
+            try:
+                edited = await safe_edit_message(
+                    ctx,
+                    chat_id=chat_id,
+                    message_id=last_msg_id,
+                    new_text=VIDEO_MENU_TEXT,
+                    reply_markup=keyboard,
+                    log_on_noop="card_edit_noop",
+                )
                 cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
-                log.debug("video.menu.not_modified", extra={"chat_id": target_chat})
+                if edited:
+                    log.info(
+                        "video.menu.show_edit",
+                        extra={"chat_id": chat_id, "message_id": last_msg_id},
+                    )
+                else:
+                    log.info(
+                        "video.menu.show_edit_noop",
+                        extra={"chat_id": chat_id, "message_id": last_msg_id},
+                    )
                 return last_msg_id
-            log.debug(
-                "video.menu.edit_bad_request",
-                extra={"chat_id": target_chat, "error": str(exc)},
-            )
-        except TelegramError as exc:
-            log.debug(
-                "video.menu.edit_failed",
-                extra={"chat_id": target_chat, "error": str(exc)},
-            )
+            except BadRequest as exc:
+                lowered = str(exc).lower()
+                if "message is not modified" in lowered:
+                    cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
+                    log.info(
+                        "card_edit_noop",
+                        extra={"chat_id": chat_id, "message_id": last_msg_id},
+                    )
+                    return last_msg_id
+                log.debug(
+                    "video.menu.edit_bad_request",
+                    extra={"chat_id": chat_id, "error": str(exc)},
+                )
+            except TelegramError as exc:
+                log.debug(
+                    "video.menu.edit_failed",
+                    extra={"chat_id": chat_id, "error": str(exc)},
+                )
 
-    message_id = await _send_video_menu_message(ctx, chat_id=target_chat, message=message)
-    if message_id is not None:
-        cache_set(last_key, str(message_id), _VIDEO_MENU_CACHE_TTL)
-    return message_id
+        sent_id = await _send_video_menu_message(ctx, chat_id=chat_id, message=message)
+        if sent_id is not None:
+            cache_set(last_key, str(sent_id), _VIDEO_MENU_CACHE_TTL)
+            log.info(
+                "video.menu.show_send",
+                extra={"chat_id": chat_id, "message_id": sent_id},
+            )
+        return sent_id
+    finally:
+        release_ttl_lock(lock_key)
+        log.info(
+            "video.menu.lock_release",
+            extra={"chat_id": chat_id, "user_id": user_id},
+        )
 
 
 def _video_mode_config(mode: str) -> Optional[Tuple[str, str, str]]:
@@ -8742,31 +8890,8 @@ def _mj_error_message(payload: Optional[Dict[str, Any]]) -> str:
     return "No response from MidJourney Official Website after multiple attempts."
 
 
-def _make_mj_upscale_filename(task_id: str, index: int) -> str:
-    safe_task = re.sub(r"[^a-zA-Z0-9_-]", "", task_id) or "task"
-    return f"mj_upscaled_{safe_task}_{index}.png"
-
-
-async def _notify_mj_upscale_ready(
-    chat_id: int,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    *,
-    locale: str,
-    count: int,
-) -> None:
-    buttons_hint = " ".join(f"U{i + 1}" for i in range(max(count, 0)))
-    text = _mj_ui_text("upscale_ready", locale)
-    if buttons_hint:
-        text = f"{text} {buttons_hint}"
-    markup = _mj_upscale_keyboard(max(count, 0), locale, include_repeat=True)
-    await tg_safe_send(
-        ctx.bot.send_message,
-        method_name="sendMessage",
-        kind="message",
-        chat_id=chat_id,
-        text=text,
-        reply_markup=markup,
-    )
+def _make_mj_upscale_filename(result_url: Optional[str], index: int) -> str:
+    return _mj_document_filename(index + 1, result_url, suffix="upscaled")
 
 
 async def _wait_for_mj_grid_result(
@@ -8838,13 +8963,19 @@ async def _poll_and_send_upscaled_image(
                 result_url = urls[0] if urls else None
             if not result_url:
                 return {"ok": False, "reason": "empty", "message": "MJ вернул пустой результат."}
-            download = await asyncio.to_thread(_download_mj_image_bytes, result_url, image_index)
-            if not download:
-                return {"ok": False, "reason": "download_failed", "message": "Не удалось загрузить изображение."}
-            image_bytes, _ = download
-            filename = _make_mj_upscale_filename(origin_task_id, image_index)
-            await send_image_as_document(ctx.bot, chat_id, image_bytes, filename)
-            await _notify_mj_upscale_ready(chat_id, ctx, locale=locale, count=result_count)
+            filename = _make_mj_upscale_filename(result_url, image_index)
+            try:
+                document = InputFile(result_url, filename)
+                await ctx.bot.send_document(
+                    chat_id,
+                    document=document,
+                )
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "send_failed",
+                    "message": f"Не удалось отправить изображение: {exc}",
+                }
             duration_ms = int((time.time() - start_ts) * 1000)
             event(
                 "MJ_UPSCALE_RESULT",
@@ -9070,6 +9201,222 @@ async def _launch_mj_upscale(
         current_state["mj_upscale_active"] = None
 
 
+async def handle_mj_upscale_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    prefix, _, remainder = query.data.partition(":")
+    if prefix != "mj.upscale.menu":
+        return
+
+    grid_id = remainder.strip()
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    message = query.message
+    chat = update.effective_chat or (message.chat if message else None)
+    chat_id = getattr(chat, "id", None)
+
+    grid = _load_mj_grid_snapshot(grid_id)
+    if not grid:
+        if chat_id is not None:
+            await ctx.bot.send_message(
+                chat_id,
+                "Срок действия набора истёк. Сгенерируйте новый.",
+            )
+        mj_log.warning(
+            "mj.upscale.error",
+            extra={"meta": {"chat_id": chat_id, "grid_id": grid_id, "reason": "grid_missing"}},
+        )
+        return
+
+    urls = grid.get("result_urls") or []
+    available = [u for u in urls if isinstance(u, str) and u]
+    if not available:
+        if chat_id is not None:
+            await ctx.bot.send_message(
+                chat_id,
+                "Срок действия набора истёк. Сгенерируйте новый.",
+            )
+        mj_log.warning(
+            "mj.upscale.error",
+            extra={"meta": {"chat_id": chat_id, "grid_id": grid_id, "reason": "no_urls"}},
+        )
+        return
+
+    markup = getattr(message, "reply_markup", None)
+    inline_keyboard = getattr(markup, "inline_keyboard", None) if markup else None
+    show_select = not inline_keyboard or len(inline_keyboard) <= 1
+
+    try:
+        if show_select:
+            reply_markup = mj_upscale_select_keyboard(grid_id, count=len(available))
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+            mj_log.info(
+                "mj.upscale.menu_show",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "grid_id": grid_id,
+                        "count": len(available),
+                    }
+                },
+            )
+        else:
+            await query.edit_message_reply_markup(reply_markup=mj_upscale_root_keyboard(grid_id))
+    except TelegramError as exc:
+        mj_log.warning(
+            "mj.upscale.menu_edit_fail",
+            extra={
+                "meta": {
+                    "chat_id": chat_id,
+                    "grid_id": grid_id,
+                    "error": str(exc),
+                }
+            },
+        )
+
+
+async def handle_mj_upscale_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    prefix, _, remainder = query.data.partition(":")
+    if prefix != "mj.upscale":
+        return
+
+    grid_part, _, index_part = remainder.partition(":")
+    grid_id = grid_part.strip()
+
+    try:
+        index_value = int(index_part)
+    except (TypeError, ValueError):
+        try:
+            await query.answer("Некорректный номер кадра.", show_alert=True)
+        except Exception:
+            pass
+        mj_log.warning(
+            "mj.upscale.error",
+            extra={"meta": {"grid_id": grid_id, "reason": "bad_index"}},
+        )
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    message = query.message
+    chat = update.effective_chat or (message.chat if message else None)
+    chat_id = getattr(chat, "id", None)
+    user = query.from_user or update.effective_user
+    user_id = user.id if user else None
+
+    lock_key = _MJ_UPSCALE_LOCK_KEY_TMPL.format(grid_id=grid_id, index=index_value)
+    if not acquire_ttl_lock(lock_key, _MJ_UPSCALE_LOCK_TTL):
+        try:
+            await query.answer("Уже запускаю апскейл этого кадра.")
+        except Exception:
+            pass
+        mj_log.info(
+            "mj.upscale.lock_active",
+            extra={"meta": {"grid_id": grid_id, "index": index_value}},
+        )
+        return
+
+    try:
+        if user_id is None or chat_id is None:
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "grid_id": grid_id,
+                        "index": index_value,
+                        "reason": "missing_context",
+                    }
+                },
+            )
+            if chat_id is not None:
+                await ctx.bot.send_message(chat_id, "⚠️ Не удалось определить пользователя для апскейла.")
+            return
+
+        grid = _load_mj_grid_snapshot(grid_id)
+        if not grid:
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "grid_id": grid_id,
+                        "index": index_value,
+                        "reason": "grid_missing",
+                    }
+                },
+            )
+            await ctx.bot.send_message(chat_id, "Срок действия набора истёк. Сгенерируйте новый.")
+            return
+
+        urls = grid.get("result_urls") or []
+        if index_value <= 0 or index_value > len(urls):
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "grid_id": grid_id,
+                        "index": index_value,
+                        "reason": "index_out_of_range",
+                    }
+                },
+            )
+            await ctx.bot.send_message(chat_id, "⚠️ Этот кадр недоступен для апскейла.")
+            return
+
+        locale = state(ctx).get("mj_locale") or _determine_user_locale(user)
+        state(ctx)["mj_locale"] = locale
+
+        mj_log.info(
+            "mj.upscale.enqueue",
+            extra={
+                "meta": {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "grid_id": grid_id,
+                    "index": index_value,
+                }
+            },
+        )
+
+        success = await _launch_mj_upscale(
+            chat_id,
+            ctx,
+            user_id=user_id,
+            grid=grid,
+            image_index=index_value - 1,
+            locale=locale,
+            source="grid_menu",
+        )
+
+        if not success:
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "grid_id": grid_id,
+                        "index": index_value,
+                        "reason": "launch_failed",
+                    }
+                },
+            )
+    finally:
+        release_ttl_lock(lock_key)
 async def _handle_mj_upscale_input(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -9776,39 +10123,15 @@ async def poll_mj_and_send_photos(
                     await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
                     return
 
-                base_prompt = re.sub(r"\s+", " ", prompt_for_retry).strip()
-                snippet = base_prompt[:100] if base_prompt else "—"
-                caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
-
                 _store_last_mj_grid(s, user_id, task_id, urls, prompt=prompt_for_retry)
 
-                downloaded: List[Tuple[bytes, str]] = []
-                for idx, u in enumerate(urls):
-                    result = await asyncio.to_thread(_download_mj_image_bytes, u, idx)
-                    if result:
-                        downloaded.append(result)
-                    else:
-                        mj_log.warning(
-                            "mj.album.download_fail",
-                            extra={"meta": {"url": u, "index": idx, "reason": "skipped"}},
-                        )
-
-                if not downloaded:
-                    await _refund("download_failed")
-                    await ctx.bot.send_message(
-                        chat_id,
-                        "⚠️ MJ вернул результат, но изображения не удалось загрузить. 💎 Токены возвращены.",
-                    )
-                    return
-
-                sent_successfully = await _deliver_mj_media(
-                    ctx.bot,
+                sent_successfully = await _deliver_mj_grid_documents(
+                    ctx,
                     chat_id=chat_id,
                     user_id=user_id,
-                    caption=caption,
-                    items=downloaded,
-                    send_as_album=MJ_SEND_AS_ALBUM,
-                    task_id=task_id,
+                    grid_id=task_id,
+                    urls=urls,
+                    prompt=prompt_for_retry,
                 )
 
                 if not sent_successfully:
@@ -9818,24 +10141,6 @@ async def poll_mj_and_send_photos(
                         "❌ Не удалось отправить изображения MJ. 💎 Токены возвращены.",
                     )
                     return
-
-                locale = s.get("mj_locale") or "ru"
-                ready_text = _mj_ui_text("gallery_ready", locale)
-                keyboard = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                _mj_ui_text("repeat", locale), callback_data="mj:repeat"
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                _mj_ui_text("back", locale), callback_data="back"
-                            )
-                        ],
-                    ]
-                )
-                await ctx.bot.send_message(chat_id, ready_text, reply_markup=keyboard)
 
                 success = True
                 return
@@ -10090,19 +10395,7 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "video.command",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    if user_id:
-        input_state.clear(user_id, reason="video_menu")
-        set_mode(user_id, False)
-        clear_wait(user_id, reason="video_menu")
-
-    s = state(ctx)
-    s["mode"] = None
-    s.pop("model", None)
-    message = update.effective_message
-    if message is not None:
-        await show_video_menu(ctx, message=message)
-    else:
-        await show_video_menu(ctx, chat_id=chat.id)
+    await start_video_mode(update, ctx)
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -10238,19 +10531,12 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     user = update.effective_user
     user_id = user.id if user else None
-    if user_id is not None:
-        input_state.clear(user_id, reason="video_menu")
-        set_mode(user_id, False)
-        clear_wait(user_id, reason="video_menu")
-
-    s = state(ctx)
-    s["mode"] = None
 
     log.debug(
         "video.menu.reply",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    await show_video_menu(ctx, message=message)
+    await start_video_mode(update, ctx)
 
 
 async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10272,6 +10558,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         await query.answer()
+        setattr(query, "_answered", True)
     except Exception as exc:
         log.debug("video.menu.answer_fail", extra={"chat_id": chat_id, "error": str(exc)})
 
@@ -10279,14 +10566,6 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         "video.callback",
         extra={"chat_id": chat_id, "user_id": user_id, "data": data},
     )
-
-    s = state(ctx)
-    if user_id is not None:
-        input_state.clear(user_id, reason="video_menu")
-        set_mode(user_id, False)
-        clear_wait(user_id, reason="video_menu")
-        clear_wait_state(user_id, reason="video_menu")
-    s["mode"] = None
 
     if data.startswith("mode:veo_"):
         selected_mode = data.split(":", 1)[1]
@@ -10314,7 +10593,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if data == CB_VIDEO_MENU:
         if chat_id is None:
             return
-        await show_video_menu(ctx, chat_id=chat_id)
+        await start_video_mode(update, ctx)
         return
 
     return
@@ -13496,6 +13775,8 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (rf"^{CB_VIDEO_MENU}$", video_menu_callback),
     (r"^video:", video_menu_callback),
+    (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
+    (r"^mj\.upscale:", handle_mj_upscale_choice),
     (r"^hub:", hub_router),
     (r"^go:", main_suggest_router),
     (None, on_callback),

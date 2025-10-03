@@ -102,27 +102,34 @@ def test_banana_deliver_skips_document(monkeypatch, tmp_path, bot_module):
 
 
 def test_mj_documents_sent_without_compression(monkeypatch, bot_module):
-    calls: list[dict[str, object]] = []
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_document=None, send_message=None))
+    doc_calls: list[dict[str, object]] = []
+    menu_calls: list[dict[str, object]] = []
 
-    async def _fake_send(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
-        calls.append({"filename": filename, "caption": caption})
-        return SimpleNamespace(message_id=len(calls))
+    async def fake_send_document(chat_id, *, document, **kwargs):
+        doc_calls.append({"chat_id": chat_id, "document": document, "kwargs": kwargs})
 
-    monkeypatch.setattr(bot_module, "send_image_as_document", _fake_send)
+    async def fake_send_message(chat_id, text, *, reply_markup=None):
+        menu_calls.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
+
+    monkeypatch.setattr(ctx.bot, "send_document", fake_send_document)
+    monkeypatch.setattr(ctx.bot, "send_message", fake_send_message)
+    monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", lambda *args, **kwargs: None)
 
     delivered = asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            SimpleNamespace(),
+        bot_module._deliver_mj_grid_documents(
+            ctx,
             chat_id=55,
             user_id=66,
-            caption="MJ",
-            items=[(b"a", "1.png"), (b"b", "2.png")],
-            send_as_album=True,
-            task_id="task-3",
+            grid_id="task-3",
+            urls=["https://cdn/1.png", "https://cdn/2.png"],
+            prompt="MJ",
         )
     )
 
     assert delivered is True
-    assert [call["caption"] for call in calls] == ["MJ", None]
-    assert calls[0]["filename"] == "midjourney_task-3_01.png"
-    assert calls[1]["filename"] == "midjourney_task-3_02.png"
+    assert [call["document"].filename for call in doc_calls] == [
+        "midjourney_01.png",
+        "midjourney_02.png",
+    ]
+    assert menu_calls and menu_calls[0]["markup"].inline_keyboard[0][0].callback_data.startswith("mj.upscale.menu:")
