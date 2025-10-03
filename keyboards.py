@@ -13,6 +13,8 @@ CB_VIDEO_MENU = "video_menu"
 CB_VIDEO_MODE_FAST = "mode:veo_text_fast"
 CB_VIDEO_MODE_QUALITY = "mode:veo_text_quality"
 CB_VIDEO_MODE_PHOTO = "mode:veo_photo"
+CB_VIDEO_MODE_SORA_TEXT = "mode:sora2_ttv"
+CB_VIDEO_MODE_SORA_IMAGE = "mode:sora2_itv"
 CB_VIDEO_BACK = "video:back"
 
 

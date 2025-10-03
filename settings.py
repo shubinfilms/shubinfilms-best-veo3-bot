@@ -47,6 +47,7 @@ class _AppSettings(BaseModel):
 
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
     KIE_API_KEY: Optional[str] = Field(default=None)
+    PUBLIC_BASE_URL: Optional[str] = Field(default=None)
 
     SUNO_ENABLED: bool = Field(default=False)
     SUNO_API_BASE: Optional[str] = Field(default="https://api.kie.ai")
@@ -75,6 +76,9 @@ class _AppSettings(BaseModel):
     UPLOAD_BASE64_PATH: str = Field(default="/api/v1/upload/base64")
     UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
+    SORA2_GEN_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/createTask")
+    SORA2_STATUS_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/getTask")
+
     YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
     YOOKASSA_RETURN_URL: Optional[str] = Field(default=None)
@@ -92,6 +96,7 @@ class _AppSettings(BaseModel):
     @field_validator(
         "KIE_BASE_URL",
         "KIE_API_KEY",
+        "PUBLIC_BASE_URL",
         "SUNO_API_BASE",
         "SUNO_API_TOKEN",
         "SUNO_CALLBACK_SECRET",
@@ -230,6 +235,9 @@ def _strip_optional(value: Optional[str]) -> Optional[str]:
 
 KIE_BASE_URL = (_strip_optional(_APP_SETTINGS.KIE_BASE_URL) or "https://api.kie.ai").rstrip("/")
 KIE_API_KEY = _strip_optional(_APP_SETTINGS.KIE_API_KEY)
+PUBLIC_BASE_URL = _strip_optional(_APP_SETTINGS.PUBLIC_BASE_URL)
+if PUBLIC_BASE_URL:
+    PUBLIC_BASE_URL = PUBLIC_BASE_URL.rstrip("/")
 
 _suno_base_candidate = _APP_SETTINGS.SUNO_API_BASE or KIE_BASE_URL
 SUNO_API_BASE = (_strip_optional(_suno_base_candidate) or KIE_BASE_URL).rstrip("/")
@@ -271,6 +279,14 @@ UPLOAD_BASE64_PATH = _APP_SETTINGS.UPLOAD_BASE64_PATH
 SUNO_READY = bool(
     SUNO_ENABLED and SUNO_API_TOKEN and SUNO_CALLBACK_SECRET and SUNO_CALLBACK_URL
 )
+
+SORA2_GEN_PATH = _APP_SETTINGS.SORA2_GEN_PATH
+SORA2_STATUS_PATH = _APP_SETTINGS.SORA2_STATUS_PATH
+SORA2 = {
+    "GEN_PATH": SORA2_GEN_PATH,
+    "STATUS_PATH": SORA2_STATUS_PATH,
+    "CALLBACK_URL": f"{PUBLIC_BASE_URL}/sora2-callback" if PUBLIC_BASE_URL else None,
+}
 
 BANANA_SEND_AS_DOCUMENT = bool(_APP_SETTINGS.BANANA_SEND_AS_DOCUMENT)
 MJ_SEND_AS_ALBUM = bool(_APP_SETTINGS.MJ_SEND_AS_ALBUM)

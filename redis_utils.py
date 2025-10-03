@@ -76,6 +76,7 @@ _MJ_LOCK_KEY_TMPL = f"{_PFX}:mj:lock:{{}}"
 _MJ_LOCK_TTL = 15 * 60
 _MENU_LOCK_KEY_TMPL = f"{_PFX}:menu:lock:{{}}:{{}}"
 _MENU_MSG_KEY_TMPL = f"{_PFX}:menu:msg:{{}}:{{}}"
+_USER_LOCK_KEY_TMPL = f"{_PFX}:user:lock:{{}}:{{}}"
 _MJ_GALLERY_KEY_TMPL = f"{_PFX}:mj:gallery:{{}}:{{}}"
 _MJ_GALLERY_TTL = 2 * 60 * 60
 
@@ -88,6 +89,11 @@ def _menu_lock_key(name: str, chat_id: int) -> str:
 def _menu_msg_key(name: str, chat_id: int) -> str:
     normalized = str(name or "card").strip() or "card"
     return _MENU_MSG_KEY_TMPL.format(normalized, int(chat_id))
+
+
+def _user_lock_key(user_id: int, key: str) -> str:
+    normalized = str(key or "lock").strip() or "lock"
+    return _USER_LOCK_KEY_TMPL.format(int(user_id), normalized)
 
 if not _redis_url:
     _logger.warning(
@@ -331,6 +337,33 @@ def release_menu_lock(name: str, chat_id: int) -> None:
         _memory_delete(key)
 
 
+def user_lock(user_id: Optional[int], key: str, ttl: int = 30) -> bool:
+    if not user_id:
+        return True
+    lock_key = _user_lock_key(int(user_id), key)
+    ttl_value = max(int(ttl), 1)
+    if _r:
+        try:
+            return bool(_r.set(lock_key, "1", nx=True, ex=ttl_value))
+        except Exception as exc:
+            _logger.warning("user_lock.acquire_error | key=%s err=%s", lock_key, exc)
+            return True
+    return _memory_set_if_absent(lock_key, "1", ttl_value)
+
+
+def release_user_lock(user_id: Optional[int], key: str) -> None:
+    if not user_id:
+        return
+    lock_key = _user_lock_key(int(user_id), key)
+    if _r:
+        try:
+            _r.delete(lock_key)
+        except Exception as exc:
+            _logger.warning("user_lock.release_error | key=%s err=%s", lock_key, exc)
+    else:
+        _memory_delete(lock_key)
+
+
 def save_menu_message(name: str, chat_id: int, message_id: int, ttl: int) -> None:
     payload = json.dumps(
         {
@@ -457,20 +490,29 @@ def save_task_meta(
     message_id: int,
     mode: str,
     aspect: str,
+    *,
+    extra: Optional[Mapping[str, Any]] = None,
+    ttl: Optional[int] = None,
 ) -> None:
+    ttl_value = max(int(ttl) if ttl is not None else _TTL, 1)
     doc: Dict[str, Any] = {
         "chat_id": int(chat_id),
         "message_id": int(message_id),
         "mode": mode,
         "aspect": aspect,
         "created_at": _now_iso(),
+        "_ttl": ttl_value,
     }
+    if extra:
+        for key, value in extra.items():
+            if key not in {"chat_id", "message_id"}:
+                doc[key] = value
     payload = json.dumps(doc, ensure_ascii=False)
     key = task_key(task_id)
     if _r:
-        _r.setex(key, _TTL, payload)
+        _r.setex(key, ttl_value, payload)
     else:
-        _memory_set(key, payload)
+        _memory_set_with_ttl(key, payload, ttl_value)
 
 
 def load_task_meta(task_id: str) -> Optional[Dict[str, Any]]:
@@ -488,6 +530,32 @@ def load_task_meta(task_id: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         _logger.exception("Failed to decode task-meta for %s", task_id)
         return None
+
+
+def update_task_meta(
+    task_id: str,
+    *,
+    ttl: Optional[int] = None,
+    **fields: Any,
+) -> Optional[Dict[str, Any]]:
+    current = load_task_meta(task_id)
+    if not current:
+        return None
+    current.update(fields)
+    ttl_source = ttl if ttl is not None else current.get("_ttl")
+    ttl_value = max(int(ttl_source) if ttl_source else _TTL, 1)
+    current["_ttl"] = ttl_value
+    payload = json.dumps(current, ensure_ascii=False)
+    key = task_key(task_id)
+    if _r:
+        try:
+            _r.setex(key, ttl_value, payload)
+        except Exception as exc:
+            _logger.warning("task_meta.update_error | key=%s err=%s", key, exc)
+            return current
+    else:
+        _memory_set_with_ttl(key, payload, ttl_value)
+    return current
 
 
 def clear_task_meta(task_id: str) -> None:
