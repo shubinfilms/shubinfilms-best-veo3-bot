@@ -69,6 +69,8 @@ def test_sora2_success_releases_lock(tmp_path, monkeypatch, bot_module):
         "mode": "sora2_ttv",
         "wait_message_id": 333,
         "chat_id": 999,
+        "duration": bot_module.SORA2_DEFAULT_TTV_DURATION,
+        "resolution": bot_module.SORA2_DEFAULT_TTV_RESOLUTION,
     }
 
     result_payload = {"video_url": "https://example.com/result.mp4"}
@@ -89,5 +91,9 @@ def test_sora2_success_releases_lock(tmp_path, monkeypatch, bot_module):
     assert ctx.bot.sent_docs
     sent_doc = ctx.bot.sent_docs[0]
     assert sent_doc["chat_id"] == 999
-    assert "Готово" in sent_doc["caption"]
+    expected_caption = (
+        f"Sora 2 • Text-to-Video • {bot_module.SORA2_DEFAULT_TTV_DURATION}s "
+        f"• {bot_module.SORA2_DEFAULT_TTV_RESOLUTION.replace('x', '×')}"
+    )
+    assert sent_doc["caption"] == expected_caption
     assert bot_module.ACTIVE_TASKS.get(999) is None

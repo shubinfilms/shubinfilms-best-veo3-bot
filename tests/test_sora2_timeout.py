@@ -1,6 +1,8 @@
 import importlib
+import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -26,13 +28,13 @@ def test_sora2_client_uses_configured_timeout(monkeypatch):
 
     class DummyResponse:
         status_code = 200
-        text = "{}"
 
-        def raise_for_status(self) -> None:
-            return None
+        def __init__(self, payload: dict[str, Any]):
+            self._payload = payload
+            self.text = json.dumps(payload)
 
-        def json(self) -> dict[str, object]:
-            return {}
+        def json(self) -> dict[str, Any]:
+            return self._payload
 
         @property
         def is_success(self) -> bool:
@@ -49,13 +51,14 @@ def test_sora2_client_uses_configured_timeout(monkeypatch):
             return False
 
         def post(self, url, headers=None, json=None):
-            return DummyResponse()
+            if "createTask" in url:
+                return DummyResponse({"taskId": "abc"})
+            return DummyResponse({"status": "success", "result": {}})
 
     monkeypatch.setattr(httpx, "Client", DummyClient)
 
-    result = sora2_client._perform_request("https://example.invalid", {"ping": "pong"})
-
-    assert result == {}
+    result = sora2_client.create_task({"task_type": "text2video", "input": {"prompt": "hi"}})
+    assert result.task_id == "abc"
 
     timeout = captured["timeout"]
     assert isinstance(timeout, httpx.Timeout)

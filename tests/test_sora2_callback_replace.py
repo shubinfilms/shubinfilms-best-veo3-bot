@@ -124,6 +124,8 @@ def test_sora2_callback_replaces_sticker(monkeypatch, bot_module, tmp_path):
         "price": 0,
         "service": "SORA2_TTV",
         "mode": "sora2_ttv",
+        "duration": bot_module.SORA2_DEFAULT_TTV_DURATION,
+        "resolution": bot_module.SORA2_DEFAULT_TTV_RESOLUTION,
     }
 
     asyncio.run(
@@ -142,7 +144,11 @@ def test_sora2_callback_replaces_sticker(monkeypatch, bot_module, tmp_path):
     assert bot.send_document_calls, "document was not sent"
     doc_call = bot.send_document_calls[0]
     assert doc_call["chat_id"] == chat_id
-    assert "Готово" in (doc_call["caption"] or "")
+    expected_caption = (
+        f"Sora 2 • Text-to-Video • {bot_module.SORA2_DEFAULT_TTV_DURATION}s "
+        f"• {bot_module.SORA2_DEFAULT_TTV_RESOLUTION.replace('x', '×')}"
+    )
+    assert doc_call["caption"] == expected_caption
     buttons = doc_call["reply_markup"].inline_keyboard
     assert any(btn.text == "🔁 Сгенерировать ещё" for row in buttons for btn in row)
     assert not bot.send_video_calls
@@ -180,6 +186,8 @@ def test_sora2_callback_fallback_to_send(monkeypatch, bot_module, tmp_path):
         "price": 0,
         "service": "SORA2_TTV",
         "mode": "sora2_ttv",
+        "duration": bot_module.SORA2_DEFAULT_TTV_DURATION,
+        "resolution": bot_module.SORA2_DEFAULT_TTV_RESOLUTION,
     }
 
     asyncio.run(

@@ -81,6 +81,10 @@ class _AppSettings(BaseModel):
     SORA2_GEN_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/createTask")
     SORA2_STATUS_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/queryTask")
     SORA2_WAIT_STICKER_ID: str = Field(default="5375464961822695044")
+    SORA2_TIMEOUT_CONNECT: int = Field(default=20, ge=1, le=120)
+    SORA2_TIMEOUT_READ: int = Field(default=30, ge=1, le=300)
+    SORA2_TIMEOUT_WRITE: int = Field(default=30, ge=1, le=300)
+    SORA2_TIMEOUT_POOL: int = Field(default=10, ge=1, le=120)
 
     YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
@@ -297,10 +301,10 @@ SORA2 = {
     "CALLBACK_URL": f"{PUBLIC_BASE_URL}/sora2-callback" if PUBLIC_BASE_URL else None,
     "API_KEY": SORA2_API_KEY,
 }
-SORA2_TIMEOUT_CONNECT = int(os.getenv("SORA2_TIMEOUT_CONNECT", 20))
-SORA2_TIMEOUT_READ = int(os.getenv("SORA2_TIMEOUT_READ", 30))
-SORA2_TIMEOUT_WRITE = int(os.getenv("SORA2_TIMEOUT_WRITE", 30))
-SORA2_TIMEOUT_POOL = int(os.getenv("SORA2_TIMEOUT_POOL", 10))
+SORA2_TIMEOUT_CONNECT = int(_APP_SETTINGS.SORA2_TIMEOUT_CONNECT)
+SORA2_TIMEOUT_READ = int(_APP_SETTINGS.SORA2_TIMEOUT_READ)
+SORA2_TIMEOUT_WRITE = int(_APP_SETTINGS.SORA2_TIMEOUT_WRITE)
+SORA2_TIMEOUT_POOL = int(_APP_SETTINGS.SORA2_TIMEOUT_POOL)
 
 BANANA_SEND_AS_DOCUMENT = bool(_APP_SETTINGS.BANANA_SEND_AS_DOCUMENT)
 MJ_SEND_AS_ALBUM = bool(_APP_SETTINGS.MJ_SEND_AS_ALBUM)

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import httpx
 
@@ -13,6 +14,7 @@ import settings
 
 logger = logging.getLogger(__name__)
 _MAX_LOG_BODY = 512
+_INVALID_422_MARKERS = ("model cannot be null", "page does not exist")
 
 
 class Sora2Error(RuntimeError):
@@ -38,6 +40,15 @@ class QueryTaskResponse:
     status: str
     result_url: Optional[str]
     raw: Mapping[str, Any]
+
+
+def _timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=settings.SORA2_TIMEOUT_CONNECT,
+        read=settings.SORA2_TIMEOUT_READ,
+        write=settings.SORA2_TIMEOUT_WRITE,
+        pool=settings.SORA2_TIMEOUT_POOL,
+    )
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -76,35 +87,27 @@ def _log_response(url: str, response: httpx.Response) -> None:
     )
 
 
-def _raise_for_status(url: str, response: httpx.Response) -> None:
-    status = response.status_code
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {}
-    body_text = response.text or ""
-    lowered = (body_text or "").lower()
-    if status in {401, 403}:
-        logger.warning(
-            "sora2_auth_error",
-            extra={"path": url, "status": status},
-        )
-        raise Sora2AuthError("authentication with Sora2 API failed")
-    if status == 422 and "the page does not exist" in lowered:
-        logger.warning(
-            "sora2_unpublished_or_disabled",
-            extra={"path": url, "status": status},
-        )
-        raise Sora2UnavailableError("Sora2 model is disabled for this API key")
-    if not response.is_success:
-        snippet = (body_text or "")[:_MAX_LOG_BODY]
-        logger.error(
-            "sora2_http_error",
-            extra={"path": url, "status": status, "body": snippet},
-        )
-        raise Sora2Error(f"Sora2 request failed with status {status}: {snippet}")
+def _sanitize_payload_for_log(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    sample: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "input" and isinstance(value, Mapping):
+            input_copy: Dict[str, Any] = {}
+            for inner_key, inner_value in value.items():
+                if inner_key == "prompt":
+                    text = str(inner_value or "")
+                    input_copy["prompt_length"] = len(text)
+                elif inner_key == "image_urls" and isinstance(inner_value, Sequence) and not isinstance(inner_value, (str, bytes, bytearray)):
+                    urls = [str(url) for url in list(inner_value)[:4]]
+                    input_copy["image_urls"] = urls
+                else:
+                    input_copy[inner_key] = inner_value
+            sample[key] = input_copy
+        else:
+            sample[key] = value
+    return sample
 
-def _perform_request(url: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+
+def _send_once(url: str, payload: Mapping[str, Any]) -> httpx.Response:
     api_key = settings.SORA2_API_KEY
     if not api_key:
         raise Sora2Error("Sora2 API key is not configured")
@@ -113,34 +116,131 @@ def _perform_request(url: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         "Content-Type": "application/json",
     }
     _log_request(url, payload)
-    timeout = httpx.Timeout(
-        connect=settings.SORA2_TIMEOUT_CONNECT,
-        read=settings.SORA2_TIMEOUT_READ,
-        write=settings.SORA2_TIMEOUT_WRITE,
-        pool=settings.SORA2_TIMEOUT_POOL,
-    )
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, headers=headers, json=payload)
-    except httpx.TimeoutException as exc:  # pragma: no cover - network
-        logger.error("sora2_http_timeout", extra={"path": url, "error": str(exc)})
-        raise Sora2Error("Sora2 request timed out") from exc
-    except httpx.RequestError as exc:
-        logger.error("sora2_http_failure", extra={"path": url, "error": str(exc)})
-        raise Sora2Error("Sora2 request failed") from exc
+    with httpx.Client(timeout=_timeout()) as client:
+        response = client.post(url, headers=headers, json=payload)
     _log_response(url, response)
-    _raise_for_status(url, response)
-    try:
-        data = response.json()
-    except Exception as exc:
-        raise Sora2Error("Sora2 response is not valid JSON") from exc
-    return data
+    return response
+
+
+def _request_with_retries(
+    url: str,
+    payload: Mapping[str, Any],
+    *,
+    auto_model: bool,
+) -> Mapping[str, Any]:
+    network_retries = [1, 2]
+    server_retries = [1, 3]
+    invalid_retry_allowed = bool(auto_model)
+
+    while True:
+        try:
+            response = _send_once(url, payload)
+        except httpx.TimeoutException as exc:  # pragma: no cover - network
+            if network_retries:
+                delay = network_retries.pop(0)
+                logger.warning(
+                    "sora2.http.timeout",
+                    extra={"path": url, "delay": delay, "error": str(exc)},
+                )
+                time.sleep(delay)
+                continue
+            raise Sora2Error("Sora2 request timed out") from exc
+        except httpx.RequestError as exc:
+            if network_retries:
+                delay = network_retries.pop(0)
+                logger.warning(
+                    "sora2.http.failure",
+                    extra={"path": url, "delay": delay, "error": str(exc)},
+                )
+                time.sleep(delay)
+                continue
+            raise Sora2Error("Sora2 request failed") from exc
+
+        status = response.status_code
+        body_text = response.text or ""
+        lowered = body_text.lower()
+
+        if status in {401, 403}:
+            logger.warning(
+                "sora2_auth_error",
+                extra={"path": url, "status": status},
+            )
+            raise Sora2AuthError("authentication with Sora2 API failed")
+
+        if status == 422 and any(marker in lowered for marker in _INVALID_422_MARKERS):
+            logger.warning(
+                "sora2.invalid_request",
+                extra={
+                    "path": url,
+                    "status": status,
+                    "token_tail": _mask_token(settings.SORA2_API_KEY),
+                    "payload_sample": _sanitize_payload_for_log(payload),
+                },
+            )
+            if invalid_retry_allowed:
+                invalid_retry_allowed = False
+                time.sleep(0.75)
+                continue
+            if "page does not exist" in lowered:
+                raise Sora2UnavailableError("Sora2 model is disabled for this API key")
+            raise Sora2Error("Sora2 request failed with status 422")
+
+        if 500 <= status < 600:
+            if server_retries:
+                delay = server_retries.pop(0)
+                logger.warning(
+                    "sora2.http.server_error",
+                    extra={
+                        "path": url,
+                        "status": status,
+                        "delay": delay,
+                        "token_tail": _mask_token(settings.SORA2_API_KEY),
+                    },
+                )
+                time.sleep(delay)
+                continue
+            raise Sora2Error(f"Sora2 request failed with status {status}")
+
+        if not response.is_success:
+            logger.error(
+                "sora2.http.error",
+                extra={
+                    "path": url,
+                    "status": status,
+                    "token_tail": _mask_token(settings.SORA2_API_KEY),
+                    "body": (body_text or "")[:_MAX_LOG_BODY],
+                },
+            )
+            raise Sora2Error(f"Sora2 request failed with status {status}")
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise Sora2Error("Sora2 response is not valid JSON") from exc
+        if not isinstance(data, Mapping):
+            raise Sora2Error("Sora2 response is not a JSON object")
+        return data
 
 
 def create_task(payload: Mapping[str, Any]) -> CreateTaskResponse:
     """Submit a new generation task to Sora2."""
 
-    response = _perform_request(settings.SORA2_GEN_PATH, payload)
+    task_type = str(payload.get("task_type") or "").strip().lower()
+    normalized: Dict[str, Any] = dict(payload)
+    input_payload = dict(normalized.get("input") or {})
+    if task_type == "text2video":
+        normalized.setdefault("model", "sora2-text-to-video")
+        input_payload.setdefault("prompt", "")
+    elif task_type == "image2video":
+        normalized.setdefault("model", "sora2-image-to-video")
+        input_payload.setdefault("image_urls", [])
+    normalized["input"] = input_payload
+
+    response = _request_with_retries(
+        settings.SORA2_GEN_PATH,
+        normalized,
+        auto_model="model" not in payload,
+    )
     task_id = (
         str(response.get("taskId") or response.get("task_id") or "").strip()
     )
@@ -183,8 +283,12 @@ def _extract_result_url(payload: Mapping[str, Any]) -> Optional[str]:
 def query_task(task_id: str) -> QueryTaskResponse:
     """Fetch current status for a Sora2 task."""
 
-    payload = {"taskId": str(task_id)}
-    response = _perform_request(settings.SORA2_STATUS_PATH, payload)
+    payload = {"task_id": str(task_id)}
+    response = _request_with_retries(
+        settings.SORA2_STATUS_PATH,
+        payload,
+        auto_model=False,
+    )
     status = _extract_status(response)
     return QueryTaskResponse(status=status, result_url=_extract_result_url(response), raw=response)
 
@@ -228,18 +332,13 @@ def upload_image_urls(image_urls: Iterable[str]) -> List[str]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    timeout = httpx.Timeout(
-        connect=settings.SORA2_TIMEOUT_CONNECT,
-        read=settings.SORA2_TIMEOUT_READ,
-        write=settings.SORA2_TIMEOUT_WRITE,
-        pool=settings.SORA2_TIMEOUT_POOL,
-    )
     results: List[str] = []
     for original in cleaned:
-        _log_request(endpoint, {"url": original})
+        payload = {"url": original}
+        _log_request(endpoint, payload)
         try:
-            with httpx.Client(timeout=timeout) as client:
-                response = client.post(endpoint, headers=headers, json={"url": original})
+            with httpx.Client(timeout=_timeout()) as client:
+                response = client.post(endpoint, headers=headers, json=payload)
         except httpx.RequestError as exc:  # pragma: no cover - network
             logger.error(
                 "sora2.upload_http_failure",
@@ -247,7 +346,12 @@ def upload_image_urls(image_urls: Iterable[str]) -> List[str]:
             )
             raise Sora2Error("Failed to upload image URL for Sora2") from exc
         _log_response(endpoint, response)
-        _raise_for_status(endpoint, response)
+        if not response.is_success:
+            logger.error(
+                "sora2.upload_http_error",
+                extra={"path": endpoint, "status": response.status_code},
+            )
+            raise Sora2Error("Failed to upload image URL for Sora2")
         try:
             payload = response.json()
         except Exception as exc:  # pragma: no cover - defensive
