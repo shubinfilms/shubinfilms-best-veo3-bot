@@ -75,6 +75,11 @@ class _AppSettings(BaseModel):
     UPLOAD_BASE64_PATH: str = Field(default="/api/v1/upload/base64")
     UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
+    YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
+    YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
+    YOOKASSA_RETURN_URL: Optional[str] = Field(default=None)
+    YOOKASSA_CURRENCY: str = Field(default="RUB")
+
     @field_validator("LOG_LEVEL", mode="before")
     def _normalize_level(cls, value: object) -> str:
         if value is None:
@@ -91,6 +96,9 @@ class _AppSettings(BaseModel):
         "SUNO_API_TOKEN",
         "SUNO_CALLBACK_SECRET",
         "SUNO_CALLBACK_URL",
+        "YOOKASSA_SHOP_ID",
+        "YOOKASSA_SECRET_KEY",
+        "YOOKASSA_RETURN_URL",
         mode="before",
     )
     def _strip_optional(cls, value: object) -> Optional[str]:
@@ -232,6 +240,13 @@ SUNO_TIMEOUT_SEC = int(round(HTTP_TIMEOUT_TOTAL))
 SUNO_MAX_RETRIES = max(1, HTTP_RETRY_ATTEMPTS)
 SUNO_ENABLED = bool(_APP_SETTINGS.SUNO_ENABLED)
 
+YOOKASSA_SHOP_ID = _strip_optional(_APP_SETTINGS.YOOKASSA_SHOP_ID)
+YOOKASSA_SECRET_KEY = _strip_optional(_APP_SETTINGS.YOOKASSA_SECRET_KEY)
+YOOKASSA_RETURN_URL = _strip_optional(_APP_SETTINGS.YOOKASSA_RETURN_URL)
+YOOKASSA_CURRENCY = (
+    (_APP_SETTINGS.YOOKASSA_CURRENCY or "RUB").strip() or "RUB"
+)
+
 SUNO_GEN_PATH = _APP_SETTINGS.SUNO_GEN_PATH
 SUNO_TASK_STATUS_PATH = _APP_SETTINGS.SUNO_TASK_STATUS_PATH
 SUNO_WAV_PATH = _APP_SETTINGS.SUNO_WAV_PATH
@@ -360,6 +375,10 @@ __all__ = [
     "UPLOAD_STREAM_PATH",
     "UPLOAD_URL_PATH",
     "UPLOAD_BASE64_PATH",
+    "YOOKASSA_SHOP_ID",
+    "YOOKASSA_SECRET_KEY",
+    "YOOKASSA_RETURN_URL",
+    "YOOKASSA_CURRENCY",
     "BANANA_SEND_AS_DOCUMENT",
     "MJ_SEND_AS_ALBUM",
     "resolve_outbound_ip",

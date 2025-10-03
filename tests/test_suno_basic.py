@@ -96,10 +96,21 @@ def _reset_env(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.setenv("SUNO_ENABLED", "true")
     monkeypatch.setenv("SUNO_CALLBACK_URL", "https://callback.local/suno-callback")
+    monkeypatch.setenv("LEDGER_BACKEND", "memory")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
     monkeypatch.delenv("ADMIN_IDS", raising=False)
     monkeypatch.setattr(suno_web, "SUNO_ENABLED", True, raising=False)
     suno_web._memory_idempotency.clear()
+
+    bot = importlib.import_module("bot")
+    balance = importlib.import_module("balance")
+
+    async def _ensure_tokens_stub(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(bot, "ensure_tokens", _ensure_tokens_stub)
+    monkeypatch.setattr(balance, "ensure_tokens", _ensure_tokens_stub)
 
 
 def _client():

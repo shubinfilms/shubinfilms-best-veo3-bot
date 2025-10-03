@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from pathlib import Path
 import sys
 
+import pytest
+
 from telegram import InlineKeyboardMarkup
 from telegram.error import BadRequest
 
@@ -44,6 +46,16 @@ from utils.suno_state import (
 import utils.api_client as api_client_utils
 
 bot_module = importlib.import_module("bot")
+balance_module = importlib.import_module("balance")
+
+
+@pytest.fixture(autouse=True)
+def _patch_ensure_tokens(monkeypatch):
+    async def _ensure_tokens_stub(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(bot_module, "ensure_tokens", _ensure_tokens_stub)
+    monkeypatch.setattr(balance_module, "ensure_tokens", _ensure_tokens_stub)
 
 
 class FakeBot:
