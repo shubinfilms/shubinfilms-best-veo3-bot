@@ -2631,15 +2631,32 @@ def _normalize_mj_grid(value: Any) -> Optional[Dict[str, Any]]:
         normalized_urls = []
     if not normalized_urls:
         return None
-    return {"task_id": task_id, "result_urls": normalized_urls}
+    prompt_raw = value.get("prompt")
+    prompt = prompt_raw.strip() if isinstance(prompt_raw, str) else None
+    if not prompt:
+        prompt = _extract_mj_prompt(value)
+    grid: Dict[str, Any] = {"task_id": task_id, "result_urls": normalized_urls}
+    if prompt:
+        grid["prompt"] = prompt
+    return grid
 
 
-def _store_last_mj_grid(state_dict: Dict[str, Any], user_id: Optional[int], task_id: str, urls: Sequence[str]) -> None:
-    grid = {"task_id": task_id, "result_urls": list(urls)}
+def _store_last_mj_grid(
+    state_dict: Dict[str, Any],
+    user_id: Optional[int],
+    task_id: str,
+    urls: Sequence[str],
+    *,
+    prompt: Optional[str] = None,
+) -> None:
+    grid: Dict[str, Any] = {"task_id": task_id, "result_urls": list(urls)}
+    prompt_clean = prompt.strip() if isinstance(prompt, str) else None
+    if prompt_clean:
+        grid["prompt"] = prompt_clean
     state_dict["mj_last_grid"] = grid
     if user_id:
         try:
-            set_last_mj_grid(int(user_id), task_id, list(urls))
+            set_last_mj_grid(int(user_id), task_id, list(urls), prompt=prompt_clean)
         except Exception as exc:
             mj_log.warning("mj.grid.cache_fail | user=%s err=%s", user_id, exc)
 
@@ -8520,6 +8537,7 @@ def mj_generate_upscale(
     task_id: str,
     image_index: int,
     *,
+    prompt: Optional[str] = None,
     callback_url: Optional[str] = None,
     watermark: bool = False,
 ) -> Tuple[bool, Optional[str], str]:
@@ -8528,6 +8546,10 @@ def mj_generate_upscale(
         "imageIndex": int(image_index),
         "waterMark": bool(watermark),
     }
+    if isinstance(prompt, str):
+        prompt_value = prompt.strip()
+        if prompt_value:
+            payload["prompt"] = prompt_value
     if callback_url:
         payload["callBackUrl"] = callback_url
     status, resp, req_id, path_used = _kie_request_with_endpoint(
@@ -8596,6 +8618,68 @@ def mj_status(task_id: str) -> Tuple[bool, Optional[int], Optional[Dict[str, Any
     if status == 200 and code == 200:
         return True, flag, data if isinstance(data, dict) else None
     return False, None, None
+
+_MJ_PROMPT_KEYS: Tuple[str, ...] = (
+    "prompt",
+    "promptEn",
+    "prompt_en",
+    "prompt_en_translate",
+    "promptTranslateEn",
+    "promptTranslate",
+    "translatedPrompt",
+    "translated_prompt",
+    "finalPrompt",
+    "final_prompt",
+)
+
+
+def _extract_mj_prompt(source: Any) -> Optional[str]:
+    def _from_dict(data: Dict[str, Any]) -> Optional[str]:
+        for key in _MJ_PROMPT_KEYS:
+            if key in data:
+                value = data.get(key)
+                if isinstance(value, str):
+                    trimmed = value.strip()
+                    if trimmed:
+                        return trimmed
+        return None
+
+    if isinstance(source, dict):
+        direct = _from_dict(source)
+        if direct:
+            return direct
+        nested_keys = (
+            "resultInfoJson",
+            "resultInfo",
+            "resultJson",
+            "meta",
+            "metadata",
+            "extraInfo",
+            "extraJson",
+        )
+        for meta_key in nested_keys:
+            raw = source.get(meta_key)
+            stack: List[Any] = [raw]
+            while stack:
+                current = stack.pop()
+                if current is None:
+                    continue
+                if isinstance(current, str):
+                    try:
+                        parsed = json.loads(current)
+                    except Exception:
+                        continue
+                    stack.append(parsed)
+                    continue
+                if isinstance(current, dict):
+                    nested_prompt = _from_dict(current)
+                    if nested_prompt:
+                        return nested_prompt
+                    stack.extend(current.values())
+                elif isinstance(current, list):
+                    stack.extend(current)
+    return None
+
 
 def _extract_mj_image_urls(status_data: Dict[str, Any]) -> List[str]:
     res: List[str] = []
@@ -8800,11 +8884,23 @@ async def _launch_mj_upscale(
     already_charged: bool = False,
     balance_after: Optional[int] = None,
 ) -> bool:
+    s = state(ctx)
     origin_task_id = grid.get("task_id")
     result_urls = grid.get("result_urls") or []
     if not isinstance(origin_task_id, str) or not result_urls:
         await ctx.bot.send_message(chat_id, _mj_ui_text("upscale_need_photo", locale))
         return False
+
+    prompt_text = ""
+    grid_prompt = grid.get("prompt") if isinstance(grid, dict) else None
+    if isinstance(grid_prompt, str):
+        prompt_text = grid_prompt.strip()
+    if not prompt_text:
+        prompt_text = _extract_mj_prompt(grid) or ""
+    if not prompt_text:
+        prompt_text = (s.get("last_prompt") or "").strip()
+    if not prompt_text:
+        prompt_text = MJ_UPSCALE_PROMPT_PLACEHOLDER
 
     price = PRICE_MJ_UPSCALE
     charged_here = False
@@ -8884,6 +8980,7 @@ async def _launch_mj_upscale(
             mj_generate_upscale,
             origin_task_id,
             image_index,
+            prompt=prompt_text,
         )
         if not ok_submit or not new_task_id:
             new_balance: Optional[int] = None
@@ -8920,7 +9017,6 @@ async def _launch_mj_upscale(
             _log_failure("submit_failed", submit_msg or "submit_failed")
             return False
 
-        s = state(ctx)
         s["mj_upscale_active"] = {
             "task_id": new_task_id,
             "origin_task_id": origin_task_id,
@@ -9082,7 +9178,7 @@ async def _handle_mj_upscale_input(
                 pass
         return
 
-    grid_ok, urls, fail_reason, fail_message, _ = await _wait_for_mj_grid_result(
+    grid_ok, urls, fail_reason, fail_message, payload = await _wait_for_mj_grid_result(
         task_id,
         chat_id=chat_id,
         ctx=ctx,
@@ -9124,13 +9220,18 @@ async def _handle_mj_upscale_input(
                 pass
         return
 
-    _store_last_mj_grid(s, user_id, task_id, urls)
+    prompt_from_payload = _extract_mj_prompt(payload)
+    _store_last_mj_grid(s, user_id, task_id, urls, prompt=prompt_from_payload)
+
+    grid_payload: Dict[str, Any] = {"task_id": task_id, "result_urls": urls}
+    if prompt_from_payload:
+        grid_payload["prompt"] = prompt_from_payload
 
     await _launch_mj_upscale(
         chat_id,
         ctx,
         user_id=user_id,
-        grid={"task_id": task_id, "result_urls": urls},
+        grid=grid_payload,
         image_index=0,
         locale=locale,
         source="from_file",
@@ -9690,7 +9791,7 @@ async def poll_mj_and_send_photos(
                 snippet = base_prompt[:100] if base_prompt else "—"
                 caption = "🖼 Midjourney\n• Формат: {ar}\n• Промпт: \"{snip}\"".format(ar=aspect_ratio, snip=snippet)
 
-                _store_last_mj_grid(s, user_id, task_id, urls)
+                _store_last_mj_grid(s, user_id, task_id, urls, prompt=prompt_for_retry)
 
                 downloaded: List[Tuple[bytes, str]] = []
                 for idx, u in enumerate(urls):
@@ -13388,13 +13489,19 @@ LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Aw
 _REGISTERED_APPS: set[int] = set()
 
 
+HANDLERS_FLAG = "bestveo.handlers_registered"
+
+
+MJ_UPSCALE_PROMPT_PLACEHOLDER = "upscale image"
+
+
 def register_handlers(application: Any) -> None:
     app_id = id(application)
-    if getattr(application, "_bestveo_handlers_registered", False) or app_id in _REGISTERED_APPS:
+    if application.bot_data.get(HANDLERS_FLAG) or app_id in _REGISTERED_APPS:
         log.warning("handlers.duplicate_registration", extra={"application": app_id})
         return
 
-    application._bestveo_handlers_registered = True
+    application.bot_data[HANDLERS_FLAG] = True
     _REGISTERED_APPS.add(app_id)
 
     card_input_handler = MessageHandler(

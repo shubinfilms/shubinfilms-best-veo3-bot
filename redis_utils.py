@@ -140,12 +140,22 @@ def _mj_lock_key(user_id: int, task_id: str, index: int) -> str:
     return _MJ_LOCK_KEY_TMPL.format(f"{int(user_id)}:{task_id}:{int(index)}")
 
 
-def set_last_mj_grid(user_id: int, task_id: str, result_urls: List[str]) -> None:
+def set_last_mj_grid(
+    user_id: int,
+    task_id: str,
+    result_urls: List[str],
+    *,
+    prompt: Optional[str] = None,
+) -> None:
     doc = {
         "task_id": str(task_id),
         "result_urls": [str(url) for url in result_urls if isinstance(url, str)],
         "created_at": _now_iso(),
     }
+    if isinstance(prompt, str):
+        prompt_clean = prompt.strip()
+        if prompt_clean:
+            doc["prompt"] = prompt_clean
     payload = json.dumps(doc, ensure_ascii=False)
     key = _mj_last_key(user_id)
     if _r:
@@ -183,7 +193,12 @@ def get_last_mj_grid(user_id: int) -> Optional[Dict[str, Any]]:
     normalized_urls = [str(url) for url in urls if isinstance(url, str)]
     if not normalized_urls:
         return None
-    return {"task_id": task_id, "result_urls": normalized_urls}
+    prompt = data.get("prompt")
+    prompt_value = prompt.strip() if isinstance(prompt, str) else None
+    result: Dict[str, Any] = {"task_id": task_id, "result_urls": normalized_urls}
+    if prompt_value:
+        result["prompt"] = prompt_value
+    return result
 
 
 def clear_last_mj_grid(user_id: int) -> None:
