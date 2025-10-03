@@ -265,7 +265,7 @@ from suno.cover_source import (
     validate_audio_file as validate_cover_audio_file,
 )
 from suno.service import SunoService, SunoAPIError, RecordInfoPollResult
-from sora2_client import sora2_create_task, sora2_get_task, sora2_upload_image_urls
+from sora2_client import sora2_create_task, sora2_query_task, sora2_upload_image_urls
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.client import (
     AMBIENT_NATURE_PRESET_ID,
@@ -8805,6 +8805,10 @@ def _build_sora2_payload(
     aspect_ratio: str,
 ) -> Dict[str, Any]:
     callback_url = SORA2.get("CALLBACK_URL")
+    if not callback_url:
+        public_base = (os.getenv("PUBLIC_BASE_URL") or "").strip()
+        if public_base:
+            callback_url = f"{public_base.rstrip('/')}/sora2-callback"
     input_payload: Dict[str, Any] = {"aspect_ratio": aspect_ratio}
     prompt_text = prompt.strip()
     if prompt_text:
@@ -9070,7 +9074,7 @@ async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 return
             if status not in {"success", "failed"} and now >= next_remote_poll:
                 try:
-                    response = await asyncio.to_thread(sora2_get_task, task_id)
+                    response = await asyncio.to_thread(sora2_query_task, task_id)
                 except Exception as exc:
                     log.warning("sora2.poll.error", extra={"task_id": task_id, "error": str(exc)})
                     next_remote_poll = now + random.uniform(20, 30)
@@ -9153,9 +9157,13 @@ async def _start_sora2_generation(
 
     payload = _build_sora2_payload(mode, prompt, prepared_image_urls, aspect_ratio=aspect_ratio)
     try:
-        response = await asyncio.to_thread(sora2_create_task, payload)
+        task_id = await asyncio.to_thread(sora2_create_task, payload)
     except Exception as exc:
-        log.exception("sora2.create_task_failed | user_id=%s err=%s", user_id, exc)
+        log.error(
+            "sora2.create_task_failed",
+            exc_info=True,
+            extra={"user_id": user_id},
+        )
         try:
             new_balance = credit_balance(
                 user_id,
@@ -9173,42 +9181,6 @@ async def _start_sora2_generation(
                 f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
             )
         await message.reply_text("⚠️ Не удалось создать задачу Sora 2. 💎 Токены возвращены.")
-        return None
-
-    task_id = str(response.get("taskId") or response.get("task_id") or "").strip()
-    if not task_id:
-        error_message = _sora2_extract_error(response)
-        body_snippet = json.dumps(response, ensure_ascii=False) if isinstance(response, Mapping) else str(response)
-        log.warning(
-            "sora2.create_task.missing_task",
-            extra={
-                "model": payload.get("model"),
-                "has_images": bool(prepared_image_urls),
-                "aspect_ratio": aspect_ratio,
-                "status": response.get("status") if isinstance(response, Mapping) else None,
-                "body": body_snippet[:512],
-            },
-        )
-        try:
-            new_balance = credit_balance(
-                user_id,
-                price,
-                reason="service:refund",
-                meta={"service": service_name, "reason": "missing_task_id"},
-            )
-        except Exception as refund_exc:
-            log.exception("sora2.no_task_refund_failed | user_id=%s err=%s", user_id, refund_exc)
-        else:
-            await show_balance_notification(
-                chat_id,
-                ctx,
-                user_id,
-                f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
-            )
-        user_message = "⚠️ Sora 2 не приняла задачу. 💎 Токены возвращены."
-        if error_message:
-            user_message = f"⚠️ Sora 2 не приняла задачу: {error_message}"
-        await message.reply_text(user_message)
         return None
 
     wait_msg_id = await show_wait_sticker(ctx, chat_id, SORA2_WAIT_STICKER_ID)

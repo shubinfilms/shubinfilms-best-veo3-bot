@@ -85,10 +85,15 @@ def test_sora2_start_button(monkeypatch, bot_module):
 
     def fake_create_task(payload):
         payloads.append(payload)
-        return {"taskId": "task-123"}
+        return "task-123"
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
     monkeypatch.setattr(bot_module, "_schedule_sora2_poll", lambda *args, **kwargs: None)
+
+    async def immediate_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot_module.asyncio, "to_thread", immediate_to_thread)
 
     saved_meta = {}
 
