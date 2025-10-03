@@ -669,7 +669,14 @@ _SUNO_REFUND_MEMORY: Dict[str, float] = {}
 
 _SUNO_STRICT_ENABLED = bool(_env_bool("SUNO_STRICT_LYRICS_ENABLED", True))
 _SUNO_LYRICS_RETRY_THRESHOLD = max(0.0, min(1.0, _env_float("SUNO_LYRICS_RETRY_THRESHOLD", 0.75)))
-_SUNO_LYRICS_MAXLEN = max(1, _env_int("SUNO_LYRICS_MAXLEN", 8000))
+_SUNO_LYRICS_MODEL_LIMIT = LYRICS_MAX_LENGTH
+_SUNO_LYRICS_MAXLEN = max(
+    1,
+    min(
+        _SUNO_LYRICS_MODEL_LIMIT,
+        _env_int("SUNO_LYRICS_MAXLEN", _SUNO_LYRICS_MODEL_LIMIT),
+    ),
+)
 _SUNO_LYRICS_STRICT_TEMPERATURE = max(0.0, _env_float("SUNO_LYRICS_STRICT_TEMPERATURE", 0.3))
 _SUNO_LYRICS_STRICT_FLAG = _env("SUNO_LYRICS_STRICT_FLAG", "").strip()
 _SUNO_LYRICS_SEED_RAW = _env("SUNO_LYRICS_SEED", "").strip()
@@ -7310,10 +7317,12 @@ async def _launch_suno_generation(
             )
             return
         if len(lyrics) > _SUNO_LYRICS_MAXLEN:
+            excess = len(lyrics) - _SUNO_LYRICS_MAXLEN
             await _suno_notify(
                 ctx,
                 chat_id,
-                f"⚠️ Текст слишком длинный ({len(lyrics)}). Максимум — {_SUNO_LYRICS_MAXLEN} символов.",
+                f"⚠️ Текст слишком длинный ({len(lyrics)}). Максимум — {_SUNO_LYRICS_MAXLEN} символов. "
+                f"Сократите примерно на {excess} символов.",
                 reply_to=reply_to,
             )
             return
@@ -7428,6 +7437,8 @@ async def _launch_suno_generation(
             instrumental=bool(payload.get("instrumental", True)),
             has_lyrics=bool(payload.get("has_lyrics")),
             lyrics=payload.get("lyrics"),
+            style=payload.get("style"),
+            lyrics_source=payload.get("lyrics_source"),
             prompt_len=payload.get("prompt_len", 16),
             model=model,
             tags=payload.get("tags"),

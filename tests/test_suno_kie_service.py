@@ -60,7 +60,7 @@ def test_enqueue_music_builds_instrumental_payload():
     assert payload["userId"] == "878622103"
     assert payload["callBackUrl"] == "https://bot.example.com/suno-callback"
     assert "callBackSecret" not in payload
-    assert payload["customMode"] is False
+    assert payload["customMode"] is True
     assert payload["prompt_len"] == 16
     assert payload["instrumental"] is True
     assert payload["has_lyrics"] is False
@@ -92,15 +92,18 @@ def test_enqueue_music_builds_vocal_payload():
             instrumental=False,
             has_lyrics=True,
             lyrics="hello world",
+            style="pop ballad",
         )
 
     payload = captured.get("json")
     assert isinstance(payload, dict)
     assert payload["model"] == "V5"
-    assert payload["customMode"] is False
+    assert payload["customMode"] is True
     assert payload["has_lyrics"] is True
     assert payload["instrumental"] is False
+    assert payload["prompt"] == "hello world"
     assert payload["lyrics"] == "hello world"
+    assert payload["style"] == "pop ballad"
     assert payload["tags"] == ["pop", "ballad"]
     assert task_id == "task-2"
 

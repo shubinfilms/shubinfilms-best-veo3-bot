@@ -731,6 +731,19 @@ class SunoService:
         return " ".join(text.split())
 
     @staticmethod
+    def _normalize_user_lyrics(value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.strip() for line in text.split("\n")]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+
+    @staticmethod
     def _strict_similarity(a: str, b: str) -> float:
         if not a or not b:
             return 0.0
@@ -2032,6 +2045,8 @@ class SunoService:
                 instrumental=instrumental,
                 has_lyrics=bool(has_lyrics),
                 lyrics=lyrics_text,
+                style=style,
+                lyrics_source=lyrics_source,
                 prompt_len=prompt_len,
                 model=model_name,
                 tags=derived_tags,
@@ -2094,6 +2109,8 @@ class SunoService:
             "lyrics_source": lyrics_source,
             "strict_enabled": bool(strict_enabled),
         }
+        if lyrics_text:
+            meta.setdefault("original_lyrics", str(lyrics_text))
         if strict_enabled:
             strict_meta: Dict[str, Any] = {
                 "attempts": 0,
@@ -2346,6 +2363,27 @@ class SunoService:
             strict_warning: Optional[str] = None
             strict_actual_lyrics: Optional[str] = None
             strict_similarity: Optional[float] = None
+            lyrics_source_label = ""
+            if meta:
+                raw_source = meta.extras.get("lyrics_source")
+                if raw_source not in (None, ""):
+                    lyrics_source_label = str(raw_source).strip().lower()
+            expected_prompt_normalized: Optional[str] = None
+            original_candidates: list[str] = []
+            if strict_context and strict_context.get("original"):
+                original_candidates.append(str(strict_context.get("original")))
+            if meta:
+                extras = meta.extras
+                for key in ("strict_original_lyrics", "original_lyrics"):
+                    candidate = extras.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        original_candidates.append(candidate)
+            for candidate in original_candidates:
+                normalized_candidate = self._normalize_user_lyrics(candidate)
+                if normalized_candidate:
+                    expected_prompt_normalized = normalized_candidate
+                    break
+            prompt_mismatches: list[Dict[str, Any]] = []
             if strict_context and incoming_status in final_states:
                 strict_decision = self._process_strict_delivery(
                     task=task,
@@ -2406,6 +2444,18 @@ class SunoService:
                 if not cover_url:
                     cover_url = self._preset_cover_url(preset_id)
                 audio_url = track.source_audio_url or track.audio_url
+                normalized_prompt = self._normalize_user_lyrics(track.prompt)
+                prompt_match_value: Optional[bool] = None
+                if lyrics_source_label == "user" and expected_prompt_normalized:
+                    prompt_match_value = normalized_prompt == expected_prompt_normalized
+                    if not prompt_match_value:
+                        prompt_mismatches.append(
+                            {
+                                "take": take_id,
+                                "expected_len": len(expected_prompt_normalized),
+                                "actual_len": len(normalized_prompt),
+                            }
+                        )
 
                 if not self._delivery_register(task.task_id, take_id):
                     self._log_delivery(
@@ -2425,6 +2475,12 @@ class SunoService:
                             "source_image_url": track.source_image_url,
                             "tags": track.tags,
                             "duration": track.duration,
+                            "prompt": track.prompt,
+                            **(
+                                {"prompt_match": prompt_match_value}
+                                if prompt_match_value is not None
+                                else {}
+                            ),
                         }
                     )
                     if isinstance(track.duration, (int, float)):
@@ -2509,10 +2565,40 @@ class SunoService:
                         "source_image_url": track.source_image_url,
                         "tags": track.tags,
                         "duration": track.duration,
+                        "prompt": track.prompt,
+                        **(
+                            {"prompt_match": prompt_match_value}
+                            if prompt_match_value is not None
+                            else {}
+                        ),
                     }
                 )
                 if isinstance(track.duration, (int, float)):
                     durations.append(float(track.duration))
+
+            if lyrics_source_label == "user" and expected_prompt_normalized:
+                if prompt_mismatches:
+                    log.warning(
+                        "Suno prompt mismatch",
+                        extra={
+                            "meta": {
+                                "task_id": task.task_id,
+                                "takes": len(task.items),
+                                "details": prompt_mismatches[:3],
+                            }
+                        },
+                    )
+                else:
+                    log.info(
+                        "Suno prompt verified",
+                        extra={
+                            "meta": {
+                                "task_id": task.task_id,
+                                "takes": len(task.items),
+                                "length": len(expected_prompt_normalized),
+                            }
+                        },
+                    )
 
             record = dict(existing_record)
             record.update(
@@ -2531,6 +2617,8 @@ class SunoService:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
+            if lyrics_source_label == "user" and expected_prompt_normalized:
+                record["lyrics_prompt_match"] = not prompt_mismatches
             record.setdefault(
                 "created_at", existing_record.get("created_at") or datetime.now(timezone.utc).isoformat()
             )

@@ -60,6 +60,7 @@ class SunoTrack(BaseModel):
     duration: float | None = None
     source_audio_url: str | None = None
     source_image_url: str | None = None
+    prompt: str | None = None
 
 
 class SunoTask(BaseModel):
@@ -148,6 +149,8 @@ def _build_track(raw: Any, index: int) -> SunoTrack | None:
     title = _first(raw, "title", "name")
     source_audio_url = _first(raw, "sourceAudioUrl", "audio_url", "audioUrl", "url", "fileUrl", "mp3Url")
     source_image_url = _first(raw, "sourceImageUrl", "image_url", "imageUrl", "coverUrl", "imgUrl")
+    prompt_value = _first(raw, "prompt", "lyrics", "lyric", "text")
+    prompt_text = str(prompt_value) if prompt_value not in (None, "") else None
     audio_url = _first(raw, "audio_url", "audioUrl", "url", "fileUrl", "mp3Url") or source_audio_url
     image_url = _first(raw, "image_url", "imageUrl", "coverUrl", "imgUrl") or source_image_url
     tags_value = _first(raw, "tags", "tag", "style", "styles")
@@ -177,6 +180,7 @@ def _build_track(raw: Any, index: int) -> SunoTrack | None:
         duration=duration,
         source_audio_url=str(source_audio_url) if source_audio_url else None,
         source_image_url=str(source_image_url) if source_image_url else None,
+        prompt=prompt_text,
     )
 
 

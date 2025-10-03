@@ -31,9 +31,11 @@ def test_vocal_user_lyrics_passed_in_payload() -> None:
 
     assert payload.get("lyrics") == "Line one\nLine two"
     assert payload.get("lyrics_source") == LyricsSource.USER.value
+    assert payload.get("prompt") == "Line one\nLine two"
 
     set_lyrics_source(state, LyricsSource.AI)
     payload_ai = build_generation_payload(state, model="V5", lang="ru")
 
     assert "lyrics" not in payload_ai or payload_ai.get("lyrics") in (None, "")
     assert payload_ai.get("lyrics_source") == LyricsSource.AI.value
+    assert payload_ai.get("prompt") == "Alt pop"

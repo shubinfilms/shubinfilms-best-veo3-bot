@@ -82,7 +82,8 @@ def test_toggle_to_user_requests_lyrics(monkeypatch, bot_module):
     assert not state_dict["suno_lyrics_confirmed"]
     assert refresh_calls
     assert wait_calls and wait_calls[0]["kind"] == bot_module.WaitKind.SUNO_LYRICS
-    assert notify_calls and "8000" in notify_calls[0]["text"]
+    expected_limit = str(bot_module._SUNO_LYRICS_MAXLEN)
+    assert notify_calls and expected_limit in notify_calls[0]["text"]
 
 
 def test_toggle_back_to_ai_clears_wait(monkeypatch, bot_module):
