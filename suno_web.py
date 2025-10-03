@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import base64
 import os
 import signal
 import threading
@@ -47,11 +48,14 @@ from settings import (
     KIE_BASE_URL,
     resolve_outbound_ip,
     token_tail,
+    YOOKASSA_SECRET_KEY,
+    YOOKASSA_SHOP_ID,
 )
 from telegram_utils import mask_tokens
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.service import SunoService
 from suno.tempfiles import cleanup_old_directories, task_directory
+from payments.yookassa_callback import process_callback as process_yookassa_callback
 
 configure_logging("suno-web")
 log = logging.getLogger("suno-web")
@@ -78,6 +82,13 @@ _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _WEB_LABELS = {"env": _ENV, "service": "web"}
 _EXPECTED_RENDER_BASE = (os.getenv("RENDER_EXTERNAL_URL") or "https://shubinfilms-best-veo3-bot.onrender.com").rstrip("/")
 _EXPECTED_CALLBACK_URL = f"{_EXPECTED_RENDER_BASE}/suno-callback"
+
+if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+    _YK_AUTH_HEADER = "Basic " + base64.b64encode(
+        f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode("utf-8")
+    ).decode("ascii")
+else:
+    _YK_AUTH_HEADER = None
 
 
 def _json_preview(payload: Any, *, limit: int = 700) -> str:
@@ -543,6 +554,27 @@ async def suno_callback(
         log.info("suno callback processed", extra={"meta": meta})
     suno_callback_total.labels(status=process_status, **_WEB_LABELS).inc()
     return {"ok": process_status == "ok"}
+
+
+@app.post("/yookassa/callback")
+async def yookassa_callback(request: Request) -> JSONResponse:
+    if not _YK_AUTH_HEADER:
+        log.warning("yookassa.callback.disabled")
+        raise HTTPException(status_code=503, detail="callback disabled")
+
+    provided = request.headers.get("Authorization")
+    if provided != _YK_AUTH_HEADER:
+        log.warning("yookassa.callback.unauthorized")
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        log.warning("yookassa.callback.invalid_json")
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    result = process_yookassa_callback(payload)
+    return JSONResponse(result)
 
 
 __all__ = ["app"]

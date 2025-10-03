@@ -156,7 +156,21 @@ from keyboards import (
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
 )
-from texts import SUNO_MODE_PROMPT, SUNO_START_READY_MESSAGE, SUNO_STARTING_MESSAGE, t
+from texts import (
+    SUNO_MODE_PROMPT,
+    SUNO_START_READY_MESSAGE,
+    SUNO_STARTING_MESSAGE,
+    common_text,
+    t,
+)
+
+from balance import ensure_tokens, insufficient_balance_keyboard
+from payments.yookassa import (
+    YOOKASSA_PACKS_ORDER,
+    YookassaError,
+    create_payment as yookassa_create_payment,
+    pack_button_label as yookassa_pack_button_label,
+)
 
 from redis_utils import (
     credit,
@@ -5191,24 +5205,79 @@ def image_menu_kb() -> InlineKeyboardMarkup:
 
 
 def inline_topup_keyboard() -> InlineKeyboardMarkup:
+    return insufficient_balance_keyboard()
+
+
+def topup_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open")],
-            [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+            [InlineKeyboardButton(common_text("topup.menu.stars"), callback_data="topup:stars")],
+            [InlineKeyboardButton(common_text("topup.menu.yookassa"), callback_data="topup:yookassa")],
+            [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")],
         ]
     )
+
+
+def yookassa_pack_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(yookassa_pack_button_label(pack.pack_id), callback_data=f"yk:{pack.pack_id}")]
+        for pack in YOOKASSA_PACKS_ORDER
+    ]
+    rows.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")])
+    return InlineKeyboardMarkup(rows)
+
+
+def yookassa_payment_keyboard(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(common_text("topup.yookassa.pay"), url=url)],
+            [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")],
+        ]
+    )
+
+
+async def show_topup_menu(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    query: Optional["telegram.CallbackQuery"] = None,
+    user_id: Optional[int] = None,
+) -> None:
+    text = common_text("topup.menu.title")
+    keyboard = topup_menu_keyboard()
+    if query is not None:
+        message = query.message
+        if message is not None:
+            try:
+                await _safe_edit_message_text(query.edit_message_text, text, reply_markup=keyboard)
+                log.info(
+                    "topup.open",
+                    extra={"meta": {"chat_id": chat_id, "user_id": user_id, "via": "edit"}},
+                )
+                return
+            except Exception:
+                pass
+    try:
+        await ctx.bot.send_message(chat_id, text, reply_markup=keyboard)
+    finally:
+        log.info(
+            "topup.open",
+            extra={"meta": {"chat_id": chat_id, "user_id": user_id, "via": "send"}},
+        )
 
 
 def balance_menu_kb() -> InlineKeyboardMarkup:
     keyboard = [
         [
-            InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup_open"),
+            InlineKeyboardButton(common_text("topup.menu.stars"), callback_data="topup:stars"),
+            InlineKeyboardButton(common_text("topup.menu.yookassa"), callback_data="topup:yookassa"),
+        ],
+        [
             InlineKeyboardButton("🧾 История операций", callback_data="tx:open"),
         ],
         [InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")],
         [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -7545,16 +7614,11 @@ async def _launch_suno_generation(
         if not isinstance(new_balance, int):
             new_balance = s.get("suno_balance")
     else:
+        if not await ensure_tokens(ctx, chat_id, user_id, PRICE_SUNO):
+            return
         ok, new_balance = debit_try(user_id, PRICE_SUNO, "suno:start", meta=meta)
     if not ok:
-        balance_after = new_balance if isinstance(new_balance, int) else _safe_get_balance(user_id)
-        await show_balance_notification(
-            chat_id,
-            ctx,
-            user_id,
-            f"🙇 Недостаточно токенов. Нужно: {PRICE_SUNO}💎, у вас: {balance_after}💎.",
-            reply_markup=inline_topup_keyboard(),
-        )
+        await ensure_tokens(ctx, chat_id, user_id, PRICE_SUNO)
         return
 
     s["suno_generating"] = True
@@ -9402,6 +9466,8 @@ async def _launch_mj_upscale(
         lock_acquired = True
 
         if charge_tokens:
+            if not await ensure_tokens(ctx, chat_id, user_id, price):
+                return False
             ok, balance_value = debit_try(
                 user_id,
                 price,
@@ -9414,18 +9480,7 @@ async def _launch_mj_upscale(
                 },
             )
             if not ok:
-                current_balance = (
-                    balance_value
-                    if isinstance(balance_value, int)
-                    else get_balance(user_id)
-                )
-                await show_balance_notification(
-                    chat_id,
-                    ctx,
-                    user_id,
-                    f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
-                    reply_markup=inline_topup_keyboard(),
-                )
+                await ensure_tokens(ctx, chat_id, user_id, price)
                 return False
             charged_here = True
             charged_total = True
@@ -9898,6 +9953,8 @@ async def _handle_mj_upscale_input(
     aspect_ratio = _guess_aspect_ratio_from_size(width, height)
     price = PRICE_MJ_UPSCALE
 
+    if not await ensure_tokens(ctx, chat_id, user_id, price):
+        return
     ok, balance_after = debit_try(
         user_id,
         price,
@@ -9910,16 +9967,7 @@ async def _handle_mj_upscale_input(
         },
     )
     if not ok:
-        current_balance = (
-            balance_after if isinstance(balance_after, int) else get_balance(user_id)
-        )
-        await show_balance_notification(
-            chat_id,
-            ctx,
-            user_id,
-            f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
-            reply_markup=inline_topup_keyboard(),
-        )
+        await ensure_tokens(ctx, chat_id, user_id, price)
         return
 
     if isinstance(balance_after, int):
@@ -10646,8 +10694,111 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{diamonds}")]
         )
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    rows.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")])
     return InlineKeyboardMarkup(rows)
+
+
+async def handle_topup_callback(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    data: str,
+) -> bool:
+    query = update.callback_query
+    chat = update.effective_chat
+    message = query.message if query else None
+    chat_id = None
+    if message is not None:
+        chat_id = message.chat_id
+    elif chat is not None:
+        chat_id = chat.id
+
+    if chat_id is None or query is None:
+        return False
+
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    if data == "topup:open":
+        await query.answer()
+        await show_topup_menu(ctx, chat_id, query=query, user_id=user_id)
+        return True
+
+    if data == "topup:stars":
+        await query.answer()
+        text = "\n".join(
+            filter(
+                None,
+                [
+                    common_text("topup.stars.title"),
+                    common_text("topup.stars.info"),
+                ],
+            )
+        )
+        try:
+            await _safe_edit_message_text(query.edit_message_text, text, reply_markup=stars_topup_kb())
+        except Exception:
+            await ctx.bot.send_message(chat_id, text, reply_markup=stars_topup_kb())
+        return True
+
+    if data == "topup:yookassa":
+        await query.answer()
+        text = common_text("topup.yookassa.title")
+        try:
+            await _safe_edit_message_text(query.edit_message_text, text, reply_markup=yookassa_pack_keyboard())
+        except Exception:
+            await ctx.bot.send_message(chat_id, text, reply_markup=yookassa_pack_keyboard())
+        return True
+
+    if data.startswith("yk:"):
+        pack_id = data.split(":", 1)[1]
+        await query.answer()
+        error_keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(common_text("topup.yookassa.retry"), callback_data="topup:yookassa")],
+                [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")],
+            ]
+        )
+        if user_id is None:
+            error_text = common_text("topup.yookassa.error")
+            try:
+                await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+            except Exception:
+                await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+            return True
+        try:
+            payment = yookassa_create_payment(user_id, pack_id)
+        except YookassaError as exc:
+            log.warning(
+                "topup.yookassa.error",
+                extra={"meta": {"user_id": user_id, "pack_id": pack_id, "err": str(exc)}},
+            )
+            error_text = common_text("topup.yookassa.error")
+            try:
+                await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+            except Exception:
+                await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+            return True
+        except Exception as exc:  # pragma: no cover - unexpected failure
+            log.exception(
+                "topup.yookassa.exception",
+                extra={"meta": {"user_id": user_id, "pack_id": pack_id, "err": str(exc)}},
+            )
+            error_text = common_text("topup.yookassa.error")
+            try:
+                await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+            except Exception:
+                await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+            return True
+
+        text = common_text("topup.yookassa.created")
+        keyboard = yookassa_payment_keyboard(payment.confirmation_url)
+        try:
+            await _safe_edit_message_text(query.edit_message_text, text, reply_markup=keyboard)
+        except Exception:
+            await ctx.bot.send_message(chat_id, text, reply_markup=keyboard)
+        return True
+
+    return False
 
 async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
@@ -10939,10 +11090,11 @@ async def prompt_master_insert_callback_entry(update: Update, ctx: ContextTypes.
 
 async def topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    await update.message.reply_text(
-        "💳 Пополнение через *Telegram Stars*.\nЕсли звёзд не хватает — купите в официальном боте:",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=stars_topup_kb()
-    )
+    chat = update.effective_chat
+    if chat is None:
+        return
+    user = update.effective_user
+    await show_topup_menu(ctx, chat.id, user_id=user.id if user else None)
 
 
 async def promo_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -11664,6 +11816,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if data.startswith("topup:") or data.startswith("yk:"):
+        handled = await handle_topup_callback(update, ctx, data)
+        if handled:
+            return
+
     if data == CB_MODE_PM:
         if chat_id is not None:
             _mode_set(chat_id, MODE_PM)
@@ -11799,9 +11956,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 replace=True,
             )
         return
-
-    if data == "topup_open":
-        await q.message.reply_text("💳 Выберите пакет Stars ниже:", reply_markup=stars_topup_kb()); return
 
     # Покупка
     if data.startswith("buy:stars:"):
@@ -12108,6 +12262,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.exception("MJ ensure_user failed for %s: %s", uid, exc)
                 await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
                 return
+            if not await ensure_tokens(ctx, chat_id, uid, price):
+                return
             ok, balance_after = debit_try(
                 uid,
                 price,
@@ -12115,14 +12271,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 meta={"service": "MJ", "aspect": aspect_value, "prompt": _short_prompt(prompt, 160)},
             )
             if not ok:
-                current_balance = balance_after if isinstance(balance_after, int) else get_balance(uid)
-                await show_balance_notification(
-                    chat_id,
-                    ctx,
-                    uid,
-                    f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
-                    reply_markup=inline_topup_keyboard(),
-                )
+                await ensure_tokens(ctx, chat_id, uid, price)
                 return
             clear_wait_state(uid, reason="mj_confirm")
             await q.message.reply_text("✅ Промпт принят.")
@@ -12246,6 +12395,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.exception("Banana ensure_user failed for %s: %s", uid, exc)
                 await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
                 return
+            chat_id = update.effective_chat.id
+            if not await ensure_tokens(ctx, chat_id, uid, PRICE_BANANA):
+                return
             ok, balance_after = debit_try(
                 uid,
                 PRICE_BANANA,
@@ -12253,20 +12405,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 meta={"service": "BANANA", "images": len(imgs)},
             )
             if not ok:
-                current_balance = balance_after if isinstance(balance_after, int) else get_balance(uid)
-                await show_balance_notification(
-                    update.effective_chat.id,
-                    ctx,
-                    uid,
-                    f"🙇 Недостаточно токенов. Нужно: {PRICE_BANANA}💎, у вас: {current_balance}💎.",
-                    reply_markup=inline_topup_keyboard(),
-                )
+                await ensure_tokens(ctx, chat_id, uid, PRICE_BANANA)
                 return
             new_balance = balance_after
             s["banana_balance"] = new_balance
             s["_last_text_banana"] = None
             clear_wait_state(uid, reason="banana_confirm")
-            chat_id = update.effective_chat.id
             await show_banana_card(chat_id, ctx)
             await show_balance_notification(
                 chat_id,
@@ -12797,6 +12941,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "model": s.get("model") or "veo3_fast",
             "has_image": bool(s.get("last_image_url")),
         }
+        if not await ensure_tokens(ctx, chat_id, uid, price):
+            return
         ok, balance_after = debit_try(
             uid,
             price,
@@ -12804,14 +12950,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             meta=meta,
         )
         if not ok:
-            current_balance = balance_after if isinstance(balance_after, int) else get_balance(uid)
-            await show_balance_notification(
-                chat_id,
-                ctx,
-                uid,
-                f"🙇 Недостаточно токенов. Нужно: {price}💎, у вас: {current_balance}💎.",
-                reply_markup=inline_topup_keyboard(),
-            )
+            await ensure_tokens(ctx, chat_id, uid, price)
             return
         clear_wait_state(uid, reason="veo_start")
         await show_balance_notification(

@@ -6,6 +6,30 @@ from suno.cover_source import MAX_AUDIO_MB
 
 FAQ_INTRO = "🧾 *FAQ*\nВыберите раздел:"
 
+COMMON_TEXTS_RU = {
+    "topup.menu.title": "Выберите способ пополнения:",
+    "topup.menu.stars": "💎 Оплатить звёздами",
+    "topup.menu.yookassa": "💳 Оплатить картой (ЮKassa)",
+    "topup.menu.back": "⬅️ Назад",
+    "topup.inline.open": "Пополнить баланс",
+    "topup.inline.back": "⬅️ Назад в меню",
+    "topup.yookassa.pack_1": "Пакет 1 (+X1💎)",
+    "topup.yookassa.pack_2": "Пакет 2 (+X2💎)",
+    "topup.yookassa.pack_3": "Пакет 3 (+X3💎)",
+    "topup.yookassa.title": "Выберите пакет пополнения:",
+    "topup.yookassa.pay": "Перейти к оплате",
+    "topup.yookassa.created": "Счёт создан. Перейдите к оплате:",
+    "topup.yookassa.retry": "Попробовать снова",
+    "topup.yookassa.error": "⚠️ Не удалось создать платёж. Попробуйте ещё раз.",
+    "topup.yookassa.processing": "⚠️ Обработка платежа уже идёт. Подождите пару секунд и обновите меню.",
+    "topup.stars.title": "💎 Пополнение через Telegram Stars",
+    "topup.stars.info": (
+        "Если звёзд не хватает — купите в официальном боте @PremiumBot."
+    ),
+    "balance.insufficient": "Недостаточно токенов: нужно {need}💎, на балансе {have}💎.",
+    "balance.success": "Оплата прошла успешно! Баланс: {new_balance}💎.",
+}
+
 FAQ_SECTIONS = {
     "veo": "🎬 *Видео (VEO)*\n• Fast — быстрее и дешевле.\n• Quality — дольше, но лучше детализация.\n• Формат: присылаете идею/ фото → карточка → «Сгенерировать».\n• Время: 2–10 мин.",
     "mj": "🎨 *Изображения (MJ)*\n• Стоимость: 10💎 за 1 изображение.\n• Один бесплатный перезапуск при сетевой ошибке.",
@@ -108,3 +132,13 @@ def help_text(language_code: Optional[str], support_username: str) -> tuple[str,
 SUNO_MODE_PROMPT = t("suno.prompt.mode_select")
 SUNO_START_READY_MESSAGE = t("suno.prompt.ready")
 SUNO_STARTING_MESSAGE = t("suno.prompt.starting")
+
+
+def common_text(key: str, /, **kwargs: Any) -> str:
+    value = COMMON_TEXTS_RU.get(key, key)
+    if kwargs:
+        try:
+            return value.format(**kwargs)
+        except Exception:
+            return value
+    return value
