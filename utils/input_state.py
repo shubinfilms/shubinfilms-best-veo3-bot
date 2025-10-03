@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, Literal
 
 import time
 
@@ -29,6 +29,7 @@ class WaitKind(str, Enum):
     SUNO_STYLE = "suno_style"
     SUNO_LYRICS = "suno_lyrics"
     MJ_PROMPT = "mj_prompt"
+    SORA2_PROMPT = "sora2_prompt"
 
 
 def classify_wait_input(text: Optional[str]) -> Tuple[bool, Optional[str]]:
@@ -227,6 +228,7 @@ def set_wait(
         "suno_style",
         "suno_lyrics",
         "banana_prompt",
+        "sora2_prompt",
     ],
     card_msg_id: Optional[int],
     *,

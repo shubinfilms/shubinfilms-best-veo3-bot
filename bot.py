@@ -22,7 +22,19 @@ import atexit
 from pathlib import Path
 # main
 from collections.abc import Mapping
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping, Sequence, Mapping
+from typing import (
+    Dict,
+    Any,
+    Optional,
+    List,
+    Tuple,
+    Callable,
+    Awaitable,
+    Union,
+    MutableMapping,
+    Sequence,
+    Iterable,
+)
 from datetime import datetime, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
@@ -151,6 +163,8 @@ from keyboards import (
     CB_VIDEO_MODE_FAST,
     CB_VIDEO_MODE_PHOTO,
     CB_VIDEO_MODE_QUALITY,
+    CB_VIDEO_MODE_SORA_IMAGE,
+    CB_VIDEO_MODE_SORA_TEXT,
     mj_upscale_root_keyboard,
     mj_upscale_select_keyboard,
     suno_modes_keyboard,
@@ -216,6 +230,9 @@ from redis_utils import (
     clear_menu_message,
     set_mj_gallery,
     get_mj_gallery,
+    user_lock,
+    release_user_lock,
+    update_task_meta,
 )
 
 from ledger import (
@@ -232,6 +249,7 @@ from settings import (
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
+    SORA2,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -245,6 +263,7 @@ from suno.cover_source import (
     validate_audio_file as validate_cover_audio_file,
 )
 from suno.service import SunoService, SunoAPIError, RecordInfoPollResult
+from sora2_client import sora2_create_task, sora2_get_task
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.client import (
     AMBIENT_NATURE_PRESET_ID,
@@ -322,6 +341,7 @@ APP_VERSION = "2025-09-14r4"
 
 
 ACTIVE_TASKS: Dict[int, str] = {}
+_SORA2_POLLERS: Dict[str, asyncio.Task[None]] = {}
 SHUTDOWN_EVENT = threading.Event()
 
 SUNO_SERVICE = SunoService()
@@ -2116,12 +2136,16 @@ PRICE_BANANA = 5
 PRICE_VEO_FAST = 50
 PRICE_VEO_QUALITY = 150
 PRICE_VEO_ANIMATE = 50
+PRICE_SORA2_TEXT = 180
+PRICE_SORA2_IMAGE = 200
 PRICE_SUNO = SUNO_PRICE
 
 TOKEN_COSTS = {
     "veo_fast": PRICE_VEO_FAST,
     "veo_quality": PRICE_VEO_QUALITY,
     "veo_photo": PRICE_VEO_ANIMATE,
+    "sora2_ttv": PRICE_SORA2_TEXT,
+    "sora2_itv": PRICE_SORA2_IMAGE,
     "mj": PRICE_MJ,          # 16:9 или 9:16
     "mj_upscale": PRICE_MJ_UPSCALE,
     "banana": PRICE_BANANA,
@@ -3545,6 +3569,7 @@ _WAIT_LIMITS = {
     WaitKind.VEO_PROMPT: 3000,
     WaitKind.MJ_PROMPT: 2000,
     WaitKind.BANANA_PROMPT: 2000,
+    WaitKind.SORA2_PROMPT: 5000,
 }
 
 _WAIT_ALLOW_NEWLINES = {
@@ -3553,6 +3578,7 @@ _WAIT_ALLOW_NEWLINES = {
     WaitKind.VEO_PROMPT,
     WaitKind.MJ_PROMPT,
     WaitKind.BANANA_PROMPT,
+    WaitKind.SORA2_PROMPT,
 }
 
 _WAIT_CLEAR_VALUES = {"-", "—"}
@@ -3593,6 +3619,7 @@ DEFAULT_STATE = {
     "last_ui_msg_id_veo": None, "last_ui_msg_id_banana": None, "last_ui_msg_id_mj": None,
     "last_ui_msg_id_image_engine": None,
     "last_ui_msg_id_suno": None,
+    "last_ui_msg_id_sora2": None,
     "banana_images": [],
     "mj_last_wait_ts": 0.0,
     "mj_generating": False, "last_mj_task_id": None,
@@ -3607,6 +3634,7 @@ DEFAULT_STATE = {
     "_last_text_mj": None,
     "_last_text_image_engine": None,
     "_last_text_suno": None,
+    "_last_text_sora2": None,
     "veo_duration_hint": None,
     "veo_lip_sync_required": False,
     "veo_voiceover_origin": None,
@@ -3639,6 +3667,11 @@ DEFAULT_STATE = {
         "last_markup_hash": None,
         "chat_id": None,
     },
+    "sora2_prompt": None,
+    "sora2_image_urls": [],
+    "sora2_generating": False,
+    "sora2_last_task_id": None,
+    "video_wait_message_id": None,
 }
 
 
@@ -3913,6 +3946,47 @@ async def _apply_wait_state_input(
             if isinstance(card_id, int):
                 refresh_card_pointer(user_id, card_id)
         handled = True
+    elif wait_state.kind == WaitKind.SORA2_PROMPT:
+        s = state(ctx)
+        raw = message.text or ""
+        if raw.strip().lower() == "clear":
+            s["sora2_prompt"] = None
+            s["sora2_image_urls"] = []
+        else:
+            urls = _extract_http_urls(raw)
+            existing_urls = list(s.get("sora2_image_urls") or [])
+            overflow = False
+            for url in urls:
+                if url not in existing_urls:
+                    if len(existing_urls) >= SORA2_MAX_IMAGES:
+                        overflow = True
+                        break
+                    existing_urls.append(url)
+            if len(existing_urls) > SORA2_MAX_IMAGES:
+                existing_urls = existing_urls[:SORA2_MAX_IMAGES]
+                overflow = True
+            if existing_urls != s.get("sora2_image_urls"):
+                s["sora2_image_urls"] = existing_urls
+                if overflow:
+                    await message.reply_text(
+                        f"⚠️ Максимум {SORA2_MAX_IMAGES} ссылок. Лишние не сохранены."
+                    )
+            prompt_source = raw
+            for url in urls:
+                prompt_source = prompt_source.replace(url, " ")
+            candidate = normalize_input(prompt_source, allow_newlines=True)
+            candidate = truncate_text(candidate, SORA2_MAX_PROMPT_LENGTH).strip()
+            if cleaned == "":
+                s["sora2_prompt"] = None
+            elif candidate:
+                s["sora2_prompt"] = candidate
+        s["_last_text_sora2"] = None
+        await show_sora2_card(wait_state.chat_id, ctx)
+        if user_id is not None:
+            card_id = s.get("last_ui_msg_id_sora2")
+            if isinstance(card_id, int):
+                refresh_card_pointer(user_id, card_id)
+        handled = True
     elif wait_state.kind == WaitKind.BANANA_PROMPT:
         s = state(ctx)
         s["last_prompt"] = cleaned or None
@@ -4155,6 +4229,28 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         card_meta.setdefault("last_text_hash", None)
         card_meta.setdefault("last_markup_hash", None)
         card_meta.setdefault("chat_id", None)
+    sora_prompt = state_dict.get("sora2_prompt")
+    if isinstance(sora_prompt, str):
+        state_dict["sora2_prompt"] = sora_prompt.strip() or None
+    else:
+        state_dict["sora2_prompt"] = None
+    image_urls = state_dict.get("sora2_image_urls")
+    if isinstance(image_urls, list):
+        cleaned_urls: list[str] = []
+        for url in image_urls:
+            if not isinstance(url, str):
+                continue
+            trimmed = url.strip()
+            if trimmed and trimmed not in cleaned_urls:
+                cleaned_urls.append(trimmed)
+            if len(cleaned_urls) >= 4:
+                break
+        state_dict["sora2_image_urls"] = cleaned_urls
+    else:
+        state_dict["sora2_image_urls"] = []
+    wait_msg = state_dict.get("video_wait_message_id")
+    if not isinstance(wait_msg, int):
+        state_dict["video_wait_message_id"] = None
     return state_dict
 
 
@@ -4598,6 +4694,47 @@ _VIDEO_MENU_LOCK_TTL = 90
 _VIDEO_MENU_MESSAGE_TTL = 90
 _VIDEO_MENU_LOCK_NAME = "video:menu:lock"
 _VIDEO_MENU_MESSAGE_NAME = "video:menu:card"
+VEO_WAIT_STICKER_ID = "5375464961822695044"
+SORA2_WAIT_STICKER_ID = "5375464961822695044"
+SORA2_MAX_PROMPT_LENGTH = 5000
+SORA2_MIN_IMAGES = 1
+SORA2_MAX_IMAGES = 4
+
+
+async def show_wait_sticker(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    sticker_id: str,
+) -> Optional[int]:
+    try:
+        message = await ctx.bot.send_sticker(chat_id, sticker_id)
+    except Exception as exc:
+        log.warning(
+            "video.wait_sticker_failed",
+            extra={"chat_id": chat_id, "error": str(exc)},
+        )
+        return None
+    return getattr(message, "message_id", None)
+
+
+async def replace_wait_with_docs(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    wait_msg_id: Optional[int],
+    files: Iterable[str],
+) -> None:
+    if wait_msg_id:
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, wait_msg_id)
+    for path in files:
+        try:
+            with open(path, "rb") as handle:
+                await ctx.bot.send_document(chat_id, handle)
+        except Exception as exc:
+            log.warning(
+                "video.wait_replace_send_failed",
+                extra={"chat_id": chat_id, "path": path, "error": str(exc)},
+            )
 
 
 def _clear_video_menu_state(chat_id: int, *, user_id: Optional[int] = None) -> None:
@@ -4610,6 +4747,8 @@ _VIDEO_MODE_HINTS: Dict[str, str] = {
     "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
     "veo_text_quality": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
     "veo_photo": "📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.",
+    "sora2_ttv": "✍️ Пришлите текст (до 5000 символов). Нажмите «🚀 Запустить Sora 2», когда будете готовы.",
+    "sora2_itv": "📸 Пришлите 1–4 ссылок на изображения и текст (до 5000 символов). Для очистки ссылок отправьте слово clear.",
 }
 
 _MJ_GRID_CACHE_KEY_TMPL = "mj:grid:{grid_id}"
@@ -4895,9 +5034,26 @@ def video_menu_kb() -> InlineKeyboardMarkup:
             f"🖼️ Оживить изображение (Veo) — 💎 {TOKEN_COSTS['veo_photo']}",
             callback_data=CB_VIDEO_MODE_PHOTO,
         )],
+        [InlineKeyboardButton(
+            f"🧠 Sora 2 (Text-to-Video) — 💎 {TOKEN_COSTS['sora2_ttv']}",
+            callback_data=CB_VIDEO_MODE_SORA_TEXT,
+        )],
+        [InlineKeyboardButton(
+            f"🧠 Sora 2 (Image-to-Video) — 💎 {TOKEN_COSTS['sora2_itv']}",
+            callback_data=CB_VIDEO_MODE_SORA_IMAGE,
+        )],
         [InlineKeyboardButton("⬅️ Назад", callback_data=CB_VIDEO_BACK)],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def video_result_footer_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Сгенерировать ещё", callback_data="start_new_cycle")],
+            [InlineKeyboardButton("🏠 Назад в меню", callback_data=CB_GO_HOME)],
+        ]
+    )
 
 
 async def _try_edit_menu_card(
@@ -5017,6 +5173,16 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
 
     user_id = user.id if user else None
 
+    user_lock_acquired = False
+    if user_id is not None:
+        user_lock_acquired = user_lock(user_id, "video_menu")
+        if not user_lock_acquired:
+            log.info(
+                "video.menu.lock_busy",
+                extra={"chat_id": chat_id, "user_id": user_id},
+            )
+            return None
+
     s = state(ctx)
     s["mode"] = None
     s.pop("model", None)
@@ -5135,6 +5301,8 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
                 "video.menu.lock_forced_release",
                 extra={"chat_id": chat_id, "user_id": user_id},
             )
+        if user_id is not None and user_lock_acquired:
+            release_user_lock(user_id, "video_menu")
 
 
 def _video_mode_config(mode: str) -> Optional[Tuple[str, str, str]]:
@@ -5157,6 +5325,33 @@ async def _start_video_mode(
 ) -> bool:
     if chat_id is None:
         return False
+    if mode in {"sora2_ttv", "sora2_itv"}:
+        s = state(ctx)
+        s["mode"] = mode
+        s["sora2_prompt"] = None
+        if mode == "sora2_ttv":
+            s["sora2_image_urls"] = []
+        elif not isinstance(s.get("sora2_image_urls"), list):
+            s["sora2_image_urls"] = []
+        s["sora2_generating"] = False
+        s["sora2_last_task_id"] = None
+        s["video_wait_message_id"] = None
+        await sora2_entry(chat_id, ctx)
+        card_id_raw = s.get("last_ui_msg_id_sora2")
+        card_id = card_id_raw if isinstance(card_id_raw, int) else None
+        _activate_wait_state(
+            user_id=user_id,
+            chat_id=chat_id,
+            card_msg_id=card_id,
+            kind=WaitKind.SORA2_PROMPT,
+            meta={"mode": mode},
+        )
+        if message is not None:
+            hint = _VIDEO_MODE_HINTS.get(mode)
+            if hint:
+                with suppress(Exception):
+                    await message.reply_text(hint)
+        return True
     config = _video_mode_config(mode)
     if config is None:
         return False
@@ -8417,6 +8612,498 @@ async def _poll_suno_and_send(
             log.warning("[SUNO] poll card refresh fail | task_id=%s err=%s", task_id, exc)
 
 
+# --------- Sora2 Card ----------
+_SORA2_MODE_TITLES = {
+    "sora2_ttv": "Text-to-Video",
+    "sora2_itv": "Image-to-Video",
+}
+
+
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _extract_http_urls(text: str) -> List[str]:
+    urls: List[str] = []
+    for match in _URL_RE.findall(text or ""):
+        trimmed = match.strip().rstrip(",.;)")
+        if trimmed and trimmed not in urls:
+            urls.append(trimmed)
+    return urls
+
+
+def sora2_card_text(s: Dict[str, Any]) -> str:
+    mode = s.get("mode") or "sora2_ttv"
+    display = _SORA2_MODE_TITLES.get(mode, "Text-to-Video")
+    prompt_raw = (s.get("sora2_prompt") or "").strip()
+    prompt_html = html.escape(prompt_raw) if prompt_raw else ""
+    image_urls = [str(url) for url in s.get("sora2_image_urls", []) if isinstance(url, str) and url.strip()]
+    lines = [
+        "🟦 <b>Карточка Sora 2</b>",
+        f"• Режим: <b>{display}</b>",
+    ]
+    if image_urls:
+        lines.append(f"• Фото: <b>{len(image_urls)}/{SORA2_MAX_IMAGES}</b>")
+    lines.extend([
+        "",
+        "🖊️ <b>Промпт:</b>",
+        f"<code>{prompt_html}</code>" if prompt_html else "<code> </code>",
+    ])
+    if image_urls:
+        lines.append("")
+        lines.append("🔗 <b>Ссылки:</b>")
+        for url in image_urls:
+            lines.append(f"• <code>{html.escape(url)}</code>")
+    return "\n".join(lines)
+
+
+def sora2_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🚀 Запустить Sora 2", callback_data="sora2:start")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_sora2_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_new: bool = False,
+) -> None:
+    s = state(ctx)
+    text = sora2_card_text(s)
+    if not force_new and text == s.get("_last_text_sora2"):
+        return
+    kb = sora2_kb(s)
+    mid = await upsert_card(
+        ctx,
+        chat_id,
+        s,
+        "last_ui_msg_id_sora2",
+        text,
+        kb,
+        force_new=force_new,
+    )
+    if mid:
+        s["_last_text_sora2"] = text
+    else:
+        s["_last_text_sora2"] = None
+
+
+async def sora2_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = state(ctx)
+    mid = s.get("last_ui_msg_id_sora2")
+    if mid:
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, mid)
+    s["last_ui_msg_id_sora2"] = None
+    s["_last_text_sora2"] = None
+    await show_sora2_card(chat_id, ctx, force_new=True)
+
+
+# --------- Sora2 Generation ----------
+_SORA2_MODEL_IDS = {
+    "sora2_ttv": "sora-2-text-to-video",
+    "sora2_itv": "sora-2-image-to-video",
+}
+
+_SORA2_SERVICE_CODES = {
+    "sora2_ttv": "SORA2_TTV",
+    "sora2_itv": "SORA2_ITV",
+}
+
+
+def _sora2_price_and_service(mode: str) -> Tuple[int, str]:
+    if mode == "sora2_itv":
+        return PRICE_SORA2_IMAGE, _SORA2_SERVICE_CODES.get(mode, "SORA2_ITV")
+    return PRICE_SORA2_TEXT, _SORA2_SERVICE_CODES.get(mode, "SORA2_TTV")
+
+
+def _sora2_model_id(mode: str) -> str:
+    return _SORA2_MODEL_IDS.get(mode, _SORA2_MODEL_IDS["sora2_ttv"])
+
+
+def _sora2_lookup_url(payload: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed.lower().startswith("http"):
+                return trimmed
+    for value in payload.values():
+        if isinstance(value, Mapping):
+            found = _sora2_lookup_url(value, keys)
+            if found:
+                return found
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, Mapping):
+                    found = _sora2_lookup_url(item, keys)
+                    if found:
+                        return found
+    return None
+
+
+def _sora2_extract_assets(payload: Mapping[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    video_keys = ("video", "videoUrl", "video_url", "url", "resultUrl")
+    cover_keys = ("cover", "coverUrl", "cover_url", "thumbnail", "preview")
+    video_url = _sora2_lookup_url(payload, video_keys)
+    cover_url = _sora2_lookup_url(payload, cover_keys)
+    return video_url, cover_url
+
+
+def _build_sora2_payload(mode: str, prompt: str, image_urls: Sequence[str]) -> Dict[str, Any]:
+    payload = {
+        "model": _sora2_model_id(mode),
+        "callBackUrl": SORA2.get("CALLBACK_URL"),
+        "input": {
+            "prompt": prompt,
+            "duration": 10,
+            "aspect_ratio": "16:9",
+            "quality": "standard",
+            "audio": True,
+        },
+    }
+    if mode == "sora2_itv":
+        payload["input"]["image_urls"] = list(image_urls)
+    return payload
+
+
+async def _download_temp_file(url: str, suffix: str) -> Optional[str]:
+    if not url:
+        return None
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.close()
+    path = tmp.name
+    try:
+        timeout = ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                with open(path, "wb") as handle:
+                    async for chunk in response.content.iter_chunked(65536):
+                        handle.write(chunk)
+        return path
+    except Exception as exc:
+        log.warning("sora2.download_failed", extra={"url": url, "error": str(exc)})
+        with suppress(Exception):
+            Path(path).unlink()
+        return None
+
+
+async def _download_sora2_assets(result: Mapping[str, Any]) -> List[str]:
+    video_url, cover_url = _sora2_extract_assets(result)
+    files: List[str] = []
+    if video_url:
+        video_path = await _download_temp_file(video_url, ".mp4")
+        if video_path:
+            files.append(video_path)
+    if cover_url:
+        cover_path = await _download_temp_file(cover_url, ".jpg")
+        if cover_path:
+            files.append(cover_path)
+    return files
+
+
+def _schedule_sora2_poll(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    existing = _SORA2_POLLERS.get(task_id)
+    if existing and not existing.done():
+        existing.cancel()
+    task = asyncio.create_task(_poll_sora2_and_send(task_id, ctx))
+    _SORA2_POLLERS[task_id] = task
+
+
+async def _finalize_sora2_task(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    task_id: str,
+    meta: Mapping[str, Any],
+    status: str,
+    result_payload: Optional[Mapping[str, Any]],
+    source: str,
+) -> None:
+    chat_id_raw = meta.get("chat_id")
+    try:
+        chat_id = int(chat_id_raw)
+    except (TypeError, ValueError):
+        log.warning("sora2.finalize.chat_missing", extra={"task_id": task_id, "chat_id": chat_id_raw})
+        return
+    user_id_raw = meta.get("user_id")
+    try:
+        user_id = int(user_id_raw) if user_id_raw is not None else None
+    except (TypeError, ValueError):
+        user_id = None
+    wait_msg_id = meta.get("wait_message_id") if isinstance(meta.get("wait_message_id"), int) else None
+    price = int(meta.get("price") or 0)
+    service = str(meta.get("service") or "SORA2")
+    mode = str(meta.get("mode") or "sora2_ttv")
+
+    ACTIVE_TASKS.pop(chat_id, None)
+    s = state(ctx)
+    if s.get("sora2_last_task_id") == task_id:
+        s["sora2_last_task_id"] = None
+    s["sora2_generating"] = False
+    if s.get("video_wait_message_id") == wait_msg_id:
+        s["video_wait_message_id"] = None
+    if mode.startswith("sora2_"):
+        s["sora2_prompt"] = None
+        s["sora2_image_urls"] = []
+        s["_last_text_sora2"] = None
+        await show_sora2_card(chat_id, ctx)
+    if user_id is not None:
+        clear_wait_state(user_id, reason="sora2_done")
+
+    files: List[str] = []
+    try:
+        if status == "success" and isinstance(result_payload, Mapping):
+            files = await _download_sora2_assets(result_payload)
+            await replace_wait_with_docs(ctx, chat_id, wait_msg_id, files)
+            await tg_safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text="✅ Готово!",
+                reply_markup=video_result_footer_kb(),
+            )
+            log.info(
+                "video.result.ok",
+                extra={"task_id": task_id, "mode": mode, "source": source},
+            )
+        else:
+            await replace_wait_with_docs(ctx, chat_id, wait_msg_id, [])
+            error_reason = meta.get("error") if isinstance(meta.get("error"), str) else None
+            if not error_reason and isinstance(result_payload, Mapping):
+                error_reason = str(result_payload.get("error") or result_payload.get("message") or "Ошибка Sora 2")
+            message = error_reason or "⚠️ Не удалось получить результат Sora 2."
+            await tg_safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text=message,
+            )
+            if price > 0 and user_id is not None:
+                try:
+                    new_balance = credit_balance(
+                        user_id,
+                        price,
+                        reason="service:refund",
+                        meta={"service": service, "reason": status or "error", "task_id": task_id},
+                    )
+                except Exception as exc:
+                    log.exception("sora2.refund_failed | task_id=%s err=%s", task_id, exc)
+                else:
+                    await show_balance_notification(
+                        chat_id,
+                        ctx,
+                        user_id,
+                        f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+                    )
+            log.info(
+                "video.result.error",
+                extra={"task_id": task_id, "mode": mode, "source": source, "status": status},
+            )
+    finally:
+        for path in files:
+            with suppress(Exception):
+                Path(path).unlink()
+        update_task_meta(task_id, handled=True, status=status, completed_at=datetime.now(timezone.utc).isoformat())
+        clear_task_meta(task_id)
+        poller = _SORA2_POLLERS.pop(task_id, None)
+        if poller and not poller.done():
+            poller.cancel()
+
+
+async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    start = time.monotonic()
+    next_remote_poll = time.monotonic()
+    try:
+        while True:
+            meta = load_task_meta(task_id)
+            if not meta:
+                return
+            status = str(meta.get("status") or "pending").lower()
+            handled = bool(meta.get("handled"))
+            if status in {"success", "failed"} and not handled:
+                result_payload = meta.get("result") if isinstance(meta.get("result"), Mapping) else None
+                await _finalize_sora2_task(
+                    ctx,
+                    task_id,
+                    meta,
+                    status,
+                    result_payload,
+                    str(meta.get("source") or "webhook"),
+                )
+                return
+            now = time.monotonic()
+            if now - start > 30 * 60:
+                meta_update = update_task_meta(task_id, status="failed", error="timeout", source="timeout") or meta
+                await _finalize_sora2_task(ctx, task_id, meta_update, "failed", None, "timeout")
+                return
+            if status not in {"success", "failed"} and now >= next_remote_poll:
+                try:
+                    response = await asyncio.to_thread(sora2_get_task, task_id)
+                except Exception as exc:
+                    log.warning("sora2.poll.error", extra={"task_id": task_id, "error": str(exc)})
+                    next_remote_poll = now + random.uniform(20, 30)
+                else:
+                    remote_status = str(response.get("status") or "").lower() or "pending"
+                    result_payload = response.get("result") if isinstance(response.get("result"), Mapping) else None
+                    update_task_meta(
+                        task_id,
+                        status=remote_status,
+                        result=result_payload,
+                        source="poll",
+                    )
+                    if remote_status in {"success", "failed"}:
+                        continue
+                    next_remote_poll = now + random.uniform(20, 30)
+            await asyncio.sleep(5)
+    finally:
+        poller = _SORA2_POLLERS.get(task_id)
+        if poller and poller.done():
+            _SORA2_POLLERS.pop(task_id, None)
+
+
+async def _start_sora2_generation(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: Optional[int],
+    message: Message,
+) -> None:
+    s = state(ctx)
+    mode = s.get("mode") or "sora2_ttv"
+    prompt = (s.get("sora2_prompt") or "").strip()
+    image_urls = list(s.get("sora2_image_urls") or [])
+    if not prompt:
+        await message.reply_text("⚠️ Пришлите текстовый промпт.")
+        return
+    if len(prompt) > SORA2_MAX_PROMPT_LENGTH:
+        await message.reply_text(
+            f"⚠️ Промпт слишком длинный ({len(prompt)}). Максимум — {SORA2_MAX_PROMPT_LENGTH} символов."
+        )
+        return
+    if mode == "sora2_itv" and len(image_urls) < SORA2_MIN_IMAGES:
+        await message.reply_text("⚠️ Добавьте хотя бы одну ссылку на изображение (до 4 штук).")
+        return
+    if user_id is None:
+        await message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
+        return
+    if not user_lock(user_id, "video_start"):
+        await message.reply_text("⏳ Уже обрабатываю нажатие, подождите пару секунд…")
+        return
+
+    price, service_name = _sora2_price_and_service(mode)
+    try:
+        ensure_user(user_id)
+    except Exception as exc:
+        log.exception("sora2.ensure_user_failed | user_id=%s err=%s", user_id, exc)
+        await message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
+        release_user_lock(user_id, "video_start")
+        return
+    if not await ensure_tokens(ctx, chat_id, user_id, price):
+        release_user_lock(user_id, "video_start")
+        return
+    ok, balance_after = debit_try(
+        user_id,
+        price,
+        reason="service:start",
+        meta={"service": service_name, "prompt": _short_prompt(prompt, 160), "mode": mode},
+    )
+    if not ok:
+        await ensure_tokens(ctx, chat_id, user_id, price)
+        release_user_lock(user_id, "video_start")
+        return
+
+    await show_balance_notification(
+        chat_id,
+        ctx,
+        user_id,
+        f"✅ Списано {price}💎. Текущий баланс: {balance_after}💎 — запускаю…",
+    )
+
+    payload = _build_sora2_payload(mode, prompt, image_urls)
+    try:
+        response = await asyncio.to_thread(sora2_create_task, payload)
+    except Exception as exc:
+        log.exception("sora2.create_task_failed | user_id=%s err=%s", user_id, exc)
+        try:
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta={"service": service_name, "reason": "submit_exception", "message": str(exc)},
+            )
+        except Exception as refund_exc:
+            log.exception("sora2.submit_refund_failed | user_id=%s err=%s", user_id, refund_exc)
+        else:
+            await show_balance_notification(
+                chat_id,
+                ctx,
+                user_id,
+                f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+            )
+        release_user_lock(user_id, "video_start")
+        await message.reply_text("⚠️ Не удалось создать задачу Sora 2. 💎 Токены возвращены.")
+        return
+
+    task_id = str(response.get("taskId") or response.get("task_id") or "").strip()
+    if not task_id:
+        try:
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta={"service": service_name, "reason": "missing_task_id"},
+            )
+        except Exception as refund_exc:
+            log.exception("sora2.no_task_refund_failed | user_id=%s err=%s", user_id, refund_exc)
+        else:
+            await show_balance_notification(
+                chat_id,
+                ctx,
+                user_id,
+                f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+            )
+        release_user_lock(user_id, "video_start")
+        await message.reply_text("⚠️ Не удалось получить идентификатор задачи Sora 2. 💎 Токены возвращены.")
+        return
+
+    wait_msg_id = await show_wait_sticker(ctx, chat_id, SORA2_WAIT_STICKER_ID)
+    s["video_wait_message_id"] = wait_msg_id
+    s["sora2_generating"] = True
+    s["sora2_last_task_id"] = task_id
+    ACTIVE_TASKS[chat_id] = task_id
+
+    save_task_meta(
+        task_id,
+        chat_id,
+        message.message_id,
+        mode,
+        "16:9",
+        extra={
+            "user_id": user_id,
+            "price": price,
+            "service": service_name,
+            "status": "pending",
+            "handled": False,
+            "prompt_preview": _short_prompt(prompt, 160),
+            "image_urls": image_urls,
+            "wait_message_id": wait_msg_id,
+        },
+        ttl=30 * 60,
+    )
+
+    log.info(
+        "video.start",
+        extra={"mode": mode, "task_id": task_id, "user_id": user_id, "chat_id": chat_id},
+    )
+
+    await message.reply_text("🎬 Отправляю задачу в Sora 2…")
+    _schedule_sora2_poll(task_id, ctx)
+    release_user_lock(user_id, "video_start")
+
 # --------- VEO Card ----------
 _PROMPT_PLACEHOLDER = "Введите промпт…"
 
@@ -11190,6 +11877,17 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         )
         if handled:
             return
+
+    if data == "sora2:start":
+        if chat_id is None or message is None:
+            return
+        await _start_sora2_generation(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            message=message,
+        )
+        return
 
     if data == CB_VIDEO_BACK:
         target_chat = chat_id if chat_id is not None else (user_id if user_id else None)

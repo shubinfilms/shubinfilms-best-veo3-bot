@@ -11,7 +11,7 @@ COMMON_TEXTS_RU = {
     "topup.menu.stars": "💎 Оплатить звёздами",
     "topup.menu.yookassa": "💳 Оплатить картой (ЮKassa)",
     "topup.menu.back": "⬅️ Назад",
-    "topup.inline.open": "Пополнить баланс",
+    "topup.inline.open": "💳 Пополнить баланс",
     "topup.inline.back": "⬅️ Назад в меню",
     "topup.yookassa.pack_1": "Пакет 1 (+X1💎)",
     "topup.yookassa.pack_2": "Пакет 2 (+X2💎)",

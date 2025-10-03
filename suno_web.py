@@ -26,7 +26,7 @@ from metrics import (
     suno_callback_total,
     suno_latency_seconds,
 )
-from redis_utils import rds
+from redis_utils import rds, update_task_meta
 from settings import (
     HTTP_POOL_CONNECTIONS,
     HTTP_POOL_PER_HOST,
@@ -554,6 +554,38 @@ async def suno_callback(
         log.info("suno callback processed", extra={"meta": meta})
     suno_callback_total.labels(status=process_status, **_WEB_LABELS).inc()
     return {"ok": process_status == "ok"}
+
+
+@app.post("/sora2-callback")
+async def sora2_callback(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "invalid_json"}, status_code=400)
+    if not isinstance(payload, Mapping):
+        return JSONResponse({"status": "invalid_payload"}, status_code=400)
+    task_id = str(payload.get("taskId") or payload.get("task_id") or "").strip()
+    if not task_id:
+        return JSONResponse({"status": "missing_task_id"}, status_code=400)
+    status = str(payload.get("status") or "").lower() or "unknown"
+    error_value = payload.get("error")
+    result_payload = payload.get("result") if isinstance(payload.get("result"), Mapping) else None
+    meta = update_task_meta(
+        task_id,
+        status=status,
+        error=error_value,
+        result=result_payload,
+        source="webhook",
+        handled=False,
+    )
+    if meta is None:
+        log.warning("sora2.callback.unknown_task", extra={"task_id": task_id})
+        return JSONResponse({"status": "task_not_found"}, status_code=404)
+    log.info(
+        "sora2.callback.received",
+        extra={"task_id": task_id, "status": status, "has_result": bool(result_payload)},
+    )
+    return JSONResponse({"status": "received"})
 
 
 @app.post("/yookassa/callback")
