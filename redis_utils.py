@@ -74,6 +74,18 @@ _ref_joined_memory: Dict[int, float] = {}
 _MJ_LAST_KEY_TMPL = f"{_PFX}:mj:last:{{}}"
 _MJ_LOCK_KEY_TMPL = f"{_PFX}:mj:lock:{{}}"
 _MJ_LOCK_TTL = 15 * 60
+_MENU_LOCK_KEY_TMPL = f"{_PFX}:menu:lock:{{}}:{{}}"
+_MENU_MSG_KEY_TMPL = f"{_PFX}:menu:msg:{{}}:{{}}"
+
+
+def _menu_lock_key(name: str, chat_id: int) -> str:
+    normalized = str(name or "lock").strip() or "lock"
+    return _MENU_LOCK_KEY_TMPL.format(normalized, int(chat_id))
+
+
+def _menu_msg_key(name: str, chat_id: int) -> str:
+    normalized = str(name or "card").strip() or "card"
+    return _MENU_MSG_KEY_TMPL.format(normalized, int(chat_id))
 
 if not _redis_url:
     _logger.warning(
@@ -227,6 +239,100 @@ def release_mj_upscale_lock(user_id: int, task_id: str, index: int) -> None:
             _r.delete(key)
         except Exception as exc:
             _logger.warning("mj_upscale_lock.release_error | key=%s err=%s", key, exc)
+    else:
+        _memory_delete(key)
+
+
+def acquire_menu_lock(name: str, chat_id: int, ttl: int) -> bool:
+    key = _menu_lock_key(name, chat_id)
+    if _r:
+        try:
+            return bool(_r.set(key, "1", nx=True, ex=max(ttl, 1)))
+        except Exception as exc:
+            _logger.warning("menu_lock.acquire_error | key=%s err=%s", key, exc)
+            return False
+    return _memory_set_if_absent(key, "1", ttl)
+
+
+def release_menu_lock(name: str, chat_id: int) -> None:
+    key = _menu_lock_key(name, chat_id)
+    if _r:
+        try:
+            _r.delete(key)
+        except Exception as exc:
+            _logger.warning("menu_lock.release_error | key=%s err=%s", key, exc)
+    else:
+        _memory_delete(key)
+
+
+def save_menu_message(name: str, chat_id: int, message_id: int, ttl: int) -> None:
+    payload = json.dumps(
+        {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "ts": time.time(),
+        },
+        ensure_ascii=False,
+    )
+    key = _menu_msg_key(name, chat_id)
+    if _r:
+        try:
+            _r.setex(key, max(ttl, 1), payload)
+            return
+        except Exception as exc:
+            _logger.warning("menu_msg.save_error | key=%s err=%s", key, exc)
+    _memory_set_with_ttl(key, payload, ttl)
+
+
+def get_menu_message(name: str, chat_id: int, *, max_age: Optional[int] = None) -> Optional[Tuple[int, float]]:
+    key = _menu_msg_key(name, chat_id)
+    raw: Optional[str]
+    if _r:
+        try:
+            redis_raw = _r.get(key)
+        except Exception as exc:
+            _logger.warning("menu_msg.get_error | key=%s err=%s", key, exc)
+            redis_raw = None
+        if redis_raw is None:
+            raw = None
+        elif isinstance(redis_raw, bytes):
+            raw = redis_raw.decode("utf-8", "ignore")
+        else:
+            raw = str(redis_raw)
+    else:
+        raw = _memory_get(key)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        _logger.warning("menu_msg.parse_error | key=%s", key)
+        clear_menu_message(name, chat_id)
+        return None
+    message_id = data.get("message_id")
+    timestamp = data.get("ts")
+    try:
+        msg_value = int(message_id)
+    except (TypeError, ValueError):
+        clear_menu_message(name, chat_id)
+        return None
+    try:
+        ts_value = float(timestamp)
+    except (TypeError, ValueError):
+        ts_value = time.time()
+    if max_age is not None and max_age > 0 and (time.time() - ts_value) > max_age:
+        clear_menu_message(name, chat_id)
+        return None
+    return msg_value, ts_value
+
+
+def clear_menu_message(name: str, chat_id: int) -> None:
+    key = _menu_msg_key(name, chat_id)
+    if _r:
+        try:
+            _r.delete(key)
+        except Exception as exc:
+            _logger.warning("menu_msg.clear_error | key=%s err=%s", key, exc)
     else:
         _memory_delete(key)
 

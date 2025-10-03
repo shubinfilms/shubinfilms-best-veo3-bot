@@ -195,6 +195,11 @@ from redis_utils import (
     cache_set,
     acquire_ttl_lock,
     release_ttl_lock,
+    acquire_menu_lock,
+    release_menu_lock,
+    save_menu_message,
+    get_menu_message,
+    clear_menu_message,
 )
 
 from ledger import (
@@ -1329,6 +1334,17 @@ PM_STATE_TTL = 30 * 60
 PM_PLACEHOLDER_TEXT = "Пишу промпт…"
 PM_ERROR_TEXT = "⚠️ Не получилось, попробуйте ещё раз."
 PM_MENU_TEXT = "🧠 Prompt-Master\nВыберите раздел:"
+_PM_MENU_LOCK_NAME = "pm:lock"
+_PM_MENU_MESSAGE_NAME = "pm:card"
+_PM_MENU_LOCK_TTL = 60
+_PM_MENU_MESSAGE_TTL = 90
+
+
+def _clear_pm_menu_state(chat_id: int, *, user_id: Optional[int] = None) -> None:
+    clear_menu_message(_PM_MENU_MESSAGE_NAME, chat_id)
+    release_menu_lock(_PM_MENU_LOCK_NAME, chat_id)
+    if user_id is not None:
+        release_menu_lock(_PM_MENU_LOCK_NAME, user_id)
 
 _PM_STEP_MEMORY: Dict[int, Tuple[float, str]] = {}
 _PM_BUFFER_MEMORY: Dict[int, Tuple[float, Dict[str, Any]]] = {}
@@ -1649,15 +1665,103 @@ def is_pm_waiting(user_id: Optional[int]) -> bool:
 
 
 async def _pm_send_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await tg_safe_send(
-        ctx.bot.send_message,
-        method_name="sendMessage",
-        kind="message",
-        chat_id=chat_id,
-        text=PM_MENU_TEXT,
-        reply_markup=pm_main_kb(),
-        parse_mode=None,
-    )
+    lock_owned = acquire_menu_lock(_PM_MENU_LOCK_NAME, chat_id, _PM_MENU_LOCK_TTL)
+    forced_release = False
+    markup = pm_main_kb()
+
+    try:
+        record = get_menu_message(
+            _PM_MENU_MESSAGE_NAME,
+            chat_id,
+            max_age=_PM_MENU_MESSAGE_TTL,
+        )
+
+        if not lock_owned:
+            if record:
+                saved_id, _ = record
+                outcome = await _try_edit_menu_card(
+                    ctx,
+                    chat_id=chat_id,
+                    message_id=saved_id,
+                    text=PM_MENU_TEXT,
+                    reply_markup=markup,
+                    log_prefix="pm.menu",
+                    parse_mode=None,
+                )
+                if outcome == "ok":
+                    save_menu_message(
+                        _PM_MENU_MESSAGE_NAME,
+                        chat_id,
+                        saved_id,
+                        _PM_MENU_MESSAGE_TTL,
+                    )
+                    chat_data = getattr(ctx, "chat_data", None)
+                    if isinstance(chat_data, MutableMapping):
+                        chat_data["pm_menu_msg_id"] = saved_id
+                    return
+                clear_menu_message(_PM_MENU_MESSAGE_NAME, chat_id)
+            release_menu_lock(_PM_MENU_LOCK_NAME, chat_id)
+            forced_release = True
+            lock_owned = acquire_menu_lock(
+                _PM_MENU_LOCK_NAME,
+                chat_id,
+                _PM_MENU_LOCK_TTL,
+            )
+
+        record = get_menu_message(
+            _PM_MENU_MESSAGE_NAME,
+            chat_id,
+            max_age=_PM_MENU_MESSAGE_TTL,
+        )
+        if record:
+            saved_id, _ = record
+            outcome = await _try_edit_menu_card(
+                ctx,
+                chat_id=chat_id,
+                message_id=saved_id,
+                text=PM_MENU_TEXT,
+                reply_markup=markup,
+                log_prefix="pm.menu",
+                parse_mode=None,
+            )
+            if outcome == "ok":
+                save_menu_message(
+                    _PM_MENU_MESSAGE_NAME,
+                    chat_id,
+                    saved_id,
+                    _PM_MENU_MESSAGE_TTL,
+                )
+                chat_data = getattr(ctx, "chat_data", None)
+                if isinstance(chat_data, MutableMapping):
+                    chat_data["pm_menu_msg_id"] = saved_id
+                return
+            clear_menu_message(_PM_MENU_MESSAGE_NAME, chat_id)
+
+        result = await tg_safe_send(
+            ctx.bot.send_message,
+            method_name="sendMessage",
+            kind="message",
+            chat_id=chat_id,
+            text=PM_MENU_TEXT,
+            reply_markup=markup,
+            parse_mode=None,
+        )
+        message_id = getattr(result, "message_id", None)
+        if isinstance(message_id, int):
+            save_menu_message(
+                _PM_MENU_MESSAGE_NAME,
+                chat_id,
+                message_id,
+                _PM_MENU_MESSAGE_TTL,
+            )
+            chat_data = getattr(ctx, "chat_data", None)
+            if isinstance(chat_data, MutableMapping):
+                chat_data["pm_menu_msg_id"] = message_id
+    finally:
+        if lock_owned:
+            release_menu_lock(_PM_MENU_LOCK_NAME, chat_id)
+        elif forced_release:
+            log.debug("pm.menu.lock_forced_release", extra={"chat_id": chat_id})
 
 
 async def _pm_send_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, text: str) -> None:
@@ -1805,6 +1909,7 @@ async def prompt_master_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             _pm_clear_state(user_id)
         await query.answer()
         if chat_id is not None:
+            _clear_pm_menu_state(chat_id, user_id=user_id)
             await show_main_menu(chat_id, ctx)
         return
 
@@ -2731,20 +2836,22 @@ def _load_mj_grid_snapshot(grid_id: str) -> Optional[Dict[str, Any]]:
     return result
 
 
-def _mj_guess_extension(url: str, default: str = ".jpeg") -> str:
+def _mj_guess_extension(url: str, default: str = ".jpg") -> str:
     try:
         path = urlparse(url).path.lower()
     except Exception:
         return default
     for ext in (".jpeg", ".jpg", ".png", ".webp"):
         if path.endswith(ext):
-            return ".jpeg" if ext == ".jpg" else ext
+            if ext in {".jpeg", ".jpg"}:
+                return ".jpg"
+            return ext
     return default
 
 
 def _mj_document_filename(index: int, url: Optional[str] = None, *, suffix: str = "") -> str:
     ext = _mj_guess_extension(url or "")
-    base = f"midjourney_{index:02d}"
+    base = f"mj_{index:02d}"
     if suffix:
         base = f"{base}_{suffix}"
     return f"{base}{ext}"
@@ -4322,10 +4429,17 @@ BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
 VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
-_VIDEO_MENU_LOCK_TTL = 5
-_VIDEO_MENU_CACHE_TTL = 60 * 60
-_VIDEO_MENU_LOCK_KEY_TMPL = "lock:video_menu:{user_id}"
-_VIDEO_MENU_LAST_KEY_TMPL = "video:last_msg:{chat_id}"
+_VIDEO_MENU_LOCK_TTL = 90
+_VIDEO_MENU_MESSAGE_TTL = 90
+_VIDEO_MENU_LOCK_NAME = "video:menu:lock"
+_VIDEO_MENU_MESSAGE_NAME = "video:menu:card"
+
+
+def _clear_video_menu_state(chat_id: int, *, user_id: Optional[int] = None) -> None:
+    clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
+    release_menu_lock(_VIDEO_MENU_LOCK_NAME, chat_id)
+    if user_id is not None:
+        release_menu_lock(_VIDEO_MENU_LOCK_NAME, user_id)
 
 _VIDEO_MODE_HINTS: Dict[str, str] = {
     "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
@@ -4497,7 +4611,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s["mode"] = None
         await query.answer()
         try:
-            await start_video_mode(update, ctx)
+            await start_video_menu(update, ctx)
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.video_send_failed | chat=%s err=%s", chat_id, exc)
         return
@@ -4621,6 +4735,63 @@ def video_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+async def _try_edit_menu_card(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    log_prefix: str,
+    parse_mode: Optional[ParseMode] = None,
+    disable_web_page_preview: bool = True,
+) -> str:
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+        log.info(
+            "%s.edit_success",
+            log_prefix,
+            extra={"chat_id": chat_id, "message_id": message_id},
+        )
+        return "ok"
+    except BadRequest as exc:
+        lowered = str(exc).lower()
+        if "message to edit not found" in lowered or "message identifier invalid" in lowered:
+            log.info(
+                "%s.missing",
+                log_prefix,
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
+            return "missing"
+        if "message is not modified" in lowered:
+            log.info(
+                "%s.not_modified",
+                log_prefix,
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
+            return "not_modified"
+        log.debug(
+            "%s.edit_bad_request",
+            log_prefix,
+            extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+        )
+        return "error"
+    except TelegramError as exc:
+        log.debug(
+            "%s.edit_failed",
+            log_prefix,
+            extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+        )
+        return "error"
+
+
 async def _send_video_menu_message(
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
@@ -4657,7 +4828,7 @@ async def _send_video_menu_message(
     return getattr(result, "message_id", None)
 
 
-async def start_video_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     message = getattr(update, "effective_message", None)
     chat = getattr(update, "effective_chat", None) or (
         getattr(message, "chat", None) if message else None
@@ -4680,99 +4851,125 @@ async def start_video_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
             )
 
     user_id = user.id if user else None
-    if user_id is not None:
-        input_state.clear(user_id, reason="video_menu")
-        set_mode(user_id, False)
-        clear_wait(user_id, reason="video_menu")
-        try:
-            clear_wait_state(user_id, reason="video_menu")
-        except TypeError:
-            clear_wait_state(user_id)
 
     s = state(ctx)
     s["mode"] = None
     s.pop("model", None)
 
     lock_owner = user_id if user_id is not None else chat_id
-    lock_key = _VIDEO_MENU_LOCK_KEY_TMPL.format(user_id=lock_owner)
-    if not acquire_ttl_lock(lock_key, _VIDEO_MENU_LOCK_TTL):
-        log.debug(
-            "video.menu.lock_active",
-            extra={"chat_id": chat_id, "user_id": user_id},
-        )
-        return None
-
-    log.info(
-        "video.menu.lock_acquired",
-        extra={"chat_id": chat_id, "user_id": user_id},
-    )
+    lock_owned = acquire_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner, _VIDEO_MENU_LOCK_TTL)
+    forced_release = False
+    result_id: Optional[int] = None
 
     try:
         keyboard = video_menu_kb()
-        last_key = _VIDEO_MENU_LAST_KEY_TMPL.format(chat_id=chat_id)
-        last_id_raw = cache_get(last_key)
-        last_msg_id: Optional[int] = None
-        if last_id_raw:
-            try:
-                last_msg_id = int(last_id_raw)
-            except (TypeError, ValueError):
-                last_msg_id = None
+        record = get_menu_message(
+            _VIDEO_MENU_MESSAGE_NAME,
+            chat_id,
+            max_age=_VIDEO_MENU_MESSAGE_TTL,
+        )
 
-        if last_msg_id is not None:
-            try:
-                edited = await safe_edit_message(
+        if not lock_owned:
+            if record:
+                saved_id, _ = record
+                outcome = await _try_edit_menu_card(
                     ctx,
                     chat_id=chat_id,
-                    message_id=last_msg_id,
-                    new_text=VIDEO_MENU_TEXT,
+                    message_id=saved_id,
+                    text=VIDEO_MENU_TEXT,
                     reply_markup=keyboard,
-                    log_on_noop="card_edit_noop",
+                    log_prefix="video.menu",
+                    parse_mode=None,
                 )
-                cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
-                if edited:
-                    log.info(
-                        "video.menu.show_edit",
-                        extra={"chat_id": chat_id, "message_id": last_msg_id},
+                if outcome == "ok":
+                    save_menu_message(
+                        _VIDEO_MENU_MESSAGE_NAME,
+                        chat_id,
+                        saved_id,
+                        _VIDEO_MENU_MESSAGE_TTL,
                     )
-                else:
-                    log.info(
-                        "video.menu.show_edit_noop",
-                        extra={"chat_id": chat_id, "message_id": last_msg_id},
-                    )
-                return last_msg_id
-            except BadRequest as exc:
-                lowered = str(exc).lower()
-                if "message is not modified" in lowered:
-                    cache_set(last_key, str(last_msg_id), _VIDEO_MENU_CACHE_TTL)
-                    log.info(
-                        "card_edit_noop",
-                        extra={"chat_id": chat_id, "message_id": last_msg_id},
-                    )
-                    return last_msg_id
-                log.debug(
-                    "video.menu.edit_bad_request",
-                    extra={"chat_id": chat_id, "error": str(exc)},
+                    result_id = saved_id
+                    return result_id
+                clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
+            release_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner)
+            forced_release = True
+            lock_owned = acquire_menu_lock(
+                _VIDEO_MENU_LOCK_NAME,
+                lock_owner,
+                _VIDEO_MENU_LOCK_TTL,
+            )
+
+        record = get_menu_message(
+            _VIDEO_MENU_MESSAGE_NAME,
+            chat_id,
+            max_age=_VIDEO_MENU_MESSAGE_TTL,
+        )
+        if record:
+            saved_id, _ = record
+            outcome = await _try_edit_menu_card(
+                ctx,
+                chat_id=chat_id,
+                message_id=saved_id,
+                text=VIDEO_MENU_TEXT,
+                reply_markup=keyboard,
+                log_prefix="video.menu",
+                parse_mode=None,
+            )
+            if outcome == "ok":
+                save_menu_message(
+                    _VIDEO_MENU_MESSAGE_NAME,
+                    chat_id,
+                    saved_id,
+                    _VIDEO_MENU_MESSAGE_TTL,
                 )
-            except TelegramError as exc:
-                log.debug(
-                    "video.menu.edit_failed",
-                    extra={"chat_id": chat_id, "error": str(exc)},
-                )
+                msg_ids = s.get("msg_ids")
+                if not isinstance(msg_ids, dict):
+                    msg_ids = {}
+                    s["msg_ids"] = msg_ids
+                msg_ids["video_menu"] = saved_id
+                result_id = saved_id
+                return result_id
+            clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
 
         sent_id = await _send_video_menu_message(ctx, chat_id=chat_id, message=message)
         if sent_id is not None:
-            cache_set(last_key, str(sent_id), _VIDEO_MENU_CACHE_TTL)
+            save_menu_message(
+                _VIDEO_MENU_MESSAGE_NAME,
+                chat_id,
+                sent_id,
+                _VIDEO_MENU_MESSAGE_TTL,
+            )
+            msg_ids = s.get("msg_ids")
+            if not isinstance(msg_ids, dict):
+                msg_ids = {}
+                s["msg_ids"] = msg_ids
+            msg_ids["video_menu"] = sent_id
             log.info(
                 "video.menu.show_send",
                 extra={"chat_id": chat_id, "message_id": sent_id},
             )
-        return sent_id
+            result_id = sent_id
+        return result_id
     finally:
-        release_ttl_lock(lock_key)
-        log.info(
-            "video.menu.lock_release",
-            extra={"chat_id": chat_id, "user_id": user_id},
-        )
+        if user_id is not None:
+            input_state.clear(user_id, reason="video_menu")
+            set_mode(user_id, False)
+            clear_wait(user_id, reason="video_menu")
+            try:
+                clear_wait_state(user_id, reason="video_menu")
+            except TypeError:
+                clear_wait_state(user_id)
+        if lock_owned:
+            release_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner)
+            log.info(
+                "video.menu.lock_release",
+                extra={"chat_id": chat_id, "user_id": user_id},
+            )
+        elif forced_release:
+            log.info(
+                "video.menu.lock_forced_release",
+                extra={"chat_id": chat_id, "user_id": user_id},
+            )
 
 
 def _video_mode_config(mode: str) -> Optional[Tuple[str, str, str]]:
@@ -10210,6 +10407,8 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user_id = user.id if user else None
+    _clear_video_menu_state(chat_id, user_id=user_id)
+    _clear_pm_menu_state(chat_id, user_id=user_id)
     if user_id:
         set_mode(user_id, False)
         clear_wait(user_id)
@@ -10395,7 +10594,7 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "video.command",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    await start_video_mode(update, ctx)
+    await start_video_menu(update, ctx)
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -10536,7 +10735,7 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         "video.menu.reply",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    await start_video_mode(update, ctx)
+    await start_video_menu(update, ctx)
 
 
 async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10582,6 +10781,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if data == CB_VIDEO_BACK:
         target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
         if target_chat is not None:
+            _clear_video_menu_state(target_chat, user_id=user_id)
             await show_emoji_hub_for_chat(
                 target_chat,
                 ctx,
@@ -10593,7 +10793,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if data == CB_VIDEO_MENU:
         if chat_id is None:
             return
-        await start_video_mode(update, ctx)
+        await start_video_menu(update, ctx)
         return
 
     return
@@ -13875,7 +14075,14 @@ async def run_bot_async() -> None:
                    .build())
 
     try:
-        register_handlers(application)
+        if not application.bot_data.get(HANDLERS_FLAG):
+            register_handlers(application)
+            application.bot_data[HANDLERS_FLAG] = True
+        else:
+            log.info(
+                "handlers.already_registered",
+                extra={"application": id(application)},
+            )
     except Exception:
         log.exception("handler registration failed")
         raise

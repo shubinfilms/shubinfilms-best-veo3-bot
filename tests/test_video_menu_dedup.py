@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,33 +25,72 @@ def bot_module(monkeypatch):
 
 
 def _make_ctx(bot=None):
-    return SimpleNamespace(bot=bot or SimpleNamespace(), user_data={}, application=None)
+    return SimpleNamespace(
+        bot=bot or SimpleNamespace(),
+        user_data={},
+        application=None,
+        chat_data={},
+    )
 
 
-def test_start_video_mode_deduplicates_card(monkeypatch, bot_module):
-    cache: dict[str, str] = {}
+def test_start_video_menu_deduplicates_card(monkeypatch, bot_module):
+    locks: set[tuple[str, int]] = set()
+    records: dict[tuple[str, int], tuple[int, float]] = {}
     send_calls: list[tuple[int | None, object | None]] = []
     edit_calls: list[tuple[int, int]] = []
-    release_calls: list[str] = []
+    release_calls: list[tuple[str, int]] = []
 
-    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda name, ttl: True)
-    monkeypatch.setattr(bot_module, "release_ttl_lock", lambda name: release_calls.append(name))
-    monkeypatch.setattr(bot_module, "cache_get", lambda name: cache.get(name))
-    monkeypatch.setattr(bot_module, "cache_set", lambda name, value, ttl: cache.update({name: value}))
+    def fake_acquire(name: str, chat_id: int, ttl: int) -> bool:
+        key = (name, chat_id)
+        if key in locks:
+            return False
+        locks.add(key)
+        return True
+
+    def fake_release(name: str, chat_id: int) -> None:
+        release_calls.append((name, chat_id))
+        locks.discard((name, chat_id))
+
+    def fake_save(name: str, chat_id: int, message_id: int, ttl: int) -> None:
+        records[(name, chat_id)] = (message_id, time.time())
+
+    def fake_get(name: str, chat_id: int, *, max_age: int | None = None):
+        record = records.get((name, chat_id))
+        if not record:
+            return None
+        if max_age is not None and (time.time() - record[1]) > max_age:
+            records.pop((name, chat_id), None)
+            return None
+        return record
+
+    def fake_clear(name: str, chat_id: int) -> None:
+        records.pop((name, chat_id), None)
 
     async def fake_send(ctx, *, chat_id=None, message=None):  # type: ignore[override]
         send_calls.append((chat_id, message))
         return 777
 
-    async def fake_edit(ctx, chat_id, message_id, **kwargs):  # type: ignore[override]
+    async def fake_edit(
+        ctx,
+        *,
+        chat_id: int,
+        message_id: int,
+        **kwargs,
+    ) -> str:
         edit_calls.append((chat_id, message_id))
-        return True
+        return "ok"
 
+    monkeypatch.setattr(bot_module, "acquire_menu_lock", fake_acquire)
+    monkeypatch.setattr(bot_module, "release_menu_lock", fake_release)
+    monkeypatch.setattr(bot_module, "save_menu_message", fake_save)
+    monkeypatch.setattr(bot_module, "get_menu_message", fake_get)
+    monkeypatch.setattr(bot_module, "clear_menu_message", fake_clear)
     monkeypatch.setattr(bot_module, "_send_video_menu_message", fake_send)
-    monkeypatch.setattr(bot_module, "safe_edit_message", fake_edit)
+    monkeypatch.setattr(bot_module, "_try_edit_menu_card", fake_edit)
     monkeypatch.setattr(bot_module, "input_state", SimpleNamespace(clear=lambda *args, **kwargs: None))
     monkeypatch.setattr(bot_module, "set_mode", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot_module, "clear_wait", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "clear_wait_state", lambda *args, **kwargs: None)
 
     update = SimpleNamespace(
         effective_message=SimpleNamespace(chat_id=42, reply_text=lambda *args, **kwargs: SimpleNamespace(message_id=999)),
@@ -60,27 +100,61 @@ def test_start_video_mode_deduplicates_card(monkeypatch, bot_module):
     )
     ctx = _make_ctx()
 
-    asyncio.run(bot_module.start_video_mode(update, ctx))
+    asyncio.run(bot_module.start_video_menu(update, ctx))
     assert send_calls == [(42, update.effective_message)]
-    assert cache == {"video:last_msg:42": "777"}
+    key = (bot_module._VIDEO_MENU_MESSAGE_NAME, 42)
+    assert records[key][0] == 777
 
-    asyncio.run(bot_module.start_video_mode(update, ctx))
+    asyncio.run(bot_module.start_video_menu(update, ctx))
     assert send_calls == [(42, update.effective_message)]
     assert edit_calls == [(42, 777)]
-    assert release_calls == ["lock:video_menu:9", "lock:video_menu:9"]
+    assert release_calls == [
+        (bot_module._VIDEO_MENU_LOCK_NAME, 9),
+        (bot_module._VIDEO_MENU_LOCK_NAME, 9),
+    ]
 
 
-def test_start_video_mode_respects_lock(monkeypatch, bot_module):
-    monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda *args, **kwargs: False)
+def test_start_video_menu_edits_when_lock_active(monkeypatch, bot_module):
+    message_key = (bot_module._VIDEO_MENU_MESSAGE_NAME, 7)
+    records = {message_key: (123, time.time())}
+    edit_calls: list[tuple[int, int]] = []
+
+    def fake_acquire(name: str, chat_id: int, ttl: int) -> bool:
+        return False
+
+    def fake_release(name: str, chat_id: int) -> None:
+        pass
+
+    def fake_get(name: str, chat_id: int, *, max_age: int | None = None):
+        return records.get((name, chat_id))
+
+    def fake_save(name: str, chat_id: int, message_id: int, ttl: int) -> None:
+        records[(name, chat_id)] = (message_id, time.time())
+
+    async def fake_edit(
+        ctx,
+        *,
+        chat_id: int,
+        message_id: int,
+        **kwargs,
+    ) -> str:
+        edit_calls.append((chat_id, message_id))
+        return "ok"
+
+    async def fail_send(*args, **kwargs):  # type: ignore[override]
+        raise AssertionError("send should not be called when editing is possible")
+
+    monkeypatch.setattr(bot_module, "acquire_menu_lock", fake_acquire)
+    monkeypatch.setattr(bot_module, "release_menu_lock", fake_release)
+    monkeypatch.setattr(bot_module, "get_menu_message", fake_get)
+    monkeypatch.setattr(bot_module, "save_menu_message", fake_save)
+    monkeypatch.setattr(bot_module, "clear_menu_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "_try_edit_menu_card", fake_edit)
+    monkeypatch.setattr(bot_module, "_send_video_menu_message", fail_send)
     monkeypatch.setattr(bot_module, "input_state", SimpleNamespace(clear=lambda *args, **kwargs: None))
     monkeypatch.setattr(bot_module, "set_mode", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot_module, "clear_wait", lambda *args, **kwargs: None)
-
-    async def fake_send(*args, **kwargs):  # type: ignore[override]
-        raise AssertionError("send should not be called when lock is active")
-
-    monkeypatch.setattr(bot_module, "_send_video_menu_message", fake_send)
-    monkeypatch.setattr(bot_module, "safe_edit_message", fake_send)
+    monkeypatch.setattr(bot_module, "clear_wait_state", lambda *args, **kwargs: None)
 
     update = SimpleNamespace(
         effective_message=SimpleNamespace(chat_id=7),
@@ -89,7 +163,8 @@ def test_start_video_mode_respects_lock(monkeypatch, bot_module):
         callback_query=None,
     )
 
-    asyncio.run(bot_module.start_video_mode(update, _make_ctx()))
+    asyncio.run(bot_module.start_video_menu(update, _make_ctx()))
+    assert edit_calls == [(7, 123)]
 
 
 def test_video_menu_callback_delegates_to_start(monkeypatch, bot_module):
@@ -98,7 +173,7 @@ def test_video_menu_callback_delegates_to_start(monkeypatch, bot_module):
     async def fake_start(update, ctx):  # type: ignore[override]
         calls.append((update, ctx))
 
-    monkeypatch.setattr(bot_module, "start_video_mode", fake_start)
+    monkeypatch.setattr(bot_module, "start_video_menu", fake_start)
 
     async def fake_ensure(update):
         return None

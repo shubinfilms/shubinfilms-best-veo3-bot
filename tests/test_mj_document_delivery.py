@@ -73,9 +73,9 @@ def test_grid_delivery_sends_documents_and_menu(monkeypatch, bot_module):
     assert delivered is True
     assert len(doc_calls) == 3
     assert [call["document"].filename for call in doc_calls] == [
-        "midjourney_01.jpeg",
-        "midjourney_02.png",
-        "midjourney_03.jpeg",
+        "mj_01.jpg",
+        "mj_02.png",
+        "mj_03.jpg",
     ]
     assert [call["document"].input_file_content.decode() for call in doc_calls] == urls
     assert menu_calls and menu_calls[0]["markup"].inline_keyboard[0][0].callback_data.startswith("mj.upscale.menu:")
