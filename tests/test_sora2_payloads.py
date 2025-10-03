@@ -134,21 +134,19 @@ def test_sora2_payload_text_to_video(monkeypatch, bot_module, ctx):
 
     assert payloads, "payload not built"
     payload = payloads[0]
-    assert payload["task_type"] == "text2video"
-    assert payload["model"] == "sora2-text-to-video"
-    assert payload["input"]["aspect_ratio"] == "4:5"
+    assert "task_type" not in payload
+    assert payload["model"] == "sora-2-text-to-video"
+    assert payload["input"]["aspect_ratio"] == "portrait"
     assert payload["input"]["prompt"] == "Epic scene"
-    assert "quality" not in payload["input"]
+    assert payload["input"]["quality"] == "standard"
     assert "image_urls" not in payload["input"]
-    assert payload["resolution"] == bot_module.SORA2_DEFAULT_TTV_RESOLUTION
-    assert payload["duration"] == bot_module.SORA2_DEFAULT_TTV_DURATION
-    assert payload["audio"] is True
     extra = saved_meta.get("extra", {})
     assert extra.get("image_urls") == []
     assert extra.get("submit_raw") == {"taskId": "ttv-1"}
     assert extra.get("duration") == bot_module.SORA2_DEFAULT_TTV_DURATION
     assert extra.get("resolution") == bot_module.SORA2_DEFAULT_TTV_RESOLUTION
     assert extra.get("audio") is True
+    assert extra.get("quality") == "standard"
     bot_module.ACTIVE_TASKS.clear()
 
 
@@ -198,14 +196,14 @@ def test_sora2_payload_image_to_video(monkeypatch, bot_module, ctx):
     assert upload_calls == [["https://img.one/a.png", "https://img.two/b.png"]]
     assert payloads, "payload not built"
     payload = payloads[0]
-    assert payload["task_type"] == "image2video"
-    assert payload["model"] == "sora2-image-to-video"
-    assert payload["input"]["aspect_ratio"] == "16:9"
+    assert "task_type" not in payload
+    assert payload["model"] == "sora-2-image-to-video"
+    assert payload["input"]["aspect_ratio"] == "landscape"
     assert payload["input"].get("prompt", "") == ""
-    assert "quality" not in payload["input"]
+    assert payload["input"]["quality"] == "standard"
     assert payload["input"]["image_urls"] == ["https://uploads.example/0", "https://uploads.example/1"]
-    assert payload["resolution"] == bot_module.SORA2_DEFAULT_ITV_RESOLUTION
-    assert payload["duration"] == bot_module.SORA2_DEFAULT_ITV_DURATION
+    assert "resolution" not in payload
+    assert "duration" not in payload
     assert "audio" not in payload
     extra = saved_meta.get("extra", {})
     assert extra.get("image_urls") == payload["input"]["image_urls"]
@@ -213,5 +211,6 @@ def test_sora2_payload_image_to_video(monkeypatch, bot_module, ctx):
     assert extra.get("duration") == bot_module.SORA2_DEFAULT_ITV_DURATION
     assert extra.get("resolution") == bot_module.SORA2_DEFAULT_ITV_RESOLUTION
     assert extra.get("audio") is None
+    assert extra.get("quality") == "standard"
     bot_module.ACTIVE_TASKS.clear()
 

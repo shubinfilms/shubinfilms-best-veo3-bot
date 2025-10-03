@@ -279,6 +279,7 @@ from suno.service import SunoService, SunoAPIError, RecordInfoPollResult
 from sora2_client import (
     CreateTaskResponse,
     QueryTaskResponse,
+    Sora2BadRequestError,
     Sora2AuthError,
     Sora2Error,
     Sora2UnavailableError,
@@ -4758,8 +4759,8 @@ SORA2_DEFAULT_TTV_DURATION = 10
 SORA2_DEFAULT_TTV_RESOLUTION = "1280x720"
 SORA2_DEFAULT_ITV_DURATION = 5
 SORA2_DEFAULT_ITV_RESOLUTION = "1280x720"
-SORA2_POLL_INTERVAL = 3.5
-SORA2_POLL_TIMEOUT = 5 * 60
+SORA2_POLL_BACKOFF_SERIES: Tuple[float, ...] = (5.0, 8.0, 13.0, 21.0, 34.0)
+SORA2_POLL_TIMEOUT = 7 * 60
 
 
 def _format_resolution_for_caption(value: Optional[str]) -> Optional[str]:
@@ -8984,8 +8985,8 @@ async def sora2_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --------- Sora2 Generation ----------
 _SORA2_MODEL_IDS = {
-    "sora2_ttv": "sora2-text-to-video",
-    "sora2_itv": "sora2-image-to-video",
+    "sora2_ttv": "sora-2-text-to-video",
+    "sora2_itv": "sora-2-image-to-video",
 }
 
 _SORA2_SERVICE_CODES = {
@@ -9011,6 +9012,26 @@ def _sora2_normalize_aspect(raw: Any) -> str:
     return candidate
 
 
+def _sora2_aspect_for_api(aspect_ratio: Optional[str]) -> Optional[str]:
+    aspect = (aspect_ratio or "").strip()
+    if not aspect:
+        return None
+    if aspect in {"9:16", "4:5"}:
+        return "portrait"
+    if aspect == "16:9":
+        return "landscape"
+    return None
+
+
+def _sora2_quality_from_resolution(resolution: Optional[str]) -> Optional[str]:
+    text = str(resolution or "").strip().lower()
+    if not text:
+        return "standard"
+    if any(token in text for token in ("1080", "1920", "2160", "4k")):
+        return "hd"
+    return "standard"
+
+
 def _sora2_lookup_url(payload: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
     for key in keys:
         value = payload.get(key)
@@ -9023,12 +9044,16 @@ def _sora2_lookup_url(payload: Mapping[str, Any], keys: Sequence[str]) -> Option
             found = _sora2_lookup_url(value, keys)
             if found:
                 return found
-        elif isinstance(value, list):
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             for item in value:
                 if isinstance(item, Mapping):
                     found = _sora2_lookup_url(item, keys)
                     if found:
                         return found
+                elif isinstance(item, str):
+                    trimmed = item.strip()
+                    if trimmed.lower().startswith("http"):
+                        return trimmed
     return None
 
 
@@ -9067,19 +9092,13 @@ def _sora2_sanitize_image_urls(urls: Sequence[str]) -> List[str]:
     return cleaned
 
 
-def _sora2_task_type(mode: str) -> str:
-    return "image2video" if mode == "sora2_itv" else "text2video"
-
-
 def _build_sora2_payload(
     mode: str,
     prompt: str,
     image_urls: Sequence[str],
     *,
     aspect_ratio: Optional[str],
-    resolution: str,
-    duration: int,
-    audio: Optional[bool],
+    quality: Optional[str],
 ) -> Dict[str, Any]:
     callback_url = SORA2.get("CALLBACK_URL")
     if not callback_url:
@@ -9087,26 +9106,27 @@ def _build_sora2_payload(
         if public_base:
             callback_url = f"{public_base.rstrip('/')}/sora2-callback"
     input_payload: Dict[str, Any] = {}
-    if aspect_ratio:
-        input_payload["aspect_ratio"] = aspect_ratio
     prompt_text = prompt.strip()
-    if prompt_text:
-        input_payload["prompt"] = prompt_text
+    input_payload["prompt"] = prompt_text
 
     if mode == "sora2_itv":
         cleaned_urls = _sora2_sanitize_image_urls(image_urls)
         if cleaned_urls:
             input_payload["image_urls"] = cleaned_urls
 
+    aspect_value = _sora2_aspect_for_api(aspect_ratio)
+    if aspect_value:
+        input_payload["aspect_ratio"] = aspect_value
+
+    quality_value = (quality or "standard").strip().lower()
+    if quality_value not in {"standard", "hd"}:
+        quality_value = "standard"
+    input_payload["quality"] = quality_value
+
     payload: Dict[str, Any] = {
-        "task_type": _sora2_task_type(mode),
         "model": _sora2_model_id(mode),
         "input": input_payload,
-        "resolution": resolution,
-        "duration": int(duration),
     }
-    if audio is not None:
-        payload["audio"] = bool(audio)
     if callback_url:
         payload["callBackUrl"] = callback_url
     return payload
@@ -9143,6 +9163,23 @@ async def _download_temp_file(url: str, suffix: str) -> Optional[str]:
 
 async def _download_sora2_assets(result: Mapping[str, Any]) -> List[str]:
     video_url, cover_url = _sora2_extract_assets(result)
+    if not video_url:
+        urls_candidate = result.get("resultUrls") or result.get("result_urls") or []
+        if isinstance(urls_candidate, Sequence) and not isinstance(urls_candidate, (str, bytes, bytearray)):
+            prioritized: List[str] = []
+            for item in urls_candidate:
+                if isinstance(item, str) and item.strip():
+                    prioritized.append(item.strip())
+            for candidate in prioritized:
+                lowered = candidate.lower()
+                if lowered.startswith("http") and lowered.endswith(".mp4"):
+                    video_url = candidate
+                    break
+            if not video_url:
+                for candidate in prioritized:
+                    if candidate.lower().startswith("http"):
+                        video_url = candidate
+                        break
     files: List[str] = []
     if video_url:
         video_path = await _download_temp_file(video_url, ".mp4")
@@ -9356,7 +9393,10 @@ async def _finalize_sora2_task(
 
 async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     start = time.monotonic()
-    next_remote_poll = start
+    backoff_plan = list(SORA2_POLL_BACKOFF_SERIES) or [5.0]
+    next_remote_poll = start + backoff_plan[0]
+    backoff_iter = iter(backoff_plan[1:])
+    backoff_fallback = backoff_plan[-1]
     try:
         while True:
             meta = load_task_meta(task_id)
@@ -9366,6 +9406,16 @@ async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> 
             handled = bool(meta.get("handled"))
             if status in {"success", "failed"} and not handled:
                 result_payload = meta.get("result") if isinstance(meta.get("result"), Mapping) else None
+                if not result_payload:
+                    urls_meta = meta.get("result_urls")
+                    if isinstance(urls_meta, Sequence) and not isinstance(urls_meta, (str, bytes, bytearray)):
+                        normalized_urls = [
+                            str(item).strip()
+                            for item in urls_meta
+                            if isinstance(item, str) and item.strip()
+                        ]
+                        if normalized_urls:
+                            result_payload = {"resultUrls": normalized_urls}
                 await _finalize_sora2_task(
                     ctx,
                     task_id,
@@ -9411,19 +9461,41 @@ async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> 
                         extra={"task_id": task_id, "error": str(exc)},
                     )
                 else:
-                    remote_status = (query_response.status or "pending").lower()
-                    result_payload = None
-                    raw = query_response.raw
-                    if isinstance(raw, Mapping):
-                        result_payload = raw.get("result") if isinstance(raw.get("result"), Mapping) else raw
+                    remote_state = (query_response.status or "pending").lower()
+                    normalized_status = remote_state
+                    if remote_state == "fail":
+                        normalized_status = "failed"
+                    elif remote_state == "success":
+                        normalized_status = "success"
+
+                    result_payload_map: Optional[Dict[str, Any]] = None
+                    if isinstance(query_response.result_payload, Mapping):
+                        result_payload_map = dict(query_response.result_payload)
+                    if query_response.result_urls:
+                        urls_list = list(query_response.result_urls)
+                        if result_payload_map is None:
+                            result_payload_map = {"resultUrls": urls_list}
+                        else:
+                            result_payload_map.setdefault("resultUrls", urls_list)
+
+                    if remote_state == "fail":
+                        log.warning(
+                            "sora2.poll.failed",
+                            extra={"task_id": task_id, "error": query_response.error_message},
+                        )
+
                     update_task_meta(
                         task_id,
-                        status=remote_status,
-                        result=result_payload,
+                        status=normalized_status,
+                        result=result_payload_map,
+                        result_urls=list(query_response.result_urls),
+                        error=query_response.error_message,
                         source="poll",
-                        raw=raw,
+                        raw=query_response.raw,
+                        state=remote_state,
                     )
-                next_remote_poll = now + SORA2_POLL_INTERVAL
+                delay = next(backoff_iter, backoff_fallback)
+                next_remote_poll = now + delay
             await asyncio.sleep(1)
     finally:
         poller = _SORA2_POLLERS.get(task_id)
@@ -9481,6 +9553,7 @@ async def _start_sora2_generation(
         duration = SORA2_DEFAULT_TTV_DURATION
         resolution = SORA2_DEFAULT_TTV_RESOLUTION
         audio_flag = True
+    quality = _sora2_quality_from_resolution(resolution)
     ok, balance_after = debit_try(
         user_id,
         price,
@@ -9503,15 +9576,44 @@ async def _start_sora2_generation(
         prompt_for_api,
         prepared_image_urls,
         aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration=duration,
-        audio=audio_flag,
+        quality=quality,
     )
     try:
         create_response: CreateTaskResponse = await asyncio.to_thread(
             sora2_create_task, payload
         )
         task_id = create_response.task_id
+    except Sora2BadRequestError as exc:
+        log.warning(
+            "sora2.create_task_bad_request",
+            extra={
+                "user_id": user_id,
+                "error": str(exc),
+                "mode": mode,
+                "has_images": bool(prepared_image_urls),
+            },
+        )
+        try:
+            new_balance = credit_balance(
+                user_id,
+                price,
+                reason="service:refund",
+                meta={"service": service_name, "reason": "bad_request"},
+            )
+        except Exception as refund_exc:
+            log.exception("sora2.submit_refund_failed | user_id=%s err=%s", user_id, refund_exc)
+        else:
+            await show_balance_notification(
+                chat_id,
+                ctx,
+                user_id,
+                f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
+            )
+        await message.reply_text(
+            "⚠️ Проверьте входные данные для Sora 2. Убедитесь, что текст и ссылки доступны."
+        )
+        await _refresh_video_menu_ui(ctx, chat_id=chat_id, message=message)
+        return None
     except Sora2UnavailableError as exc:
         mark_sora2_unavailable()
         log.warning(
@@ -9642,13 +9744,19 @@ async def _start_sora2_generation(
             "duration": duration,
             "resolution": resolution,
             "audio": audio_flag,
+            "quality": quality,
         },
         ttl=30 * 60,
     )
 
     log.info(
         "sora2.payload.sent",
-        extra={"task_id": task_id, "model": payload.get("model")},
+        extra={
+            "task_id": task_id,
+            "model": payload.get("model"),
+            "quality": payload.get("input", {}).get("quality"),
+            "has_images": bool(prepared_image_urls),
+        },
     )
     log.info(
         "sora2.start",
@@ -9662,6 +9770,7 @@ async def _start_sora2_generation(
             "raw": create_response.raw,
             "duration": duration,
             "resolution": resolution,
+            "quality": quality,
         },
     )
     log.info(
