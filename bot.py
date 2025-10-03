@@ -265,7 +265,7 @@ from suno.cover_source import (
     validate_audio_file as validate_cover_audio_file,
 )
 from suno.service import SunoService, SunoAPIError, RecordInfoPollResult
-from sora2_client import sora2_create_task, sora2_get_task
+from sora2_client import sora2_create_task, sora2_get_task, sora2_upload_image_urls
 from suno.schemas import CallbackEnvelope, SunoTask
 from suno.client import (
     AMBIENT_NATURE_PRESET_ID,
@@ -4706,7 +4706,7 @@ SORA2_MAX_PROMPT_LENGTH = 5000
 SORA2_MIN_IMAGES = 1
 SORA2_MAX_IMAGES = 4
 SORA2_ALLOWED_ASPECTS = {"16:9", "9:16", "1:1", "4:5"}
-SORA2_LOCK_TTL = 60
+SORA2_LOCK_TTL = 15 * 60
 
 
 async def show_wait_sticker(
@@ -8714,8 +8714,8 @@ async def sora2_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --------- Sora2 Generation ----------
 _SORA2_MODEL_IDS = {
-    "sora2_ttv": "sora2-text-to-video",
-    "sora2_itv": "sora2-image-to-video",
+    "sora2_ttv": "sora-2-text-to-video",
+    "sora2_itv": "sora-2-image-to-video",
 }
 
 _SORA2_SERVICE_CODES = {
@@ -8770,6 +8770,33 @@ def _sora2_extract_assets(payload: Mapping[str, Any]) -> Tuple[Optional[str], Op
     return video_url, cover_url
 
 
+def _sora2_extract_error(payload: Mapping[str, Any]) -> Optional[str]:
+    for key in ("error", "message", "detail", "msg", "reason"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    data = payload.get("data")
+    if isinstance(data, Mapping):
+        nested = _sora2_extract_error(data)
+        if nested:
+            return nested
+    return None
+
+
+def _sora2_sanitize_image_urls(urls: Sequence[str]) -> List[str]:
+    cleaned: List[str] = []
+    for raw in urls:
+        text = str(raw or "").strip()
+        if not text or not text.lower().startswith("http"):
+            continue
+        if text in cleaned:
+            continue
+        cleaned.append(text)
+        if len(cleaned) >= SORA2_MAX_IMAGES:
+            break
+    return cleaned
+
+
 def _build_sora2_payload(
     mode: str,
     prompt: str,
@@ -8777,27 +8804,32 @@ def _build_sora2_payload(
     *,
     aspect_ratio: str,
 ) -> Dict[str, Any]:
-    payload = {
-        "model": _sora2_model_id(mode),
-        "callBackUrl": SORA2.get("CALLBACK_URL"),
-        "input": {
-            "prompt": prompt,
-        },
-        "aspect_ratio": aspect_ratio,
-        "quality": "standard",
-    }
+    callback_url = SORA2.get("CALLBACK_URL")
+    input_payload: Dict[str, Any] = {"aspect_ratio": aspect_ratio}
+    prompt_text = prompt.strip()
+    if prompt_text:
+        input_payload["prompt"] = prompt_text
+
     if mode == "sora2_itv":
-        urls: List[str] = []
-        for url in image_urls:
-            text = str(url).strip()
-            if not text or text in urls:
-                continue
-            urls.append(text)
-            if len(urls) >= SORA2_MAX_IMAGES:
-                break
-        if urls:
-            payload["input"]["image_urls"] = urls
+        cleaned_urls = _sora2_sanitize_image_urls(image_urls)
+        if cleaned_urls:
+            input_payload["image_urls"] = cleaned_urls
+        input_payload["quality"] = "standard"
+
+    payload: Dict[str, Any] = {
+        "model": _sora2_model_id(mode),
+        "input": input_payload,
+    }
+    if callback_url:
+        payload["callBackUrl"] = callback_url
     return payload
+
+
+async def _prepare_sora2_image_urls(image_urls: Sequence[str]) -> List[str]:
+    cleaned = _sora2_sanitize_image_urls(image_urls)
+    if not cleaned:
+        return []
+    return await asyncio.to_thread(sora2_upload_image_urls, cleaned)
 
 
 async def _download_temp_file(url: str, suffix: str) -> Optional[str]:
@@ -8852,17 +8884,20 @@ async def _finalize_sora2_task(
     result_payload: Optional[Mapping[str, Any]],
     source: str,
 ) -> None:
-    chat_id_raw = meta.get("chat_id")
-    try:
-        chat_id = int(chat_id_raw)
-    except (TypeError, ValueError):
-        log.warning("sora2.finalize.chat_missing", extra={"task_id": task_id, "chat_id": chat_id_raw})
-        return
+    user_id: Optional[int] = None
     user_id_raw = meta.get("user_id")
     try:
         user_id = int(user_id_raw) if user_id_raw is not None else None
     except (TypeError, ValueError):
         user_id = None
+    chat_id_raw = meta.get("chat_id")
+    try:
+        chat_id = int(chat_id_raw)
+    except (TypeError, ValueError):
+        log.warning("sora2.finalize.chat_missing", extra={"task_id": task_id, "chat_id": chat_id_raw})
+        if user_id is not None:
+            release_sora2_lock(user_id)
+        return
     wait_msg_id = meta.get("wait_message_id") if isinstance(meta.get("wait_message_id"), int) else None
     price = int(meta.get("price") or 0)
     service = str(meta.get("service") or "SORA2")
@@ -8998,6 +9033,8 @@ async def _finalize_sora2_task(
                 extra={"task_id": task_id, "mode": mode, "source": source, "status": status},
             )
     finally:
+        if user_id is not None:
+            release_sora2_lock(user_id)
         update_task_meta(task_id, handled=True, status=status, completed_at=datetime.now(timezone.utc).isoformat())
         clear_task_meta(task_id)
         poller = _SORA2_POLLERS.pop(task_id, None)
@@ -9085,6 +9122,17 @@ async def _start_sora2_generation(
     if not await ensure_tokens(ctx, chat_id, user_id, price):
         return None
 
+    try:
+        prepared_image_urls = await _prepare_sora2_image_urls(image_urls)
+    except Exception as exc:
+        log.exception("sora2.image_prepare_failed | user_id=%s err=%s", user_id, exc)
+        await message.reply_text("⚠️ Не удалось обработать изображения. Попробуйте снова.")
+        return None
+
+    if mode == "sora2_itv" and len(prepared_image_urls) < SORA2_MIN_IMAGES:
+        await message.reply_text("📸 Нужны 1–4 изображения для этого режима. Попробуйте снова.")
+        return None
+
     prompt_preview = _short_prompt(prompt, 160)
     ok, balance_after = debit_try(
         user_id,
@@ -9103,7 +9151,7 @@ async def _start_sora2_generation(
         f"✅ Списано {price}💎. Текущий баланс: {balance_after}💎 — запускаю…",
     )
 
-    payload = _build_sora2_payload(mode, prompt, image_urls, aspect_ratio=aspect_ratio)
+    payload = _build_sora2_payload(mode, prompt, prepared_image_urls, aspect_ratio=aspect_ratio)
     try:
         response = await asyncio.to_thread(sora2_create_task, payload)
     except Exception as exc:
@@ -9129,6 +9177,18 @@ async def _start_sora2_generation(
 
     task_id = str(response.get("taskId") or response.get("task_id") or "").strip()
     if not task_id:
+        error_message = _sora2_extract_error(response)
+        body_snippet = json.dumps(response, ensure_ascii=False) if isinstance(response, Mapping) else str(response)
+        log.warning(
+            "sora2.create_task.missing_task",
+            extra={
+                "model": payload.get("model"),
+                "has_images": bool(prepared_image_urls),
+                "aspect_ratio": aspect_ratio,
+                "status": response.get("status") if isinstance(response, Mapping) else None,
+                "body": body_snippet[:512],
+            },
+        )
         try:
             new_balance = credit_balance(
                 user_id,
@@ -9145,7 +9205,10 @@ async def _start_sora2_generation(
                 user_id,
                 f"⚠️ Ошибка. Возврат {price}💎. Баланс: {new_balance}💎",
             )
-        await message.reply_text("⚠️ Не удалось получить идентификатор задачи Sora 2. 💎 Токены возвращены.")
+        user_message = "⚠️ Sora 2 не приняла задачу. 💎 Токены возвращены."
+        if error_message:
+            user_message = f"⚠️ Sora 2 не приняла задачу: {error_message}"
+        await message.reply_text(user_message)
         return None
 
     wait_msg_id = await show_wait_sticker(ctx, chat_id, SORA2_WAIT_STICKER_ID)
@@ -9168,7 +9231,7 @@ async def _start_sora2_generation(
             "status": "pending",
             "handled": False,
             "prompt_preview": prompt_preview,
-            "image_urls": list(image_urls),
+            "image_urls": list(prepared_image_urls),
             "wait_message_id": wait_msg_id,
             "aspect_ratio": aspect_ratio,
         },
@@ -9185,7 +9248,7 @@ async def _start_sora2_generation(
             "user_id": user_id,
             "mode": mode,
             "aspect": aspect_ratio,
-            "with_images": bool(image_urls),
+            "with_images": bool(prepared_image_urls),
             "task_id": task_id,
             "chat_id": chat_id,
         },
@@ -9230,8 +9293,13 @@ async def _handle_sora2_start(
 
     s = state(ctx)
     prompt = (s.get("sora2_prompt") or "").strip()
-    image_urls = list(s.get("sora2_image_urls") or [])
+    raw_image_urls = list(s.get("sora2_image_urls") or [])
+    image_urls = _sora2_sanitize_image_urls(raw_image_urls)
     aspect_ratio = _sora2_normalize_aspect(s.get("aspect"))
+
+    if not prompt and not image_urls:
+        await query.answer("✍️ Нужен текст или 1–4 изображения.", show_alert=True)
+        return
 
     if mode == "sora2_ttv":
         if len(prompt) < 3:
@@ -9249,6 +9317,7 @@ async def _handle_sora2_start(
         return
 
     lock_acquired = False
+    task_id: Optional[str] = None
     try:
         if user_id is not None:
             lock_acquired = acquire_sora2_lock(int(user_id), ttl=SORA2_LOCK_TTL)
@@ -9257,7 +9326,7 @@ async def _handle_sora2_start(
                 return
 
         await query.answer()
-        await _start_sora2_generation(
+        task_id = await _start_sora2_generation(
             ctx,
             chat_id=chat_id,
             user_id=user_id,
@@ -9268,7 +9337,7 @@ async def _handle_sora2_start(
             aspect_ratio=aspect_ratio,
         )
     finally:
-        if lock_acquired and user_id is not None:
+        if lock_acquired and user_id is not None and not task_id:
             release_sora2_lock(int(user_id))
 
 

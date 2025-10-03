@@ -130,10 +130,12 @@ def test_sora2_start_button(monkeypatch, bot_module):
 
     assert payloads, "payload was not sent"
     payload = payloads[0]
-    assert payload["model"] == "sora2-text-to-video"
-    assert payload["aspect_ratio"] == "9:16"
+    assert payload["model"] == "sora-2-text-to-video"
+    assert payload["input"]["aspect_ratio"] == "9:16"
     assert payload["input"]["prompt"] == "Make a movie"
     assert "image_urls" not in payload["input"]
+    assert payload["callBackUrl"].endswith("/sora2-callback")
+    assert "aspect_ratio" not in payload
 
     assert ctx.bot.sent_stickers == [(555, bot_module.SORA2_WAIT_STICKER_ID)]
     assert ensure_calls
@@ -141,8 +143,9 @@ def test_sora2_start_button(monkeypatch, bot_module):
     assert state.get("sora2_last_task_id") == "task-123"
     assert bot_module.ACTIVE_TASKS.get(555) == "task-123"
     assert lock_calls == [(42, bot_module.SORA2_LOCK_TTL)]
-    assert release_calls == [42]
+    assert release_calls == []
     assert saved_meta.get("extra", {}).get("wait_message_id") == state.get("sora2_wait_msg_id")
     assert saved_meta.get("extra", {}).get("aspect_ratio") == "9:16"
+    assert saved_meta.get("extra", {}).get("image_urls") == []
 
     bot_module.ACTIVE_TASKS.clear()
