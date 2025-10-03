@@ -1,9 +1,14 @@
 import asyncio
+import base64
 from types import SimpleNamespace
 
 import pytest
 
 from tests.suno_test_utils import FakeBot, bot_module
+
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
 
 
 def _run(coro):
@@ -49,8 +54,9 @@ def test_mj_upscale_from_grid_ok(monkeypatch, ctx, state):
 
     monkeypatch.setattr(bot_module, "mj_status", fake_status)
 
-    def fake_generate_upscale(task_id, index, **_):
-        submissions[(task_id, index)] = True
+    def fake_generate_upscale(task_id, index, **kwargs):
+        submissions[(task_id, index)] = kwargs.get("prompt")
+        assert kwargs.get("prompt") == bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER
         return True, "upscale-1", "ok"
 
     monkeypatch.setattr(bot_module, "mj_generate_upscale", fake_generate_upscale)
@@ -90,7 +96,7 @@ def test_mj_upscale_from_grid_ok(monkeypatch, ctx, state):
 
     _run(bot_module.on_callback(update, ctx))
 
-    assert submissions == {("grid123", 1): True}
+    assert submissions == {("grid123", 1): bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER}
     assert sent_docs[chat_id][1] == "mj_upscaled_grid123_1.png"
     assert calls_status[-1] == "upscale-1"
 
@@ -130,20 +136,33 @@ def test_mj_upscale_from_file_ok(monkeypatch, ctx, state):
 
     monkeypatch.setattr(bot_module, "mj_status", fake_status)
     monkeypatch.setattr(bot_module, "mj_generate_img2img", lambda *_args, **_kwargs: (True, "grid-task", "ok"))
-    monkeypatch.setattr(bot_module, "mj_generate_upscale", lambda *_args, **_kwargs: (True, "upscale-task", "ok"))
+    def fake_generate_upscale(*_args, **kwargs):
+        assert kwargs.get("prompt") == bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER
+        return True, "upscale-task", "ok"
+
+    monkeypatch.setattr(bot_module, "mj_generate_upscale", fake_generate_upscale)
     monkeypatch.setattr(bot_module, "_download_mj_image_bytes", lambda url, idx: (b"image", "name.png"))
     monkeypatch.setattr(bot_module, "acquire_mj_upscale_lock", lambda *args, **kwargs: True)
     monkeypatch.setattr(bot_module, "release_mj_upscale_lock", lambda *args, **kwargs: None)
 
     sent_docs = {}
+    called = False
 
     async def fake_send_image(bot, chat_id_arg, data, filename, **_):
+        nonlocal called
+        called = True
         sent_docs[chat_id_arg] = filename
 
     monkeypatch.setattr(bot_module, "send_image_as_document", fake_send_image)
 
     class FakeFile:
         file_path = "photos/file.jpg"
+
+        async def download_as_bytearray(self):
+            return PNG_BYTES
+
+        async def download_as_bytes(self):
+            return PNG_BYTES
 
     async def fake_get_file(_file_id):
         return FakeFile()
@@ -164,6 +183,7 @@ def test_mj_upscale_from_file_ok(monkeypatch, ctx, state):
 
     _run(bot_module.on_document(update, ctx))
 
+    assert called
     assert sent_docs[chat_id] == "mj_upscaled_grid-task_0.png"
     assert not refund_calls
 
@@ -190,7 +210,8 @@ def test_mj_upscale_bad_status(monkeypatch, ctx, state):
     monkeypatch.setattr(bot_module, "acquire_mj_upscale_lock", lambda *args, **kwargs: True)
     monkeypatch.setattr(bot_module, "release_mj_upscale_lock", lambda *args, **kwargs: None)
 
-    def fake_generate_upscale(*_args, **_kwargs):
+    def fake_generate_upscale(*_args, **kwargs):
+        assert kwargs.get("prompt") == bot_module.MJ_UPSCALE_PROMPT_PLACEHOLDER
         return True, "upscale-bad", "ok"
 
     monkeypatch.setattr(bot_module, "mj_generate_upscale", fake_generate_upscale)
