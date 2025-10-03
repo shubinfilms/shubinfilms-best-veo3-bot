@@ -61,6 +61,8 @@ class DummyBot:
         return SimpleNamespace(message_id=902)
 
     async def send_document(self, chat_id, document, caption, reply_markup):
+        if self.edit_error:
+            raise self._telegram_error("document failed")
         self.send_document_calls.append({
             "chat_id": chat_id,
             "document": document,
@@ -92,7 +94,7 @@ async def _passthrough_safe_send(method, *, method_name, kind, req_id=None, **kw
     return await method(**kwargs)
 
 
-def test_sora2_callback_replaces_sticker(monkeypatch, bot_module):
+def test_sora2_callback_replaces_sticker(monkeypatch, bot_module, tmp_path):
     ctx, state, bot, release_calls = _setup_context(monkeypatch, bot_module)
     wait_id = 1234
     chat_id = 999
@@ -105,6 +107,14 @@ def test_sora2_callback_replaces_sticker(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "update_task_meta", lambda *args, **kwargs: update_calls.append((args, kwargs)))
     clear_calls = []
     monkeypatch.setattr(bot_module, "clear_task_meta", lambda task_id: clear_calls.append(task_id))
+
+    video_path = tmp_path / "result.mp4"
+    video_path.write_bytes(b"data")
+
+    async def fake_download(result):
+        return [str(video_path)]
+
+    monkeypatch.setattr(bot_module, "_download_sora2_assets", fake_download)
 
     result_payload = {"videoUrl": "https://cdn.example/video.mp4"}
     meta = {
@@ -127,14 +137,14 @@ def test_sora2_callback_replaces_sticker(monkeypatch, bot_module):
         )
     )
 
-    assert bot.edit_calls, "edit was not attempted"
-    call = bot.edit_calls[0]
-    assert call["chat_id"] == chat_id
-    assert call["message_id"] == wait_id
-    assert call["media"].media == "https://cdn.example/video.mp4"
-    buttons = call["reply_markup"].inline_keyboard
+    assert bot.delete_calls == [(chat_id, wait_id)]
+    assert not bot.edit_calls
+    assert bot.send_document_calls, "document was not sent"
+    doc_call = bot.send_document_calls[0]
+    assert doc_call["chat_id"] == chat_id
+    assert "Готово" in (doc_call["caption"] or "")
+    buttons = doc_call["reply_markup"].inline_keyboard
     assert any(btn.text == "🔁 Сгенерировать ещё" for row in buttons for btn in row)
-    assert not bot.delete_calls
     assert not bot.send_video_calls
     assert state.get("sora2_wait_msg_id") is None
     assert chat_id not in bot_module.ACTIVE_TASKS
@@ -142,7 +152,7 @@ def test_sora2_callback_replaces_sticker(monkeypatch, bot_module):
     assert release_calls == [42]
 
 
-def test_sora2_callback_fallback_to_send(monkeypatch, bot_module):
+def test_sora2_callback_fallback_to_send(monkeypatch, bot_module, tmp_path):
     ctx, state, bot, release_calls = _setup_context(monkeypatch, bot_module, edit_error=True)
     wait_id = 2222
     chat_id = 333
@@ -153,6 +163,14 @@ def test_sora2_callback_fallback_to_send(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "tg_safe_send", _passthrough_safe_send)
     monkeypatch.setattr(bot_module, "update_task_meta", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot_module, "clear_task_meta", lambda *args, **kwargs: None)
+
+    video_path = tmp_path / "result.mp4"
+    video_path.write_bytes(b"data")
+
+    async def fake_download(result):
+        return [str(video_path)]
+
+    monkeypatch.setattr(bot_module, "_download_sora2_assets", fake_download)
 
     result_payload = {"videoUrl": "https://cdn.example/video.mp4"}
     meta = {

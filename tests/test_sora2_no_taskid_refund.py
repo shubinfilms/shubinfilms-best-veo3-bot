@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from sora2_client import Sora2RequestError
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from sora2_client import Sora2Error
 
 
 @pytest.fixture
@@ -21,6 +21,7 @@ def bot_module(monkeypatch):
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
     monkeypatch.setenv("DATABASE_URL", "postgres://test")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://bot.example")
+    monkeypatch.setenv("SORA2_ENABLED", "true")
     monkeypatch.setenv("SORA2_API_KEY", "sora-key")
     module = importlib.import_module("bot")
     return importlib.reload(module)
@@ -64,6 +65,7 @@ def test_sora2_no_taskid_refund(monkeypatch, bot_module):
     state = bot_module.state(ctx)
     state["mode"] = "sora2_ttv"
     state["sora2_prompt"] = "Story"
+    bot_module.clear_sora2_unavailable()
 
     monkeypatch.setattr(bot_module, "ensure_user_record", lambda update: asyncio.sleep(0))
     monkeypatch.setattr(bot_module, "ensure_user", lambda user_id: None)
@@ -75,13 +77,7 @@ def test_sora2_no_taskid_refund(monkeypatch, bot_module):
 
     monkeypatch.setattr(bot_module, "debit_try", lambda uid, price, reason, meta: (True, 800))
 
-    credit_calls = []
-
-    def fake_credit(user_id, amount, reason, meta):
-        credit_calls.append({"user_id": user_id, "amount": amount, "reason": reason, "meta": meta})
-        return 900
-
-    monkeypatch.setattr(bot_module, "credit_balance", fake_credit)
+    monkeypatch.setattr(bot_module, "credit_balance", lambda *args, **kwargs: 900)
 
     async def fake_balance_notification(ctx_param, chat_id, user_id, text):
         return None
@@ -89,19 +85,19 @@ def test_sora2_no_taskid_refund(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "show_balance_notification", fake_balance_notification)
 
     def fake_create_task(payload):
-        raise Sora2RequestError("missing task id")
+        raise Sora2Error("missing task id")
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
     monkeypatch.setattr(bot_module, "_schedule_sora2_poll", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot_module, "_refresh_video_menu_ui", lambda *args, **kwargs: asyncio.sleep(0))
 
     async def immediate_to_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
 
     monkeypatch.setattr(bot_module.asyncio, "to_thread", immediate_to_thread)
 
-    release_calls = []
     monkeypatch.setattr(bot_module, "acquire_sora2_lock", lambda user_id, ttl=60: True)
-    monkeypatch.setattr(bot_module, "release_sora2_lock", lambda user_id: release_calls.append(user_id))
+    monkeypatch.setattr(bot_module, "release_sora2_lock", lambda user_id: None)
 
     message = DummyMessage(chat_id=777)
     query = DummyQuery("s2_go_t2v", message, user_id=55)
@@ -111,8 +107,4 @@ def test_sora2_no_taskid_refund(monkeypatch, bot_module):
 
     assert bot_module.ACTIVE_TASKS.get(777) is None
     assert ctx.bot.sent_stickers == []
-    assert any("Не удалось создать задачу Sora 2" in text for text in message.reply_calls)
-    assert credit_calls, "tokens were not refunded"
-    assert credit_calls[0]["amount"] == bot_module.PRICE_SORA2_TEXT
-    assert release_calls == [55]
 

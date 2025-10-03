@@ -17,6 +17,7 @@ def test_sora2_client_uses_configured_timeout(monkeypatch):
     monkeypatch.setenv("SORA2_TIMEOUT_READ", "25")
     monkeypatch.setenv("SORA2_TIMEOUT_WRITE", "35")
     monkeypatch.setenv("SORA2_TIMEOUT_POOL", "45")
+    monkeypatch.setenv("SORA2_API_KEY", "key")
 
     importlib.reload(settings)
     importlib.reload(sora2_client)
@@ -33,6 +34,10 @@ def test_sora2_client_uses_configured_timeout(monkeypatch):
         def json(self) -> dict[str, object]:
             return {}
 
+        @property
+        def is_success(self) -> bool:
+            return True
+
     class DummyClient:
         def __init__(self, *args, **kwargs):
             captured["timeout"] = kwargs.get("timeout")
@@ -43,17 +48,12 @@ def test_sora2_client_uses_configured_timeout(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def request(self, method, url, headers=None, json=None):
+        def post(self, url, headers=None, json=None):
             return DummyResponse()
 
     monkeypatch.setattr(httpx, "Client", DummyClient)
 
-    result = sora2_client._perform_request(
-        "POST",
-        "https://example.invalid",
-        {"Content-Type": "application/json"},
-        {},
-    )
+    result = sora2_client._perform_request("https://example.invalid", {"ping": "pong"})
 
     assert result == {}
 

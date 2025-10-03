@@ -78,6 +78,7 @@ _MENU_LOCK_KEY_TMPL = f"{_PFX}:menu:lock:{{}}:{{}}"
 _MENU_MSG_KEY_TMPL = f"{_PFX}:menu:msg:{{}}:{{}}"
 _USER_LOCK_KEY_TMPL = f"{_PFX}:user:lock:{{}}:{{}}"
 _SORA2_LOCK_KEY_TMPL = f"{_PFX}:lock:sora2:{{}}"
+_SORA2_UNAVAILABLE_KEY = f"{_PFX}:sora2:unavailable"
 _MJ_GALLERY_KEY_TMPL = f"{_PFX}:mj:gallery:{{}}:{{}}"
 _MJ_GALLERY_TTL = 2 * 60 * 60
 
@@ -144,6 +145,19 @@ def _memory_delete(key: str) -> None:
         _memory_store.pop(key, None)
 
 
+def _memory_exists(key: str) -> bool:
+    now = time.time()
+    with _memory_lock:
+        entry = _memory_store.get(key)
+        if not entry:
+            return False
+        expires_at, _ = entry
+        if expires_at <= now:
+            _memory_store.pop(key, None)
+            return False
+        return True
+
+
 def _memory_set_if_absent(key: str, value: str, ttl: int) -> bool:
     now = time.time()
     expires_at = now + max(ttl, 1)
@@ -155,6 +169,41 @@ def _memory_set_if_absent(key: str, value: str, ttl: int) -> bool:
                 return False
         _memory_store[key] = (expires_at, value)
         return True
+
+
+def mark_sora2_unavailable(*, ttl: int = 60 * 60) -> None:
+    key = _SORA2_UNAVAILABLE_KEY
+    if _r:
+        try:
+            _r.setex(key, max(1, int(ttl)), "1")
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.warning("redis.setex_failed | key=%s err=%s", key, exc)
+            _memory_set_with_ttl(key, "1", ttl)
+    else:
+        _memory_set_with_ttl(key, "1", ttl)
+
+
+def clear_sora2_unavailable() -> None:
+    key = _SORA2_UNAVAILABLE_KEY
+    if _r:
+        try:
+            _r.delete(key)
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.warning("redis.del_failed | key=%s err=%s", key, exc)
+            _memory_delete(key)
+    else:
+        _memory_delete(key)
+
+
+def is_sora2_unavailable() -> bool:
+    key = _SORA2_UNAVAILABLE_KEY
+    if _r:
+        try:
+            return bool(_r.get(key))
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.warning("redis.get_failed | key=%s err=%s", key, exc)
+            return _memory_exists(key)
+    return _memory_exists(key)
 
 
 def _mj_last_key(user_id: int) -> str:

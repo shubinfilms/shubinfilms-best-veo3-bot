@@ -76,9 +76,11 @@ class _AppSettings(BaseModel):
     UPLOAD_BASE64_PATH: str = Field(default="/api/v1/upload/base64")
     UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
+    SORA2_ENABLED: bool = Field(default=False)
     SORA2_API_KEY: Optional[str] = Field(default=None)
     SORA2_GEN_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/createTask")
     SORA2_STATUS_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/queryTask")
+    SORA2_WAIT_STICKER_ID: str = Field(default="5375464961822695044")
 
     YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
@@ -281,9 +283,14 @@ SUNO_READY = bool(
     SUNO_ENABLED and SUNO_API_TOKEN and SUNO_CALLBACK_SECRET and SUNO_CALLBACK_URL
 )
 
+SORA2_ENABLED = bool(_APP_SETTINGS.SORA2_ENABLED)
 SORA2_GEN_PATH = _APP_SETTINGS.SORA2_GEN_PATH
 SORA2_STATUS_PATH = _APP_SETTINGS.SORA2_STATUS_PATH
 SORA2_API_KEY = _strip_optional(_APP_SETTINGS.SORA2_API_KEY) or KIE_API_KEY
+SORA2_WAIT_STICKER_ID = (
+    str(_APP_SETTINGS.SORA2_WAIT_STICKER_ID or "5375464961822695044").strip()
+    or "5375464961822695044"
+)
 SORA2 = {
     "GEN_PATH": SORA2_GEN_PATH,
     "STATUS_PATH": SORA2_STATUS_PATH,
@@ -404,6 +411,16 @@ __all__ = [
     "YOOKASSA_CURRENCY",
     "BANANA_SEND_AS_DOCUMENT",
     "MJ_SEND_AS_ALBUM",
+    "SORA2_ENABLED",
+    "SORA2_API_KEY",
+    "SORA2_GEN_PATH",
+    "SORA2_STATUS_PATH",
+    "SORA2_WAIT_STICKER_ID",
+    "SORA2",
+    "SORA2_TIMEOUT_CONNECT",
+    "SORA2_TIMEOUT_READ",
+    "SORA2_TIMEOUT_WRITE",
+    "SORA2_TIMEOUT_POOL",
     "resolve_outbound_ip",
     "token_tail",
 ]
