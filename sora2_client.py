@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import httpx
 
-from settings import (
-    KIE_API_KEY,
-    SORA2_API_KEY,
-    SORA2_GEN_PATH,
-    SORA2_STATUS_PATH,
-    UPLOAD_BASE_URL,
-    UPLOAD_URL_PATH,
-)
+import settings
 
 
 logger = logging.getLogger(__name__)
@@ -22,20 +14,10 @@ _MAX_RESPONSE_LOG = 512
 
 
 def _auth_token() -> str:
-    token = SORA2_API_KEY or KIE_API_KEY
+    token = settings.SORA2_API_KEY or settings.KIE_API_KEY
     if not token:
         raise RuntimeError("Sora 2 API key is not configured")
     return token
-
-
-def _timeout() -> httpx.Timeout:
-    if os.getenv("SORA2_TIMEOUT"):
-        return httpx.Timeout(float(os.getenv("SORA2_TIMEOUT", "30")))
-    connect = float(os.getenv("SORA2_TIMEOUT_CONNECT", "20"))
-    read = float(os.getenv("SORA2_TIMEOUT_READ", "30"))
-    write = float(os.getenv("SORA2_TIMEOUT_WRITE", "30"))
-    pool = float(os.getenv("SORA2_TIMEOUT_POOL", "30"))
-    return httpx.Timeout(connect=connect, read=read, write=write, pool=pool)
 
 
 def _log_response(method: str, url: str, response: httpx.Response) -> None:
@@ -55,11 +37,16 @@ class Sora2RequestError(Exception):
 
 
 def _perform_request(method: str, url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> Dict[str, Any]:
-    tout = _timeout()
+    timeout = httpx.Timeout(
+        connect=settings.SORA2_TIMEOUT_CONNECT,
+        read=settings.SORA2_TIMEOUT_READ,
+        write=settings.SORA2_TIMEOUT_WRITE,
+        pool=settings.SORA2_TIMEOUT_POOL,
+    )
     last_exc: Optional[BaseException] = None
     for attempt in range(3):
         try:
-            with httpx.Client(timeout=tout) as client:
+            with httpx.Client(timeout=timeout) as client:
                 response = client.request(method, url, headers=headers, json=json_body)
                 response.raise_for_status()
                 _log_response(method, url, response)
@@ -75,7 +62,7 @@ def _perform_request(method: str, url: str, headers: Dict[str, str], json_body: 
 
 
 def sora2_create_task(payload: Dict[str, Any]) -> str:
-    url = SORA2_GEN_PATH
+    url = settings.SORA2_GEN_PATH
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {_auth_token()}",
@@ -89,7 +76,7 @@ def sora2_create_task(payload: Dict[str, Any]) -> str:
 
 
 def sora2_query_task(task_id: str) -> Dict[str, Any]:
-    url = SORA2_STATUS_PATH
+    url = settings.SORA2_STATUS_PATH
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {_auth_token()}",
@@ -100,10 +87,10 @@ def sora2_query_task(task_id: str) -> Dict[str, Any]:
 
 
 def _build_upload_url() -> Optional[str]:
-    base = (UPLOAD_BASE_URL or "").strip()
+    base = (settings.UPLOAD_BASE_URL or "").strip()
     if not base:
         return None
-    path = (UPLOAD_URL_PATH or "").strip() or "/api/v1/upload/url"
+    path = (settings.UPLOAD_URL_PATH or "").strip() or "/api/v1/upload/url"
     if not path.startswith("http"):
         if not path.startswith("/"):
             path = f"/{path}"
