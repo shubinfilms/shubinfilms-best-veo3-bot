@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 import httpx
 
@@ -14,7 +14,10 @@ import settings
 
 logger = logging.getLogger(__name__)
 _MAX_LOG_BODY = 512
-_INVALID_422_MARKERS = ("model cannot be null", "page does not exist")
+_BAD_REQUEST_MARKERS = (
+    "the input cannot be null",
+    "the page does not exist or is not published",
+)
 
 
 class Sora2Error(RuntimeError):
@@ -29,6 +32,10 @@ class Sora2AuthError(Sora2Error):
     """Raised when authentication with KIE Sora2 fails."""
 
 
+class Sora2BadRequestError(Sora2Error):
+    """Raised when Sora2 rejects the payload with a validation error."""
+
+
 @dataclass(slots=True)
 class CreateTaskResponse:
     task_id: str
@@ -38,7 +45,9 @@ class CreateTaskResponse:
 @dataclass(slots=True)
 class QueryTaskResponse:
     status: str
-    result_url: Optional[str]
+    result_urls: List[str]
+    result_payload: Optional[Mapping[str, Any]]
+    error_message: Optional[str]
     raw: Mapping[str, Any]
 
 
@@ -58,6 +67,34 @@ def _mask_token(token: Optional[str]) -> str:
     return f"***{tail}"
 
 
+def _payload_summary(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    model = payload.get("model")
+    if isinstance(model, str) and model.strip():
+        summary["model"] = model.strip()
+    input_payload = payload.get("input")
+    if isinstance(input_payload, Mapping):
+        prompt = input_payload.get("prompt")
+        if isinstance(prompt, str):
+            summary["prompt_length"] = len(prompt)
+        image_urls = input_payload.get("image_urls")
+        if isinstance(image_urls, Sequence) and not isinstance(image_urls, (str, bytes, bytearray)):
+            summary["image_count"] = len([u for u in image_urls if isinstance(u, str) and u.strip()])
+            summary["has_image"] = any(
+                isinstance(u, str) and u.strip() for u in image_urls
+            )
+        aspect = input_payload.get("aspect_ratio")
+        if isinstance(aspect, str) and aspect.strip():
+            summary["aspect_ratio"] = aspect.strip()
+        quality = input_payload.get("quality")
+        if isinstance(quality, str) and quality.strip():
+            summary["quality"] = quality.strip()
+    callback_url = payload.get("callBackUrl")
+    if isinstance(callback_url, str) and callback_url.strip():
+        summary["has_callback"] = True
+    return summary
+
+
 def _log_request(url: str, payload: Mapping[str, Any]) -> None:
     logger.info(
         "sora2.http.request",
@@ -66,7 +103,7 @@ def _log_request(url: str, payload: Mapping[str, Any]) -> None:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "sora2.http.payload",
-            extra={"path": url, "payload": json.dumps(payload, ensure_ascii=False)},
+            extra={"path": url, "payload": json.dumps(_payload_summary(payload), ensure_ascii=False)},
         )
 
 
@@ -88,23 +125,7 @@ def _log_response(url: str, response: httpx.Response) -> None:
 
 
 def _sanitize_payload_for_log(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    sample: Dict[str, Any] = {}
-    for key, value in payload.items():
-        if key == "input" and isinstance(value, Mapping):
-            input_copy: Dict[str, Any] = {}
-            for inner_key, inner_value in value.items():
-                if inner_key == "prompt":
-                    text = str(inner_value or "")
-                    input_copy["prompt_length"] = len(text)
-                elif inner_key == "image_urls" and isinstance(inner_value, Sequence) and not isinstance(inner_value, (str, bytes, bytearray)):
-                    urls = [str(url) for url in list(inner_value)[:4]]
-                    input_copy["image_urls"] = urls
-                else:
-                    input_copy[inner_key] = inner_value
-            sample[key] = input_copy
-        else:
-            sample[key] = value
-    return sample
+    return _payload_summary(payload)
 
 
 def _send_once(url: str, payload: Mapping[str, Any]) -> httpx.Response:
@@ -167,22 +188,32 @@ def _request_with_retries(
             )
             raise Sora2AuthError("authentication with Sora2 API failed")
 
-        if status == 422 and any(marker in lowered for marker in _INVALID_422_MARKERS):
-            logger.warning(
-                "sora2.invalid_request",
-                extra={
-                    "path": url,
-                    "status": status,
-                    "token_tail": _mask_token(settings.SORA2_API_KEY),
-                    "payload_sample": _sanitize_payload_for_log(payload),
-                },
-            )
+        if status == 422:
+            if any(marker in lowered for marker in _BAD_REQUEST_MARKERS):
+                logger.warning(
+                    "sora2.invalid_request",
+                    extra={
+                        "path": url,
+                        "status": status,
+                        "token_tail": _mask_token(settings.SORA2_API_KEY),
+                        "payload_sample": _sanitize_payload_for_log(payload),
+                        "body": (body_text or "")[:_MAX_LOG_BODY],
+                    },
+                )
+                raise Sora2BadRequestError("Sora2 rejected the request payload (422)")
             if invalid_retry_allowed:
                 invalid_retry_allowed = False
                 time.sleep(0.75)
                 continue
-            if "page does not exist" in lowered:
-                raise Sora2UnavailableError("Sora2 model is disabled for this API key")
+            logger.error(
+                "sora2.http.unexpected_422",
+                extra={
+                    "path": url,
+                    "status": status,
+                    "token_tail": _mask_token(settings.SORA2_API_KEY),
+                    "body": (body_text or "")[:_MAX_LOG_BODY],
+                },
+            )
             raise Sora2Error("Sora2 request failed with status 422")
 
         if 500 <= status < 600:
@@ -225,72 +256,207 @@ def _request_with_retries(
 def create_task(payload: Mapping[str, Any]) -> CreateTaskResponse:
     """Submit a new generation task to Sora2."""
 
-    task_type = str(payload.get("task_type") or "").strip().lower()
-    normalized: Dict[str, Any] = dict(payload)
-    input_payload = dict(normalized.get("input") or {})
-    if task_type == "text2video":
-        normalized.setdefault("model", "sora2-text-to-video")
-        input_payload.setdefault("prompt", "")
-    elif task_type == "image2video":
-        normalized.setdefault("model", "sora2-image-to-video")
-        input_payload.setdefault("image_urls", [])
+    normalized: Dict[str, Any] = {}
+    model = payload.get("model")
+    if isinstance(model, str) and model.strip():
+        normalized["model"] = model.strip()
+    callback_url = payload.get("callBackUrl")
+    if isinstance(callback_url, str) and callback_url.strip():
+        normalized["callBackUrl"] = callback_url.strip()
+    input_payload: Dict[str, Any] = {}
+    raw_input = payload.get("input")
+    if isinstance(raw_input, Mapping):
+        for key, value in raw_input.items():
+            if value is None:
+                continue
+            input_payload[key] = value
     normalized["input"] = input_payload
 
     response = _request_with_retries(
         settings.SORA2_GEN_PATH,
         normalized,
-        auto_model="model" not in payload,
+        auto_model=False,
     )
-    task_id = (
-        str(response.get("taskId") or response.get("task_id") or "").strip()
-    )
+    data = response.get("data") if isinstance(response, Mapping) else None
+    task_id = ""
+    if isinstance(data, Mapping):
+        task_id = str(data.get("taskId") or data.get("task_id") or "").strip()
+    if not task_id:
+        task_id = str(response.get("taskId") or response.get("task_id") or "").strip()
     if not task_id:
         raise Sora2Error("Sora2 response did not include taskId")
     return CreateTaskResponse(task_id=task_id, raw=response)
 
 
-def _extract_status(payload: Mapping[str, Any]) -> str:
-    for key in ("status", "task_status", "state"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    data = payload.get("data")
-    if isinstance(data, Mapping):
-        nested = _extract_status(data)
-        if nested:
-            return nested
-    return "unknown"
+def _log_status_request(url: str, params: Mapping[str, Any]) -> None:
+    logger.info(
+        "sora2.http.status_request",
+        extra={"path": url, "token_tail": _mask_token(settings.SORA2_API_KEY)},
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "sora2.http.status_params",
+            extra={"path": url, "params": dict(params)},
+        )
 
 
-def _extract_result_url(payload: Mapping[str, Any]) -> Optional[str]:
-    for key in ("result_url", "resultUrl", "video_url", "videoUrl", "url"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip().lower().startswith("http"):
-            return value.strip()
-    data = payload.get("result")
-    if isinstance(data, Mapping):
-        nested = _extract_result_url(data)
-        if nested:
-            return nested
-    data = payload.get("data")
-    if isinstance(data, Mapping):
-        nested = _extract_result_url(data)
-        if nested:
-            return nested
+def _collect_urls(value: Any) -> List[str]:
+    urls: List[str] = []
+    seen: Set[str] = set()
+
+    def add(candidate: str) -> None:
+        trimmed = candidate.strip()
+        if not trimmed or not trimmed.lower().startswith("http"):
+            return
+        if trimmed in seen:
+            return
+        seen.add(trimmed)
+        urls.append(trimmed)
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(node, str):
+            text = node.strip()
+            if not text:
+                return
+            if text.startswith("[") or text.startswith("{"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    add(text)
+                else:
+                    walk(parsed, depth + 1)
+            else:
+                add(text)
+            return
+        if isinstance(node, Mapping):
+            for value in node.values():
+                walk(value, depth + 1)
+            return
+        if isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for item in node:
+                walk(item, depth + 1)
+            return
+
+    walk(value)
+    return urls
+
+
+def _parse_result_json(raw: Any) -> Optional[Mapping[str, Any]]:
+    if raw is None:
+        return None
+    try:
+        parsed: Any
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return None
+            parsed = json.loads(text)
+        else:
+            parsed = raw
+    except Exception as exc:
+        logger.debug(
+            "sora2.result_json.parse_failed",
+            extra={"error": str(exc)},
+        )
+        return None
+    if isinstance(parsed, Mapping):
+        return parsed
+    if isinstance(parsed, Sequence) and not isinstance(parsed, (str, bytes, bytearray)):
+        return {"items": list(parsed)}
+    return None
+
+
+def _extract_error_message(*payloads: Mapping[str, Any]) -> Optional[str]:
+    error_keys = ("error", "errorMsg", "errorMessage", "message", "reason", "failReason")
+    for payload in payloads:
+        for key in error_keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
 
 
 def query_task(task_id: str) -> QueryTaskResponse:
     """Fetch current status for a Sora2 task."""
 
-    payload = {"task_id": str(task_id)}
-    response = _request_with_retries(
-        settings.SORA2_STATUS_PATH,
-        payload,
-        auto_model=False,
+    api_key = settings.SORA2_API_KEY
+    if not api_key:
+        raise Sora2Error("Sora2 API key is not configured")
+
+    params = {"taskId": str(task_id)}
+    url = settings.SORA2_STATUS_PATH
+    headers = {"Authorization": f"Bearer {api_key}"}
+    _log_status_request(url, params)
+    with httpx.Client(timeout=_timeout()) as client:
+        response = client.get(url, headers=headers, params=params)
+    _log_response(url, response)
+
+    status_code = response.status_code
+    body_text = response.text or ""
+    if status_code in {401, 403}:
+        logger.warning(
+            "sora2_auth_error",
+            extra={"path": url, "status": status_code},
+        )
+        raise Sora2AuthError("authentication with Sora2 API failed")
+    if status_code == 404:
+        logger.warning(
+            "sora2.status.not_found",
+            extra={"path": url, "task_id": task_id},
+        )
+        raise Sora2Error("Sora2 task not found")
+    if status_code >= 500:
+        logger.warning(
+            "sora2.status.server_error",
+            extra={"path": url, "status": status_code},
+        )
+        raise Sora2Error(f"Sora2 status endpoint returned {status_code}")
+    if not response.is_success:
+        logger.error(
+            "sora2.status.http_error",
+            extra={
+                "path": url,
+                "status": status_code,
+                "token_tail": _mask_token(settings.SORA2_API_KEY),
+                "body": body_text[:_MAX_LOG_BODY],
+            },
+        )
+        raise Sora2Error(f"Sora2 status endpoint returned {status_code}")
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise Sora2Error("Sora2 status response is not valid JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise Sora2Error("Sora2 status response is not a JSON object")
+
+    data = payload.get("data")
+    data_map: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
+    state_raw = data_map.get("state")
+    state = str(state_raw or "").strip().lower() or "unknown"
+
+    result_urls: List[str] = []
+    direct_urls = _collect_urls(data_map.get("resultUrls"))
+    if direct_urls:
+        result_urls.extend(direct_urls)
+
+    result_payload = _parse_result_json(data_map.get("resultJson"))
+    if result_payload:
+        for url_value in _collect_urls(result_payload):
+            if url_value not in result_urls:
+                result_urls.append(url_value)
+
+    error_message = _extract_error_message(data_map, payload)
+
+    return QueryTaskResponse(
+        status=state,
+        result_urls=result_urls,
+        result_payload=result_payload,
+        error_message=error_message,
+        raw=payload,
     )
-    status = _extract_status(response)
-    return QueryTaskResponse(status=status, result_url=_extract_result_url(response), raw=response)
 
 
 def _build_upload_url() -> Optional[str]:
@@ -367,6 +533,7 @@ __all__ = [
     "CreateTaskResponse",
     "QueryTaskResponse",
     "Sora2Error",
+    "Sora2BadRequestError",
     "Sora2AuthError",
     "Sora2UnavailableError",
     "create_task",

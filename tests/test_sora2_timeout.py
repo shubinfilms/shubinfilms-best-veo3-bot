@@ -52,12 +52,12 @@ def test_sora2_client_uses_configured_timeout(monkeypatch):
 
         def post(self, url, headers=None, json=None):
             if "createTask" in url:
-                return DummyResponse({"taskId": "abc"})
+                return DummyResponse({"code": 200, "data": {"taskId": "abc"}})
             return DummyResponse({"status": "success", "result": {}})
 
     monkeypatch.setattr(httpx, "Client", DummyClient)
 
-    result = sora2_client.create_task({"task_type": "text2video", "input": {"prompt": "hi"}})
+    result = sora2_client.create_task({"model": "sora-2-text-to-video", "input": {"prompt": "hi"}})
     assert result.task_id == "abc"
 
     timeout = captured["timeout"]

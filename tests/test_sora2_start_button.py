@@ -154,15 +154,15 @@ def test_sora2_start_button(monkeypatch, bot_module):
 
     assert payloads, "payload was not sent"
     payload = payloads[0]
-    assert payload["task_type"] == "text2video"
-    assert payload["model"] == "sora2-text-to-video"
-    assert payload["input"]["aspect_ratio"] == "9:16"
+    assert "task_type" not in payload
+    assert payload["model"] == "sora-2-text-to-video"
+    assert payload["input"]["aspect_ratio"] == "portrait"
     assert payload["input"]["prompt"] == "Make a movie"
-    assert "quality" not in payload["input"]
+    assert payload["input"]["quality"] == "standard"
     assert "image_urls" not in payload["input"]
-    assert payload["resolution"] == bot_module.SORA2_DEFAULT_TTV_RESOLUTION
-    assert payload["duration"] == bot_module.SORA2_DEFAULT_TTV_DURATION
-    assert payload["audio"] is True
+    assert "resolution" not in payload
+    assert "duration" not in payload
+    assert "audio" not in payload
     assert payload["callBackUrl"].endswith("/sora2-callback")
 
     assert ctx.bot.sent_stickers == [(555, bot_module.SORA2_WAIT_STICKER_ID)]
@@ -180,6 +180,7 @@ def test_sora2_start_button(monkeypatch, bot_module):
     assert extra.get("duration") == bot_module.SORA2_DEFAULT_TTV_DURATION
     assert extra.get("resolution") == bot_module.SORA2_DEFAULT_TTV_RESOLUTION
     assert extra.get("audio") is True
+    assert extra.get("quality") == "standard"
 
     bot_module.ACTIVE_TASKS.clear()
 
