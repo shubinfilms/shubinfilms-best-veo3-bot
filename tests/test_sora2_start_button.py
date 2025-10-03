@@ -154,13 +154,16 @@ def test_sora2_start_button(monkeypatch, bot_module):
 
     assert payloads, "payload was not sent"
     payload = payloads[0]
+    assert payload["task_type"] == "text2video"
     assert payload["model"] == "sora2-text-to-video"
     assert payload["input"]["aspect_ratio"] == "9:16"
     assert payload["input"]["prompt"] == "Make a movie"
-    assert payload["input"]["quality"] == "standard"
+    assert "quality" not in payload["input"]
     assert "image_urls" not in payload["input"]
+    assert payload["resolution"] == bot_module.SORA2_DEFAULT_TTV_RESOLUTION
+    assert payload["duration"] == bot_module.SORA2_DEFAULT_TTV_DURATION
+    assert payload["audio"] is True
     assert payload["callBackUrl"].endswith("/sora2-callback")
-    assert "aspect_ratio" not in payload
 
     assert ctx.bot.sent_stickers == [(555, bot_module.SORA2_WAIT_STICKER_ID)]
     assert ensure_calls
@@ -172,7 +175,11 @@ def test_sora2_start_button(monkeypatch, bot_module):
     assert saved_meta.get("extra", {}).get("wait_message_id") == state.get("sora2_wait_msg_id")
     assert saved_meta.get("extra", {}).get("aspect_ratio") == "9:16"
     assert saved_meta.get("extra", {}).get("image_urls") == []
-    assert saved_meta.get("extra", {}).get("submit_raw") == {"taskId": "task-123"}
+    extra = saved_meta.get("extra", {})
+    assert extra.get("submit_raw") == {"taskId": "task-123"}
+    assert extra.get("duration") == bot_module.SORA2_DEFAULT_TTV_DURATION
+    assert extra.get("resolution") == bot_module.SORA2_DEFAULT_TTV_RESOLUTION
+    assert extra.get("audio") is True
 
     bot_module.ACTIVE_TASKS.clear()
 

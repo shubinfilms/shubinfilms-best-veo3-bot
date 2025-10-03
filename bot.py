@@ -4727,7 +4727,37 @@ SORA2_MAX_PROMPT_LENGTH = 5000
 SORA2_MIN_IMAGES = 1
 SORA2_MAX_IMAGES = 4
 SORA2_ALLOWED_ASPECTS = {"16:9", "9:16", "1:1", "4:5"}
-SORA2_LOCK_TTL = 15 * 60
+SORA2_LOCK_TTL = 5 * 60
+SORA2_DEFAULT_TTV_DURATION = 10
+SORA2_DEFAULT_TTV_RESOLUTION = "1280x720"
+SORA2_DEFAULT_ITV_DURATION = 5
+SORA2_DEFAULT_ITV_RESOLUTION = "1280x720"
+SORA2_POLL_INTERVAL = 3.5
+SORA2_POLL_TIMEOUT = 5 * 60
+
+
+def _format_resolution_for_caption(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value).strip().lower().replace(" ", "")
+    if "x" in text:
+        width, _, height = text.partition("x")
+        if width.isdigit() and height.isdigit():
+            return f"{int(width)}×{int(height)}"
+    return str(value)
+
+
+def _sora2_caption(mode: str, duration: Optional[int], resolution: Optional[str]) -> str:
+    parts: List[str] = ["Sora 2"]
+    title = _SORA2_MODE_TITLES.get(mode, "Text-to-Video")
+    if title and title not in parts:
+        parts.append(title)
+    if duration and duration > 0:
+        parts.append(f"{int(duration)}s")
+    formatted_resolution = _format_resolution_for_caption(resolution)
+    if formatted_resolution:
+        parts.append(formatted_resolution)
+    return " • ".join(part for part in parts if part)
 
 
 async def show_wait_sticker(
@@ -4744,6 +4774,40 @@ async def show_wait_sticker(
         )
         return None
     return getattr(message, "message_id", None)
+
+
+async def safe_edit_or_send(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    message_id: Optional[int],
+    text: str,
+    reply_markup: Optional[Any] = None,
+) -> Optional[int]:
+    if message_id:
+        try:
+            await safe_edit_message(
+                ctx,
+                chat_id,
+                message_id,
+                text,
+                reply_markup=reply_markup,
+            )
+            return message_id
+        except Exception as exc:
+            log.debug(
+                "sora2.safe_edit_failed",
+                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
+    sent = await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+    )
+    return getattr(sent, "message_id", None)
 
 
 async def replace_wait_with_docs(
@@ -8870,19 +8934,28 @@ def _sora2_sanitize_image_urls(urls: Sequence[str]) -> List[str]:
     return cleaned
 
 
+def _sora2_task_type(mode: str) -> str:
+    return "image2video" if mode == "sora2_itv" else "text2video"
+
+
 def _build_sora2_payload(
     mode: str,
     prompt: str,
     image_urls: Sequence[str],
     *,
-    aspect_ratio: str,
+    aspect_ratio: Optional[str],
+    resolution: str,
+    duration: int,
+    audio: Optional[bool],
 ) -> Dict[str, Any]:
     callback_url = SORA2.get("CALLBACK_URL")
     if not callback_url:
         public_base = (os.getenv("PUBLIC_BASE_URL") or "").strip()
         if public_base:
             callback_url = f"{public_base.rstrip('/')}/sora2-callback"
-    input_payload: Dict[str, Any] = {"aspect_ratio": aspect_ratio, "quality": "standard"}
+    input_payload: Dict[str, Any] = {}
+    if aspect_ratio:
+        input_payload["aspect_ratio"] = aspect_ratio
     prompt_text = prompt.strip()
     if prompt_text:
         input_payload["prompt"] = prompt_text
@@ -8891,12 +8964,16 @@ def _build_sora2_payload(
         cleaned_urls = _sora2_sanitize_image_urls(image_urls)
         if cleaned_urls:
             input_payload["image_urls"] = cleaned_urls
-        input_payload.setdefault("quality", "standard")
 
     payload: Dict[str, Any] = {
+        "task_type": _sora2_task_type(mode),
         "model": _sora2_model_id(mode),
         "input": input_payload,
+        "resolution": resolution,
+        "duration": int(duration),
     }
+    if audio is not None:
+        payload["audio"] = bool(audio)
     if callback_url:
         payload["callBackUrl"] = callback_url
     return payload
@@ -8997,7 +9074,13 @@ async def _finalize_sora2_task(
         if user_id is not None:
             clear_wait_state(user_id, reason="sora2_done")
     keyboard = video_result_footer_kb()
-    caption_text = "✅ Готово!"
+    duration_meta = meta.get("duration")
+    try:
+        duration_value = int(duration_meta) if duration_meta is not None else None
+    except (TypeError, ValueError):
+        duration_value = None
+    resolution_value = str(meta.get("resolution") or "").strip() or None
+    caption_text = _sora2_caption(mode, duration_value, resolution_value)
     try:
         if status == "success" and isinstance(result_payload, Mapping):
             sent_message_id: Optional[int] = None
@@ -9043,40 +9126,38 @@ async def _finalize_sora2_task(
                                 "sora2.send_video_failed",
                                 extra={"task_id": task_id, "error": str(video_exc)},
                             )
-                            sent_text = await tg_safe_send(
-                                ctx.bot.send_message,
-                                method_name="sendMessage",
-                                kind="message",
+                            sent_text_id = await safe_edit_or_send(
+                                ctx,
                                 chat_id=chat_id,
+                                message_id=None,
                                 text=caption_text,
                                 reply_markup=keyboard,
                             )
-                            sent_message_id = getattr(sent_text, "message_id", None)
+                            sent_message_id = sent_text_id
                             result_kind = "as_text"
                 else:
-                    sent_text = await tg_safe_send(
-                        ctx.bot.send_message,
-                        method_name="sendMessage",
-                        kind="message",
+                    sent_text_id = await safe_edit_or_send(
+                        ctx,
                         chat_id=chat_id,
+                        message_id=None,
                         text=caption_text,
                         reply_markup=keyboard,
                     )
-                    sent_message_id = getattr(sent_text, "message_id", None)
+                    sent_message_id = sent_text_id
+                    result_kind = "as_text"
             except TelegramError as exc:
                 log.warning(
                     "sora2.result_send_failed",
                     extra={"task_id": task_id, "error": str(exc)},
                 )
-                sent_text = await tg_safe_send(
-                    ctx.bot.send_message,
-                    method_name="sendMessage",
-                    kind="message",
+                sent_text_id = await safe_edit_or_send(
+                    ctx,
                     chat_id=chat_id,
+                    message_id=None,
                     text=caption_text,
                     reply_markup=keyboard,
                 )
-                sent_message_id = getattr(sent_text, "message_id", None)
+                sent_message_id = sent_text_id
                 result_kind = "as_text"
             finally:
                 for path in files:
@@ -9100,11 +9181,10 @@ async def _finalize_sora2_task(
             if not error_reason and isinstance(result_payload, Mapping):
                 error_reason = str(result_payload.get("error") or result_payload.get("message") or "Ошибка Sora 2")
             message = error_reason or "⚠️ Не удалось получить результат Sora 2."
-            await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
+            await safe_edit_or_send(
+                ctx,
                 chat_id=chat_id,
+                message_id=None,
                 text=message,
                 reply_markup=keyboard,
             )
@@ -9143,9 +9223,7 @@ async def _finalize_sora2_task(
 
 async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     start = time.monotonic()
-    backoff_sequence = [3, 5, 8, 13, 21, 34, 55, 89, 144]
-    backoff_index = 0
-    next_remote_poll = start + backoff_sequence[0]
+    next_remote_poll = start
     try:
         while True:
             meta = load_task_meta(task_id)
@@ -9165,8 +9243,13 @@ async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
             now = time.monotonic()
-            if now - start > 5 * 60:
-                meta_update = update_task_meta(task_id, status="failed", error="timeout", source="timeout") or meta
+            if now - start > SORA2_POLL_TIMEOUT:
+                meta_update = update_task_meta(
+                    task_id,
+                    status="failed",
+                    error="timeout",
+                    source="timeout",
+                ) or meta
                 await _finalize_sora2_task(ctx, task_id, meta_update, "failed", None, "timeout")
                 return
             if status not in {"success", "failed"} and now >= next_remote_poll:
@@ -9207,11 +9290,7 @@ async def _poll_sora2_and_send(task_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> 
                         source="poll",
                         raw=raw,
                     )
-                    if remote_status in {"success", "failed"}:
-                        continue
-                delay = backoff_sequence[min(backoff_index + 1, len(backoff_sequence) - 1)]
-                backoff_index = min(backoff_index + 1, len(backoff_sequence) - 1)
-                next_remote_poll = now + delay
+                next_remote_poll = now + SORA2_POLL_INTERVAL
             await asyncio.sleep(1)
     finally:
         poller = _SORA2_POLLERS.get(task_id)
@@ -9259,7 +9338,16 @@ async def _start_sora2_generation(
         await message.reply_text("📸 Нужны 1–4 изображения для этого режима. Попробуйте снова.")
         return None
 
-    prompt_preview = _short_prompt(prompt, 160)
+    prompt_for_api = truncate_text(prompt or "", SORA2_MAX_PROMPT_LENGTH)
+    prompt_preview = _short_prompt(prompt_for_api, 160)
+    if mode == "sora2_itv":
+        duration = SORA2_DEFAULT_ITV_DURATION
+        resolution = SORA2_DEFAULT_ITV_RESOLUTION
+        audio_flag: Optional[bool] = None
+    else:
+        duration = SORA2_DEFAULT_TTV_DURATION
+        resolution = SORA2_DEFAULT_TTV_RESOLUTION
+        audio_flag = True
     ok, balance_after = debit_try(
         user_id,
         price,
@@ -9277,7 +9365,15 @@ async def _start_sora2_generation(
         f"✅ Списано {price}💎. Текущий баланс: {balance_after}💎 — запускаю…",
     )
 
-    payload = _build_sora2_payload(mode, prompt, prepared_image_urls, aspect_ratio=aspect_ratio)
+    payload = _build_sora2_payload(
+        mode,
+        prompt_for_api,
+        prepared_image_urls,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        duration=duration,
+        audio=audio_flag,
+    )
     try:
         create_response: CreateTaskResponse = await asyncio.to_thread(
             sora2_create_task, payload
@@ -9410,6 +9506,9 @@ async def _start_sora2_generation(
             "wait_message_id": wait_msg_id,
             "aspect_ratio": aspect_ratio,
             "submit_raw": create_response.raw,
+            "duration": duration,
+            "resolution": resolution,
+            "audio": audio_flag,
         },
         ttl=30 * 60,
     )
@@ -9428,6 +9527,8 @@ async def _start_sora2_generation(
             "task_id": task_id,
             "chat_id": chat_id,
             "raw": create_response.raw,
+            "duration": duration,
+            "resolution": resolution,
         },
     )
     log.info(
