@@ -33,6 +33,15 @@ def test_video_menu_single_card(bot_module):
     assert "VEO" in engine_titles[0]
     assert any("Sora2" in title for title in engine_titles)
 
+    veo_row = rows[0]
+    assert veo_row[0].callback_data == bot_module.CB.VIDEO_PICK_VEO
+
+    sora_row = rows[1]
+    assert sora_row[0].callback_data in {
+        bot_module.CB.VIDEO_PICK_SORA2,
+        bot_module.CB.VIDEO_PICK_SORA2_DISABLED,
+    }
+
     back_row = rows[-1]
     assert len(back_row) == 1
-    assert back_row[0].callback_data == bot_module.CB_VIDEO_BACK
+    assert back_row[0].callback_data == bot_module.CB.VIDEO_MENU_BACK

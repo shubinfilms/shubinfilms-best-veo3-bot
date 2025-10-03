@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -81,6 +82,15 @@ _SORA2_LOCK_KEY_TMPL = f"{_PFX}:lock:sora2:{{}}"
 _SORA2_UNAVAILABLE_KEY = f"{_PFX}:sora2:unavailable"
 _MJ_GALLERY_KEY_TMPL = f"{_PFX}:mj:gallery:{{}}:{{}}"
 _MJ_GALLERY_TTL = 2 * 60 * 60
+
+
+class MenuLocked(RuntimeError):
+    """Raised when a menu lock is already held by another task."""
+
+    def __init__(self, name: str, chat_id: int):
+        super().__init__(f"Menu lock busy: {name} for chat {chat_id}")
+        self.name = str(name)
+        self.chat_id = int(chat_id)
 
 
 def _menu_lock_key(name: str, chat_id: int) -> str:
@@ -389,6 +399,19 @@ def release_menu_lock(name: str, chat_id: int) -> None:
             _logger.warning("menu_lock.release_error | key=%s err=%s", key, exc)
     else:
         _memory_delete(key)
+
+
+@asynccontextmanager
+async def with_menu_lock(name: str, chat_id: int, ttl: int = 5):
+    """Async context manager that guards menu interactions for ``chat_id``."""
+
+    acquired = acquire_menu_lock(name, chat_id, ttl)
+    if not acquired:
+        raise MenuLocked(name, chat_id)
+    try:
+        yield
+    finally:
+        release_menu_lock(name, chat_id)
 
 
 def user_lock(user_id: Optional[int], key: str, ttl: int = 30) -> bool:

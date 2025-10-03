@@ -155,6 +155,7 @@ from utils.telegram_utils import build_photo_album_media, label_to_command, shou
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import (
+    CB,
     CB_FAQ_PREFIX,
     CB_PM_INSERT_PREFIX,
     CB_PM_PREFIX,
@@ -228,6 +229,8 @@ from redis_utils import (
     release_ttl_lock,
     acquire_menu_lock,
     release_menu_lock,
+    MenuLocked,
+    with_menu_lock,
     acquire_sora2_lock,
     release_sora2_lock,
     mark_sora2_unavailable,
@@ -3692,6 +3695,7 @@ DEFAULT_STATE = {
     "sora2_last_task_id": None,
     "sora2_wait_msg_id": None,
     "video_wait_message_id": None,
+    "video_menu_msg_id": None,
 }
 
 
@@ -4719,6 +4723,28 @@ _VIDEO_MENU_LOCK_TTL = 90
 _VIDEO_MENU_MESSAGE_TTL = 90
 _VIDEO_MENU_LOCK_NAME = "video:menu:lock"
 _VIDEO_MENU_MESSAGE_NAME = "video:menu:card"
+VIDEO_MENU_STATE_KEY = "video_menu_msg_id"
+VIDEO_MENU_MSG_IDS_KEY = "video_menu"
+VIDEO_MENU_LOCK_TTL = 5
+VIDEO_CALLBACK_ALIASES = {
+    "video_menu": CB.VIDEO_MENU,
+    "engine:veo": CB.VIDEO_PICK_VEO,
+    "engine:sora2": CB.VIDEO_PICK_SORA2,
+    "engine:sora2_disabled": CB.VIDEO_PICK_SORA2_DISABLED,
+    "mode:veo_text_fast": CB.VIDEO_MODE_VEO_FAST,
+    "mode:veo_text_quality": CB.VIDEO_MODE_VEO_QUALITY,
+    "mode:veo_photo": CB.VIDEO_MODE_VEO_PHOTO,
+    "mode:sora2_ttv": CB.VIDEO_MODE_SORA_TEXT,
+    "mode:sora2_itv": CB.VIDEO_MODE_SORA_IMAGE,
+    "video:back": CB.VIDEO_MENU_BACK,
+}
+VIDEO_MODE_CALLBACK_MAP = {
+    CB.VIDEO_MODE_VEO_FAST: "veo_text_fast",
+    CB.VIDEO_MODE_VEO_QUALITY: "veo_text_quality",
+    CB.VIDEO_MODE_VEO_PHOTO: "veo_photo",
+    CB.VIDEO_MODE_SORA_TEXT: "sora2_ttv",
+    CB.VIDEO_MODE_SORA_IMAGE: "sora2_itv",
+}
 VEO_WAIT_STICKER_ID = "5375464961822695044"
 # Loaded from settings to allow feature flagging and runtime overrides.
 # pylint: disable=invalid-name
@@ -4810,6 +4836,145 @@ async def safe_edit_or_send(
     return getattr(sent, "message_id", None)
 
 
+async def safe_edit_or_send_menu(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[Any],
+    state_key: str,
+    msg_ids_key: Optional[str] = None,
+    state_dict: Optional[Dict[str, Any]] = None,
+    fallback_message_id: Optional[int] = None,
+    parse_mode: Optional[ParseMode] = ParseMode.HTML,
+    disable_web_page_preview: bool = True,
+    log_label: str = "ui.menu",
+) -> Optional[int]:
+    """Safely edit an existing menu message or send a new one.
+
+    The helper keeps the message id stored in the shared ``state`` dictionary and
+    updates ``msg_ids`` for backwards compatibility with legacy logic.
+    """
+
+    state_dict = state_dict or state(ctx)
+    current_id = state_dict.get(state_key)
+    if not isinstance(current_id, int) and isinstance(fallback_message_id, int):
+        current_id = fallback_message_id
+        state_dict[state_key] = current_id
+
+    def _store_message_id(message_id: Optional[int]) -> None:
+        state_dict[state_key] = message_id if isinstance(message_id, int) else None
+        if not msg_ids_key:
+            return
+        msg_ids = state_dict.get("msg_ids")
+        if not isinstance(msg_ids, dict):
+            msg_ids = {}
+            state_dict["msg_ids"] = msg_ids
+        msg_ids[msg_ids_key] = message_id if isinstance(message_id, int) else None
+
+    markup = reply_markup
+    effective_parse_mode = parse_mode or ParseMode.HTML
+
+    if isinstance(current_id, int):
+        try:
+            await safe_edit_message(
+                ctx,
+                chat_id,
+                current_id,
+                text,
+                markup,
+                parse_mode=effective_parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+                log_on_noop=f"{log_label}.noop",
+            )
+            _store_message_id(current_id)
+            log.info(
+                "%s.edit",
+                log_label,
+                extra={"chat_id": chat_id, "message_id": current_id},
+            )
+            return current_id
+        except BadRequest as exc:
+            log.warning(
+                "%s.edit_bad_request",
+                log_label,
+                extra={
+                    "chat_id": chat_id,
+                    "message_id": current_id,
+                    "error": str(exc),
+                },
+            )
+        except TelegramError as exc:
+            log.warning(
+                "%s.edit_error",
+                log_label,
+                extra={
+                    "chat_id": chat_id,
+                    "message_id": current_id,
+                    "error": str(exc),
+                },
+            )
+        else:
+            _store_message_id(current_id)
+            return current_id
+
+        # Editing failed; try to clean up before sending a new message.
+        try:
+            await ctx.bot.edit_message_reply_markup(
+                chat_id,
+                current_id,
+                reply_markup=None,
+            )
+        except TelegramError as exc:
+            log.debug(
+                "%s.clear_markup_failed",
+                log_label,
+                extra={"chat_id": chat_id, "message_id": current_id, "error": str(exc)},
+            )
+        try:
+            await ctx.bot.delete_message(chat_id, current_id)
+        except TelegramError as exc:
+            log.debug(
+                "%s.delete_failed",
+                log_label,
+                extra={"chat_id": chat_id, "message_id": current_id, "error": str(exc)},
+            )
+        _store_message_id(None)
+
+    send_kwargs: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": markup,
+        "disable_web_page_preview": disable_web_page_preview,
+    }
+    if parse_mode is not None:
+        send_kwargs["parse_mode"] = effective_parse_mode
+
+    result = await tg_safe_send(
+        ctx.bot.send_message,
+        method_name="sendMessage",
+        kind="message",
+        **send_kwargs,
+    )
+    message_id = getattr(result, "message_id", None) if result is not None else None
+    _store_message_id(message_id if isinstance(message_id, int) else None)
+
+    if isinstance(message_id, int):
+        log.info(
+            "%s.send",
+            log_label,
+            extra={"chat_id": chat_id, "message_id": message_id},
+        )
+        return message_id
+
+    log.warning(
+        "%s.send_failed",
+        log_label,
+        extra={"chat_id": chat_id},
+    )
+    return None
+
+
 async def replace_wait_with_docs(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -4830,11 +4995,40 @@ async def replace_wait_with_docs(
             )
 
 
-def _clear_video_menu_state(chat_id: int, *, user_id: Optional[int] = None) -> None:
+async def _clear_video_menu_state(
+    chat_id: int,
+    *,
+    user_id: Optional[int] = None,
+    ctx: Optional[ContextTypes.DEFAULT_TYPE] = None,
+) -> None:
     clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
     release_menu_lock(_VIDEO_MENU_LOCK_NAME, chat_id)
     if user_id is not None:
         release_menu_lock(_VIDEO_MENU_LOCK_NAME, user_id)
+    if ctx is None:
+        return
+
+    state_dict = state(ctx)
+    message_id = state_dict.get(VIDEO_MENU_STATE_KEY)
+    if isinstance(message_id, int):
+        try:
+            await ctx.bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+        except TelegramError as exc:
+            log.debug(
+                "ui.video_menu.clear_markup_failed",
+                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
+        try:
+            await ctx.bot.delete_message(chat_id, message_id)
+        except TelegramError as exc:
+            log.debug(
+                "ui.video_menu.delete_failed",
+                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
+    state_dict[VIDEO_MENU_STATE_KEY] = None
+    msg_ids = state_dict.get("msg_ids")
+    if isinstance(msg_ids, dict):
+        msg_ids[VIDEO_MENU_MSG_IDS_KEY] = None
 
 _VIDEO_MODE_HINTS: Dict[str, str] = {
     "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
@@ -5299,133 +5493,83 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
     chat = getattr(update, "effective_chat", None) or (
         getattr(message, "chat", None) if message else None
     )
-    query = getattr(update, "callback_query", None)
     user = getattr(update, "effective_user", None)
 
     chat_id = chat.id if chat else (message.chat_id if message else None)
     if chat_id is None:
         return None
 
-    if query is not None and not getattr(query, "_answered", False):
-        try:
-            await query.answer()
-            setattr(query, "_answered", True)
-        except Exception as exc:  # pragma: no cover - network issues
-            log.debug(
-                "video.menu.answer_fail",
-                extra={"chat_id": chat_id, "error": str(exc)},
-            )
-
     user_id = user.id if user else None
+    s = state(ctx)
+    s["mode"] = None
+    s.pop("model", None)
+
+    record = get_menu_message(
+        _VIDEO_MENU_MESSAGE_NAME,
+        chat_id,
+        max_age=_VIDEO_MENU_MESSAGE_TTL,
+    )
+    fallback_message_id: Optional[int] = None
+    if record:
+        fallback_message_id, _ = record
+        if isinstance(fallback_message_id, int) and not isinstance(
+            s.get(VIDEO_MENU_STATE_KEY),
+            int,
+        ):
+            s[VIDEO_MENU_STATE_KEY] = fallback_message_id
 
     user_lock_acquired = False
     if user_id is not None:
         user_lock_acquired = user_lock(user_id, "video_menu")
         if not user_lock_acquired:
             log.info(
-                "video.menu.lock_busy",
+                "ui.video_menu.user_lock_busy",
                 extra={"chat_id": chat_id, "user_id": user_id},
             )
-            return None
-
-    s = state(ctx)
-    s["mode"] = None
-    s.pop("model", None)
+            raise MenuLocked(_VIDEO_MENU_LOCK_NAME, user_id)
 
     lock_owner = user_id if user_id is not None else chat_id
-    lock_owned = acquire_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner, _VIDEO_MENU_LOCK_TTL)
-    forced_release = False
-    result_id: Optional[int] = None
 
     try:
-        keyboard = video_menu_kb()
-        record = get_menu_message(
-            _VIDEO_MENU_MESSAGE_NAME,
-            chat_id,
-            max_age=_VIDEO_MENU_MESSAGE_TTL,
-        )
-
-        if not lock_owned:
-            if record:
-                saved_id, _ = record
-                outcome = await _try_edit_menu_card(
-                    ctx,
-                    chat_id=chat_id,
-                    message_id=saved_id,
-                    text=VIDEO_MENU_TEXT,
-                    reply_markup=keyboard,
-                    log_prefix="video.menu",
-                    parse_mode=None,
-                )
-                if outcome == "ok":
-                    save_menu_message(
-                        _VIDEO_MENU_MESSAGE_NAME,
-                        chat_id,
-                        saved_id,
-                        _VIDEO_MENU_MESSAGE_TTL,
-                    )
-                    result_id = saved_id
-                    return result_id
-                clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
-            release_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner)
-            forced_release = True
-            lock_owned = acquire_menu_lock(
-                _VIDEO_MENU_LOCK_NAME,
-                lock_owner,
-                _VIDEO_MENU_LOCK_TTL,
-            )
-
-        record = get_menu_message(
-            _VIDEO_MENU_MESSAGE_NAME,
-            chat_id,
-            max_age=_VIDEO_MENU_MESSAGE_TTL,
-        )
-        if record:
-            saved_id, _ = record
-            outcome = await _try_edit_menu_card(
+        async with with_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner, ttl=VIDEO_MENU_LOCK_TTL):
+            markup = video_menu_kb()
+            message_id = await safe_edit_or_send_menu(
                 ctx,
                 chat_id=chat_id,
-                message_id=saved_id,
                 text=VIDEO_MENU_TEXT,
-                reply_markup=keyboard,
-                log_prefix="video.menu",
-                parse_mode=None,
+                reply_markup=markup,
+                state_key=VIDEO_MENU_STATE_KEY,
+                msg_ids_key=VIDEO_MENU_MSG_IDS_KEY,
+                state_dict=s,
+                fallback_message_id=fallback_message_id,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                log_label="ui.video_menu",
             )
-            if outcome == "ok":
+            if isinstance(message_id, int):
                 save_menu_message(
                     _VIDEO_MENU_MESSAGE_NAME,
                     chat_id,
-                    saved_id,
+                    message_id,
                     _VIDEO_MENU_MESSAGE_TTL,
                 )
-                msg_ids = s.get("msg_ids")
-                if not isinstance(msg_ids, dict):
-                    msg_ids = {}
-                    s["msg_ids"] = msg_ids
-                msg_ids["video_menu"] = saved_id
-                result_id = saved_id
-                return result_id
-            clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
-
-        sent_id = await _send_video_menu_message(ctx, chat_id=chat_id, message=message)
-        if sent_id is not None:
-            save_menu_message(
-                _VIDEO_MENU_MESSAGE_NAME,
-                chat_id,
-                sent_id,
-                _VIDEO_MENU_MESSAGE_TTL,
-            )
-            msg_ids = s.get("msg_ids")
-            if not isinstance(msg_ids, dict):
-                msg_ids = {}
-                s["msg_ids"] = msg_ids
-            msg_ids["video_menu"] = sent_id
-            log.info(
-                "video.menu.show_send",
-                extra={"chat_id": chat_id, "message_id": sent_id},
-            )
-            result_id = sent_id
-        return result_id
+                log.info(
+                    "ui.video_menu.show",
+                    extra={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "user_id": user_id,
+                    },
+                )
+            else:
+                clear_menu_message(_VIDEO_MENU_MESSAGE_NAME, chat_id)
+            return message_id
+    except MenuLocked:
+        log.info(
+            "ui.video_menu.lock_busy",
+            extra={"chat_id": chat_id, "user_id": user_id},
+        )
+        raise
     finally:
         if user_id is not None:
             input_state.clear(user_id, reason="video_menu")
@@ -5435,17 +5579,6 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
                 clear_wait_state(user_id, reason="video_menu")
             except TypeError:
                 clear_wait_state(user_id)
-        if lock_owned:
-            release_menu_lock(_VIDEO_MENU_LOCK_NAME, lock_owner)
-            log.info(
-                "video.menu.lock_release",
-                extra={"chat_id": chat_id, "user_id": user_id},
-            )
-        elif forced_release:
-            log.info(
-                "video.menu.lock_forced_release",
-                extra={"chat_id": chat_id, "user_id": user_id},
-            )
         if user_id is not None and user_lock_acquired:
             release_user_lock(user_id, "video_menu")
 
@@ -12035,7 +12168,7 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user_id = user.id if user else None
-    _clear_video_menu_state(chat_id, user_id=user_id)
+    await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
     _clear_pm_menu_state(chat_id, user_id=user_id)
     if user_id:
         set_mode(user_id, False)
@@ -12222,7 +12355,13 @@ async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "video.command",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    await start_video_menu(update, ctx)
+    try:
+        await start_video_menu(update, ctx)
+    except MenuLocked:
+        log.info(
+            "ui.video_menu.command_locked",
+            extra={"chat_id": chat.id, "user_id": user_id},
+        )
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -12364,7 +12503,13 @@ async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         "video.menu.reply",
         extra={"chat_id": chat.id, "user_id": user_id},
     )
-    await start_video_menu(update, ctx)
+    try:
+        await start_video_menu(update, ctx)
+    except MenuLocked:
+        log.info(
+            "ui.video_menu.reply_locked",
+            extra={"chat_id": chat.id, "user_id": user_id},
+        )
 
 
 async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12373,102 +12518,128 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not query or not query.data:
         return
 
-    data = query.data
+    state_dict = state(ctx)
+    raw_data = str(query.data)
+    data = VIDEO_CALLBACK_ALIASES.get(raw_data, raw_data)
+
     message = getattr(query, "message", None)
-    chat_obj = getattr(message, "chat", None)
-    if chat_obj is None:
-        chat_obj = getattr(update, "effective_chat", None)
-    chat_id = getattr(chat_obj, "id", None)
+    chat_obj = getattr(message, "chat", None) or getattr(update, "effective_chat", None)
+    chat_id = getattr(chat_obj, "id", None) if chat_obj else None
     if chat_id is None and message is not None:
         chat_id = getattr(message, "chat_id", None)
     user = getattr(query, "from_user", None) or update.effective_user
     user_id = user.id if user else None
 
-    try:
-        await query.answer()
-        setattr(query, "_answered", True)
-    except Exception as exc:
-        log.debug("video.menu.answer_fail", extra={"chat_id": chat_id, "error": str(exc)})
+    answer_payload: Dict[str, Any] = {"text": "", "show_alert": False}
 
-    log.debug(
-        "video.callback",
+    async def _answer() -> None:
+        try:
+            await ctx.bot.answer_callback_query(
+                callback_query_id=query.id,
+                text=str(answer_payload.get("text", "")),
+                show_alert=bool(answer_payload.get("show_alert", False)),
+            )
+        except Exception as exc:
+            log.debug(
+                "ui.video_menu.answer_fail",
+                extra={"chat_id": chat_id, "error": str(exc)},
+            )
+
+    log.info(
+        "ui.video_menu.click",
         extra={"chat_id": chat_id, "user_id": user_id, "data": data},
     )
 
-    if data == CB_VIDEO_ENGINE_VEO:
-        if chat_id is None:
-            return
-        markup = veo_modes_kb()
-        if message is not None:
-            outcome = await _try_edit_menu_card(
-                ctx,
-                chat_id=chat_id,
-                message_id=message.message_id,
-                text=VIDEO_VEO_MENU_TEXT,
-                reply_markup=markup,
-                log_prefix="video.menu.veo",
-                parse_mode=None,
-            )
-            if outcome == "ok":
-                save_menu_message(
-                    _VIDEO_MENU_MESSAGE_NAME,
-                    chat_id,
-                    message.message_id,
-                    _VIDEO_MENU_MESSAGE_TTL,
-                )
-        else:
-            await ctx.bot.send_message(chat_id, VIDEO_VEO_MENU_TEXT, reply_markup=markup)
-        return
-
-    if data == CB_VIDEO_ENGINE_SORA2_DISABLED:
-        await query.answer("Sora2 скоро будет доступна", show_alert=True)
-        return
-
-    if data == CB_VIDEO_ENGINE_SORA2:
-        if not _sora2_is_enabled():
-            await query.answer(
-                "Sora2 временно недоступна. Попробуйте позже или выберите VEO.",
-                show_alert=True,
-            )
-            if chat_id is not None:
+    try:
+        if data == CB.VIDEO_MENU:
+            if chat_id is None:
+                return
+            try:
                 await start_video_menu(update, ctx)
-            return
-        if chat_id is not None:
-            _clear_video_menu_state(chat_id, user_id=user_id)
-            await sora2_entry(chat_id, ctx)
-        return
-
-    if data.startswith("mode:veo_"):
-        selected_mode = data.split(":", 1)[1]
-        handled = await _start_video_mode(
-            selected_mode,
-            chat_id=chat_id,
-            ctx=ctx,
-            user_id=user_id,
-            message=message,
-        )
-        if handled:
+            except MenuLocked:
+                answer_payload["text"] = "Обрабатываю…"
             return
 
-    if data == CB_VIDEO_BACK:
-        target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
-        if target_chat is not None:
-            _clear_video_menu_state(target_chat, user_id=user_id)
-            await show_emoji_hub_for_chat(
-                target_chat,
-                ctx,
+        if data == CB.VIDEO_PICK_VEO:
+            if chat_id is None:
+                return
+            try:
+                async with with_menu_lock(
+                    _VIDEO_MENU_LOCK_NAME,
+                    chat_id,
+                    ttl=VIDEO_MENU_LOCK_TTL,
+                ):
+                    fallback_id = getattr(message, "message_id", None)
+                    message_id = await safe_edit_or_send_menu(
+                        ctx,
+                        chat_id=chat_id,
+                        text=VIDEO_VEO_MENU_TEXT,
+                        reply_markup=veo_modes_kb(),
+                        state_key=VIDEO_MENU_STATE_KEY,
+                        msg_ids_key=VIDEO_MENU_MSG_IDS_KEY,
+                        state_dict=state_dict,
+                        fallback_message_id=fallback_id,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        log_label="ui.video_menu.veo",
+                    )
+                    if isinstance(message_id, int):
+                        save_menu_message(
+                            _VIDEO_MENU_MESSAGE_NAME,
+                            chat_id,
+                            message_id,
+                            _VIDEO_MENU_MESSAGE_TTL,
+                        )
+            except MenuLocked:
+                answer_payload["text"] = "Обрабатываю…"
+            return
+
+        if data == CB.VIDEO_PICK_SORA2_DISABLED:
+            answer_payload["text"] = "Sora2 скоро будет доступна"
+            answer_payload["show_alert"] = True
+            return
+
+        if data == CB.VIDEO_PICK_SORA2:
+            if not _sora2_is_enabled():
+                answer_payload["text"] = "Sora2 временно недоступна. Попробуйте позже или выберите VEO."
+                answer_payload["show_alert"] = True
+                if chat_id is not None:
+                    try:
+                        await start_video_menu(update, ctx)
+                    except MenuLocked:
+                        pass
+                return
+            if chat_id is not None:
+                await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
+                await sora2_entry(chat_id, ctx)
+            return
+
+        if data in VIDEO_MODE_CALLBACK_MAP:
+            selected_mode = VIDEO_MODE_CALLBACK_MAP[data]
+            handled = await _start_video_mode(
+                selected_mode,
+                chat_id=chat_id,
+                ctx=ctx,
                 user_id=user_id,
-                replace=True,
+                message=message,
             )
-        return
-
-    if data == CB_VIDEO_MENU:
-        if chat_id is None:
+            if handled and chat_id is not None:
+                await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
             return
-        await start_video_menu(update, ctx)
-        return
 
-    return
+        if data == CB.VIDEO_MENU_BACK:
+            target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
+            if target_chat is not None:
+                await _clear_video_menu_state(target_chat, user_id=user_id, ctx=ctx)
+                await show_emoji_hub_for_chat(
+                    target_chat,
+                    ctx,
+                    user_id=user_id,
+                    replace=True,
+                )
+            return
+    finally:
+        await _answer()
 
 async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await image_command(update, ctx)
@@ -15699,8 +15870,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
-    (rf"^{CB_VIDEO_MENU}$", video_menu_callback),
-    (r"^video:", video_menu_callback),
+    (r"^(?:cb:|video_menu$|engine:|mode:(?:veo|sora2)_|video:back$)", video_menu_callback),
     (r"^mj\.gallery\.again:", handle_mj_gallery_repeat),
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),

@@ -9,16 +9,31 @@ CB_PM_SWITCH = f"{CB_PM_PREFIX}switch"
 CB_PM_COPY_PREFIX = f"{CB_PM_PREFIX}copy:"
 CB_PM_INSERT_PREFIX = f"{CB_PM_PREFIX}insert:"
 
-CB_VIDEO_MENU = "video_menu"
-CB_VIDEO_ENGINE_VEO = "engine:veo"
-CB_VIDEO_ENGINE_SORA2 = "engine:sora2"
-CB_VIDEO_ENGINE_SORA2_DISABLED = "engine:sora2_disabled"
-CB_VIDEO_MODE_FAST = "mode:veo_text_fast"
-CB_VIDEO_MODE_QUALITY = "mode:veo_text_quality"
-CB_VIDEO_MODE_PHOTO = "mode:veo_photo"
-CB_VIDEO_MODE_SORA_TEXT = "mode:sora2_ttv"
-CB_VIDEO_MODE_SORA_IMAGE = "mode:sora2_itv"
-CB_VIDEO_BACK = "video:back"
+
+class CB:
+    VIDEO_MENU = "cb:menu:video"
+    VIDEO_MENU_BACK = "cb:menu:video:back"
+    VIDEO_PICK_VEO = "cb:video:veo"
+    VIDEO_PICK_SORA2 = "cb:video:sora2"
+    VIDEO_PICK_SORA2_DISABLED = "cb:video:sora2:disabled"
+    VIDEO_MODE_VEO_FAST = "cb:video:veo:mode:fast"
+    VIDEO_MODE_VEO_QUALITY = "cb:video:veo:mode:quality"
+    VIDEO_MODE_VEO_PHOTO = "cb:video:veo:mode:photo"
+    VIDEO_MODE_SORA_TEXT = "cb:video:sora2:mode:ttv"
+    VIDEO_MODE_SORA_IMAGE = "cb:video:sora2:mode:itv"
+
+
+# Backwards compatibility constants (to be removed once call sites migrate).
+CB_VIDEO_MENU = CB.VIDEO_MENU
+CB_VIDEO_ENGINE_VEO = CB.VIDEO_PICK_VEO
+CB_VIDEO_ENGINE_SORA2 = CB.VIDEO_PICK_SORA2
+CB_VIDEO_ENGINE_SORA2_DISABLED = CB.VIDEO_PICK_SORA2_DISABLED
+CB_VIDEO_MODE_FAST = CB.VIDEO_MODE_VEO_FAST
+CB_VIDEO_MODE_QUALITY = CB.VIDEO_MODE_VEO_QUALITY
+CB_VIDEO_MODE_PHOTO = CB.VIDEO_MODE_VEO_PHOTO
+CB_VIDEO_MODE_SORA_TEXT = CB.VIDEO_MODE_SORA_TEXT
+CB_VIDEO_MODE_SORA_IMAGE = CB.VIDEO_MODE_SORA_IMAGE
+CB_VIDEO_BACK = CB.VIDEO_MENU_BACK
 
 
 _PM_LABELS = {
