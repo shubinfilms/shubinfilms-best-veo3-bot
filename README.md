@@ -84,6 +84,19 @@ pytest -q
 > Pillow для определения типа обложек и совместим как с Python 3.12, так и с
 > 3.13+.
 
+## Inline video menu callbacks
+
+- Все inline-кнопки видеоменю используют константы из `keyboards.CB` (например,
+  `CB.VIDEO_MENU`, `CB.VIDEO_PICK_VEO`, `CB.VIDEO_MENU_BACK`). Это гарантирует
+  уникальные `callback_data` и единый роутинг.
+- Для показа карточек меню используйте `bot.safe_edit_or_send_menu(...)` с
+  ключом состояния (например, `"video_menu_msg_id"`). Хелпер сначала пытается
+  сделать `editMessageText/ReplyMarkup`, при необходимости удаляет предыдущую
+  карточку и только потом отправляет новую.
+- Чтобы исключить гонки при двойных кликах, оборачивайте показ меню в
+  `redis_utils.with_menu_lock("video", chat_id)`. При активном локе вторичный
+  клик получает короткий `answerCallbackQuery` с сообщением «Обрабатываю…».
+
 Проверка callback вручную:
 
 ```bash
