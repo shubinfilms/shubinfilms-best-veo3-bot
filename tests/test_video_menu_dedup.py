@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import importlib
 import sys
 from pathlib import Path
@@ -146,4 +147,44 @@ def test_command_and_callback_share_lock(monkeypatch, bot_module):
 
     assert len(send_calls) == 1
     assert cache == {"video_menu:last_menu_msg_id:7": "555"}
+
+
+def test_video_mode_button_creates_card(monkeypatch, bot_module):
+    ctx = SimpleNamespace(bot=SimpleNamespace(), user_data={}, application=None)
+    state_dict = bot_module.state(ctx)
+    state_dict["last_ui_msg_id_veo"] = None
+
+    veo_calls: list[int] = []
+    wait_calls: list[dict[str, object]] = []
+
+    async def _fake_veo_entry(chat_id: int, ctx_param):
+        veo_calls.append(chat_id)
+        state_dict["last_ui_msg_id_veo"] = 42
+
+    def _fake_activate_wait_state(*, user_id, chat_id, card_msg_id, kind, meta=None):
+        wait_calls.append({"user_id": user_id, "chat_id": chat_id, "card": card_msg_id, "kind": kind, "meta": meta})
+
+    monkeypatch.setattr(bot_module, "veo_entry", _fake_veo_entry)
+    monkeypatch.setattr(bot_module, "_activate_wait_state", _fake_activate_wait_state)
+
+    class _Query:
+        def __init__(self):
+            self.data = bot_module.CB_VIDEO_MODE_FAST
+            self.message = SimpleNamespace(chat=SimpleNamespace(id=606))
+            self.from_user = SimpleNamespace(id=808)
+
+        async def answer(self):
+            return None
+
+    update = SimpleNamespace(
+        callback_query=_Query(),
+        effective_chat=SimpleNamespace(id=606),
+        effective_user=SimpleNamespace(id=808),
+    )
+
+    asyncio.run(bot_module.video_menu_callback(update, ctx))
+
+    assert state_dict["mode"] == "veo_text_fast"
+    assert veo_calls == [606]
+    assert wait_calls and wait_calls[0]["kind"] == bot_module.WaitKind.VEO_PROMPT
 

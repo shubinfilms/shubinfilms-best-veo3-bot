@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import importlib
 import sys
 from pathlib import Path
@@ -100,117 +101,28 @@ def test_banana_deliver_skips_document(monkeypatch, tmp_path, bot_module):
     assert bot.document_called is False
 
 
-def test_mj_deliver_as_album(bot_module):
-    class _Bot:
-        def __init__(self):
-            self.media_calls = []
-            self.photo_calls = []
+def test_mj_documents_sent_without_compression(monkeypatch, bot_module):
+    calls: list[dict[str, object]] = []
 
-        async def send_media_group(self, **kwargs):
-            self.media_calls.append(kwargs)
-            return [SimpleNamespace(message_id=i) for i in range(4)]
+    async def _fake_send(bot, chat_id, data, filename, *, caption=None, reply_markup=None, req_id=None):
+        calls.append({"filename": filename, "caption": caption})
+        return SimpleNamespace(message_id=len(calls))
 
-        async def send_photo(self, **kwargs):
-            self.photo_calls.append(kwargs)
-            return SimpleNamespace(message_id=999)
+    monkeypatch.setattr(bot_module, "send_image_as_document", _fake_send)
 
-    bot = _Bot()
-    items = [(b"a", "1.png"), (b"b", "2.png"), (b"c", "3.png"), (b"d", "4.png")]
     delivered = asyncio.run(
         bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            bot,
-            chat_id=77,
-            user_id=88,
-            caption="MJ",
-            items=items,
-            send_as_album=True,
-            task_id="task-1",
-        )
-    )
-
-    assert delivered is True
-    assert len(bot.media_calls) == 1
-    payload = bot.media_calls[0]
-    assert len(payload["media"]) == 4
-    assert payload["media"][0].caption == "MJ"
-    assert all(item.caption is None for item in payload["media"][1:])
-    assert not bot.photo_calls
-
-
-def test_mj_album_fallback_on_error(bot_module, monkeypatch):
-    class _Bot:
-        def __init__(self):
-            self.media_calls = []
-            self.photo_calls = []
-
-        async def send_media_group(self, **kwargs):
-            self.media_calls.append(kwargs)
-            raise RuntimeError("network fail")
-
-        async def send_photo(self, **kwargs):
-            self.photo_calls.append(kwargs)
-            return SimpleNamespace(message_id=len(self.photo_calls))
-
-    log_records = []
-
-    class _MJLog:
-        def info(self, msg, *, extra=None):  # type: ignore[override]
-            log_records.append(("info", msg, extra))
-
-        def warning(self, msg, *, extra=None):  # type: ignore[override]
-            log_records.append(("warning", msg, extra))
-
-    monkeypatch.setattr(bot_module, "mj_log", _MJLog())
-
-    bot = _Bot()
-    items = [(b"a", "1.png"), (b"b", "2.png"), (b"c", "3.png"), (b"d", "4.png")]
-    delivered = asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            bot,
-            chat_id=101,
-            user_id=202,
-            caption="MJ",
-            items=items,
-            send_as_album=True,
-            task_id="task-2",
-        )
-    )
-
-    assert delivered is True
-    assert len(bot.media_calls) == 1
-    assert len(bot.photo_calls) == 4
-    assert any(name == "warning" and msg == "mj.album.fallback_single" for name, msg, _ in log_records)
-
-
-def test_mj_fallback_to_single_photo(bot_module):
-    class _Bot:
-        def __init__(self):
-            self.media_calls = []
-            self.photo_calls = []
-
-        async def send_media_group(self, **kwargs):
-            self.media_calls.append(kwargs)
-            return [SimpleNamespace(message_id=1)]
-
-        async def send_photo(self, **kwargs):
-            self.photo_calls.append(kwargs)
-            return SimpleNamespace(message_id=len(self.photo_calls))
-
-    bot = _Bot()
-    items = [(b"a", "1.png")]
-    delivered = asyncio.run(
-        bot_module._deliver_mj_media(  # type: ignore[attr-defined]
-            bot,
+            SimpleNamespace(),
             chat_id=55,
             user_id=66,
             caption="MJ",
-            items=items,
+            items=[(b"a", "1.png"), (b"b", "2.png")],
             send_as_album=True,
             task_id="task-3",
         )
     )
 
     assert delivered is True
-    assert not bot.media_calls  # альбом не отправлялся из-за недостатка картинок
-    assert len(bot.photo_calls) == 1
-    assert bot.photo_calls[0]["caption"] == "MJ"
+    assert [call["caption"] for call in calls] == ["MJ", None]
+    assert calls[0]["filename"] == "midjourney_task-3_01.png"
+    assert calls[1]["filename"] == "midjourney_task-3_02.png"
