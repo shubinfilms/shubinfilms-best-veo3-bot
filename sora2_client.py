@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
+import os
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -9,15 +9,15 @@ import httpx
 
 from settings import (
     KIE_API_KEY,
-    SORA2,
     SORA2_API_KEY,
+    SORA2_GEN_PATH,
+    SORA2_STATUS_PATH,
     UPLOAD_BASE_URL,
     UPLOAD_URL_PATH,
 )
 
 
-_LOG = logging.getLogger(__name__)
-_RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+logger = logging.getLogger(__name__)
 _MAX_RESPONSE_LOG = 512
 
 
@@ -29,7 +29,13 @@ def _auth_token() -> str:
 
 
 def _timeout() -> httpx.Timeout:
-    return httpx.Timeout(connect=20.0, read=30.0, write=30.0)
+    if os.getenv("SORA2_TIMEOUT"):
+        return httpx.Timeout(float(os.getenv("SORA2_TIMEOUT", "30")))
+    connect = float(os.getenv("SORA2_TIMEOUT_CONNECT", "20"))
+    read = float(os.getenv("SORA2_TIMEOUT_READ", "30"))
+    write = float(os.getenv("SORA2_TIMEOUT_WRITE", "30"))
+    pool = float(os.getenv("SORA2_TIMEOUT_POOL", "30"))
+    return httpx.Timeout(connect=connect, read=read, write=write, pool=pool)
 
 
 def _log_response(method: str, url: str, response: httpx.Response) -> None:
@@ -38,92 +44,59 @@ def _log_response(method: str, url: str, response: httpx.Response) -> None:
     except Exception:  # pragma: no cover - defensive
         text = response.content.decode("utf-8", errors="replace")
     snippet = text[:_MAX_RESPONSE_LOG]
-    _LOG.info(
+    logger.info(
         "sora2.http.response",
         extra={"method": method, "url": url, "status": response.status_code, "body": snippet},
     )
 
 
-def _should_retry(response: httpx.Response) -> bool:
-    return response.status_code in _RETRYABLE_STATUS_CODES
+class Sora2RequestError(Exception):
+    pass
 
 
-def _perform_request(
-    method: str,
-    url: str,
-    *,
-    headers: Optional[Mapping[str, str]] = None,
-    json_body: Optional[Mapping[str, Any]] = None,
-    params: Optional[Mapping[str, Any]] = None,
-    attempts: int = 3,
-) -> httpx.Response:
+def _perform_request(method: str, url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> Dict[str, Any]:
+    tout = _timeout()
     last_exc: Optional[BaseException] = None
-    for attempt in range(1, attempts + 1):
+    for attempt in range(3):
         try:
-            with httpx.Client(timeout=_timeout()) as client:
-                response = client.request(
-                    method,
-                    url,
-                    headers=dict(headers or {}),
-                    json=json_body,
-                    params=dict(params or {}),
-                )
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            with httpx.Client(timeout=tout) as client:
+                response = client.request(method, url, headers=headers, json=json_body)
+                response.raise_for_status()
+                _log_response(method, url, response)
+                return response.json()
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
             last_exc = exc
-            _LOG.warning(
-                "sora2.http.error",
-                extra={"method": method, "url": url, "attempt": attempt, "error": str(exc)},
+            logger.warning(
+                "sora2.http.retry",
+                extra={"attempt": attempt + 1, "error": str(exc)},
             )
-        else:
-            _log_response(method, url, response)
-            if response.status_code >= 400 and _should_retry(response) and attempt < attempts:
-                _LOG.warning(
-                    "sora2.http.retry",
-                    extra={
-                        "method": method,
-                        "url": url,
-                        "attempt": attempt,
-                        "status": response.status_code,
-                    },
-                )
-                time.sleep(2 ** (attempt - 1))
-                continue
-            return response
-
-        if attempt < attempts:
-            time.sleep(2 ** (attempt - 1))
-
-    if last_exc is not None:
-        raise last_exc
-    raise httpx.HTTPError(f"Failed to call {url}")
+            time.sleep(0.5 * (2 ** attempt))
+    raise Sora2RequestError(f"request failed after retries: {last_exc}")
 
 
-def sora2_create_task(payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = SORA2["GEN_PATH"]
+def sora2_create_task(payload: Dict[str, Any]) -> str:
+    url = SORA2_GEN_PATH
     headers = {
-        "Authorization": f"Bearer {_auth_token()}",
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {_auth_token()}",
     }
-    _LOG.info("sora2.http.request", extra={"method": "POST", "url": url})
-    response = _perform_request("POST", url, headers=headers, json_body=payload)
-    response.raise_for_status()
-    try:
-        return response.json()
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Invalid JSON from Sora 2 createTask") from exc
+    logger.info("sora2.http.request", extra={"endpoint": "createTask"})
+    data = _perform_request("POST", url, headers, payload)
+    task_id = (data.get("taskId") or data.get("task_id") or "").strip()
+    if not task_id:
+        raise Sora2RequestError(f"missing task id in response: {data}")
+    return task_id
 
 
-def sora2_get_task(task_id: str) -> Dict[str, Any]:
-    url = SORA2["STATUS_PATH"]
-    headers = {"Authorization": f"Bearer {_auth_token()}"}
-    params = {"taskId": task_id}
-    _LOG.info("sora2.http.request", extra={"method": "GET", "url": url, "taskId": task_id})
-    response = _perform_request("GET", url, headers=headers, params=params)
-    response.raise_for_status()
-    try:
-        return response.json()
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Invalid JSON from Sora 2 queryTask") from exc
+def sora2_query_task(task_id: str) -> Dict[str, Any]:
+    url = SORA2_STATUS_PATH
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {_auth_token()}",
+    }
+    payload = {"taskId": task_id}
+    logger.info("sora2.http.request", extra={"endpoint": "queryTask", "task_id": task_id})
+    return _perform_request("POST", url, headers, payload)
 
 
 def _build_upload_url() -> Optional[str]:
@@ -163,19 +136,13 @@ def sora2_upload_image_urls(image_urls: Iterable[str]) -> List[str]:
         cleaned = str(original or "").strip()
         if not cleaned:
             continue
-        _LOG.info("sora2.upload.request", extra={"url": cleaned})
-        response = _perform_request(
+        logger.info("sora2.upload.request", extra={"url": cleaned})
+        payload = _perform_request(
             "POST",
             upload_endpoint,
-            headers=headers,
-            json_body={"url": cleaned},
+            headers,
+            {"url": cleaned},
         )
-        if response.status_code >= 400:
-            response.raise_for_status()
-        try:
-            payload = response.json()
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Invalid JSON from upload service") from exc
         public_url = _extract_public_url(payload)
         if not public_url:
             raise RuntimeError("Upload service response missing public URL")
@@ -183,4 +150,4 @@ def sora2_upload_image_urls(image_urls: Iterable[str]) -> List[str]:
     return results
 
 
-__all__ = ["sora2_create_task", "sora2_get_task", "sora2_upload_image_urls"]
+__all__ = ["sora2_create_task", "sora2_query_task", "sora2_upload_image_urls", "Sora2RequestError"]

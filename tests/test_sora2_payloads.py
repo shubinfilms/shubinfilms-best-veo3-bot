@@ -57,6 +57,11 @@ def _setup_common(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "debit_try", lambda uid, price, reason, meta: (True, 777))
     monkeypatch.setattr(bot_module, "credit_balance", lambda *args, **kwargs: 0)
 
+    async def immediate_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot_module.asyncio, "to_thread", immediate_to_thread)
+
     async def fake_ensure_tokens(ctx_param, chat_id, user_id, price):
         return True
 
@@ -104,7 +109,7 @@ def test_sora2_payload_text_to_video(monkeypatch, bot_module, ctx):
 
     def fake_create_task(payload):
         payloads.append(payload)
-        return {"taskId": "ttv-1"}
+        return "ttv-1"
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
 
@@ -151,7 +156,7 @@ def test_sora2_payload_image_to_video(monkeypatch, bot_module, ctx):
 
     def fake_create_task(payload):
         payloads.append(payload)
-        return {"taskId": "itv-42"}
+        return "itv-42"
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
 

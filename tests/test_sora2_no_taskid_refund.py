@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from sora2_client import Sora2RequestError
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -87,10 +89,15 @@ def test_sora2_no_taskid_refund(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "show_balance_notification", fake_balance_notification)
 
     def fake_create_task(payload):
-        return {"error": "Bad model"}
+        raise Sora2RequestError("missing task id")
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
     monkeypatch.setattr(bot_module, "_schedule_sora2_poll", lambda *args, **kwargs: None)
+
+    async def immediate_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(bot_module.asyncio, "to_thread", immediate_to_thread)
 
     release_calls = []
     monkeypatch.setattr(bot_module, "acquire_sora2_lock", lambda user_id, ttl=60: True)
@@ -104,7 +111,7 @@ def test_sora2_no_taskid_refund(monkeypatch, bot_module):
 
     assert bot_module.ACTIVE_TASKS.get(777) is None
     assert ctx.bot.sent_stickers == []
-    assert any("Sora 2 не приняла задачу" in text for text in message.reply_calls)
+    assert any("Не удалось создать задачу Sora 2" in text for text in message.reply_calls)
     assert credit_calls, "tokens were not refunded"
     assert credit_calls[0]["amount"] == bot_module.PRICE_SORA2_TEXT
     assert release_calls == [55]
