@@ -76,8 +76,9 @@ class _AppSettings(BaseModel):
     UPLOAD_BASE64_PATH: str = Field(default="/api/v1/upload/base64")
     UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
+    SORA2_API_KEY: Optional[str] = Field(default=None)
     SORA2_GEN_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/createTask")
-    SORA2_STATUS_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/getTask")
+    SORA2_STATUS_PATH: str = Field(default="https://api.kie.ai/api/v1/jobs/queryTask")
 
     YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
@@ -282,10 +283,12 @@ SUNO_READY = bool(
 
 SORA2_GEN_PATH = _APP_SETTINGS.SORA2_GEN_PATH
 SORA2_STATUS_PATH = _APP_SETTINGS.SORA2_STATUS_PATH
+SORA2_API_KEY = _strip_optional(_APP_SETTINGS.SORA2_API_KEY) or KIE_API_KEY
 SORA2 = {
     "GEN_PATH": SORA2_GEN_PATH,
     "STATUS_PATH": SORA2_STATUS_PATH,
     "CALLBACK_URL": f"{PUBLIC_BASE_URL}/sora2-callback" if PUBLIC_BASE_URL else None,
+    "API_KEY": SORA2_API_KEY,
 }
 
 BANANA_SEND_AS_DOCUMENT = bool(_APP_SETTINGS.BANANA_SEND_AS_DOCUMENT)

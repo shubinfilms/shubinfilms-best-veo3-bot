@@ -77,6 +77,7 @@ _MJ_LOCK_TTL = 15 * 60
 _MENU_LOCK_KEY_TMPL = f"{_PFX}:menu:lock:{{}}:{{}}"
 _MENU_MSG_KEY_TMPL = f"{_PFX}:menu:msg:{{}}:{{}}"
 _USER_LOCK_KEY_TMPL = f"{_PFX}:user:lock:{{}}:{{}}"
+_SORA2_LOCK_KEY_TMPL = f"{_PFX}:lock:sora2:{{}}"
 _MJ_GALLERY_KEY_TMPL = f"{_PFX}:mj:gallery:{{}}:{{}}"
 _MJ_GALLERY_TTL = 2 * 60 * 60
 
@@ -94,6 +95,10 @@ def _menu_msg_key(name: str, chat_id: int) -> str:
 def _user_lock_key(user_id: int, key: str) -> str:
     normalized = str(key or "lock").strip() or "lock"
     return _USER_LOCK_KEY_TMPL.format(int(user_id), normalized)
+
+
+def _sora2_lock_key(user_id: int) -> str:
+    return _SORA2_LOCK_KEY_TMPL.format(int(user_id))
 
 if not _redis_url:
     _logger.warning(
@@ -360,6 +365,33 @@ def release_user_lock(user_id: Optional[int], key: str) -> None:
             _r.delete(lock_key)
         except Exception as exc:
             _logger.warning("user_lock.release_error | key=%s err=%s", lock_key, exc)
+    else:
+        _memory_delete(lock_key)
+
+
+def acquire_sora2_lock(user_id: Optional[int], ttl: int = 60) -> bool:
+    if not user_id:
+        return True
+    lock_key = _sora2_lock_key(int(user_id))
+    ttl_value = max(int(ttl), 1)
+    if _r:
+        try:
+            return bool(_r.set(lock_key, "1", nx=True, ex=ttl_value))
+        except Exception as exc:
+            _logger.warning("sora2.lock.acquire_error | key=%s err=%s", lock_key, exc)
+            return True
+    return _memory_set_if_absent(lock_key, "1", ttl_value)
+
+
+def release_sora2_lock(user_id: Optional[int]) -> None:
+    if not user_id:
+        return
+    lock_key = _sora2_lock_key(int(user_id))
+    if _r:
+        try:
+            _r.delete(lock_key)
+        except Exception as exc:
+            _logger.warning("sora2.lock.release_error | key=%s err=%s", lock_key, exc)
     else:
         _memory_delete(lock_key)
 
