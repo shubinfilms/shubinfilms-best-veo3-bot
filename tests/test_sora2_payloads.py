@@ -19,6 +19,7 @@ def bot_module(monkeypatch):
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
     monkeypatch.setenv("DATABASE_URL", "postgres://test")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://bot.example")
+    monkeypatch.setenv("SORA2_ENABLED", "true")
     monkeypatch.setenv("SORA2_API_KEY", "sora-key")
     module = importlib.import_module("bot")
     return importlib.reload(module)
@@ -109,9 +110,10 @@ def test_sora2_payload_text_to_video(monkeypatch, bot_module, ctx):
 
     def fake_create_task(payload):
         payloads.append(payload)
-        return "ttv-1"
+        return bot_module.CreateTaskResponse("ttv-1", {"taskId": "ttv-1"})
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
+    monkeypatch.setattr(bot_module, "_refresh_video_menu_ui", lambda *args, **kwargs: asyncio.sleep(0))
 
     state = bot_module.state(ctx)
     state["mode"] = "sora2_ttv"
@@ -132,12 +134,13 @@ def test_sora2_payload_text_to_video(monkeypatch, bot_module, ctx):
 
     assert payloads, "payload not built"
     payload = payloads[0]
-    assert payload["model"] == "sora-2-text-to-video"
+    assert payload["model"] == "sora2-text-to-video"
     assert payload["input"]["aspect_ratio"] == "4:5"
     assert payload["input"]["prompt"] == "Epic scene"
-    assert "quality" not in payload["input"]
+    assert payload["input"]["quality"] == "standard"
     assert "image_urls" not in payload["input"]
     assert saved_meta.get("extra", {}).get("image_urls") == []
+    assert saved_meta.get("extra", {}).get("submit_raw") == {"taskId": "ttv-1"}
     bot_module.ACTIVE_TASKS.clear()
 
 
@@ -156,7 +159,7 @@ def test_sora2_payload_image_to_video(monkeypatch, bot_module, ctx):
 
     def fake_create_task(payload):
         payloads.append(payload)
-        return "itv-42"
+        return bot_module.CreateTaskResponse("itv-42", {"taskId": "itv-42"})
 
     monkeypatch.setattr(bot_module, "sora2_create_task", fake_create_task)
 
@@ -187,11 +190,12 @@ def test_sora2_payload_image_to_video(monkeypatch, bot_module, ctx):
     assert upload_calls == [["https://img.one/a.png", "https://img.two/b.png"]]
     assert payloads, "payload not built"
     payload = payloads[0]
-    assert payload["model"] == "sora-2-image-to-video"
+    assert payload["model"] == "sora2-image-to-video"
     assert payload["input"]["aspect_ratio"] == "16:9"
     assert payload["input"].get("prompt", "") == ""
     assert payload["input"]["quality"] == "standard"
     assert payload["input"]["image_urls"] == ["https://uploads.example/0", "https://uploads.example/1"]
     assert saved_meta.get("extra", {}).get("image_urls") == payload["input"]["image_urls"]
+    assert saved_meta.get("extra", {}).get("submit_raw") == {"taskId": "itv-42"}
     bot_module.ACTIVE_TASKS.clear()
 

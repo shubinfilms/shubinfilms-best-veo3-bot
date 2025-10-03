@@ -51,23 +51,17 @@ def test_video_menu_keyboard_options():
     markup = bot_module.video_menu_kb()
     rows = markup.inline_keyboard
 
-    assert rows[0][0].text == (
-        f"🎬 Генерация видео (Veo Fast) — 💎 {bot_module.TOKEN_COSTS['veo_fast']}"
-    )
-    assert rows[0][0].callback_data == bot_module.CB_VIDEO_MODE_FAST
+    assert rows[0][0].text == "🎥 VEO"
+    assert rows[0][0].callback_data == bot_module.CB_VIDEO_ENGINE_VEO
 
-    assert rows[1][0].text == (
-        f"🎬 Генерация видео (Veo Quality) — 💎 {bot_module.TOKEN_COSTS['veo_quality']}"
+    assert "Sora2" in rows[1][0].text
+    assert rows[1][0].callback_data in (
+        bot_module.CB_VIDEO_ENGINE_SORA2,
+        bot_module.CB_VIDEO_ENGINE_SORA2_DISABLED,
     )
-    assert rows[1][0].callback_data == bot_module.CB_VIDEO_MODE_QUALITY
 
-    assert rows[2][0].text == (
-        f"🖼️ Оживить изображение (Veo) — 💎 {bot_module.TOKEN_COSTS['veo_photo']}"
-    )
-    assert rows[2][0].callback_data == bot_module.CB_VIDEO_MODE_PHOTO
-
-    assert rows[3][0].text == "⬅️ Назад"
-    assert rows[3][0].callback_data == bot_module.CB_VIDEO_BACK
+    assert rows[2][0].text == "⬅️ Назад"
+    assert rows[2][0].callback_data == bot_module.CB_VIDEO_BACK
 
 
 def test_menu_command_always_sends_welcome_block(monkeypatch):
