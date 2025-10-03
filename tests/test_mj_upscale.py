@@ -20,7 +20,9 @@ def bot_module(monkeypatch):
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
     monkeypatch.setenv("DATABASE_URL", "postgres://test")
     module = importlib.import_module("bot")
-    return importlib.reload(module)
+    module = importlib.reload(module)
+    module.mj_log.disabled = True
+    return module
 
 
 def _make_update(data: str, chat_id: int = 10, user_id: int = 20, markup=None):
@@ -32,7 +34,7 @@ def _make_update(data: str, chat_id: int = 10, user_id: int = 20, markup=None):
 
     query = SimpleNamespace(
         data=data,
-        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), reply_markup=markup),
+        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), reply_markup=markup, message_id=0),
         answer=answer,
         edit_message_reply_markup=edit_message_reply_markup,
         from_user=SimpleNamespace(id=user_id, language_code="ru"),
@@ -47,6 +49,14 @@ def _make_update(data: str, chat_id: int = 10, user_id: int = 20, markup=None):
 def test_handle_mj_upscale_menu_shows_select(monkeypatch, bot_module):
     grid = {"task_id": "grid", "result_urls": ["a", "b", "c"]}
     monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda grid_id: grid)
+    monkeypatch.setattr(
+        bot_module,
+        "get_mj_gallery",
+        lambda chat_id, message_id: [
+            {"source_url": "a", "file_name": "midjourney_01.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 1}
+            for _ in range(3)
+        ],
+    )
 
     global edit_calls
     edit_calls = []
@@ -67,6 +77,14 @@ def test_handle_mj_upscale_menu_shows_select(monkeypatch, bot_module):
 def test_handle_mj_upscale_menu_back_to_root(monkeypatch, bot_module):
     grid = {"task_id": "grid", "result_urls": ["a", "b"]}
     monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda grid_id: grid)
+    monkeypatch.setattr(
+        bot_module,
+        "get_mj_gallery",
+        lambda chat_id, message_id: [
+            {"source_url": "a", "file_name": "midjourney_01.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 1},
+            {"source_url": "b", "file_name": "midjourney_02.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 2},
+        ],
+    )
 
     global edit_calls
     edit_calls = []
@@ -78,8 +96,8 @@ def test_handle_mj_upscale_menu_back_to_root(monkeypatch, bot_module):
 
     assert edit_calls
     keyboard = edit_calls[0]
-    assert len(keyboard.inline_keyboard) == 1
-    assert keyboard.inline_keyboard[0][0].text == "Улучшить качество"
+    assert len(keyboard.inline_keyboard) == 3
+    assert keyboard.inline_keyboard[0][0].text == "✨ Улучшить качество"
 
 
 def test_handle_mj_upscale_choice_launches_task(monkeypatch, bot_module):
@@ -88,6 +106,15 @@ def test_handle_mj_upscale_choice_launches_task(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda name, ttl: True)
     release_calls: list[str] = []
     monkeypatch.setattr(bot_module, "release_ttl_lock", lambda name: release_calls.append(name))
+    monkeypatch.setattr(
+        bot_module,
+        "get_mj_gallery",
+        lambda chat_id, message_id: [
+            {"source_url": "a", "file_name": "midjourney_01.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 1},
+            {"source_url": "b", "file_name": "midjourney_02.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 2},
+            {"source_url": "c", "file_name": "midjourney_03.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 3},
+        ],
+    )
 
     launch_calls: list[dict[str, object]] = []
 
@@ -129,6 +156,13 @@ def test_handle_mj_upscale_choice_grid_missing(monkeypatch, bot_module):
     monkeypatch.setattr(bot_module, "acquire_ttl_lock", lambda *args, **kwargs: True)
     monkeypatch.setattr(bot_module, "release_ttl_lock", lambda *args: None)
     monkeypatch.setattr(bot_module, "_load_mj_grid_snapshot", lambda *_: None)
+    monkeypatch.setattr(
+        bot_module,
+        "get_mj_gallery",
+        lambda chat_id, message_id: [
+            {"source_url": "a", "file_name": "midjourney_01.jpeg", "bytes_len": 2048, "mime": "image/jpeg", "sent_message_id": 1}
+        ],
+    )
 
     sent_messages: list[tuple[int, str]] = []
 

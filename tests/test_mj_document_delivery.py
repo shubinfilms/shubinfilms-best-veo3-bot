@@ -20,7 +20,9 @@ def bot_module(monkeypatch):
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
     monkeypatch.setenv("DATABASE_URL", "postgres://test")
     module = importlib.import_module("bot")
-    return importlib.reload(module)
+    module = importlib.reload(module)
+    module.mj_log.disabled = True
+    return module
 
 
 def _make_ctx():
@@ -47,6 +49,11 @@ def test_grid_delivery_sends_documents_and_menu(monkeypatch, bot_module):
 
     monkeypatch.setattr(ctx.bot, "send_document", fake_send_document)
     monkeypatch.setattr(ctx.bot, "send_message", fake_send_message)
+    monkeypatch.setattr(
+        bot_module,
+        "_download_mj_image_bytes",
+        lambda url, index: (b"x" * (2048 + index), f"midjourney_{index:02d}.jpeg", "image/jpeg", url),
+    )
 
     def fake_save(grid_id, urls, *, prompt=None):
         saved_snapshots.append((grid_id, list(urls), prompt))
@@ -73,11 +80,11 @@ def test_grid_delivery_sends_documents_and_menu(monkeypatch, bot_module):
     assert delivered is True
     assert len(doc_calls) == 3
     assert [call["document"].filename for call in doc_calls] == [
-        "mj_01.jpg",
-        "mj_02.png",
-        "mj_03.jpg",
+        "midjourney_01.jpeg",
+        "midjourney_02.jpeg",
+        "midjourney_03.jpeg",
     ]
-    assert [call["document"].input_file_content.decode() for call in doc_calls] == urls
+    assert all(len(call["document"].input_file_content) > 1024 for call in doc_calls)
     assert menu_calls and menu_calls[0]["markup"].inline_keyboard[0][0].callback_data.startswith("mj.upscale.menu:")
     assert saved_snapshots == [("grid123", urls, "prompt text")]
 
@@ -126,6 +133,11 @@ def test_grid_delivery_handles_failed_documents(monkeypatch, bot_module):
 
     monkeypatch.setattr(ctx.bot, "send_message", noop_message)
     monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        bot_module,
+        "_download_mj_image_bytes",
+        lambda url, index: (b"y" * 2048, f"midjourney_{index:02d}.png", "image/png", url),
+    )
 
     delivered = asyncio.run(
         bot_module._deliver_mj_grid_documents(
@@ -153,6 +165,11 @@ def test_grid_delivery_returns_false_when_menu_fails(monkeypatch, bot_module):
     monkeypatch.setattr(ctx.bot, "send_document", fake_send_document)
     monkeypatch.setattr(ctx.bot, "send_message", failing_menu)
     monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        bot_module,
+        "_download_mj_image_bytes",
+        lambda url, index: (b"z" * 2048, f"midjourney_{index:02d}.png", "image/png", url),
+    )
 
     delivered = asyncio.run(
         bot_module._deliver_mj_grid_documents(

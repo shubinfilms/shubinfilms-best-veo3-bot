@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - optional import for type checking only
     from typing import TYPE_CHECKING
@@ -76,6 +76,8 @@ _MJ_LOCK_KEY_TMPL = f"{_PFX}:mj:lock:{{}}"
 _MJ_LOCK_TTL = 15 * 60
 _MENU_LOCK_KEY_TMPL = f"{_PFX}:menu:lock:{{}}:{{}}"
 _MENU_MSG_KEY_TMPL = f"{_PFX}:menu:msg:{{}}:{{}}"
+_MJ_GALLERY_KEY_TMPL = f"{_PFX}:mj:gallery:{{}}:{{}}"
+_MJ_GALLERY_TTL = 2 * 60 * 60
 
 
 def _menu_lock_key(name: str, chat_id: int) -> str:
@@ -152,6 +154,10 @@ def _mj_lock_key(user_id: int, task_id: str, index: int) -> str:
     return _MJ_LOCK_KEY_TMPL.format(f"{int(user_id)}:{task_id}:{int(index)}")
 
 
+def _mj_gallery_key(chat_id: int, message_id: int) -> str:
+    return _MJ_GALLERY_KEY_TMPL.format(int(chat_id), int(message_id))
+
+
 def set_last_mj_grid(
     user_id: int,
     task_id: str,
@@ -211,6 +217,66 @@ def get_last_mj_grid(user_id: int) -> Optional[Dict[str, Any]]:
     if prompt_value:
         result["prompt"] = prompt_value
     return result
+
+
+def set_mj_gallery(chat_id: int, message_id: int, payload: Sequence[Mapping[str, Any]]) -> None:
+    key = _mj_gallery_key(chat_id, message_id)
+    try:
+        data = json.dumps(list(payload), ensure_ascii=False)
+    except (TypeError, ValueError):
+        _logger.warning("Failed to serialize mj gallery payload for chat %s", chat_id)
+        return
+    if _r:
+        _r.setex(key, _MJ_GALLERY_TTL, data)
+    else:
+        _memory_set_with_ttl(key, data, _MJ_GALLERY_TTL)
+
+
+def get_mj_gallery(chat_id: int, message_id: int) -> Optional[list[dict[str, Any]]]:
+    key = _mj_gallery_key(chat_id, message_id)
+    raw: Optional[str]
+    if _r:
+        redis_raw = _r.get(key)
+        if redis_raw is None:
+            raw = None
+        elif isinstance(redis_raw, bytes):
+            raw = redis_raw.decode("utf-8", "ignore")
+        else:
+            raw = str(redis_raw)
+    else:
+        raw = _memory_get(key)
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        _logger.warning("Failed to decode mj gallery payload for chat %s", chat_id)
+        return None
+    if not isinstance(doc, list):
+        return None
+    result: list[dict[str, Any]] = []
+    for item in doc:
+        if not isinstance(item, dict):
+            continue
+        record = {
+            "file_name": str(item.get("file_name", "")),
+            "source_url": str(item.get("source_url", "")),
+            "bytes_len": int(item.get("bytes_len", 0) or 0),
+            "mime": str(item.get("mime", "")),
+            "sent_message_id": int(item.get("sent_message_id", 0) or 0),
+        }
+        result.append(record)
+    if not result:
+        return None
+    return result
+
+
+def clear_mj_gallery(chat_id: int, message_id: int) -> None:
+    key = _mj_gallery_key(chat_id, message_id)
+    if _r:
+        _r.delete(key)
+    else:
+        _memory_delete(key)
 
 
 def clear_last_mj_grid(user_id: int) -> None:

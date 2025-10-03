@@ -115,6 +115,11 @@ def test_mj_documents_sent_without_compression(monkeypatch, bot_module):
     monkeypatch.setattr(ctx.bot, "send_document", fake_send_document)
     monkeypatch.setattr(ctx.bot, "send_message", fake_send_message)
     monkeypatch.setattr(bot_module, "_save_mj_grid_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        bot_module,
+        "_download_mj_image_bytes",
+        lambda url, index: (b"x" * 2048, f"midjourney_{index:02d}.png", "image/png", url),
+    )
 
     delivered = asyncio.run(
         bot_module._deliver_mj_grid_documents(

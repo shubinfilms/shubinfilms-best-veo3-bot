@@ -16,7 +16,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata
 import threading
 import atexit
 from pathlib import Path
@@ -25,7 +25,7 @@ from collections.abc import Mapping
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, MutableMapping, Sequence, Mapping
 from datetime import datetime, timezone
 from contextlib import suppress
-from urllib.parse import urlparse, urlunparse, urlencode
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from dataclasses import dataclass
 
 import aiohttp
@@ -200,6 +200,8 @@ from redis_utils import (
     save_menu_message,
     get_menu_message,
     clear_menu_message,
+    set_mj_gallery,
+    get_mj_gallery,
 )
 
 from ledger import (
@@ -2663,14 +2665,40 @@ def _coerce_url_list(value) -> List[str]:
 
 
 _MJ_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+_MJ_MIN_VALID_BYTES = 1024
+_MJ_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+_MJ_DOWNLOAD_RETRY_COUNT = 2
+
+_MJ_SIGNED_QUERY_KEYS = {
+    "signature",
+    "expires",
+    "awsaccesskeyid",
+    "x-amz-signature",
+    "x-amz-expires",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-amz-date",
+    "token",
+    "sig",
+    "se",
+    "sp",
+    "sv",
+    "sr",
+    "skoid",
+    "sktid",
+    "skt",
+    "skv",
+    "st",
+}
 
 _MJ_UI_TEXTS = {
     "gallery_ready": {"ru": "Галерея сгенерирована.", "en": "Gallery generated."},
-    "repeat": {"ru": "Повторить", "en": "Repeat"},
-    "back": {"ru": "Назад в меню", "en": "Back to menu"},
+    "gallery_retry": {"ru": "🔁 Сгенерировать ещё", "en": "🔁 Generate more"},
+    "gallery_back": {"ru": "🏠 Назад в меню", "en": "🏠 Back to menu"},
+    "upscale_entry": {"ru": "✨ Улучшить качество", "en": "✨ Improve quality"},
     "upscale_choose": {
-        "ru": "Выберите кадр для апскейла:",
-        "en": "Pick a frame to upscale:",
+        "ru": "Выберите фотографию для апскейла:",
+        "en": "Pick a photo to upscale:",
     },
     "upscale_repeat": {
         "ru": "Повторить апскейл",
@@ -2836,25 +2864,32 @@ def _load_mj_grid_snapshot(grid_id: str) -> Optional[Dict[str, Any]]:
     return result
 
 
-def _mj_guess_extension(url: str, default: str = ".jpg") -> str:
+def _mj_guess_extension(url: str, default: str = ".jpeg") -> str:
     try:
         path = urlparse(url).path.lower()
     except Exception:
         return default
     for ext in (".jpeg", ".jpg", ".png", ".webp"):
         if path.endswith(ext):
-            if ext in {".jpeg", ".jpg"}:
-                return ".jpg"
             return ext
     return default
 
 
 def _mj_document_filename(index: int, url: Optional[str] = None, *, suffix: str = "") -> str:
     ext = _mj_guess_extension(url or "")
-    base = f"mj_{index:02d}"
+    if ext not in _MJ_ALLOWED_EXTENSIONS:
+        ext = ".jpeg"
+    base = f"midjourney_{index:02d}"
     if suffix:
         base = f"{base}_{suffix}"
-    return f"{base}{ext}"
+    normalized = unicodedata.normalize("NFKD", base)
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_only).strip("._")
+    if not sanitized:
+        sanitized = f"midjourney_{index:02d}"
+    if len(sanitized) > 60:
+        sanitized = sanitized[:60].rstrip("._-") or sanitized[:60]
+    return f"{sanitized}{ext}"
 
 
 def _mj_upscale_keyboard(count: int, locale: str, *, include_repeat: bool = False) -> InlineKeyboardMarkup:
@@ -2893,43 +2928,93 @@ def _guess_aspect_ratio_from_size(width: Optional[int], height: Optional[int]) -
 
 
 def _mj_guess_filename(url: str, index: int, content_type: Optional[str]) -> str:
-    try:
-        path = urlparse(url).path
-    except Exception:
-        path = ""
-    _, ext = os.path.splitext(path)
-    ext = ext.lower()
+    ext = _mj_guess_extension(url)
     if ext not in _MJ_ALLOWED_EXTENSIONS:
-        ext = _mj_content_type_extension(content_type) or ".jpg"
-    return f"midjourney_{index + 1:02d}{ext}"
+        ext = _mj_content_type_extension(content_type) or ".jpeg"
+    return _mj_document_filename(index + 1, suffix="", url=f"dummy{ext}")
 
 
-def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str]]:
+def _normalize_mj_url(url: str) -> str:
     try:
-        resp = requests.get(url, timeout=60)
-    except requests.RequestException as exc:
-        mj_log.warning(
-            "mj.album.download_fail",
-            extra={"meta": {"url": url, "index": index, "error": str(exc)}},
-        )
-        return None
-    if resp.status_code != 200:
-        mj_log.warning(
-            "mj.album.download_fail",
-            extra={
-                "meta": {"url": url, "index": index, "status": resp.status_code},
-            },
-        )
-        return None
-    data = resp.content
-    if not data:
-        mj_log.warning(
-            "mj.album.download_fail",
-            extra={"meta": {"url": url, "index": index, "reason": "empty"}},
-        )
-        return None
-    filename = _mj_guess_filename(url, index, resp.headers.get("Content-Type"))
-    return data, filename
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    query_items = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in _MJ_SIGNED_QUERY_KEYS or lowered.startswith("x-amz-"):
+            query_items.append((key, value))
+        elif lowered in {"width", "height", "format", "quality", "updated", "v", "cb"}:
+            continue
+        else:
+            query_items.append((key, value))
+    normalized_query = urlencode(query_items, doseq=True)
+    sanitized = parsed._replace(query=normalized_query)
+    return urlunparse(sanitized)
+
+
+def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str, str, str]]:
+    normalized_url = _normalize_mj_url(url)
+    last_error: Optional[str] = None
+    for attempt in range(_MJ_DOWNLOAD_RETRY_COUNT + 1):
+        headers: Dict[str, str] = {}
+        request_url = normalized_url
+        if attempt:
+            headers["Cache-Control"] = "no-cache"
+            try:
+                parsed = urlparse(normalized_url)
+                existing = parse_qsl(parsed.query, keep_blank_values=True)
+                existing.append(("r", uuid.uuid4().hex))
+                request_url = urlunparse(parsed._replace(query=urlencode(existing)))
+            except Exception:
+                request_url = normalized_url
+        try:
+            resp = requests.get(request_url, timeout=15, headers=headers)
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            mj_log.warning(
+                "mj.album.download_fail",
+                extra={"meta": {"url": request_url, "index": index, "error": str(exc)}},
+            )
+            continue
+        if resp.status_code != 200:
+            last_error = f"status:{resp.status_code}"
+            mj_log.warning(
+                "mj.album.download_fail",
+                extra={
+                    "meta": {"url": request_url, "index": index, "status": resp.status_code},
+                },
+            )
+            continue
+        data = resp.content or b""
+        if len(data) <= _MJ_MIN_VALID_BYTES:
+            last_error = f"payload_too_small:{len(data)}"
+            mj_log.warning(
+                "mj.album.download_retry",
+                extra={
+                    "meta": {
+                        "url": request_url,
+                        "index": index,
+                        "reason": "small_payload",
+                        "bytes": len(data),
+                        "attempt": attempt,
+                    }
+                },
+            )
+            continue
+        content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if not content_type:
+            content_type = "application/octet-stream"
+        filename = _mj_guess_filename(normalized_url, index - 1, content_type)
+        return data, filename, content_type, normalized_url
+
+    mj_log.warning(
+        "mj.album.download_fail_final",
+        extra={"meta": {"url": normalized_url, "index": index, "error": last_error or "unknown"}},
+    )
+    return None
 
 
 
@@ -3162,12 +3247,52 @@ async def _deliver_mj_grid_documents(
     )
 
     sent_count = 0
+    gallery_payload: List[Dict[str, Any]] = []
     for index, url in enumerate(normalized, start=1):
-        filename = _mj_document_filename(index, url)
+        download = await asyncio.to_thread(_download_mj_image_bytes, url, index)
+        if not download:
+            await ctx.bot.send_message(
+                chat_id,
+                "Не удалось получить файл, пробуем ещё раз.",
+            )
+            mj_log.warning(
+                "mj.grid.document_empty",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "grid_id": grid_id,
+                        "index": index,
+                        "reason": "download_failed",
+                    }
+                },
+            )
+            continue
+
+        data, filename, mime, source_url = download
+        if len(data) > _MJ_MAX_DOCUMENT_BYTES:
+            await ctx.bot.send_message(
+                chat_id,
+                "Файл слишком большой для отправки в Telegram документом, попробуйте другой запрос/соотношение сторон.",
+            )
+            mj_log.warning(
+                "mj.grid.document_too_large",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "grid_id": grid_id,
+                        "index": index,
+                        "filename": filename,
+                        "bytes": len(data),
+                    }
+                },
+            )
+            continue
         start_ts = time.monotonic()
         try:
-            document = InputFile(url, filename)
-            await ctx.bot.send_document(
+            document = InputFile(io.BytesIO(data), filename=filename)
+            message = await ctx.bot.send_document(
                 chat_id,
                 document=document,
             )
@@ -3190,6 +3315,16 @@ async def _deliver_mj_grid_documents(
             continue
 
         sent_count += 1
+        sent_message_id = getattr(message, "message_id", 0)
+        gallery_payload.append(
+            {
+                "file_name": filename,
+                "source_url": source_url,
+                "bytes_len": len(data),
+                "mime": mime,
+                "sent_message_id": int(sent_message_id or 0),
+            }
+        )
         duration_ms = int((time.monotonic() - start_ts) * 1000)
         mj_log.info(
             "mj.grid.document_sent",
@@ -3200,6 +3335,7 @@ async def _deliver_mj_grid_documents(
                     "grid_id": grid_id,
                     "index": index,
                     "filename": filename,
+                    "bytes": len(data),
                     "duration_ms": duration_ms,
                 }
             },
@@ -3209,10 +3345,11 @@ async def _deliver_mj_grid_documents(
         return False
 
     keyboard = mj_upscale_root_keyboard(grid_id)
+    locale = state(ctx).get("mj_locale") or "ru"
     try:
-        await ctx.bot.send_message(
+        gallery_message = await ctx.bot.send_message(
             chat_id,
-            "Выберите изображение для улучшения качества:",
+            _mj_ui_text("gallery_ready", locale),
             reply_markup=keyboard,
         )
     except Exception as exc:
@@ -3228,6 +3365,13 @@ async def _deliver_mj_grid_documents(
             },
         )
         return False
+
+    if gallery_payload:
+        set_mj_gallery(
+            chat_id,
+            getattr(gallery_message, "message_id", 0),
+            gallery_payload,
+        )
 
     _save_mj_grid_snapshot(grid_id, normalized, prompt=prompt)
 
@@ -9418,6 +9562,25 @@ async def handle_mj_upscale_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     chat = update.effective_chat or (message.chat if message else None)
     chat_id = getattr(chat, "id", None)
 
+    if chat_id is not None and message is not None:
+        gallery = get_mj_gallery(chat_id, message.message_id)
+        if not gallery:
+            await ctx.bot.send_message(
+                chat_id,
+                "Срок действия галереи истёк. Сгенерируйте новый запрос.",
+            )
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "grid_id": grid_id,
+                        "reason": "gallery_missing",
+                    }
+                },
+            )
+            return
+
     grid = _load_mj_grid_snapshot(grid_id)
     if not grid:
         if chat_id is not None:
@@ -9447,7 +9610,16 @@ async def handle_mj_upscale_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     markup = getattr(message, "reply_markup", None)
     inline_keyboard = getattr(markup, "inline_keyboard", None) if markup else None
-    show_select = not inline_keyboard or len(inline_keyboard) <= 1
+    show_select = True
+    if inline_keyboard:
+        for row in inline_keyboard:
+            for btn in row:
+                callback_data = getattr(btn, "callback_data", None)
+                if isinstance(callback_data, str) and callback_data.startswith("mj.upscale:"):
+                    show_select = False
+                    break
+            if not show_select:
+                break
 
     try:
         if show_select:
@@ -9542,6 +9714,39 @@ async def handle_mj_upscale_choice(update: Update, ctx: ContextTypes.DEFAULT_TYP
                 await ctx.bot.send_message(chat_id, "⚠️ Не удалось определить пользователя для апскейла.")
             return
 
+        gallery = get_mj_gallery(chat_id, message.message_id) if message is not None else None
+        if not gallery:
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "grid_id": grid_id,
+                        "index": index_value,
+                        "reason": "gallery_missing",
+                    }
+                },
+            )
+            await ctx.bot.send_message(chat_id, "Срок действия галереи истёк. Сгенерируйте новый запрос.")
+            return
+        if index_value <= 0 or index_value > len(gallery):
+            mj_log.warning(
+                "mj.upscale.error",
+                extra={
+                    "meta": {
+                        "chat_id": chat_id,
+                        "grid_id": grid_id,
+                        "index": index_value,
+                        "reason": "gallery_index_out_of_range",
+                    }
+                },
+            )
+            await ctx.bot.send_message(chat_id, "⚠️ Эта фотография недоступна для апскейла.")
+            return
+
+        gallery_entry = gallery[index_value - 1]
+        source_url = gallery_entry.get("source_url")
+
         grid = _load_mj_grid_snapshot(grid_id)
         if not grid:
             mj_log.warning(
@@ -9585,6 +9790,7 @@ async def handle_mj_upscale_choice(update: Update, ctx: ContextTypes.DEFAULT_TYP
                     "user_id": user_id,
                     "grid_id": grid_id,
                     "index": index_value,
+                    "source_url": source_url,
                 }
             },
         )
@@ -9614,6 +9820,50 @@ async def handle_mj_upscale_choice(update: Update, ctx: ContextTypes.DEFAULT_TYP
             )
     finally:
         release_ttl_lock(lock_key)
+
+
+async def handle_mj_gallery_repeat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    prefix, _, _ = query.data.partition(":")
+    if prefix != "mj.gallery.again":
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    chat = update.effective_chat
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
+
+    user = update.effective_user
+    locale = state(ctx).get("mj_locale") or _determine_user_locale(user)
+    s = state(ctx)
+    s["mj_locale"] = locale
+    s["mode"] = "mj_txt"
+    await show_mj_format_card(chat_id, ctx)
+
+
+async def handle_mj_gallery_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    if query.data != "mj.gallery.back":
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    await handle_menu(update, ctx)
+
 async def _handle_mj_upscale_input(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -13975,6 +14225,8 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (rf"^{CB_VIDEO_MENU}$", video_menu_callback),
     (r"^video:", video_menu_callback),
+    (r"^mj\.gallery\.again:", handle_mj_gallery_repeat),
+    (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
     (r"^hub:", hub_router),

@@ -130,21 +130,42 @@ def suno_start_disabled_keyboard() -> InlineKeyboardMarkup:
 
 
 def mj_upscale_root_keyboard(grid_id: str) -> InlineKeyboardMarkup:
-    button = InlineKeyboardButton(
-        "Улучшить качество",
-        callback_data=f"mj.upscale.menu:{grid_id}",
-    )
-    return InlineKeyboardMarkup([[button]])
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "✨ Улучшить качество",
+                callback_data=f"mj.upscale.menu:{grid_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔁 Сгенерировать ещё",
+                callback_data=f"mj.gallery.again:{grid_id}",
+            )
+        ],
+        [InlineKeyboardButton("🏠 Назад в меню", callback_data="mj.gallery.back")],
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 def mj_upscale_select_keyboard(grid_id: str, *, count: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     safe_count = max(int(count), 0)
     for idx in range(1, safe_count + 1):
+        if idx == 1:
+            title = "Первая фотография"
+        elif idx == 2:
+            title = "Вторая фотография"
+        elif idx == 3:
+            title = "Третья фотография"
+        elif idx == 4:
+            title = "Четвёртая фотография"
+        else:
+            title = f"{idx}-я фотография"
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"{idx}-я фотка",
+                    title,
                     callback_data=f"mj.upscale:{grid_id}:{idx}",
                 )
             ]
