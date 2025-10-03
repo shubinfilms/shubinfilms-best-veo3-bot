@@ -680,6 +680,8 @@ class SunoClient:
         instrumental: bool,
         has_lyrics: bool,
         lyrics: Optional[str],
+        style: Optional[str] = None,
+        lyrics_source: Optional[str] = None,
         prompt_len: int = 16,
         model: Optional[str] = None,
         call_back_url: Optional[str] = None,
@@ -695,17 +697,28 @@ class SunoClient:
         if not callback_url or not callback_secret:
             raise SunoClientError("Suno callback configuration missing", status=422)
         title_text = str(title or "").strip()
-        prompt_text = str(prompt or "").strip()
-        if not prompt_text:
+        style_text = str(style or "").strip()
+        source_label = str(lyrics_source or "").strip().lower()
+        user_lyrics_mode = bool(has_lyrics) and source_label not in {"ai", ""}
+        if bool(has_lyrics) and source_label in {"", None}:
+            user_lyrics_mode = True
+        prompt_text_raw = str(prompt or "")
+        if user_lyrics_mode:
+            prompt_text_raw = str(lyrics if lyrics is not None else prompt_text_raw)
+        prompt_text = prompt_text_raw
+        if not str(prompt_text).strip():
             prompt_text = title_text or "Untitled track"
         if not title_text:
-            title_text = prompt_text or "Untitled track"
+            title_text = str(prompt_text or "Untitled track").strip() or "Untitled track"
         try:
             prompt_length = max(1, int(prompt_len))
         except (TypeError, ValueError):
             prompt_length = 16
         normalized_tags = self._normalize_tags(tags)
         normalized_negative_tags = self._normalize_tags(negative_tags)
+        if not normalized_tags and style_text:
+            style_parts = re.split(r"[\s,;/\\|]+", style_text)
+            normalized_tags = self._normalize_tags(style_parts)
         preset_cfg = get_preset_config(preset)
         if preset_cfg:
             if not normalized_tags:
@@ -727,20 +740,27 @@ class SunoClient:
         if not normalized_tags:
             normalized_tags = self._derive_tags_from_prompt(prompt_text, instrumental=instrumental)
         model_name = self._normalize_model(model)
+        instrumental_mode = bool(instrumental)
+        custom_mode = user_lyrics_mode or instrumental_mode
         payload: dict[str, Any] = {
             "model": model_name,
             "title": title_text,
             "prompt": prompt_text,
-            "instrumental": bool(instrumental),
+            "instrumental": instrumental_mode,
             "has_lyrics": bool(has_lyrics),
             "lyrics": str(lyrics or "") if has_lyrics else "",
             "tags": normalized_tags,
             "negativeTags": normalized_negative_tags,
             "prompt_len": prompt_length,
-            "customMode": False,
+            "customMode": custom_mode,
             "userId": str(user_id),
             "callBackUrl": callback_url,
         }
+        if style_text:
+            payload["style"] = style_text
+        if user_lyrics_mode:
+            payload.setdefault("instrumental", False)
+            payload["customMode"] = True
         return payload
 
     def enqueue(
@@ -796,6 +816,8 @@ class SunoClient:
         instrumental: bool,
         has_lyrics: bool,
         lyrics: Optional[str],
+        style: Optional[str] = None,
+        lyrics_source: Optional[str] = None,
         prompt_len: int = 16,
         model: Optional[str] = None,
         req_id: Optional[str] = None,
@@ -812,6 +834,8 @@ class SunoClient:
             instrumental=instrumental,
             has_lyrics=has_lyrics,
             lyrics=lyrics,
+            style=style,
+            lyrics_source=lyrics_source,
             prompt_len=prompt_len,
             model=model,
             call_back_url=call_back_url,
@@ -837,6 +861,13 @@ class SunoClient:
         has_lyrics = bool(payload.get("has_lyrics") or payload.get("lyrics"))
         instrumental = bool(payload.get("instrumental"))
         lyrics_value = payload.get("lyrics") if has_lyrics else None
+        lyrics_source_value = None
+        if isinstance(payload, Mapping):
+            lyrics_source_value = (
+                payload.get("lyrics_source")
+                or payload.get("lyricsSource")
+                or payload.get("lyrics-source")
+            )
         try:
             prompt_length = int(payload.get("prompt_len") or 16)
         except (TypeError, ValueError):
@@ -878,6 +909,8 @@ class SunoClient:
             instrumental=instrumental,
             has_lyrics=has_lyrics,
             lyrics=str(lyrics_value) if lyrics_value is not None else None,
+            style=style if style else None,
+            lyrics_source=str(lyrics_source_value) if lyrics_source_value is not None else None,
             prompt_len=prompt_length,
             model=str(model_value) if model_value is not None else None,
             tags=normalized_tags_value,

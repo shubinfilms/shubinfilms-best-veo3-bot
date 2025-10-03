@@ -9,13 +9,35 @@ import hashlib
 import html
 import re
 
+from settings import SUNO_MODEL
 from suno.client import get_preset_config
 from utils.suno_modes import get_mode_config as get_suno_mode_config
 
 
 TITLE_MAX_LENGTH = 300
 STYLE_MAX_LENGTH = 500
-LYRICS_MAX_LENGTH = 8000
+
+
+_MODEL_LYRICS_LIMITS: dict[str, int] = {
+    "V5": 5000,
+    "V4_5": 5000,
+    "V4_5PLUS": 5000,
+    "V4": 3000,
+    "V3_5": 3000,
+}
+
+
+def lyrics_limit_for_model(model: str) -> int:
+    """Return the maximum lyrics length allowed for the given model."""
+
+    normalized = (model or "").strip().upper()
+    if normalized in _MODEL_LYRICS_LIMITS:
+        return _MODEL_LYRICS_LIMITS[normalized]
+    # Default to the strictest historical limit to avoid API rejection.
+    return 3000
+
+
+LYRICS_MAX_LENGTH = lyrics_limit_for_model(SUNO_MODEL)
 LYRICS_PREVIEW_LIMIT = 160
 _STORAGE_KEY = "suno_state"
 
@@ -431,14 +453,14 @@ def build_generation_payload(
         payload.pop("lyrics", None)
     if lang:
         payload["lang"] = lang
-    if state.style:
-        payload["prompt"] = state.style
-    elif (
+    if (
         state.mode == "lyrics"
         and state.lyrics_source == LyricsSource.USER
         and state.lyrics
     ):
         payload["prompt"] = state.lyrics
+    elif state.style:
+        payload["prompt"] = state.style
     elif state.title:
         payload["prompt"] = state.title
     if state.preset:
@@ -509,6 +531,7 @@ __all__ = [
     "LYRICS_PREVIEW_LIMIT",
     "STYLE_MAX_LENGTH",
     "TITLE_MAX_LENGTH",
+    "lyrics_limit_for_model",
     "LyricsSource",
     "SunoState",
     "build_generation_payload",

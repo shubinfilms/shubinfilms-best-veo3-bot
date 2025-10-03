@@ -228,7 +228,7 @@ def test_payload_shape_v5(monkeypatch, requests_mock):
     assert body["prompt"] == "lyrics"
     assert body["title"] == "Title"
     assert body["instrumental"] is True
-    assert body["customMode"] is False
+    assert body["customMode"] is True
     assert body["negativeTags"] == []
     assert body["tags"] == ["lyrics"]
 
@@ -559,6 +559,8 @@ def test_suno_service_records_request_id(monkeypatch):
             instrumental: bool,
             has_lyrics: bool,
             lyrics: Optional[str],
+            style: Optional[str] = None,
+            lyrics_source: Optional[str] = None,
             prompt_len: int = 16,
             model: Optional[str] = None,
             call_back_url: Optional[str] = None,
@@ -574,10 +576,12 @@ def test_suno_service_records_request_id(monkeypatch):
                 "instrumental": instrumental,
                 "has_lyrics": has_lyrics,
                 "lyrics": lyrics or "",
+                "style": style or "",
+                "lyrics_source": lyrics_source,
                 "tags": list(tags or ["demo"]),
                 "negativeTags": list(negative_tags or []),
                 "prompt_len": prompt_len,
-                "customMode": False,
+                "customMode": bool(instrumental or has_lyrics),
                 "userId": user_id,
                 "callBackUrl": call_back_url or "https://callback.example/suno",
             }
@@ -617,6 +621,8 @@ def test_suno_service_assigns_task_id_when_request_missing():
             instrumental: bool,
             has_lyrics: bool,
             lyrics: Optional[str],
+            style: Optional[str] = None,
+            lyrics_source: Optional[str] = None,
             prompt_len: int = 16,
             model: Optional[str] = None,
             call_back_url: Optional[str] = None,
@@ -632,10 +638,12 @@ def test_suno_service_assigns_task_id_when_request_missing():
                 "instrumental": instrumental,
                 "has_lyrics": has_lyrics,
                 "lyrics": lyrics or "",
+                "style": style or "",
+                "lyrics_source": lyrics_source,
                 "tags": list(tags or ["demo"]),
                 "negativeTags": list(negative_tags or []),
                 "prompt_len": prompt_len,
-                "customMode": False,
+                "customMode": bool(instrumental or has_lyrics),
                 "userId": user_id,
                 "callBackUrl": call_back_url or "https://callback.example/suno",
             }
@@ -707,7 +715,7 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
     sent_body = requests_mock.last_request.json()
     assert sent_body["prompt"] == "Test instrumental track"
     assert sent_body["instrumental"] is True
-    assert sent_body["customMode"] is False
+    assert sent_body["customMode"] is True
     assert sent_body["negativeTags"] == []
     assert sent_body["tags"] == ["ambient"]
 
@@ -736,6 +744,73 @@ def test_suno_service_generates_and_handles_callback(monkeypatch, requests_mock)
     assert audio_calls and audio_calls[0]["audio_url"] == "https://cdn.example.com/test.mp3"
 
 
+def test_callback_records_prompt_match_for_user_lyrics(monkeypatch, requests_mock):
+    _setup_client_env(monkeypatch)
+    requests_mock.post(
+        "https://api.example.com/api/v1/generate",
+        json={"taskId": "task-user-lyrics"},
+    )
+    service = SunoService(
+        client=SunoClient(base_url="https://api.example.com", token="token"),
+        redis=None,
+        telegram_token="dummy",
+    )
+
+    monkeypatch.setattr(service, "_send_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_send_cover_url", lambda **kwargs: (True, None))
+    monkeypatch.setattr(service, "_send_audio_url_with_retry", lambda **kwargs: (True, None))
+    monkeypatch.setattr(service, "_log_delivery", lambda *args, **kwargs: None)
+
+    lyrics_text = "Verse one\nVerse two"
+    task = service.start_music(
+        10,
+        11,
+        title="User Lyrics",
+        style="Dream pop",
+        lyrics=lyrics_text,
+        instrumental=False,
+        user_id=55,
+        prompt=lyrics_text,
+        req_id="req-user-lyrics",
+        has_lyrics=True,
+        lyrics_source="user",
+    )
+
+    assert task.task_id == "task-user-lyrics"
+    sent_payload = requests_mock.last_request.json()
+    assert sent_payload["prompt"] == lyrics_text
+    assert sent_payload["customMode"] is True
+    assert sent_payload.get("style") == "Dream pop"
+
+    envelope = CallbackEnvelope(
+        code=200,
+        msg="ok",
+        data={
+            "taskId": "task-user-lyrics",
+            "callbackType": "complete",
+            "response": {
+                "tracks": [
+                    {
+                        "id": "take-1",
+                        "audioUrl": "https://cdn.example.com/user.mp3",
+                        "prompt": lyrics_text,
+                    }
+                ]
+            },
+        },
+    )
+
+    monkeypatch.setattr(service, "_delete_user_link", lambda task_id: None)
+    monkeypatch.setattr(service, "_delete_mapping", lambda task_id: None)
+    service.handle_callback(SunoTask.from_envelope(envelope), req_id="req-user-lyrics")
+    record = service._load_task_record("task-user-lyrics")
+    assert record is not None
+    assert record.get("lyrics_prompt_match") is True
+    assert record["tracks"]
+    assert record["tracks"][0].get("prompt") == lyrics_text
+    assert record["tracks"][0].get("prompt_match") is True
+
+
 def test_callback_restores_missing_req_id(monkeypatch):
     class FakeClient:
         def __init__(self, task_id: str):
@@ -750,6 +825,8 @@ def test_callback_restores_missing_req_id(monkeypatch):
             instrumental: bool,
             has_lyrics: bool,
             lyrics: Optional[str],
+            style: Optional[str] = None,
+            lyrics_source: Optional[str] = None,
             prompt_len: int = 16,
             model: Optional[str] = None,
             call_back_url: Optional[str] = None,
@@ -765,10 +842,12 @@ def test_callback_restores_missing_req_id(monkeypatch):
                 "instrumental": instrumental,
                 "has_lyrics": has_lyrics,
                 "lyrics": lyrics or "",
+                "style": style or "",
+                "lyrics_source": lyrics_source,
                 "tags": list(tags or ["demo"]),
                 "negativeTags": list(negative_tags or []),
                 "prompt_len": prompt_len,
-                "customMode": False,
+                "customMode": bool(instrumental or has_lyrics),
                 "userId": user_id,
                 "callBackUrl": call_back_url or "https://callback.example/suno",
             }
