@@ -16,7 +16,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 configure_logging("bot")
 log_environment(logging.getLogger("bot"))
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, io, html, sys, math, random, copy
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy
 import threading
 import atexit
 from pathlib import Path
@@ -33,7 +33,7 @@ from aiohttp import ClientError, ClientResponseError, ClientTimeout
 import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, LabeledPrice, InputMediaPhoto, ReplyKeyboardMarkup,
+    InputFile, LabeledPrice, ReplyKeyboardMarkup,
     KeyboardButton, BotCommand, User, Message
 )
 from telegram.constants import ParseMode, ChatAction
@@ -270,7 +270,6 @@ from telegram_utils import (
     safe_edit,
     safe_edit_text,
     safe_send_document,
-    safe_send_media_group,
     safe_send_photo,
     safe_send_text,
     safe_send_placeholder,
@@ -661,7 +660,7 @@ _SUNO_REFUND_MEMORY: Dict[str, float] = {}
 
 _SUNO_STRICT_ENABLED = bool(_env_bool("SUNO_STRICT_LYRICS_ENABLED", True))
 _SUNO_LYRICS_RETRY_THRESHOLD = max(0.0, min(1.0, _env_float("SUNO_LYRICS_RETRY_THRESHOLD", 0.75)))
-_SUNO_LYRICS_MAXLEN = max(1, _env_int("SUNO_LYRICS_MAXLEN", 2000))
+_SUNO_LYRICS_MAXLEN = max(1, _env_int("SUNO_LYRICS_MAXLEN", 8000))
 _SUNO_LYRICS_STRICT_TEMPERATURE = max(0.0, _env_float("SUNO_LYRICS_STRICT_TEMPERATURE", 0.3))
 _SUNO_LYRICS_STRICT_FLAG = _env("SUNO_LYRICS_STRICT_FLAG", "").strip()
 _SUNO_LYRICS_SEED_RAW = _env("SUNO_LYRICS_SEED", "").strip()
@@ -2725,6 +2724,27 @@ def _mj_guess_filename(url: str, index: int, content_type: Optional[str]) -> str
     return f"midjourney_{index + 1:02d}{ext}"
 
 
+def _mj_sanitize_task_id(task_id: Optional[str]) -> str:
+    if not isinstance(task_id, str):
+        return "task"
+    cleaned = re.sub(r"[^0-9a-zA-Z_-]+", "_", task_id.strip())
+    cleaned = cleaned.strip("_")
+    if not cleaned:
+        return "task"
+    return cleaned[:60]
+
+
+def _mj_document_filename(
+    task_id: Optional[str], index: int, original_filename: str
+) -> str:
+    safe_task = _mj_sanitize_task_id(task_id)
+    _, ext = os.path.splitext(original_filename or "")
+    ext = ext.lower()
+    if ext not in _MJ_ALLOWED_EXTENSIONS:
+        ext = ".png"
+    return f"midjourney_{safe_task}_{index:02d}{ext}"
+
+
 def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str]]:
     try:
         resp = requests.get(url, timeout=60)
@@ -2752,12 +2772,6 @@ def _download_mj_image_bytes(url: str, index: int) -> Optional[Tuple[bytes, str]
     filename = _mj_guess_filename(url, index, resp.headers.get("Content-Type"))
     return data, filename
 
-
-def _make_input_photo(data: bytes, filename: str) -> InputFile:
-    buffer = io.BytesIO(data)
-    buffer.name = filename
-    buffer.seek(0)
-    return InputFile(buffer, filename=filename)
 
 
 def _trim_caption_text(text: str, limit: int = 1024) -> str:
@@ -2974,6 +2988,7 @@ async def _deliver_mj_media(
     task_id: Optional[str] = None,
 ) -> bool:
     prepared: list[dict[str, Any]] = []
+    _ = send_as_album
     for data, filename in items:
         if not data:
             continue
@@ -2982,151 +2997,59 @@ async def _deliver_mj_media(
     if not prepared:
         return False
 
-    total = len(prepared)
     trimmed_caption = _trim_caption_text(caption)
     caption_sent = False
     sent_any = False
 
-    async def _send_single_items(
-        payload: Sequence[dict[str, Any]], *, allow_caption: bool
-    ) -> None:
-        nonlocal caption_sent, sent_any
-        for offset, item in enumerate(payload):
-            photo_caption = (
-                trimmed_caption if allow_caption and not caption_sent and offset == 0 else None
+    for index, item in enumerate(prepared, start=1):
+        doc_caption = trimmed_caption if not caption_sent else None
+        start_ts = time.monotonic()
+        document_name = _mj_document_filename(task_id, index, item["filename"])
+        try:
+            message = await send_image_as_document(
+                bot,
+                chat_id,
+                item["data"],
+                document_name,
+                caption=doc_caption,
             )
-            photo_start = time.monotonic()
-            try:
-                message = await safe_send_photo(
-                    bot,
-                    chat_id=chat_id,
-                    photo=_make_input_photo(item["data"], item["filename"]),
-                    caption=photo_caption,
-                    kind="mj_photo",
-                )
-            except Exception as exc:
-                duration_ms = int((time.monotonic() - photo_start) * 1000)
-                mj_log.warning(
-                    "mj.send.photo.fail",
-                    extra={
-                        "meta": {
-                            "user_id": user_id,
-                            "chat_id": chat_id,
-                            "size": item["size"],
-                            "duration_ms": duration_ms,
-                            "error": str(exc),
-                            "task_id": task_id,
-                        }
-                    },
-                )
-                continue
-
-            duration_ms = int((time.monotonic() - photo_start) * 1000)
-            message_id = getattr(message, "message_id", None)
-            caption_sent = caption_sent or photo_caption is not None
-            sent_any = True
-            mj_log.info(
-                "mj.send.photo.ok",
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - start_ts) * 1000)
+            mj_log.warning(
+                "mj.send.document.fail",
                 extra={
                     "meta": {
                         "user_id": user_id,
                         "chat_id": chat_id,
-                        "message_id": message_id,
+                        "task_id": task_id,
+                        "filename": document_name,
                         "size": item["size"],
                         "duration_ms": duration_ms,
-                        "task_id": task_id,
+                        "error": str(exc),
                     }
                 },
             )
+            continue
 
-    def _chunk_album(items_list: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-        chunks = [list(items_list[i : i + 10]) for i in range(0, len(items_list), 10)]
-        if len(chunks) >= 2 and len(chunks[-1]) == 1:
-            donor = chunks[-2]
-            if len(donor) >= 2:
-                last_item = chunks[-1][0]
-                moved = donor.pop()
-                chunks[-1] = [moved, last_item]
-        return chunks
-
-    if send_as_album and total >= 2:
-        chunks = _chunk_album(prepared)
-        album_message_ids: list[int] = []
-        for chunk_index, chunk in enumerate(chunks):
-            chunk_caption = trimmed_caption if not caption_sent else None
-            media_group = build_photo_album_media(
-                [_make_input_photo(item["data"], item["filename"]) for item in chunk],
-                caption=chunk_caption,
-            )
-            start_ts = time.monotonic()
-            try:
-                messages = await safe_send_media_group(
-                    bot,
-                    chat_id=chat_id,
-                    media=media_group,
-                    kind="mj_media_group",
-                )
-            except Exception as exc:
-                error_code = (
-                    getattr(exc, "error_code", None)
-                    or getattr(exc, "code", None)
-                    or getattr(exc, "status_code", None)
-                )
-                mj_log.warning(
-                    "mj.album.fallback_single",
-                    extra={
-                        "meta": {
-                            "user_id": user_id,
-                            "chat_id": chat_id,
-                            "task_id": task_id,
-                            "count": total,
-                            "chunks": len(chunks),
-                            "error_code": error_code,
-                            "error_desc": str(exc),
-                        }
-                    },
-                )
-                remaining = [item for part in chunks[chunk_index:] for item in part]
-                if remaining:
-                    await _send_single_items(remaining, allow_caption=not caption_sent)
-                return sent_any
-
-            duration_ms = int((time.monotonic() - start_ts) * 1000)
-            caption_sent = caption_sent or chunk_caption is not None
-            sent_any = True
-            message_ids = [getattr(msg, "message_id", None) for msg in (messages or [])]
-            album_message_ids.extend(message_ids)
-            mj_log.info(
-                "mj.album.chunk",
-                extra={
-                    "meta": {
-                        "user_id": user_id,
-                        "chat_id": chat_id,
-                        "task_id": task_id,
-                        "chunk_index": chunk_index,
-                        "chunk_size": len(chunk),
-                        "duration_ms": duration_ms,
-                    }
-                },
-            )
-
+        duration_ms = int((time.monotonic() - start_ts) * 1000)
+        message_id = getattr(message, "message_id", None)
+        caption_sent = caption_sent or doc_caption is not None
+        sent_any = True
         mj_log.info(
-            "mj.album.sent",
+            "mj.send.document.ok",
             extra={
                 "meta": {
                     "user_id": user_id,
                     "chat_id": chat_id,
                     "task_id": task_id,
-                    "count": total,
-                    "chunks": len(chunks),
-                    "caption_len": len(trimmed_caption),
-                    "message_ids": album_message_ids,
+                    "message_id": message_id,
+                    "filename": document_name,
+                    "size": item["size"],
+                    "duration_ms": duration_ms,
                 }
             },
         )
-        return True
 
-    await _send_single_items(prepared, allow_caption=True)
     return sent_any
 
 
@@ -3773,6 +3696,13 @@ async def _handle_suno_waiting_input(
             state_dict["suno_lyrics_confirmed"] = False
             custom_reply = "🤖 Сгенерирую короткий текст через Prompt-Master."
         else:
+            if len(cleaned_value) > LYRICS_MAX_LENGTH:
+                await _send_with_retry(
+                    lambda: message.reply_text(
+                        f"⚠️ Текст слишком длинный ({len(cleaned_value)}). Максимум — {LYRICS_MAX_LENGTH} символов."
+                    )
+                )
+                return True
             set_suno_lyrics(suno_state_obj, cleaned_value)
             set_suno_lyrics_source(suno_state_obj, LyricsSource.USER)
             state_dict["suno_auto_lyrics_pending"] = False
@@ -3838,14 +3768,19 @@ async def _handle_suno_waiting_input(
 
 
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    state_dict = _apply_state_defaults(ensure_state(ctx))
     user_data = getattr(ctx, "user_data", None)
     if isinstance(user_data, dict):
         try:
             suno_state_obj = load_suno_state(ctx)
         except Exception:
             suno_state_obj = SunoState()
-        state_dict["suno_state"] = suno_state_obj.to_dict()
+    else:
+        suno_state_obj = SunoState()
+    state_dict = _apply_state_defaults(ensure_state(ctx))
+    suno_state_payload = suno_state_obj.to_dict()
+    state_dict["suno_state"] = suno_state_payload
+    if isinstance(user_data, dict):
+        user_data["suno_state"] = dict(suno_state_payload)
     waiting = state_dict.get("suno_waiting_state")
     if waiting not in {WAIT_SUNO_TITLE, WAIT_SUNO_STYLE, WAIT_SUNO_LYRICS, WAIT_SUNO_REFERENCE}:
         state_dict["suno_waiting_state"] = IDLE_SUNO
@@ -4307,6 +4242,12 @@ _VIDEO_MENU_CACHE_TTL = 3 * 24 * 60 * 60
 _VIDEO_MENU_LOCK_KEY_TMPL = "lock:video_menu:{chat_id}"
 _VIDEO_MENU_LAST_KEY_TMPL = "video_menu:last_menu_msg_id:{chat_id}"
 
+_VIDEO_MODE_HINTS: Dict[str, str] = {
+    "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
+    "veo_text_quality": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
+    "veo_photo": "📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.",
+}
+
 def _safe_get_balance(user_id: int) -> int:
     try:
         return get_balance(user_id)
@@ -4684,6 +4625,54 @@ async def show_video_menu(
     if message_id is not None:
         cache_set(last_key, str(message_id), _VIDEO_MENU_CACHE_TTL)
     return message_id
+
+
+def _video_mode_config(mode: str) -> Optional[Tuple[str, str, str]]:
+    if mode == "veo_text_fast":
+        return "16:9", "veo3_fast", _VIDEO_MODE_HINTS[mode]
+    if mode == "veo_text_quality":
+        return "16:9", "veo3", _VIDEO_MODE_HINTS[mode]
+    if mode == "veo_photo":
+        return "9:16", "veo3_fast", _VIDEO_MODE_HINTS[mode]
+    return None
+
+
+async def _start_video_mode(
+    mode: str,
+    *,
+    chat_id: Optional[int],
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: Optional[int],
+    message: Optional[Message],
+) -> bool:
+    if chat_id is None:
+        return False
+    config = _video_mode_config(mode)
+    if config is None:
+        return False
+
+    aspect, model, hint = config
+    s = state(ctx)
+    s["mode"] = mode
+    s["aspect"] = aspect
+    s["model"] = model
+
+    await veo_entry(chat_id, ctx)
+    card_id_raw = s.get("last_ui_msg_id_veo")
+    card_id = card_id_raw if isinstance(card_id_raw, int) else None
+    _activate_wait_state(
+        user_id=user_id,
+        chat_id=chat_id,
+        card_msg_id=card_id,
+        kind=WaitKind.VEO_PROMPT,
+        meta={"mode": mode},
+    )
+    if message is not None:
+        try:
+            await message.reply_text(hint)
+        except Exception:
+            pass
+    return True
 
 
 def image_menu_kb() -> InlineKeyboardMarkup:
@@ -10296,7 +10285,20 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         input_state.clear(user_id, reason="video_menu")
         set_mode(user_id, False)
         clear_wait(user_id, reason="video_menu")
+        clear_wait_state(user_id, reason="video_menu")
     s["mode"] = None
+
+    if data.startswith("mode:veo_"):
+        selected_mode = data.split(":", 1)[1]
+        handled = await _start_video_mode(
+            selected_mode,
+            chat_id=chat_id,
+            ctx=ctx,
+            user_id=user_id,
+            message=message,
+        )
+        if handled:
+            return
 
     if data == CB_VIDEO_BACK:
         target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
@@ -11112,31 +11114,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid_val = user_obj.id if user_obj else None
         if uid_val is not None:
             clear_wait_state(uid_val, reason="mode_switch")
-        if selected_mode in ("veo_text_fast", "veo_text_quality"):
-            s["aspect"] = "16:9"; s["model"] = "veo3_fast" if selected_mode.endswith("fast") else "veo3"
-            await veo_entry(update.effective_chat.id, ctx)
-            card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
-            _activate_wait_state(
-                user_id=uid_val,
-                chat_id=chat_id_val,
-                card_msg_id=card_id,
-                kind=WaitKind.VEO_PROMPT,
-                meta={"mode": selected_mode},
-            )
-            await q.message.reply_text("✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.")
-            return
-        if selected_mode == "veo_photo":
-            s["aspect"] = "9:16"; s["model"] = "veo3_fast"
-            await veo_entry(update.effective_chat.id, ctx)
-            card_id = s.get("last_ui_msg_id_veo") if isinstance(s.get("last_ui_msg_id_veo"), int) else None
-            _activate_wait_state(
-                user_id=uid_val,
-                chat_id=chat_id_val,
-                card_msg_id=card_id,
-                kind=WaitKind.VEO_PROMPT,
-                meta={"mode": selected_mode},
-            )
-            await q.message.reply_text("📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.")
+        handled = await _start_video_mode(
+            selected_mode,
+            chat_id=chat_id_val,
+            ctx=ctx,
+            user_id=uid_val,
+            message=q.message,
+        )
+        if handled:
             return
         if selected_mode == "chat":
             await q.message.reply_text("💬 Чат активен. Напишите сообщение."); return
@@ -11569,7 +11554,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = chat.id if chat else None
         user = update.effective_user
         uid = user.id if user else None
-        if uid is not None:
+        suppress_wait_clear = False
+        if action == "card" and argument.startswith("lyrics_source"):
+            suppress_wait_clear = True
+        if uid is not None and not suppress_wait_clear:
             clear_wait_state(uid, reason="suno_callback")
         s["mode"] = "suno"
         suno_state_obj = load_suno_state(ctx)
@@ -11617,11 +11605,34 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if sub_action == "lyrics_source" and (sub_argument in {"", "toggle"}):
                 await q.answer()
                 current_source = suno_state_obj.lyrics_source
-                new_source = LyricsSource.USER if current_source != LyricsSource.USER else LyricsSource.AI
+                current_value = (
+                    current_source.value
+                    if isinstance(current_source, LyricsSource)
+                    else str(current_source).strip().lower()
+                )
+                new_source = (
+                    LyricsSource.AI
+                    if current_value == LyricsSource.USER.value
+                    else LyricsSource.USER
+                )
+                if new_source == LyricsSource.AI:
+                    clear_suno_lyrics(suno_state_obj)
                 set_suno_lyrics_source(suno_state_obj, new_source)
                 save_suno_state(ctx, suno_state_obj)
-                s["suno_state"] = suno_state_obj.to_dict()
-                s["suno_waiting_state"] = IDLE_SUNO
+                suno_state_payload = suno_state_obj.to_dict()
+                s["suno_state"] = suno_state_payload
+                user_data = getattr(ctx, "user_data", None)
+                if user_data is not None:
+                    try:
+                        user_data["suno_state"] = dict(suno_state_payload)
+                    except Exception:
+                        pass
+                s["suno_lyrics_confirmed"] = False
+                message_text: Optional[str] = None
+                if new_source == LyricsSource.USER:
+                    s["suno_waiting_state"] = WAIT_SUNO_LYRICS
+                else:
+                    s["suno_waiting_state"] = IDLE_SUNO
                 _reset_suno_card_cache(s)
                 target_chat = chat_id
                 if target_chat is None and q.message is not None:
@@ -11640,16 +11651,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         generating=generating,
                         waiting_enqueue=waiting_enqueue,
                     )
-                if target_chat is not None:
-                    source_label = (
-                        t("suno.lyrics_source.user")
-                        if new_source == LyricsSource.USER
-                        else t("suno.lyrics_source.ai")
+                if new_source == LyricsSource.USER:
+                    if uid is not None and target_chat is not None:
+                        card_msg = _music_card_message_id(s)
+                        _activate_wait_state(
+                            user_id=uid,
+                            chat_id=target_chat,
+                            card_msg_id=card_msg,
+                            kind=WaitKind.SUNO_LYRICS,
+                            meta={"flow": suno_state_obj.mode, "step": "lyrics", "source": "toggle"},
+                        )
+                    message_text = (
+                        f"🔁 {t('suno.field.lyrics_source')}: {t('suno.lyrics_source.user')}\n"
+                        f"📝 Пришлите текст песни (1–{LYRICS_MAX_LENGTH} символов)."
                     )
+                else:
+                    if uid is not None:
+                        clear_wait_state(uid, reason="suno_lyrics_source_toggle")
+                    message_text = f"✨ {t('suno.field.lyrics_source')}: {t('suno.lyrics_source.ai')}"
+                if target_chat is not None and message_text:
                     await _suno_notify(
                         ctx,
                         target_chat,
-                        f"🔁 {t('suno.field.lyrics_source')}: {source_label}",
+                        message_text,
                         reply_to=q.message,
                     )
                 return
@@ -12302,14 +12326,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _banana_run_and_send(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
-    src_images: Sequence[Any],
-    prompt: str,
-    price: int,
-    user_id: int,
+    src_images: Optional[Sequence[Any]] = None,
+    prompt: str = "",
+    price: int = 0,
+    user_id: int = 0,
+    *,
+    src_urls: Optional[Sequence[str]] = None,
 ) -> None:
     s = state(ctx)
-    url_sources = [_normalize_banana_image(item) for item in src_images]
-    normalized = [entry for entry in url_sources if entry]
+    normalized: list[Dict[str, str]]
+    if src_urls is not None:
+        normalized = [
+            {"url": str(url)}
+            for url in src_urls
+            if isinstance(url, str) and url.strip()
+        ]
+    else:
+        image_items = src_images or []
+        url_sources = [_normalize_banana_image(item) for item in image_items]
+        normalized = [entry for entry in url_sources if entry]
     src_urls = [entry["url"] for entry in normalized if entry.get("url")]
     task_info: Dict[str, Optional[str]] = {"id": None}
 

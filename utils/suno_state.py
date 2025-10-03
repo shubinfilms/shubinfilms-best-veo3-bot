@@ -15,7 +15,7 @@ from utils.suno_modes import get_mode_config as get_suno_mode_config
 
 TITLE_MAX_LENGTH = 300
 STYLE_MAX_LENGTH = 500
-LYRICS_MAX_LENGTH = 2000
+LYRICS_MAX_LENGTH = 8000
 LYRICS_PREVIEW_LIMIT = 160
 _STORAGE_KEY = "suno_state"
 
@@ -353,8 +353,6 @@ def set_lyrics(state: SunoState, value: Optional[str]) -> SunoState:
     state.lyrics_hash = _hash_lyrics(state.lyrics)
     if cleaned:
         state.lyrics_source = LyricsSource.USER
-    elif state.lyrics_source == LyricsSource.USER:
-        state.lyrics_source = LyricsSource.AI
     return state
 
 
