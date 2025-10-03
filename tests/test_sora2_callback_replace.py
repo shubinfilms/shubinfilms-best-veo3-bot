@@ -78,12 +78,14 @@ class DummyBot:
         return SimpleNamespace(message_id=904)
 
 
-def _setup_context(bot_module, *, edit_error=False, video_error=False):
+def _setup_context(monkeypatch, bot_module, *, edit_error=False, video_error=False):
     bot = DummyBot(bot_module, edit_error=edit_error, video_error=video_error)
     ctx = SimpleNamespace(bot=bot, user_data={}, application=None)
     state = bot_module.state(ctx)
     state["sora2_generating"] = True
-    return ctx, state, bot
+    release_calls = []
+    monkeypatch.setattr(bot_module, "release_sora2_lock", lambda user_id: release_calls.append(user_id))
+    return ctx, state, bot, release_calls
 
 
 async def _passthrough_safe_send(method, *, method_name, kind, req_id=None, **kwargs):
@@ -91,7 +93,7 @@ async def _passthrough_safe_send(method, *, method_name, kind, req_id=None, **kw
 
 
 def test_sora2_callback_replaces_sticker(monkeypatch, bot_module):
-    ctx, state, bot = _setup_context(bot_module)
+    ctx, state, bot, release_calls = _setup_context(monkeypatch, bot_module)
     wait_id = 1234
     chat_id = 999
     state["sora2_wait_msg_id"] = wait_id
@@ -137,10 +139,11 @@ def test_sora2_callback_replaces_sticker(monkeypatch, bot_module):
     assert state.get("sora2_wait_msg_id") is None
     assert chat_id not in bot_module.ACTIVE_TASKS
     assert clear_calls == ["task-123"]
+    assert release_calls == [42]
 
 
 def test_sora2_callback_fallback_to_send(monkeypatch, bot_module):
-    ctx, state, bot = _setup_context(bot_module, edit_error=True)
+    ctx, state, bot, release_calls = _setup_context(monkeypatch, bot_module, edit_error=True)
     wait_id = 2222
     chat_id = 333
     state["sora2_wait_msg_id"] = wait_id
@@ -177,4 +180,5 @@ def test_sora2_callback_fallback_to_send(monkeypatch, bot_module):
     buttons = bot.send_video_calls[0]["reply_markup"].inline_keyboard
     assert any(btn.text == "🔁 Сгенерировать ещё" for row in buttons for btn in row)
     assert state.get("sora2_wait_msg_id") is None
+    assert release_calls == [77]
     bot_module.ACTIVE_TASKS.clear()
