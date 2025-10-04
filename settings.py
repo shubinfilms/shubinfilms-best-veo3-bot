@@ -90,6 +90,7 @@ class _AppSettings(BaseModel):
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
     YOOKASSA_RETURN_URL: Optional[str] = Field(default=None)
     YOOKASSA_CURRENCY: str = Field(default="RUB")
+    CRYPTO_PAYMENT_URL: Optional[str] = Field(default=None)
 
     @field_validator("LOG_LEVEL", mode="before")
     def _normalize_level(cls, value: object) -> str:
@@ -261,6 +262,7 @@ YOOKASSA_RETURN_URL = _strip_optional(_APP_SETTINGS.YOOKASSA_RETURN_URL)
 YOOKASSA_CURRENCY = (
     (_APP_SETTINGS.YOOKASSA_CURRENCY or "RUB").strip() or "RUB"
 )
+CRYPTO_PAYMENT_URL = _strip_optional(_APP_SETTINGS.CRYPTO_PAYMENT_URL)
 
 SUNO_GEN_PATH = _APP_SETTINGS.SUNO_GEN_PATH
 SUNO_TASK_STATUS_PATH = _APP_SETTINGS.SUNO_TASK_STATUS_PATH
@@ -413,6 +415,7 @@ __all__ = [
     "YOOKASSA_SECRET_KEY",
     "YOOKASSA_RETURN_URL",
     "YOOKASSA_CURRENCY",
+    "CRYPTO_PAYMENT_URL",
     "BANANA_SEND_AS_DOCUMENT",
     "MJ_SEND_AS_ALBUM",
     "SORA2_ENABLED",

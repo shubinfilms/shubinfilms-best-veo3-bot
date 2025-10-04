@@ -6,6 +6,26 @@ from suno.cover_source import MAX_AUDIO_MB
 
 FAQ_INTRO = "🧾 *FAQ*\nВыберите раздел:"
 
+TXT_MENU_TITLE = "📋 Главное меню"
+TXT_PROFILE_TITLE = "👥 Профиль"
+TXT_KB_PROFILE = "👥 Профиль"
+TXT_KB_KNOWLEDGE = "📚 База знаний"
+TXT_KB_PHOTO = "📸 Режим фото"
+TXT_KB_MUSIC = "🎧 Режим музыки"
+TXT_KB_VIDEO = "📹 Режим видео"
+TXT_KB_AI_DIALOG = "🧠 Диалог с ИИ"
+TXT_TOPUP_ENTRY = "💎 Пополнить баланс"
+TXT_TOPUP_CHOOSE = "Оплатить с помощью:"
+TXT_PAY_STARS = "⭐️ Телеграм Stars"
+TXT_PAY_CARD = "💳 Оплата картой"
+TXT_PAY_CRYPTO = "🔐 Crypto"
+TXT_CRYPTO_COMING_SOON = "Крипто-оплата скоро будет доступна."
+TXT_PAY_CRYPTO_OPEN_LINK = "Открыть оплату в браузере"
+TXT_AI_DIALOG_NORMAL = "💬 Обычный чат"
+TXT_AI_DIALOG_PM = "📝 Prompt-Master"
+TXT_AI_DIALOG_CHOOSE = "Выберите режим диалога:"
+TXT_KNOWLEDGE_INTRO = "📚 База знаний\nВыберите нужный раздел:"
+
 COMMON_TEXTS_RU = {
     "topup.menu.title": "Выберите способ пополнения:",
     "topup.menu.stars": "💎 Оплатить звёздами",

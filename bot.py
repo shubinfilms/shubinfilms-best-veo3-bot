@@ -158,8 +158,17 @@ from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 from keyboards import (
     CB,
     CB_FAQ_PREFIX,
+    CB_MAIN_AI_DIALOG,
+    CB_MAIN_BACK,
+    CB_MAIN_KNOWLEDGE,
+    CB_MAIN_MUSIC,
+    CB_MAIN_PHOTO,
+    CB_MAIN_PROFILE,
+    CB_MAIN_VIDEO,
     CB_PM_INSERT_PREFIX,
     CB_PM_PREFIX,
+    CB_PROFILE_BACK,
+    CB_PROFILE_TOPUP,
     CB_VIDEO_ENGINE_SORA2,
     CB_VIDEO_ENGINE_SORA2_DISABLED,
     CB_VIDEO_ENGINE_VEO,
@@ -170,15 +179,35 @@ from keyboards import (
     CB_VIDEO_MODE_QUALITY,
     CB_VIDEO_MODE_SORA_IMAGE,
     CB_VIDEO_MODE_SORA_TEXT,
+    CB_AI_MODES,
+    CB_CHAT_NORMAL,
+    CB_CHAT_PROMPTMASTER,
+    CB_PAY_CARD,
+    CB_PAY_CRYPTO,
+    CB_PAY_STARS,
     mj_upscale_root_keyboard,
     mj_upscale_select_keyboard,
+    faq_keyboard,
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
+    kb_ai_dialog_modes,
+    kb_profile_topup_entry,
+    kb_topup_methods,
 )
 from texts import (
     SUNO_MODE_PROMPT,
     SUNO_START_READY_MESSAGE,
     SUNO_STARTING_MESSAGE,
+    TXT_AI_DIALOG_NORMAL,
+    TXT_AI_DIALOG_PM,
+    TXT_AI_DIALOG_CHOOSE,
+    TXT_CRYPTO_COMING_SOON,
+    TXT_KB_AI_DIALOG,
+    TXT_KB_PROFILE,
+    TXT_KNOWLEDGE_INTRO,
+    TXT_MENU_TITLE,
+    TXT_PROFILE_TITLE,
+    TXT_TOPUP_CHOOSE,
     common_text,
     t,
 )
@@ -255,6 +284,7 @@ from ledger import (
 )
 from settings import (
     BANANA_SEND_AS_DOCUMENT,
+    CRYPTO_PAYMENT_URL,
     REDIS_PREFIX,
     SUNO_CALLBACK_URL as SETTINGS_SUNO_CALLBACK_URL,
     SUNO_ENABLED as SETTINGS_SUNO_ENABLED,
@@ -4702,7 +4732,7 @@ WELCOME = (
 )
 
 
-MAIN_MENU_TEXT = "📋 *Главное меню*\nВыберите, что хотите сделать:"
+MAIN_MENU_TEXT = f"*{TXT_MENU_TITLE}*\nВыберите, что хотите сделать:"
 
 
 MENU_BTN_VIDEO = "🎬 Генерация видео"
@@ -4710,7 +4740,7 @@ MENU_BTN_IMAGE = "🎨 Генерация изображений"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
 MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
-MENU_BTN_BALANCE = "💎 Баланс"
+MENU_BTN_BALANCE = TXT_KB_PROFILE
 MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
@@ -5155,6 +5185,25 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
     return await show_emoji_hub_for_chat(chat_id, ctx, replace=True)
 
 
+_HUB_ACTION_ALIASES: Dict[str, str] = {
+    CB_MAIN_PROFILE: "balance",
+    CB_PROFILE_BACK: "balance",
+    CB_MAIN_BACK: "root",
+    CB_MAIN_KNOWLEDGE: "knowledge",
+    CB_MAIN_PHOTO: "image",
+    CB_MAIN_MUSIC: "music",
+    CB_MAIN_VIDEO: "video",
+    CB_MAIN_AI_DIALOG: "ai_modes",
+    CB_AI_MODES: "ai_modes",
+    CB_PROFILE_TOPUP: "profile_topup",
+    CB_CHAT_NORMAL: "chat",
+    CB_CHAT_PROMPTMASTER: "prompt",
+    CB_PAY_STARS: "pay_stars",
+    CB_PAY_CARD: "pay_card",
+    CB_PAY_CRYPTO: "pay_crypto",
+}
+
+
 async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
 
@@ -5163,10 +5212,18 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     data = (query.data or "").strip()
-    if not data.startswith("hub:"):
+    if not data:
+        await query.answer()
         return
 
-    action = data.split(":", 1)[1]
+    if data.startswith("hub:"):
+        action = data.split(":", 1)[1]
+    else:
+        action = _HUB_ACTION_ALIASES.get(data)
+
+    if not action:
+        await query.answer()
+        return
     message = query.message
     chat = update.effective_chat
     user = update.effective_user
@@ -5190,6 +5247,55 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     s = state(ctx)
+
+    if action == "knowledge":
+        await query.answer()
+        knowledge_key = "last_ui_msg_id_knowledge"
+        existing = s.get(knowledge_key)
+        current_mid = existing if isinstance(existing, int) else None
+        sent_id = await safe_edit_or_send(
+            ctx,
+            chat_id=chat_id,
+            message_id=current_mid,
+            text=TXT_KNOWLEDGE_INTRO,
+            reply_markup=faq_keyboard(),
+        )
+        if isinstance(sent_id, int):
+            s[knowledge_key] = sent_id
+        return
+
+    if action == "ai_modes":
+        await query.answer()
+        if message is None:
+            return
+        text = f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
+        keyboard = kb_ai_dialog_modes()
+        try:
+            await safe_edit_message(
+                ctx,
+                chat_id,
+                message.message_id,
+                text,
+                keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            sent = await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            if isinstance(ctx.user_data, dict):
+                mid = getattr(sent, "message_id", None)
+                if isinstance(mid, int):
+                    ctx.user_data["hub_msg_id"] = mid
+        return
+
+    if action in {"profile_topup", "pay_stars", "pay_card", "pay_crypto"}:
+        handled = await handle_topup_callback(update, ctx, data)
+        if handled:
+            return
 
     if action == "video":
         log.debug(
@@ -5270,7 +5376,8 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if action == "balance":
         await query.answer()
-        await show_balance_card(chat_id, ctx, force_new=True)
+        force_new = data in {"hub:balance", CB_MAIN_PROFILE}
+        await show_balance_card(chat_id, ctx, force_new=force_new)
         return
 
     await query.answer()
@@ -5503,6 +5610,18 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
     s["mode"] = None
     s.pop("model", None)
 
+    if getattr(ctx, "bot", None) is None and message is not None:
+        await _send_video_menu_message(ctx, message=message)
+        if user_id is not None:
+            input_state.clear(user_id, reason="video_menu")
+            set_mode(user_id, False)
+            clear_wait(user_id, reason="video_menu")
+            try:
+                clear_wait_state(user_id, reason="video_menu")
+            except TypeError:
+                clear_wait_state(user_id)
+        return None
+
     record = get_menu_message(
         _VIDEO_MENU_MESSAGE_NAME,
         chat_id,
@@ -5682,13 +5801,7 @@ def inline_topup_keyboard() -> InlineKeyboardMarkup:
 
 
 def topup_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(common_text("topup.menu.stars"), callback_data="topup:stars")],
-            [InlineKeyboardButton(common_text("topup.menu.yookassa"), callback_data="topup:yookassa")],
-            [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")],
-        ]
-    )
+    return kb_topup_methods()
 
 
 def yookassa_pack_keyboard() -> InlineKeyboardMarkup:
@@ -5716,7 +5829,7 @@ async def show_topup_menu(
     query: Optional["telegram.CallbackQuery"] = None,
     user_id: Optional[int] = None,
 ) -> None:
-    text = common_text("topup.menu.title")
+    text = TXT_TOPUP_CHOOSE
     keyboard = topup_menu_keyboard()
     if query is not None:
         message = query.message
@@ -5731,7 +5844,7 @@ async def show_topup_menu(
             except Exception:
                 pass
     try:
-        await ctx.bot.send_message(chat_id, text, reply_markup=keyboard)
+        await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
     finally:
         log.info(
             "topup.open",
@@ -5740,18 +5853,12 @@ async def show_topup_menu(
 
 
 def balance_menu_kb() -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton(common_text("topup.menu.stars"), callback_data="topup:stars"),
-            InlineKeyboardButton(common_text("topup.menu.yookassa"), callback_data="topup:yookassa"),
-        ],
-        [
-            InlineKeyboardButton("🧾 История операций", callback_data="tx:open"),
-        ],
-        [InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")],
-        [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-        [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")],
-    ]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(kb_profile_topup_entry().inline_keyboard)
+    keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data="tx:open")])
+    keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")])
+    keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")])
+    keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -5765,7 +5872,7 @@ async def show_balance_card(
     uid = get_user_id(ctx) or chat_id
     balance = _safe_get_balance(uid)
     _set_cached_balance(ctx, balance)
-    text = f"💎 Ваш баланс: {balance}"
+    text = f"{TXT_PROFILE_TITLE}\n💎 Ваш баланс: {balance}"
     mid = await upsert_card(
         ctx,
         chat_id,
@@ -8759,6 +8866,12 @@ async def _poll_suno_and_send(
         )
         await _clear_wait()
 
+    async def _clear_wait() -> None:
+        try:
+            await refresh_suno_card(ctx, chat_id, state(ctx), price=PRICE_SUNO)
+        except Exception as exc:
+            log.debug("[SUNO] clear_wait_failed | chat_id=%s err=%s", chat_id, exc)
+
     try:
         try:
             existing_record = await asyncio.to_thread(SUNO_SERVICE.get_task_record, task_id)
@@ -9241,7 +9354,14 @@ async def _finalize_sora2_task(
             release_sora2_lock(user_id)
         return
     await delete_wait_sticker(ctx, chat_id=chat_id)
-    wait_msg_id = meta.get("wait_message_id") if isinstance(meta.get("wait_message_id"), int) else None
+    wait_meta = meta.get("wait_message_id")
+    try:
+        wait_msg_id = int(wait_meta) if wait_meta is not None else None
+    except (TypeError, ValueError):
+        wait_msg_id = None
+    if wait_msg_id:
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, wait_msg_id)
     price = int(meta.get("price") or 0)
     service = str(meta.get("service") or "SORA2")
     mode = str(meta.get("mode") or "sora2_ttv")
@@ -12216,12 +12336,72 @@ async def handle_topup_callback(
     user = update.effective_user
     user_id = user.id if user else None
 
-    if data == "topup:open":
+    normalized = data
+    if data == CB_PROFILE_TOPUP:
+        normalized = "topup:open"
+    elif data == CB_PAY_STARS:
+        normalized = "topup:stars"
+    elif data == CB_PAY_CARD:
+        normalized = "topup:yookassa"
+
+    if normalized == "topup:open":
         await query.answer()
-        await show_topup_menu(ctx, chat_id, query=query, user_id=user_id)
+        markup = kb_topup_methods()
+        text = TXT_TOPUP_CHOOSE
+        if message is not None:
+            try:
+                await safe_edit_message(
+                    ctx,
+                    chat_id,
+                    message.message_id,
+                    text,
+                    markup,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=markup,
+                )
+        else:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=markup,
+            )
         return True
 
-    if data == "topup:stars":
+    if data == CB_PAY_CRYPTO:
+        await query.answer()
+        markup = kb_topup_methods(crypto_url=CRYPTO_PAYMENT_URL)
+        if message is not None:
+            try:
+                await safe_edit_message(
+                    ctx,
+                    chat_id,
+                    message.message_id,
+                    TXT_CRYPTO_COMING_SOON,
+                    markup,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=TXT_CRYPTO_COMING_SOON,
+                    reply_markup=markup,
+                )
+        else:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=TXT_CRYPTO_COMING_SOON,
+                reply_markup=markup,
+            )
+        return True
+
+    if normalized == "topup:stars":
         await query.answer()
         text = "\n".join(
             filter(
@@ -12232,23 +12412,63 @@ async def handle_topup_callback(
                 ],
             )
         )
+        edit_callable = getattr(query, "edit_message_text", None)
         try:
-            await _safe_edit_message_text(query.edit_message_text, text, reply_markup=stars_topup_kb())
+            if callable(edit_callable):
+                await _safe_edit_message_text(
+                    edit_callable,
+                    text,
+                    reply_markup=stars_topup_kb(),
+                )
+            elif message is not None and getattr(ctx.bot, "edit_message_text", None):
+                await _safe_edit_message_text(
+                    ctx.bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=message.message_id,
+                    text=text,
+                    reply_markup=stars_topup_kb(),
+                )
+            else:
+                raise AttributeError("edit_message_text not available")
         except Exception:
-            await ctx.bot.send_message(chat_id, text, reply_markup=stars_topup_kb())
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=stars_topup_kb(),
+            )
         return True
 
-    if data == "topup:yookassa":
+    if normalized == "topup:yookassa":
         await query.answer()
         text = common_text("topup.yookassa.title")
+        edit_callable = getattr(query, "edit_message_text", None)
         try:
-            await _safe_edit_message_text(query.edit_message_text, text, reply_markup=yookassa_pack_keyboard())
+            if callable(edit_callable):
+                await _safe_edit_message_text(
+                    edit_callable,
+                    text,
+                    reply_markup=yookassa_pack_keyboard(),
+                )
+            elif message is not None and getattr(ctx.bot, "edit_message_text", None):
+                await _safe_edit_message_text(
+                    ctx.bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=message.message_id,
+                    text=text,
+                    reply_markup=yookassa_pack_keyboard(),
+                )
+            else:
+                raise AttributeError("edit_message_text not available")
         except Exception:
-            await ctx.bot.send_message(chat_id, text, reply_markup=yookassa_pack_keyboard())
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=yookassa_pack_keyboard(),
+            )
         return True
 
-    if data.startswith("yk:"):
-        pack_id = data.split(":", 1)[1]
+    if normalized.startswith("yk:"):
+        pack_id = normalized.split(":", 1)[1]
         await query.answer()
         error_keyboard = InlineKeyboardMarkup(
             [
@@ -12682,12 +12902,23 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     answer_payload: Dict[str, Any] = {"text": "", "show_alert": False}
 
     async def _answer() -> None:
+        text = str(answer_payload.get("text", ""))
+        show_alert = bool(answer_payload.get("show_alert", False))
+        answer_method = getattr(query, "answer", None)
         try:
-            await ctx.bot.answer_callback_query(
-                callback_query_id=query.id,
-                text=str(answer_payload.get("text", "")),
-                show_alert=bool(answer_payload.get("show_alert", False)),
-            )
+            if callable(answer_method):
+                if text or show_alert:
+                    await answer_method(text=text, show_alert=show_alert)
+                else:
+                    await answer_method()
+                return
+            bot_obj = getattr(ctx, "bot", None)
+            if bot_obj is not None:
+                await bot_obj.answer_callback_query(
+                    callback_query_id=getattr(query, "id", ""),
+                    text=text,
+                    show_alert=show_alert,
+                )
         except Exception as exc:
             log.debug(
                 "ui.video_menu.answer_fail",
@@ -16028,7 +16259,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
-    (r"^hub:", hub_router),
+    (r"^(?:hub:|main_|profile_|pay_|ai_modes$|chat_(?:normal|promptmaster)$)", hub_router),
     (r"^go:", main_suggest_router),
     (r"^s2_go_t2v$", sora2_start_t2v),
     (r"^s2_go_i2v$", sora2_start_i2v),

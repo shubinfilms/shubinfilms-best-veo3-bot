@@ -1,3 +1,5 @@
+from typing import Optional
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 CB_FAQ_PREFIX = "faq:"
@@ -194,3 +196,84 @@ def mj_upscale_select_keyboard(grid_id: str, *, count: int) -> InlineKeyboardMar
         [InlineKeyboardButton("⬅️ Назад", callback_data=f"mj.upscale.menu:{grid_id}")]
     )
     return InlineKeyboardMarkup(rows)
+CB_MAIN_PROFILE = "main_profile"
+CB_MAIN_KNOWLEDGE = "main_knowledge"
+CB_MAIN_PHOTO = "main_photo"
+CB_MAIN_MUSIC = "main_music"
+CB_MAIN_VIDEO = "main_video"
+CB_MAIN_AI_DIALOG = "main_ai_dialog"
+CB_MAIN_BACK = "main_back"
+CB_PROFILE_TOPUP = "profile_topup"
+CB_PROFILE_BACK = "profile_back"
+CB_AI_MODES = "ai_modes"
+CB_CHAT_NORMAL = "chat_normal"
+CB_CHAT_PROMPTMASTER = "chat_promptmaster"
+CB_PAY_STARS = "pay_stars"
+CB_PAY_CARD = "pay_card"
+CB_PAY_CRYPTO = "pay_crypto"
+
+
+def kb_main_menu_profile_first() -> InlineKeyboardMarkup:
+    from texts import (
+        TXT_KB_AI_DIALOG,
+        TXT_KB_KNOWLEDGE,
+        TXT_KB_MUSIC,
+        TXT_KB_PHOTO,
+        TXT_KB_PROFILE,
+        TXT_KB_VIDEO,
+    )
+
+    rows = [
+        [InlineKeyboardButton(TXT_KB_PROFILE, callback_data=CB_MAIN_PROFILE)],
+        [InlineKeyboardButton(TXT_KB_KNOWLEDGE, callback_data=CB_MAIN_KNOWLEDGE)],
+        [
+            InlineKeyboardButton(TXT_KB_PHOTO, callback_data=CB_MAIN_PHOTO),
+            InlineKeyboardButton(TXT_KB_MUSIC, callback_data=CB_MAIN_MUSIC),
+        ],
+        [
+            InlineKeyboardButton(TXT_KB_VIDEO, callback_data=CB_MAIN_VIDEO),
+            InlineKeyboardButton(TXT_KB_AI_DIALOG, callback_data=CB_MAIN_AI_DIALOG),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_profile_topup_entry() -> InlineKeyboardMarkup:
+    from texts import TXT_TOPUP_ENTRY
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(TXT_TOPUP_ENTRY, callback_data=CB_PROFILE_TOPUP)]]
+    )
+
+
+def kb_topup_methods(*, crypto_url: Optional[str] = None) -> InlineKeyboardMarkup:
+    from texts import (
+        TXT_PAY_CARD,
+        TXT_PAY_CRYPTO,
+        TXT_PAY_CRYPTO_OPEN_LINK,
+        TXT_PAY_STARS,
+    )
+    from texts import common_text
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(TXT_PAY_STARS, callback_data=CB_PAY_STARS)],
+        [InlineKeyboardButton(TXT_PAY_CARD, callback_data=CB_PAY_CARD)],
+        [InlineKeyboardButton(TXT_PAY_CRYPTO, callback_data=CB_PAY_CRYPTO)],
+    ]
+    if crypto_url:
+        rows.append([InlineKeyboardButton(TXT_PAY_CRYPTO_OPEN_LINK, url=crypto_url)])
+    rows.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data=CB_PROFILE_BACK)])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_ai_dialog_modes() -> InlineKeyboardMarkup:
+    from texts import TXT_AI_DIALOG_NORMAL, TXT_AI_DIALOG_PM
+    from texts import common_text
+
+    rows = [
+        [InlineKeyboardButton(TXT_AI_DIALOG_NORMAL, callback_data=CB_CHAT_NORMAL)],
+        [InlineKeyboardButton(TXT_AI_DIALOG_PM, callback_data=CB_CHAT_PROMPTMASTER)],
+        [InlineKeyboardButton(common_text("topup.menu.back"), callback_data=CB_MAIN_BACK)],
+    ]
+    return InlineKeyboardMarkup(rows)
+
