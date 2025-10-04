@@ -104,6 +104,7 @@ from ui_helpers import (
     pm_result_kb,
     sync_suno_start_message,
 )
+from stickers import delete_wait_sticker, send_ok_sticker, send_wait_sticker
 
 from utils.suno_state import (
     LYRICS_MAX_LENGTH,
@@ -2305,10 +2306,7 @@ async def process_promo_submission(
 
     _set_cached_balance(ctx, balance_after)
 
-    await message.reply_text(
-        "✅ Промокод активирован!\nНачислено: +100 💎\nНовый баланс: "
-        f"{balance_after} 💎"
-    )
+    await send_ok_sticker(ctx, "promo", balance_after, chat_id=chat.id)
 
     try:
         await show_main_menu(chat.id, ctx)
@@ -6434,6 +6432,14 @@ async def _suno_request(
 
     timeout_cfg = ClientTimeout(total=timeout)
     attempt = 0
+
+    async def _clear_wait() -> None:
+        with suppress(Exception):
+            await delete_wait_sticker(ctx, chat_id=chat_id)
+        if s.get("video_wait_message_id"):
+            s["video_wait_message_id"] = None
+        if s.get("video_wait_message_id"):
+            s["video_wait_message_id"] = None
     dynamic_attempts = int(timeout // 10) if timeout else 0
     max_attempts = max(1, min(10, dynamic_attempts if dynamic_attempts > 0 else 3))
 
@@ -7687,6 +7693,8 @@ async def _suno_issue_refund(
     if req_id:
         meta["req_id"] = req_id
 
+    await delete_wait_sticker(ctx, chat_id=chat_id)
+
     metric_reason = "notify_error"
     if reason.startswith("suno:refund:create"):
         metric_reason = "enqeue_error"
@@ -7736,6 +7744,7 @@ async def _suno_issue_refund(
         s["suno_balance"] = new_balance
     _reset_suno_card_cache(s)
     s["suno_waiting_state"] = IDLE_SUNO
+    s["video_wait_message_id"] = None
     await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
     await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
 
@@ -8118,6 +8127,9 @@ async def _launch_suno_generation(
     s["suno_current_req_id"] = req_id
 
     try:
+        wait_msg_id = await send_wait_sticker(ctx, "suno", chat_id=chat_id)
+        if wait_msg_id:
+            s["video_wait_message_id"] = wait_msg_id
         await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         await refresh_balance_card_if_open(user_id, chat_id, ctx=ctx, state_dict=s)
 
@@ -8745,6 +8757,7 @@ async def _poll_suno_and_send(
             reply_to=reply_to,
             user_message=refund_text,
         )
+        await _clear_wait()
 
     try:
         try:
@@ -8806,6 +8819,7 @@ async def _poll_suno_and_send(
                     notify_exc,
                 )
             await _issue_refund(message, reason="suno:refund:status_err")
+            await _clear_wait()
             return
 
         if state_value != "ready":
@@ -8814,6 +8828,8 @@ async def _poll_suno_and_send(
                 task_id,
                 state_value,
             )
+            if state_value in {"error", "failed"}:
+                await _clear_wait()
             return
 
         tracks_payload = _poll_tracks(details)
@@ -8878,6 +8894,7 @@ async def _poll_suno_and_send(
     except Exception as exc:
         log.exception("[SUNO] poll unexpected failure | task_id=%s err=%s", task_id, exc)
         await _issue_refund(_suno_error_message(None, _clean_reason(str(exc))), reason="suno:refund:poll_err")
+        await _clear_wait()
     finally:
         s = state(ctx)
         if s.get("suno_last_task_id") == task_id:
@@ -8886,6 +8903,7 @@ async def _poll_suno_and_send(
         s["suno_current_req_id"] = None
         _reset_suno_start_flags(s)
         _reset_suno_card_cache(s)
+        s["video_wait_message_id"] = None
         try:
             await refresh_suno_card(ctx, chat_id, s, price=PRICE_SUNO)
         except Exception as exc:
@@ -9222,6 +9240,7 @@ async def _finalize_sora2_task(
         if user_id is not None:
             release_sora2_lock(user_id)
         return
+    await delete_wait_sticker(ctx, chat_id=chat_id)
     wait_msg_id = meta.get("wait_message_id") if isinstance(meta.get("wait_message_id"), int) else None
     price = int(meta.get("price") or 0)
     service = str(meta.get("service") or "SORA2")
@@ -9255,9 +9274,6 @@ async def _finalize_sora2_task(
         if status == "success" and isinstance(result_payload, Mapping):
             sent_message_id: Optional[int] = None
             result_kind = "as_document"
-            if wait_msg_id:
-                with suppress(Exception):
-                    await ctx.bot.delete_message(chat_id, wait_msg_id)
             files = await _download_sora2_assets(result_payload)
             video_path = None
             for path in files:
@@ -9717,7 +9733,7 @@ async def _start_sora2_generation(
         await message.reply_text("⚠️ Не удалось создать задачу Sora 2. 💎 Токены возвращены.")
         return None
 
-    wait_msg_id = await show_wait_sticker(ctx, chat_id, SORA2_WAIT_STICKER_ID)
+    wait_msg_id = await send_wait_sticker(ctx, "sora2", chat_id=chat_id)
     s["sora2_wait_msg_id"] = wait_msg_id
     s["video_wait_message_id"] = wait_msg_id
     s["sora2_generating"] = True
@@ -11915,17 +11931,26 @@ async def poll_veo_and_send(
     temp_file: Optional[Path] = None
 
     try:
+        async def _clear_wait(target: Optional[int] = None) -> None:
+            chat_to_clear = target if target is not None else original_chat_id
+            with suppress(Exception):
+                await delete_wait_sticker(ctx, chat_id=chat_to_clear)
+            if s.get("video_wait_message_id"):
+                s["video_wait_message_id"] = None
+
         async with aiohttp.ClientSession(timeout=ClientTimeout(total=600)) as session:
             try:
                 video_url = await _poll_record_info()
             except TimeoutError as exc:
                 log_evt("KIE_TIMEOUT", task_id=task_id, reason="poll_exception", message=str(exc))
                 await _refund("timeout", str(exc))
+                await _clear_wait()
                 await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
                 return
             except Exception as exc:
                 log.exception("VEO status polling failed: %s", exc)
                 await _refund("poll_exception", str(exc))
+                await _clear_wait()
                 await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
                 return
 
@@ -11957,6 +11982,7 @@ async def poll_veo_and_send(
 
             temp_file, file_size = await _download_video(session, video_url)
 
+            await _clear_wait(target_chat_id)
             await _send_message_with_retry(target_chat_id, "🎞️ Рендер завершён — отправляю файл…", reply_to=reply_to_id)
             sent_message = await _send_media_with_retry(target_chat_id, temp_file, file_size, reply_to=reply_to_id)
             media_kind = "video" if file_size <= 48 * 1024 * 1024 else "document"
@@ -11977,10 +12003,12 @@ async def poll_veo_and_send(
     except TimeoutError as exc:
         log_evt("KIE_TIMEOUT", task_id=task_id, reason="timeout", message=str(exc))
         await _refund("timeout_final", str(exc))
+        await _clear_wait()
         await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     except Exception as exc:
         log.exception("VEO render failed: %s", exc)
         await _refund("exception", str(exc))
+        await _clear_wait()
         await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     finally:
         if temp_file and temp_file.exists():
@@ -12010,6 +12038,10 @@ async def poll_mj_and_send_photos(
     s = state(ctx)
     s["last_mj_task_id"] = task_id
 
+    async def _clear_wait() -> None:
+        with suppress(Exception):
+            await delete_wait_sticker(ctx, chat_id=chat_id)
+
     async def _refund(reason_tag: str, message: Optional[str] = None) -> Optional[int]:
         meta: Dict[str, Any] = {"service": "MJ", "reason": reason_tag, "task_id": task_id}
         if message:
@@ -12037,11 +12069,13 @@ async def poll_mj_and_send_photos(
             ok, flag, data = await asyncio.to_thread(mj_status, task_id)
             if not ok:
                 await _refund("status_error")
+                await _clear_wait()
                 await ctx.bot.send_message(chat_id, "❌ MJ: сервис недоступен. 💎 Токены возвращены.")
                 return
             if flag == 0:
                 if time.time() - start_ts > max_wait:
                     await _refund("timeout")
+                    await _clear_wait()
                     await ctx.bot.send_message(chat_id, "⌛ MJ долго отвечает. 💎 Токены возвращены.")
                     return
                 await asyncio.sleep(delay)
@@ -12072,6 +12106,7 @@ async def poll_mj_and_send_photos(
                         delay = 12
                         continue
                 await _refund("error", err)
+                await _clear_wait()
                 await ctx.bot.send_message(chat_id, f"❌ MJ: {err}\n💎 Токены возвращены.")
                 return
             if flag == 1:
@@ -12084,6 +12119,7 @@ async def poll_mj_and_send_photos(
 
                 if not urls:
                     await _refund("empty")
+                    await _clear_wait()
                     await ctx.bot.send_message(chat_id, "⚠️ MJ вернул пустой результат. 💎 Токены возвращены.")
                     return
 
@@ -12098,6 +12134,8 @@ async def poll_mj_and_send_photos(
                     prompt=prompt_for_retry,
                 )
 
+                await _clear_wait()
+
                 if not sent_successfully:
                     await _refund("send_failed")
                     await ctx.bot.send_message(
@@ -12111,6 +12149,8 @@ async def poll_mj_and_send_photos(
     except Exception as e:
         log.exception("MJ poll crash: %s", e)
         await _refund("exception", str(e))
+        with suppress(Exception):
+            await delete_wait_sticker(ctx, chat_id=chat_id)
         try:
             await ctx.bot.send_message(chat_id, "💥 Внутренняя ошибка MJ. 💎 Токены возвращены.")
         except Exception:
@@ -13888,6 +13928,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             s["mj_generating"] = True
             s["mj_last_wait_ts"] = time.time()
+            wait_msg_id = await send_wait_sticker(ctx, "mj", chat_id=chat_id)
+            if wait_msg_id:
+                s["video_wait_message_id"] = wait_msg_id
             await show_mj_generating_card(chat_id, ctx, prompt, aspect_value)
             ok, task_id, msg = await asyncio.to_thread(mj_generate, prompt, aspect_value)
             event("MJ_SUBMIT_RESP", ok=ok, task_id=task_id, msg=msg)
@@ -14634,6 +14677,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("Failed to save task meta for %s", task_id)
         await q.message.reply_text("🎬 Рендер начат — вернусь с готовым видео.")
+        wait_msg_id = await send_wait_sticker(ctx, "veo", chat_id=chat_id)
+        if wait_msg_id:
+            s["video_wait_message_id"] = wait_msg_id
         asyncio.create_task(
             poll_veo_and_send(update.effective_chat.id, task_id, gen_id, ctx, uid, price, service_name)
         ); return
@@ -15647,9 +15693,7 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
                                     exc,
                                 )
 
-    await message.reply_text(
-        f"✅ Начислено +{diamonds_to_credit} 💎. Новый баланс: {new_balance} 💎."
-    )
+    await send_ok_sticker(ctx, "purchase", new_balance, chat_id=message.chat_id)
 
     chat_id = update.effective_chat.id if update.effective_chat else user_id
     await show_main_menu(chat_id, ctx)
