@@ -31,7 +31,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
-from keyboards import CB_VIDEO_MENU
+from keyboards import CB_VIDEO_MENU, kb_main_menu_profile_first
 
 log = logging.getLogger("telegram.utils")
 
@@ -176,6 +176,8 @@ def sanitize_html(text: str) -> str:
 def build_hub_text(user_balance: int) -> str:
     """Render the main hub text with the current balance."""
 
+    from texts import TXT_MENU_TITLE
+
     try:
         balance_value = int(user_balance)
     except (TypeError, ValueError):
@@ -183,6 +185,7 @@ def build_hub_text(user_balance: int) -> str:
 
     return (
         "👋 Добро пожаловать!\n\n"
+        f"{TXT_MENU_TITLE}\n"
         f"💎 Ваш баланс: {balance_value}\n"
         f"📈 Больше идей и примеров — [канал с промптами]({_HUB_PROMPTS_URL})\n\n"
         "Выберите, что хотите сделать:"
@@ -191,20 +194,7 @@ def build_hub_text(user_balance: int) -> str:
 
 def build_hub_keyboard() -> InlineKeyboardMarkup:
     """Return a compact 2x3 inline keyboard for the emoji hub."""
-
-    rows = [
-        [
-            InlineKeyboardButton("🎬", callback_data=CB_VIDEO_MENU),
-            InlineKeyboardButton("🎨", callback_data="hub:image"),
-            InlineKeyboardButton("🎵", callback_data="hub:music"),
-        ],
-        [
-            InlineKeyboardButton("🧠", callback_data="hub:prompt"),
-            InlineKeyboardButton("💬", callback_data="hub:chat"),
-            InlineKeyboardButton("💎", callback_data="hub:balance"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+    return kb_main_menu_profile_first()
 
 
 def _extract_status(exc: BaseException) -> Optional[int]:

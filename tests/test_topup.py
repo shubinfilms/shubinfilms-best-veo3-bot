@@ -17,6 +17,7 @@ os.environ.setdefault("LEDGER_BACKEND", "memory")
 
 import balance
 import bot
+from texts import TXT_PAY_CARD, TXT_PAY_STARS
 
 
 def test_topup_menu_opens_once():
@@ -52,8 +53,8 @@ def test_insufficient_tokens_shows_button(monkeypatch):
 
 def test_stars_button_label():
     keyboard = bot.topup_menu_keyboard()
-    assert keyboard.inline_keyboard[0][0].text.startswith("💎")
-    assert keyboard.inline_keyboard[1][0].text.startswith("💳")
+    assert keyboard.inline_keyboard[0][0].text == TXT_PAY_STARS
+    assert keyboard.inline_keyboard[1][0].text == TXT_PAY_CARD
 
 
 @pytest.fixture
