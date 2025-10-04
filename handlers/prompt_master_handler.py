@@ -37,6 +37,7 @@ from prompt_master import (
 from utils.html_render import html_to_plain, render_pm_html, safe_lines
 from utils.safe_send import sanitize_html, safe_send, send_html_with_fallback
 from utils.input_state import get_wait_state
+from stickers import delete_wait_sticker, send_wait_sticker
 
 logger = logging.getLogger(__name__)
 
@@ -546,139 +547,145 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
 
     chat = update.effective_chat
     chat_id = chat.id if chat else None
-    build_started = time.monotonic()
-    logger.info("pm.start", extra={"engine": engine, "lang": lang})
-    status_keyboard = prompt_master_mode_keyboard(lang)
-    status_text = _status_message(engine, lang)
-    status = (
-        await send_html_with_fallback(
-            context.bot,
-            chat_id,
-            status_text,
-            reply_markup=status_keyboard,
+    if chat_id is not None:
+        await send_wait_sticker(context, "promptmaster", chat_id=chat_id)
+    try:
+        build_started = time.monotonic()
+        logger.info("pm.start", extra={"engine": engine, "lang": lang})
+        status_keyboard = prompt_master_mode_keyboard(lang)
+        status_text = _status_message(engine, lang)
+        status = (
+            await send_html_with_fallback(
+                context.bot,
+                chat_id,
+                status_text,
+                reply_markup=status_keyboard,
+            )
+            if chat_id is not None
+            else None
         )
-        if chat_id is not None
-        else None
-    )
-    slow_task: Optional[asyncio.Task[None]] = None
-    slow_state = {"done": False}
-    if status is not None:
-        async def _slow_notice() -> None:
-            try:
-                await asyncio.sleep(3.0)
-                if slow_state.get("done"):
+        slow_task: Optional[asyncio.Task[None]] = None
+        slow_state = {"done": False}
+        if status is not None:
+
+            async def _slow_notice() -> None:
+                try:
+                    await asyncio.sleep(3.0)
+                    if slow_state.get("done"):
+                        return
+                    await _edit_with_fallback(
+                        context,
+                        status.chat_id,
+                        status.message_id,
+                        f"{status_text}<br>{_slow_status(lang)}",
+                        status_keyboard,
+                    )
+                except asyncio.CancelledError:
                     return
+                except Exception:
+                    logger.debug("prompt_master.slow_status.fail", exc_info=True)
+
+            slow_task = asyncio.create_task(_slow_notice())
+
+        builder = ENGINE_BUILDERS.get(engine)
+        result_payload: Optional[PMResult] = None
+        try:
+            result_payload = builder(text, lang) if builder else None
+        except Exception:
+            logger.exception("prompt_master.build_failed", extra={"engine": engine})
+
+        if result_payload is None:
+            slow_state["done"] = True
+            if slow_task:
+                slow_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await slow_task
+            await _handle_render_failure(
+                context,
+                status,
+                lang,
+                engine,
+                status_keyboard,
+                chat_id,
+            )
+            return
+
+        if chat_id is not None:
+            _store_prompt(chat_id, engine, result_payload)
+        state["result"] = result_payload
+
+        result_html = result_payload.get("body_html", "")
+        if not result_html:
+            logger.error("pm.render.empty", extra={"engine": engine})
+            slow_state["done"] = True
+            if slow_task:
+                slow_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await slow_task
+            await _handle_render_failure(
+                context,
+                status,
+                lang,
+                engine,
+                status_keyboard,
+                chat_id,
+            )
+            return
+        slow_state["done"] = True
+        if slow_task:
+            slow_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await slow_task
+        meta = result_payload.get("raw_payload") or {}
+        duration = time.monotonic() - build_started
+        logger.info(
+            "pm.build.success",
+            extra={
+                "engine": engine,
+                "duration": round(duration, 3),
+                "lang": lang,
+                "voiceover_origin": meta.get("voiceover_origin"),
+                "voiceover_requested": meta.get("voiceover_requested"),
+            },
+        )
+        markup = prompt_master_result_keyboard(engine, lang)
+        if status is not None:
+            try:
                 await _edit_with_fallback(
                     context,
                     status.chat_id,
                     status.message_id,
-                    f"{status_text}<br>{_slow_status(lang)}",
-                    status_keyboard,
+                    result_html,
+                    markup,
                 )
-            except asyncio.CancelledError:
-                return
+                logger.info("pm.card.sent", extra={"engine": engine})
+                if state.get("autodelete", True):
+                    await _safe_delete(message)
             except Exception:
-                logger.debug("prompt_master.slow_status.fail", exc_info=True)
-
-        slow_task = asyncio.create_task(_slow_notice())
-
-    builder = ENGINE_BUILDERS.get(engine)
-    result_payload: Optional[PMResult] = None
-    try:
-        result_payload = builder(text, lang) if builder else None
-    except Exception:
-        logger.exception("prompt_master.build_failed", extra={"engine": engine})
-
-    if result_payload is None:
-        slow_state["done"] = True
-        if slow_task:
-            slow_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await slow_task
-        await _handle_render_failure(
-            context,
-            status,
-            lang,
-            engine,
-            status_keyboard,
-            chat_id,
-        )
-        return
-
-    if chat_id is not None:
-        _store_prompt(chat_id, engine, result_payload)
-    state["result"] = result_payload
-
-    result_html = result_payload.get("body_html", "")
-    if not result_html:
-        logger.error("pm.render.empty", extra={"engine": engine})
-        slow_state["done"] = True
-        if slow_task:
-            slow_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await slow_task
-        await _handle_render_failure(
-            context,
-            status,
-            lang,
-            engine,
-            status_keyboard,
-            chat_id,
-        )
-        return
-    slow_state["done"] = True
-    if slow_task:
-        slow_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await slow_task
-    meta = result_payload.get("raw_payload") or {}
-    duration = time.monotonic() - build_started
-    logger.info(
-        "pm.build.success",
-        extra={
-            "engine": engine,
-            "duration": round(duration, 3),
-            "lang": lang,
-            "voiceover_origin": meta.get("voiceover_origin"),
-            "voiceover_requested": meta.get("voiceover_requested"),
-        },
-    )
-    markup = prompt_master_result_keyboard(engine, lang)
-    if status is not None:
-        try:
-            await _edit_with_fallback(
-                context,
-                status.chat_id,
-                status.message_id,
-                result_html,
-                markup,
-            )
-            logger.info("pm.card.sent", extra={"engine": engine})
-            if state.get("autodelete", True):
-                await _safe_delete(message)
-        except Exception:
-            logger.exception("pm.card.fail", extra={"engine": engine})
-            await _notify_failure(context, chat_id, lang)
-        return
-    if chat_id is not None:
-        try:
-            sent = await send_html_with_fallback(
-                context.bot,
-                chat_id,
-                result_html,
-                reply_markup=markup,
-            )
-        except Exception:
-            logger.exception("pm.card.fail", extra={"engine": engine})
-            await _notify_failure(context, chat_id, lang)
+                logger.exception("pm.card.fail", extra={"engine": engine})
+                await _notify_failure(context, chat_id, lang)
             return
-        if sent is not None:
-            logger.info("pm.card.sent", extra={"engine": engine})
-            if state.get("autodelete", True):
-                await _safe_delete(message)
-        else:
-            logger.error("pm.card.fail", extra={"engine": engine})
-            await _notify_failure(context, chat_id, lang)
+        if chat_id is not None:
+            try:
+                sent = await send_html_with_fallback(
+                    context.bot,
+                    chat_id,
+                    result_html,
+                    reply_markup=markup,
+                )
+            except Exception:
+                logger.exception("pm.card.fail", extra={"engine": engine})
+                await _notify_failure(context, chat_id, lang)
+                return
+            if sent is not None:
+                logger.info("pm.card.sent", extra={"engine": engine})
+                if state.get("autodelete", True):
+                    await _safe_delete(message)
+            else:
+                logger.error("pm.card.fail", extra={"engine": engine})
+    finally:
+        if chat_id is not None:
+            await delete_wait_sticker(context, chat_id=chat_id)
 
 
 async def prompt_master_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

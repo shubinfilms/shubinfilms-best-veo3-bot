@@ -27,6 +27,7 @@ from suno.client import (
 )
 from suno.schemas import ApiEnvelope, CallbackEnvelope, SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
+from stickers import pop_wait_sticker_id
 from settings import (
     HTTP_POOL_CONNECTIONS,
     HTTP_POOL_PER_HOST,
@@ -1400,6 +1401,23 @@ class SunoService:
             bot_telegram_send_fail_total.labels(method=method).inc()
             log.warning("Telegram sendMessage network error", exc_info=True)
 
+    def _delete_wait_sticker(self, chat_id: int) -> None:
+        message_id = pop_wait_sticker_id(chat_id)
+        if not message_id:
+            return
+        payload = {"chat_id": chat_id, "message_id": int(message_id)}
+        method = "deleteMessage"
+        try:
+            resp = self._bot_session.post(self._bot_url(method), json=payload, timeout=20)
+            if not resp.ok:
+                bot_telegram_send_fail_total.labels(method=method).inc()
+                log.warning(
+                    "Telegram deleteMessage failed | status=%s text=%s", resp.status_code, resp.text
+                )
+        except requests.RequestException:
+            bot_telegram_send_fail_total.labels(method=method).inc()
+            log.warning("Telegram deleteMessage network error", exc_info=True)
+
     def _send_file(
         self,
         method: str,
@@ -2292,6 +2310,8 @@ class SunoService:
         incoming_status = (task.callback_type or "").lower()
         existing_status = str(existing_record.get("status") or "").lower()
         final_states = {"complete", "error", "failed", "success"}
+        if incoming_status in final_states:
+            self._delete_wait_sticker(int(chat_id))
         if incoming_status in final_states and self._recently_delivered(task.task_id):
             log.info(
                 "Suno callback duplicate final",
