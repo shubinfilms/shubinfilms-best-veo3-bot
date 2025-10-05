@@ -194,10 +194,10 @@ from keyboards import (
     mj_upscale_select_keyboard,
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
-    kb_ai_dialog_modes,
     kb_kb_root,
     kb_kb_templates,
     kb_profile_topup_entry,
+    dialog_picker_inline,
     menu_pay_unified,
 )
 from texts import (
@@ -349,6 +349,9 @@ from chat_service import (
     INPUT_MAX_CHARS,
 )
 from chat_mode import is_on as chat_mode_is_on, turn_on as chat_mode_turn_on
+from session_state import disable_chat as session_disable_chat
+from session_state import enable_regular_chat as session_enable_regular_chat
+from session_state import is_chat_enabled as session_is_chat_enabled
 from metrics import (
     suno_enqueue_duration_seconds,
     suno_enqueue_total,
@@ -1473,13 +1476,14 @@ async def disable_chat_mode(
 ) -> bool:
     state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
     active_mode = state_obj.get(STATE_CHAT_MODE)
-    had_mode = bool(active_mode)
+    had_mode = bool(active_mode) or session_is_chat_enabled(ctx)
     if user_id is not None and not had_mode:
         try:
             had_mode = chat_mode_is_on(user_id)
         except Exception:
             had_mode = False
 
+    session_disable_chat(ctx)
     state_obj[STATE_CHAT_MODE] = None
     state_obj[STATE_ACTIVE_CARD] = None
     state_obj["mode"] = None
@@ -1573,12 +1577,14 @@ async def enable_chat_mode(
             )
 
     if target_mode == "normal":
+        session_enable_regular_chat(ctx)
         state_dict[STATE_CHAT_MODE] = "normal"
         state_dict[STATE_ACTIVE_CARD] = "chat:normal"
         await start_mode(update, ctx, "dialog_default")
         return
 
     if target_mode == "prompt_master":
+        session_disable_chat(ctx)
         state_dict[STATE_CHAT_MODE] = "prompt_master"
         state_dict[STATE_ACTIVE_CARD] = "chat:prompt_master"
         await start_mode(update, ctx, "prompt_master")
@@ -1632,6 +1638,7 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
     normalized = (mode or "").strip().lower()
     if normalized in {"chat", "dialog", "dialog_default"}:
         normalized = "dialog_default"
+        session_enable_regular_chat(ctx)
         chat_mode_turn_on(user_id)
         await set_active_mode(user_id, normalized)
         if chat_id is not None:
@@ -1664,6 +1671,7 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
         return
 
     if normalized == "prompt_master":
+        session_disable_chat(ctx)
         await set_active_mode(user_id, normalized)
         if chat_id is not None:
             _mode_set(chat_id, MODE_PM)
@@ -4504,6 +4512,10 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     else:
         suno_state_obj = SunoState()
     state_dict = _apply_state_defaults(ensure_state(ctx))
+    if session_is_chat_enabled(ctx):
+        state_dict[STATE_CHAT_MODE] = "normal"
+    elif state_dict.get(STATE_CHAT_MODE) == "normal":
+        state_dict[STATE_CHAT_MODE] = None
     suno_state_payload = suno_state_obj.to_dict()
     state_dict["suno_state"] = suno_state_payload
     if isinstance(user_data, dict):
@@ -5600,8 +5612,8 @@ TEXT_ALIASES.update(
         "🎬 Генерация видео": VIDEO_MENU_CB,
         "🎨 Генерация изображений": IMAGE_MENU_CB,
         "🎵 Генерация музыки": MUSIC_MENU_CB,
-        "🧠 Prompt-Master": AI_MENU_CB,
-        "💬 Обычный чат": AI_MENU_CB,
+        "🧠 Prompt-Master": "prompt_master",
+        "💬 Обычный чат": "dialog_default",
     }
 )
 
@@ -5612,7 +5624,7 @@ HOME_ROUTE_ACTIONS: Dict[str, str] = {
     "music": "music",
     "video": "video",
     "dialog": "ai_modes",
-    "chat": "chat",
+    "chat": "ai_modes",
     "balance_command": "balance",
 }
 
@@ -5680,7 +5692,13 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "nav_image": "image",
     "nav_music": "music",
     "nav_prompt": "prompt",
-    "nav_chat": "chat",
+    "nav_chat": "ai_modes",
+    "nav:profile": "balance",
+    "nav:kbase": "knowledge",
+    "nav:photo": "image",
+    "nav:music": "music",
+    "nav:video": "video",
+    "nav:dialog": "ai_modes",
     "profile": "balance",
     "back_main": "profile_topup",
 }
@@ -5833,7 +5851,8 @@ async def _dispatch_home_action(
         if message is None or chat_id is None:
             return
         text = f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
-        keyboard = kb_ai_dialog_modes()
+        session_disable_chat(ctx)
+        keyboard = dialog_picker_inline()
         try:
             await safe_edit_message(
                 ctx,
@@ -5943,9 +5962,27 @@ async def _dispatch_home_action(
         return
 
     if action == "chat":
-        if user_id is None:
+        if message is None or chat_id is None:
             return
-        await enable_chat_mode(update, ctx, "normal")
+        session_disable_chat(ctx)
+        text = f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
+        keyboard = dialog_picker_inline()
+        try:
+            await safe_edit_message(
+                ctx,
+                chat_id,
+                message.message_id,
+                text,
+                keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            sent = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+            if isinstance(ctx.user_data, dict):
+                mid = getattr(sent, "message_id", None)
+                if isinstance(mid, int):
+                    ctx.user_data["hub_msg_id"] = mid
         return
 
     if action == "balance":
@@ -5977,6 +6014,24 @@ async def dialog_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 
 
 async def prompt_master_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer()
+    await enable_chat_mode(update, ctx, "prompt_master")
+
+
+async def dialog_choose_regular_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer()
+    await enable_chat_mode(update, ctx, "normal")
+
+
+async def dialog_choose_promptmaster_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     query = update.callback_query
     if query is not None:
@@ -13358,6 +13413,10 @@ async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await route_home(update, ctx, "home:photo")
 
 
+async def dialog_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await route_home(update, ctx, "nav:dialog")
+
+
 async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     await topup(update, ctx)
@@ -16888,6 +16947,7 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("cancel",), cancel_command),
     (("faq",), faq_command_entry),
     (("prompt_master",), prompt_master_command),
+    (("dialog",), dialog_command),
     (("pm_reset",), prompt_master_reset_command),
     (("chat",), chat_command),
     (("reset",), chat_reset_command),
@@ -16897,7 +16957,7 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("music", "suno"), suno_command),
     (("balance",), balance_command),
     (("profile",), profile_command),
-    (("kb",), kb_command),
+    (("kb", "knowledge_base"), kb_command),
     (("help", "support"), help_command_entry),
 ]
 
@@ -16925,6 +16985,8 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog_default$", dialog_mode_callback),
     (r"^prompt_master$", prompt_master_mode_callback),
+    (r"^dialog:choose_regular$", dialog_choose_regular_callback),
+    (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
@@ -16934,7 +16996,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
     (
-        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
+        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
         hub_router,
     ),
     (r"^go:", main_suggest_router),
