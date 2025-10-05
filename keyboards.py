@@ -19,21 +19,33 @@ EMOJI = {
     "pay": "💎",
 }
 
+CB_PROFILE = "mnu:profile"
+CB_KB = "mnu:kb"
+CB_PHOTO = "mnu:photo"
+CB_MUSIC = "mnu:music"
+CB_VIDEO = "mnu:video"
+CB_CHAT = "mnu:chat"
+
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(text="👥 Профиль", callback_data=CB_PROFILE)],
+            [InlineKeyboardButton(text="📚 База знаний", callback_data=CB_KB)],
+            [
+                InlineKeyboardButton(text="📸 Режим фото", callback_data=CB_PHOTO),
+                InlineKeyboardButton(text="🎧 Режим музыки", callback_data=CB_MUSIC),
+            ],
+            [
+                InlineKeyboardButton(text="📹 Режим видео", callback_data=CB_VIDEO),
+                InlineKeyboardButton(text="🧠 Диалог с ИИ", callback_data=CB_CHAT),
+            ],
+        ]
+    )
+
 
 def kb_home_menu() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="👥 Профиль", callback_data="home:profile")],
-        [InlineKeyboardButton(text="📚 База знаний", callback_data="home:kb")],
-        [
-            InlineKeyboardButton(text="📸 Режим фото", callback_data="home:photo"),
-            InlineKeyboardButton(text="🎧 Режим музыки", callback_data="home:music"),
-        ],
-        [
-            InlineKeyboardButton(text="📹 Режим видео", callback_data="home:video"),
-            InlineKeyboardButton(text="🧠 Диалог с ИИ", callback_data="home:chat"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+    return main_menu_kb()
 
 
 def reply_kb_home() -> ReplyKeyboardMarkup:

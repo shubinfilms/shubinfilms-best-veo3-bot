@@ -2,9 +2,11 @@ import os
 import sys
 from pathlib import Path
 
-from keyboards import kb_home_menu, menu_pay_unified
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+from keyboards import kb_home_menu, menu_pay_unified
 
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 os.environ.setdefault("LEDGER_BACKEND", "memory")
@@ -29,12 +31,12 @@ def test_kb_home_menu_layout():
         "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
-        "home:profile",
-        "home:kb",
-        "home:photo",
-        "home:music",
-        "home:video",
-        "home:chat",
+        "mnu:profile",
+        "mnu:kb",
+        "mnu:photo",
+        "mnu:music",
+        "mnu:video",
+        "mnu:chat",
     ]
 
 
