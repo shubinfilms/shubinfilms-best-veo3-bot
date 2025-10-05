@@ -161,6 +161,7 @@ from keyboards import (
     AI_MENU_CB,
     AI_TO_PROMPTMASTER_CB,
     AI_TO_SIMPLE_CB,
+    kb_banana_templates,
     CB,
     CB_FAQ_PREFIX,
     CB_MAIN_BACK,
@@ -3392,7 +3393,8 @@ async def _deliver_banana_media(
     user_id: int,
     file_path: Path,
     caption: str,
-    reply_markup: Optional[Any] = None,
+    photo_reply_markup: Optional[Any] = None,
+    document_reply_markup: Optional[Any] = None,
     send_document: bool = True,
 ) -> bool:
     try:
@@ -3422,7 +3424,7 @@ async def _deliver_banana_media(
                 chat_id=chat_id,
                 photo=InputFile(handle, filename=file_path.name),
                 caption=caption,
-                reply_markup=reply_markup,
+                reply_markup=photo_reply_markup,
                 kind="banana_photo",
             )
         duration_ms = int((time.monotonic() - photo_start) * 1000)
@@ -3467,7 +3469,7 @@ async def _deliver_banana_media(
                     chat_id=chat_id,
                     document=InputFile(handle, filename=doc_filename),
                     caption=None,
-                    reply_markup=reply_markup,
+                    reply_markup=document_reply_markup,
                     kind="banana_document",
                     disable_notification=True,
                 )
@@ -6972,16 +6974,6 @@ async def mj_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s["_last_text_mj"] = None
     await show_mj_format_card(chat_id, ctx, force_new=True)
 
-def banana_examples_block() -> str:
-    return (
-        "💡 <b>Примеры запросов:</b>\n"
-        "• поменяй фон на городской вечер\n"
-        "• смени одежду на чёрный пиджак\n"
-        "• добавь лёгкий макияж, подчеркни глаза\n"
-        "• убери лишние предметы со стола\n"
-        "• поставь нас на одну фотографию"
-    )
-
 BANANA_MODE_HINT_MD = (
     "🍌 Banana включён\n"
     "Сначала пришлите до *4 фото* (можно по одному). Когда будут готовы — пришлите *текст-промпт*, что изменить."
@@ -6991,11 +6983,15 @@ MJ_MODE_HINT_TEXT = (
     "🖼 Midjourney включён. Введите промпт сообщением и нажмите «Подтвердить»."
 )
 
+BANANA_HELPER_LINE = "Пришлите до 4 фото и текст-промпт, что изменить."
+
+
 def banana_card_text(s: Dict[str, Any]) -> str:
     n = len(s.get("banana_images") or [])
     prompt = (s.get("last_prompt") or "").strip()
     prompt_html = html.escape(prompt)
     has_prompt = "есть" if prompt else "нет"
+    s["banana_helper_line"] = BANANA_HELPER_LINE
     lines = [
         "🍌 <b>Карточка Banana</b>",
         f"🧩 Фото: <b>{n}/4</b>  •  Промпт: <b>{has_prompt}</b>",
@@ -7003,7 +6999,7 @@ def banana_card_text(s: Dict[str, Any]) -> str:
         "🖊️ <b>Промпт:</b>",
         f"<code>{prompt_html}</code>" if prompt else "<code></code>",
         "",
-        banana_examples_block()
+        BANANA_HELPER_LINE,
     ]
     balance = s.get("banana_balance")
     if balance is not None:
@@ -7014,7 +7010,10 @@ def banana_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("➕ Добавить ещё фото", callback_data="banana:add_more")],
         [InlineKeyboardButton("🧹 Очистить фото", callback_data="banana:reset_imgs")],
-        [InlineKeyboardButton("✍️ Изменить промпт", callback_data="banana:edit_prompt")],
+        [
+            InlineKeyboardButton("✍️ Изменить промпт", callback_data="banana:edit_prompt"),
+            InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana_templates"),
+        ],
         [InlineKeyboardButton("🚀 Начать генерацию Banana", callback_data="banana:start")],
         [InlineKeyboardButton("🔁 Сменить движок", callback_data="banana:switch_engine")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
@@ -7022,12 +7021,10 @@ def banana_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def banana_result_keyboard() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton("🔁 Повторить")],
-        [KeyboardButton("⬅️ Назад в меню")],
-    ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+def banana_result_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔁 Сгенерировать ещё", callback_data="banana_regenerate_fresh")]]
+    )
 
 
 # --------- Suno Helpers ----------
@@ -14314,6 +14311,54 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_pm_insert_to_veo(update, ctx, data)
         return
 
+    if data == "banana_templates":
+        if message is None:
+            await q.answer("Карточка недоступна", show_alert=True)
+            return
+        s["_last_text_banana"] = None
+        await _safe_edit_message_text(
+            q.edit_message_text,
+            "✨ Готовые шаблоны для Banana\nВыберите заготовку, она подставится в поле промпта:",
+            reply_markup=kb_banana_templates(),
+        )
+        await q.answer()
+        return
+
+    if data == "banana_back_to_card":
+        s["_last_text_banana"] = None
+        if chat_id is not None:
+            await show_banana_card(chat_id, ctx, force_new=True)
+        await q.answer()
+        return
+
+    if data.startswith("btpl_"):
+        template_mapping = {
+            "btpl_bg_remove": "удали фон на прозрачный/однотонный",
+            "btpl_bg_studio": "замени фон на студийный (чистая белая/серая подложка)",
+            "btpl_outfit_black": "измени одежду на чёрный пиджак",
+            "btpl_makeup_soft": "добавь лёгкий макияж, подчеркни глаза (естественно)",
+            "btpl_desk_clean": "убери лишние предметы со стола",
+        }
+        prompt_text = template_mapping.get(data)
+        if prompt_text is None:
+            await q.answer("Шаблон не найден", show_alert=True)
+            return
+        s["last_prompt"] = prompt_text
+        s["_last_text_banana"] = None
+        if chat_id is not None:
+            await show_banana_card(chat_id, ctx, force_new=True)
+        await q.answer("Шаблон подставлен ✅")
+        return
+
+    if data == "banana_regenerate_fresh":
+        s["banana_images"] = []
+        s["last_prompt"] = None
+        s["_last_text_banana"] = None
+        if chat_id is not None:
+            await show_banana_card(chat_id, ctx, force_new=True)
+        await q.answer("Новая карточка Banana ✨")
+        return
+
     await q.answer()
 
     if data.startswith("tx:"):
@@ -15752,22 +15797,11 @@ async def _banana_run_and_send(
             user_id=user_id,
             file_path=temp_path,
             caption=caption,
-            reply_markup=None,
+            photo_reply_markup=banana_result_inline_keyboard(),
+            document_reply_markup=None,
             send_document=BANANA_SEND_AS_DOCUMENT,
         )
-        if delivered:
-            try:
-                await ctx.bot.send_message(
-                    chat_id,
-                    "Галерея сгенерирована.",
-                    reply_markup=banana_result_keyboard(),
-                )
-            except Exception as exc:
-                log.warning(
-                    "banana.result.keyboard_fail",
-                    extra={"meta": {"chat_id": chat_id, "error": str(exc)}},
-                )
-        else:
+        if not delivered:
             await ctx.bot.send_message(
                 chat_id,
                 "❌ Не удалось отправить изображение Banana. Попробуйте позже.",

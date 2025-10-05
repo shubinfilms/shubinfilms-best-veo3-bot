@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
-from telegram import ReplyKeyboardMarkup
+from telegram import InlineKeyboardMarkup
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -81,10 +81,12 @@ def test_banana_generate_flow(monkeypatch, tmp_path, bot_module):
     assert len(fake_bot.photo_calls) == 1
     assert len(fake_bot.document_calls) == 1
     assert menu_calls == []
-    assert len(fake_bot.messages) >= 2
-    follow_up = fake_bot.messages[-1]
-    assert follow_up["text"] == "Галерея сгенерирована."
-    markup = follow_up.get("reply_markup")
-    assert isinstance(markup, ReplyKeyboardMarkup)
-    keyboard_text = [[getattr(button, "text", button) for button in row] for row in markup.keyboard]
-    assert keyboard_text == [["🔁 Повторить"], ["⬅️ Назад в меню"]]
+    assert len(fake_bot.messages) == 1
+    first_message = fake_bot.messages[0]
+    assert first_message["text"].startswith("🍌 Задача Banana")
+    photo_call = fake_bot.photo_calls[0]
+    markup = photo_call.get("reply_markup")
+    assert isinstance(markup, InlineKeyboardMarkup)
+    buttons = markup.inline_keyboard
+    assert buttons and buttons[0][0].text == "🔁 Сгенерировать ещё"
+    assert buttons[0][0].callback_data == "banana_regenerate_fresh"
