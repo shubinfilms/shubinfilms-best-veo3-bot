@@ -77,6 +77,7 @@ _MJ_LOCK_KEY_TMPL = f"{_PFX}:mj:lock:{{}}"
 _MJ_LOCK_TTL = 15 * 60
 _MENU_LOCK_KEY_TMPL = f"{_PFX}:menu:lock:{{}}:{{}}"
 _MENU_MSG_KEY_TMPL = f"{_PFX}:menu:msg:{{}}:{{}}"
+_MAIN_MENU_GUARD_KEY_TMPL = f"{_PFX}:ui:last_main_menu:{{}}"
 _USER_LOCK_KEY_TMPL = f"{_PFX}:user:lock:{{}}:{{}}"
 _SORA2_LOCK_KEY_TMPL = f"{_PFX}:lock:sora2:{{}}"
 _SORA2_UNAVAILABLE_KEY = f"{_PFX}:sora2:unavailable"
@@ -101,6 +102,10 @@ def _menu_lock_key(name: str, chat_id: int) -> str:
 def _menu_msg_key(name: str, chat_id: int) -> str:
     normalized = str(name or "card").strip() or "card"
     return _MENU_MSG_KEY_TMPL.format(normalized, int(chat_id))
+
+
+def _main_menu_guard_key(chat_id: int) -> str:
+    return _MAIN_MENU_GUARD_KEY_TMPL.format(int(chat_id))
 
 
 def _user_lock_key(user_id: int, key: str) -> str:
@@ -466,6 +471,21 @@ def release_sora2_lock(user_id: Optional[int]) -> None:
             _logger.warning("sora2.lock.release_error | key=%s err=%s", lock_key, exc)
     else:
         _memory_delete(lock_key)
+
+
+def acquire_main_menu_guard(chat_id: int, ttl: int = 3) -> bool:
+    """Return ``True`` if a guard for the main menu was acquired."""
+
+    ttl_value = max(int(ttl), 1)
+    guard_key = _main_menu_guard_key(chat_id)
+    if _r:
+        try:
+            return bool(_r.set(guard_key, "1", nx=True, ex=ttl_value))
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.warning(
+                "main_menu_guard.set_failed | key=%s err=%s", guard_key, exc
+            )
+    return _memory_set_if_absent(guard_key, "1", ttl_value)
 
 
 def save_menu_message(name: str, chat_id: int, message_id: int, ttl: int) -> None:

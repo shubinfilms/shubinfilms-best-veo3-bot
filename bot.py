@@ -275,6 +275,7 @@ from redis_utils import (
     user_lock,
     release_user_lock,
     update_task_meta,
+    acquire_main_menu_guard,
 )
 
 from ledger import (
@@ -5200,6 +5201,9 @@ async def show_emoji_hub(
 
 async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     return await show_emoji_hub_for_chat(chat_id, ctx, replace=True)
+
+
+MAIN_MENU_GUARD_TTL = 3
 
 
 TEXT_ALIASES: Dict[str, str] = {
@@ -12725,24 +12729,18 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id is None:
         return
 
+    guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
+
     user_id = user.id if user else None
     await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
     _clear_pm_menu_state(chat_id, user_id=user_id)
     if user_id:
         set_mode(user_id, False)
         clear_wait(user_id)
-    await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
-
-    if query is None:
-        source_message = update.effective_message
-        if source_message is not None:
-            try:
-                await source_message.reply_text("👇 Быстрый доступ:", reply_markup=reply_kb_home())
-            except Exception as exc:
-                log.debug(
-                    "menu.reply_keyboard_failed",
-                    extra={"chat_id": chat_id, "error": str(exc)},
-                )
+    if guard_acquired:
+        await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
+    else:
+        log.debug("menu.guard_skip", extra={"chat_id": chat_id})
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -12758,6 +12756,19 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
         except Exception as exc:
             log.exception("Signup bonus failed for %s: %s", uid, exc)
+
+    message = update.effective_message
+    if message is not None:
+        try:
+            await message.reply_text(
+                "Клавиатура быстрых действий доступна через иконку клавиатуры ⌨️",
+                reply_markup=reply_kb_home(),
+            )
+        except Exception as exc:
+            log.debug(
+                "start.reply_keyboard_failed",
+                extra={"chat_id": message.chat_id, "error": str(exc)},
+            )
 
     await handle_menu(update, ctx)
 
