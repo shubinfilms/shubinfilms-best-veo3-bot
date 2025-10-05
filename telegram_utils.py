@@ -31,7 +31,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
-from keyboards import CB_VIDEO_MENU, kb_home_menu
+from keyboards import CB_VIDEO_MENU, main_menu_kb
 
 log = logging.getLogger("telegram.utils")
 
@@ -191,7 +191,7 @@ def build_hub_text(user_balance: int) -> str:
 
 def build_hub_keyboard() -> InlineKeyboardMarkup:
     """Return a compact 2x3 inline keyboard for the emoji hub."""
-    return kb_home_menu()
+    return main_menu_kb()
 
 
 def _extract_status(exc: BaseException) -> Optional[int]:

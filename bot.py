@@ -169,6 +169,12 @@ from keyboards import (
     CB_PM_PREFIX,
     CB_PROFILE_BACK,
     CB_PROFILE_TOPUP,
+    CB_CHAT,
+    CB_KB,
+    CB_MUSIC,
+    CB_PHOTO,
+    CB_PROFILE,
+    CB_VIDEO,
     CB_VIDEO_ENGINE_SORA2,
     CB_VIDEO_ENGINE_SORA2_DISABLED,
     CB_VIDEO_ENGINE_VEO,
@@ -193,7 +199,6 @@ from keyboards import (
     kb_ai_dialog_modes,
     kb_profile_topup_entry,
     menu_pay_unified,
-    reply_kb_home,
 )
 from texts import (
     SUNO_MODE_PROMPT,
@@ -5115,10 +5120,6 @@ def render_welcome_for(
     _set_cached_balance(ctx, balance)
     return WELCOME.format(balance=balance, prompts_url=PROMPTS_CHANNEL_URL)
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    return reply_kb_home()
-
-
 async def show_emoji_hub_for_chat(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -5249,6 +5250,12 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "home:music": "music",
     "home:video": "video",
     "home:chat": "ai_modes",
+    CB_PROFILE: "balance",
+    CB_KB: "knowledge",
+    CB_PHOTO: "image",
+    CB_MUSIC: "music",
+    CB_VIDEO: "video",
+    CB_CHAT: "ai_modes",
     CB_MAIN_PROFILE: "balance",
     CB_PROFILE_BACK: "balance",
     CB_MAIN_BACK: "root",
@@ -5304,7 +5311,7 @@ async def route_home(
     user_id = user.id if user else None
 
     raw_action = route
-    if route.startswith("home:"):
+    if route.startswith(("home:", "mnu:")):
         raw_action = route.split(":", 1)[1]
 
     action = HOME_ROUTE_ACTIONS.get(raw_action, raw_action)
@@ -5531,7 +5538,10 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer()
         return
 
-    if data.startswith("home:"):
+    from_user = getattr(query, "from_user", None)
+    log.debug("cb %s from %s", data, getattr(from_user, "id", None))
+
+    if data.startswith(("home:", "mnu:")):
         await route_home(update, ctx, data, query=query)
         return
 
@@ -5547,7 +5557,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = getattr(chat, "id", None)
     if chat_id is None and message is not None:
         chat_id = getattr(message, "chat_id", None)
-    user = getattr(query, "from_user", None) or getattr(update, "effective_user", None)
+    user = from_user or getattr(update, "effective_user", None)
     user_id = user.id if user else None
 
     with suppress(BadRequest):
@@ -12762,7 +12772,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await message.reply_text(
                 "Клавиатура быстрых действий доступна через иконку клавиатуры ⌨️",
-                reply_markup=reply_kb_home(),
             )
         except Exception as exc:
             log.debug(
@@ -16385,7 +16394,10 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
-    (r"^(?:hub:|main_|profile_|pay_|nav_|back_main$|ai_modes$|chat_(?:normal|promptmaster)$)", hub_router),
+    (
+        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|back_main$|ai_modes$|chat_(?:normal|promptmaster)$)",
+        hub_router,
+    ),
     (r"^go:", main_suggest_router),
     (r"^s2_go_t2v$", sora2_start_t2v),
     (r"^s2_go_i2v$", sora2_start_i2v),
