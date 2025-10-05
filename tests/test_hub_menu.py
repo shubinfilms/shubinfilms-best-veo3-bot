@@ -12,7 +12,7 @@ def test_build_hub_keyboard_layout():
     keyboard = build_hub_keyboard()
     rows = keyboard.inline_keyboard
 
-    assert [len(row) for row in rows] == [1, 1, 2, 2]
+    assert [len(row) for row in rows] == [2, 2, 2]
 
     texts = [button.text for row in rows for button in row]
     callbacks = [button.callback_data for row in rows for button in row]
@@ -20,18 +20,18 @@ def test_build_hub_keyboard_layout():
     assert texts == [
         "👤 Профиль",
         "📚 База знаний",
-        "📸 Режим фото",
-        "🎧 Режим музыки",
-        "📹 Режим видео",
-        "🧠 Диалог с ИИ",
+        "📸 Фото",
+        "🎧 Музыка",
+        "📹 Видео",
+        "🧠 Диалог",
     ]
     assert callbacks == [
-        "menu_profile",
-        "kb_entry",
-        "image_menu",
-        "music_menu",
-        "video_menu",
-        "menu_chat_ai",
+        "home:profile",
+        "home:kb",
+        "home:photo",
+        "home:music",
+        "home:video",
+        "home:dialog",
     ]
 
 

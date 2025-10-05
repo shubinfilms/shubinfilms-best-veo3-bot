@@ -23,7 +23,7 @@ def test_main_menu_profile_first_layout():
     assert isinstance(markup, InlineKeyboardMarkup)
 
     rows = markup.inline_keyboard
-    assert rows[0][0].text == TXT_KB_PROFILE
-    assert rows[1][0].text == TXT_KB_KNOWLEDGE
-    assert [button.text for button in rows[2]] == [TXT_KB_PHOTO, TXT_KB_MUSIC]
-    assert [button.text for button in rows[3]] == [TXT_KB_VIDEO, TXT_KB_AI_DIALOG]
+    assert len(rows) == 3
+    assert [button.text for button in rows[0]] == [TXT_KB_PROFILE, TXT_KB_KNOWLEDGE]
+    assert [button.text for button in rows[1]] == [TXT_KB_PHOTO, TXT_KB_MUSIC]
+    assert [button.text for button in rows[2]] == [TXT_KB_VIDEO, TXT_KB_AI_DIALOG]

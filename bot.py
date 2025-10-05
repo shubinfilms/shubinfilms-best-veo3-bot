@@ -46,7 +46,6 @@ import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, InputMediaVideo, LabeledPrice, ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton, BotCommand, User, Message, CallbackQuery
 )
 from telegram.constants import ParseMode, ChatAction
@@ -188,6 +187,9 @@ from keyboards import (
     MUSIC_MENU_CB,
     PROFILE_MENU_CB,
     VIDEO_MENU_CB,
+    build_empty_reply_kb,
+    build_main_reply_kb,
+    iter_home_menu_buttons,
     mj_upscale_root_keyboard,
     mj_upscale_select_keyboard,
     suno_modes_keyboard,
@@ -197,7 +199,6 @@ from keyboards import (
     kb_kb_templates,
     kb_profile_topup_entry,
     menu_pay_unified,
-    reply_kb_home,
 )
 from texts import (
     SUNO_MODE_PROMPT,
@@ -210,6 +211,7 @@ from texts import (
     TXT_KB_AI_DIALOG,
     TXT_KB_PROFILE,
     TXT_KNOWLEDGE_INTRO,
+    TXT_MENU_TITLE,
     TXT_PROFILE_TITLE,
     TXT_TOPUP_CHOOSE,
     TXT_PAY_CRYPTO_OPEN_LINK,
@@ -1493,18 +1495,29 @@ async def disable_chat_mode(
 
     if notify and had_mode and chat_id is not None:
         try:
-            await tg_safe_send(
+            sent_message = await tg_safe_send(
                 ctx.bot.send_message,
                 method_name="sendMessage",
                 kind="message",
                 chat_id=chat_id,
                 text="🛑 Режим диалога отключён.",
+                reply_markup=build_main_reply_kb(),
             )
         except Exception as exc:
             log.debug(
                 "chat.disable.notify_failed",
                 extra={"chat_id": chat_id, "error": str(exc)},
             )
+        else:
+            if isinstance(sent_message, Message):
+                state_obj[STATE_QUICK_KEYBOARD_CHAT] = chat_id
+                msg_ids = state_obj.get("msg_ids")
+                if isinstance(msg_ids, dict):
+                    msg_ids["quick_keyboard_remove"] = getattr(
+                        sent_message,
+                        "message_id",
+                        None,
+                    )
 
     return had_mode
 
@@ -1515,6 +1528,9 @@ async def enable_chat_mode(
     mode: str,
 ) -> None:
     message = getattr(update, "effective_message", None)
+    query = getattr(update, "callback_query", None)
+    if message is None and query is not None:
+        message = getattr(query, "message", None)
     chat_obj = getattr(update, "effective_chat", None)
     if chat_obj is None and message is not None:
         chat_obj = getattr(message, "chat", None)
@@ -1583,6 +1599,9 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
 
     user_id = int(user.id)
     message = getattr(update, "effective_message", None)
+    query = getattr(update, "callback_query", None)
+    if message is None and query is not None:
+        message = getattr(query, "message", None)
     chat_obj = getattr(update, "effective_chat", None)
     if chat_obj is None and message is not None:
         chat_obj = getattr(message, "chat", None)
@@ -1603,8 +1622,9 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
 
     if isinstance(ctx.user_data, dict):
         ctx.user_data.pop("pm_state", None)
-    if isinstance(ctx.chat_data, dict):
-        ctx.chat_data.pop("prompt_master", None)
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    if isinstance(chat_data_obj, dict):
+        chat_data_obj.pop("prompt_master", None)
 
     state_dict["mode"] = None
     state_dict[STATE_ACTIVE_CARD] = None
@@ -5238,29 +5258,32 @@ async def safe_edit_or_send_menu(
     return None
 
 
-async def hide_quick_keyboard(
+async def ensure_main_reply_keyboard(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: Optional[int],
     *,
     state_dict: Optional[Dict[str, Any]] = None,
+    text: Optional[str] = None,
 ) -> None:
     if chat_id is None:
         return
 
     state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
-    already_hidden = state_obj.get(STATE_QUICK_KEYBOARD_CHAT)
-    if already_hidden == chat_id:
+    already_sent = state_obj.get(STATE_QUICK_KEYBOARD_CHAT)
+    if already_sent == chat_id:
         return
+
+    payload_text = text if isinstance(text, str) and text.strip() else " "
 
     try:
         message = await ctx.bot.send_message(
             chat_id=chat_id,
-            text=" ",
-            reply_markup=ReplyKeyboardRemove(),
+            text=payload_text,
+            reply_markup=build_main_reply_kb(),
         )
     except Exception as exc:
         log.debug(
-            "ui.quick_keyboard.hide_failed",
+            "ui.reply_keyboard.restore_failed",
             extra={"chat_id": chat_id, "error": str(exc)},
         )
         return
@@ -5269,6 +5292,15 @@ async def hide_quick_keyboard(
     msg_ids = state_obj.get("msg_ids")
     if isinstance(msg_ids, dict):
         msg_ids["quick_keyboard_remove"] = getattr(message, "message_id", None)
+
+
+async def hide_quick_keyboard(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    *,
+    state_dict: Optional[Dict[str, Any]] = None,
+) -> None:
+    await ensure_main_reply_keyboard(ctx, chat_id, state_dict=state_dict)
 
 
 async def _kb_show_root(
@@ -5506,7 +5538,6 @@ async def show_emoji_hub_for_chat(
     log.info("hub.show | user_id=%s balance=%s", resolved_uid, balance)
 
     state_dict = state(ctx)
-    await hide_quick_keyboard(ctx, chat_id, state_dict=state_dict)
 
     await _clear_bottom_menu(ctx, chat_id, state_dict=state_dict)
 
@@ -5535,6 +5566,10 @@ async def show_emoji_hub_for_chat(
     message_id = getattr(message, "message_id", None)
     if isinstance(message_id, int):
         ctx.user_data["hub_msg_id"] = message_id
+
+    await ensure_main_reply_keyboard(ctx, chat_id, state_dict=state_dict)
+
+    if isinstance(message_id, int):
         return message_id
     return None
 
@@ -5562,19 +5597,20 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
 MAIN_MENU_GUARD_TTL = 3
 
 
-TEXT_ALIASES: Dict[str, str] = {
-    "👤 Профиль": "home:profile",
-    "📚 База знаний": "home:kb",
-    "📸 Режим фото": "home:photo",
-    "🎧 Режим музыки": "home:music",
-    "📹 Режим видео": "home:video",
-    "🧠 Диалог с ИИ": "home:chat",
-    "🎬 Генерация видео": "home:video",
-    "🎨 Генерация изображений": "home:photo",
-    "🎵 Генерация музыки": "home:music",
-    "🧠 Prompt-Master": "home:chat",
-    "💬 Обычный чат": "home:chat",
-}
+TEXT_ALIASES: Dict[str, str] = {text: callback for text, callback in iter_home_menu_buttons()}
+TEXT_ALIASES.update(
+    {
+        "📸 Режим фото": IMAGE_MENU_CB,
+        "🎧 Режим музыки": MUSIC_MENU_CB,
+        "📹 Режим видео": VIDEO_MENU_CB,
+        "🧠 Диалог с ИИ": AI_MENU_CB,
+        "🎬 Генерация видео": VIDEO_MENU_CB,
+        "🎨 Генерация изображений": IMAGE_MENU_CB,
+        "🎵 Генерация музыки": MUSIC_MENU_CB,
+        "🧠 Prompt-Master": AI_MENU_CB,
+        "💬 Обычный чат": AI_MENU_CB,
+    }
+)
 
 HOME_ROUTE_ACTIONS: Dict[str, str] = {
     "profile": "balance",
@@ -5582,6 +5618,7 @@ HOME_ROUTE_ACTIONS: Dict[str, str] = {
     "photo": "image",
     "music": "music",
     "video": "video",
+    "dialog": "ai_modes",
     "chat": "chat",
     "balance_command": "balance",
 }
@@ -5611,6 +5648,7 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "home:photo": "image",
     "home:music": "music",
     "home:video": "video",
+    "home:dialog": "ai_modes",
     "home:chat": "ai_modes",
     PROFILE_MENU_CB: "balance",
     "profile:menu": "balance",
@@ -5713,6 +5751,11 @@ async def _dispatch_home_action(
     query: Optional[CallbackQuery],
     data: str,
 ) -> None:
+    if message is None:
+        message = getattr(update, "effective_message", None)
+    if message is None and query is not None:
+        message = getattr(query, "message", None)
+
     if not action:
         return
 
@@ -13177,10 +13220,18 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             state_dict=state_dict,
         )
         clear_wait(user_id)
+
     if not guard_acquired:
         log.debug("menu.guard_skip", extra={"chat_id": chat_id})
 
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
+
+    await ensure_main_reply_keyboard(
+        ctx,
+        chat_id,
+        state_dict=state_dict,
+        text=TXT_MENU_TITLE,
+    )
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -13196,18 +13247,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
         except Exception as exc:
             log.exception("Signup bonus failed for %s: %s", uid, exc)
-
-    message = update.effective_message
-    if message is not None:
-        try:
-            await message.reply_text(
-                "Клавиатура быстрых действий доступна через иконку клавиатуры ⌨️",
-            )
-        except Exception as exc:
-            log.debug(
-                "start.reply_keyboard_failed",
-                extra={"chat_id": message.chat_id, "error": str(exc)},
-            )
 
     await handle_menu(update, ctx)
 
@@ -17152,5 +17191,5 @@ if __name__ == "__main__":
 def main_menu_kb() -> ReplyKeyboardMarkup:
     """Compatibility helper exposing the reply keyboard layout."""
 
-    return reply_kb_home()
+    return build_main_reply_kb()
 
