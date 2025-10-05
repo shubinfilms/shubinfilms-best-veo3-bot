@@ -46,6 +46,7 @@ import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, InputMediaVideo, LabeledPrice, ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton, BotCommand, User, Message, CallbackQuery
 )
 from telegram.constants import ParseMode, ChatAction
@@ -188,10 +189,11 @@ from keyboards import (
     VIDEO_MENU_CB,
     mj_upscale_root_keyboard,
     mj_upscale_select_keyboard,
-    faq_keyboard,
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
     kb_ai_dialog_modes,
+    kb_kb_root,
+    kb_kb_templates,
     kb_profile_topup_entry,
     menu_pay_unified,
     reply_kb_home,
@@ -1458,6 +1460,117 @@ async def _ensure_active_mode(user_id: Optional[int], expected: str) -> None:
         await set_active_mode(user_id, expected)
 
 
+async def disable_chat_mode(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int],
+    user_id: Optional[int] = None,
+    state_dict: Optional[Dict[str, Any]] = None,
+    notify: bool = True,
+) -> bool:
+    state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
+    active_mode = state_obj.get(STATE_CHAT_MODE)
+    had_mode = bool(active_mode)
+    if user_id is not None and not had_mode:
+        try:
+            had_mode = chat_mode_is_on(user_id)
+        except Exception:
+            had_mode = False
+
+    state_obj[STATE_CHAT_MODE] = None
+    state_obj[STATE_ACTIVE_CARD] = None
+    state_obj["mode"] = None
+
+    if user_id is not None:
+        try:
+            await clear_mode_state(user_id)
+        except Exception as exc:
+            log.debug(
+                "chat.disable.clear_failed",
+                extra={"user_id": user_id, "error": str(exc)},
+            )
+
+    if notify and had_mode and chat_id is not None:
+        try:
+            await tg_safe_send(
+                ctx.bot.send_message,
+                method_name="sendMessage",
+                kind="message",
+                chat_id=chat_id,
+                text="🛑 Режим диалога отключён.",
+            )
+        except Exception as exc:
+            log.debug(
+                "chat.disable.notify_failed",
+                extra={"chat_id": chat_id, "error": str(exc)},
+            )
+
+    return had_mode
+
+
+async def enable_chat_mode(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    mode: str,
+) -> None:
+    message = getattr(update, "effective_message", None)
+    chat_obj = getattr(update, "effective_chat", None)
+    if chat_obj is None and message is not None:
+        chat_obj = getattr(message, "chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+
+    user = getattr(update, "effective_user", None)
+    if user is None and message is not None:
+        user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", None)
+
+    state_dict = state(ctx)
+
+    if chat_id is not None:
+        await hide_quick_keyboard(ctx, chat_id, state_dict=state_dict)
+
+    normalized = (mode or "").strip().lower()
+    target_mode = None
+    if normalized in {"chat", "dialog", "dialog_default", "normal"}:
+        target_mode = "normal"
+    elif normalized in {"prompt_master", "prompt-master", "promptmaster", "pm"}:
+        target_mode = "prompt_master"
+
+    if user_id is not None:
+        current_mode = state_dict.get(STATE_CHAT_MODE)
+        needs_disable = False
+        if current_mode and current_mode != target_mode:
+            needs_disable = True
+        elif not current_mode and target_mode == "normal":
+            try:
+                needs_disable = chat_mode_is_on(user_id)
+            except Exception:
+                needs_disable = False
+        if needs_disable:
+            await disable_chat_mode(
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                state_dict=state_dict,
+                notify=False,
+            )
+
+    if target_mode == "normal":
+        state_dict[STATE_CHAT_MODE] = "normal"
+        state_dict[STATE_ACTIVE_CARD] = "chat:normal"
+        await start_mode(update, ctx, "dialog_default")
+        return
+
+    if target_mode == "prompt_master":
+        state_dict[STATE_CHAT_MODE] = "prompt_master"
+        state_dict[STATE_ACTIVE_CARD] = "chat:prompt_master"
+        await start_mode(update, ctx, "prompt_master")
+        return
+
+    state_dict[STATE_CHAT_MODE] = None
+    state_dict[STATE_ACTIVE_CARD] = None
+
+
 async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
     user = getattr(update, "effective_user", None)
     if user is None:
@@ -1474,6 +1587,10 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
         chat_obj = getattr(message, "chat", None)
     chat_id = getattr(chat_obj, "id", None)
 
+    state_dict = state(ctx)
+    if chat_id is not None:
+        await hide_quick_keyboard(ctx, chat_id, state_dict=state_dict)
+
     await clear_mode_state(user_id)
     _pm_clear_step(user_id)
     _pm_clear_buffer(user_id)
@@ -1488,8 +1605,8 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
     if isinstance(ctx.chat_data, dict):
         ctx.chat_data.pop("prompt_master", None)
 
-    state_dict = state(ctx)
     state_dict["mode"] = None
+    state_dict[STATE_ACTIVE_CARD] = None
 
     normalized = (mode or "").strip().lower()
     if normalized in {"chat", "dialog", "dialog_default"}:
@@ -1499,6 +1616,8 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
         if chat_id is not None:
             _mode_set(chat_id, MODE_CHAT)
         state_dict["chat_hint_sent"] = False
+        state_dict[STATE_CHAT_MODE] = "normal"
+        state_dict[STATE_ACTIVE_CARD] = "chat:normal"
         hint_text = md2_escape("💬 Обычный чат включён. Пишите вопрос. /reset — очистить контекст.")
         if message is not None and chat_id is not None:
             try:
@@ -1527,12 +1646,16 @@ async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) 
         await set_active_mode(user_id, normalized)
         if chat_id is not None:
             _mode_set(chat_id, MODE_PM)
+        state_dict[STATE_CHAT_MODE] = "prompt_master"
+        state_dict[STATE_ACTIVE_CARD] = "chat:prompt_master"
         try:
             await prompt_master_open(update, ctx)
         except Exception:
             log.exception("prompt_master.start_mode_failed", extra={"user_id": user_id})
         return
 
+    state_dict[STATE_CHAT_MODE] = None
+    state_dict[STATE_ACTIVE_CARD] = None
     await set_active_mode(user_id, normalized or None)
     if normalized and chat_id is not None:
         _mode_set(chat_id, normalized)
@@ -4848,6 +4971,11 @@ BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
 BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
+KB_MENU_STATE_KEY = "last_ui_msg_id_kb"
+KB_MENU_MSG_IDS_KEY = "kb"
+STATE_CHAT_MODE = "chat_mode"
+STATE_ACTIVE_CARD = "active_card"
+STATE_QUICK_KEYBOARD_CHAT = "quick_keyboard_hidden_for"
 
 VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
 VIDEO_VEO_MENU_TEXT = "🎥 Режимы VEO:"
@@ -5098,7 +5226,7 @@ async def safe_edit_or_send_menu(
             log_label,
             extra={"chat_id": chat_id, "message_id": message_id},
         )
-        return message_id
+    return message_id
 
     log.warning(
         "%s.send_failed",
@@ -5107,6 +5235,114 @@ async def safe_edit_or_send_menu(
     )
     return None
 
+
+async def hide_quick_keyboard(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    *,
+    state_dict: Optional[Dict[str, Any]] = None,
+) -> None:
+    if chat_id is None:
+        return
+
+    state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
+    already_hidden = state_obj.get(STATE_QUICK_KEYBOARD_CHAT)
+    if already_hidden == chat_id:
+        return
+
+    try:
+        message = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=" ",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception as exc:
+        log.debug(
+            "ui.quick_keyboard.hide_failed",
+            extra={"chat_id": chat_id, "error": str(exc)},
+        )
+        return
+
+    state_obj[STATE_QUICK_KEYBOARD_CHAT] = chat_id
+    msg_ids = state_obj.get("msg_ids")
+    if isinstance(msg_ids, dict):
+        msg_ids["quick_keyboard_remove"] = getattr(message, "message_id", None)
+
+
+async def _kb_show_root(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state_dict: Dict[str, Any],
+) -> Optional[int]:
+    message_id = await safe_edit_or_send_menu(
+        ctx,
+        chat_id=chat_id,
+        text=TXT_KNOWLEDGE_INTRO,
+        reply_markup=kb_kb_root(),
+        state_key=KB_MENU_STATE_KEY,
+        msg_ids_key=KB_MENU_MSG_IDS_KEY,
+        state_dict=state_dict,
+        log_label="ui.kb.root",
+    )
+    state_dict[STATE_ACTIVE_CARD] = "kb:root"
+    return message_id
+
+
+async def _kb_show_examples(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state_dict: Dict[str, Any],
+) -> Optional[int]:
+    message_id = await safe_edit_or_send_menu(
+        ctx,
+        chat_id=chat_id,
+        text="🪄 Примеры генераций: (скоро)",
+        reply_markup=kb_kb_root(),
+        state_key=KB_MENU_STATE_KEY,
+        msg_ids_key=KB_MENU_MSG_IDS_KEY,
+        state_dict=state_dict,
+        log_label="ui.kb.examples",
+    )
+    state_dict[STATE_ACTIVE_CARD] = "kb:examples"
+    return message_id
+
+
+async def _kb_show_lessons(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state_dict: Dict[str, Any],
+) -> Optional[int]:
+    message_id = await safe_edit_or_send_menu(
+        ctx,
+        chat_id=chat_id,
+        text="💡 Мини видео уроки: (скоро)",
+        reply_markup=kb_kb_root(),
+        state_key=KB_MENU_STATE_KEY,
+        msg_ids_key=KB_MENU_MSG_IDS_KEY,
+        state_dict=state_dict,
+        log_label="ui.kb.lessons",
+    )
+    state_dict[STATE_ACTIVE_CARD] = "kb:lessons"
+    return message_id
+
+
+async def _kb_show_templates(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state_dict: Dict[str, Any],
+) -> Optional[int]:
+    message_id = await safe_edit_or_send_menu(
+        ctx,
+        chat_id=chat_id,
+        text="✨ Готовые шаблоны\nВыберите шаблон:",
+        reply_markup=kb_kb_templates(),
+        state_key=KB_MENU_STATE_KEY,
+        msg_ids_key=KB_MENU_MSG_IDS_KEY,
+        state_dict=state_dict,
+        log_label="ui.kb.templates",
+    )
+    state_dict[STATE_ACTIVE_CARD] = "kb:templates"
+    return message_id
 
 async def refresh_suno_card(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -5267,7 +5503,10 @@ async def show_emoji_hub_for_chat(
 
     log.info("hub.show | user_id=%s balance=%s", resolved_uid, balance)
 
-    await _clear_bottom_menu(ctx, chat_id)
+    state_dict = state(ctx)
+    await hide_quick_keyboard(ctx, chat_id, state_dict=state_dict)
+
+    await _clear_bottom_menu(ctx, chat_id, state_dict=state_dict)
 
     hub_msg_id_val = ctx.user_data.get("hub_msg_id")
     hub_msg_id = hub_msg_id_val if isinstance(hub_msg_id_val, int) else None
@@ -5322,7 +5561,7 @@ MAIN_MENU_GUARD_TTL = 3
 
 
 TEXT_ALIASES: Dict[str, str] = {
-    "👥 Профиль": "home:profile",
+    "👤 Профиль": "home:profile",
     "📚 База знаний": "home:kb",
     "📸 Режим фото": "home:photo",
     "🎧 Режим музыки": "home:music",
@@ -5357,6 +5596,11 @@ _NAVIGATION_RESET_ACTIONS = {
     "prompt_master",
     "ai_modes",
     "root",
+    "kb_examples",
+    "kb_templates",
+    "kb_lessons",
+    "kb_faq",
+    "tpl_banana",
 }
 
 _HUB_ACTION_ALIASES: Dict[str, str] = {
@@ -5367,20 +5611,38 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "home:video": "video",
     "home:chat": "ai_modes",
     PROFILE_MENU_CB: "balance",
+    "profile:menu": "balance",
     KNOWLEDGE_MENU_CB: "knowledge",
+    "kb:menu": "knowledge",
     IMAGE_MENU_CB: "image",
+    "image:menu": "image",
     MUSIC_MENU_CB: "music",
+    "music:menu": "music",
     VIDEO_MENU_CB: "video",
+    "video:menu": "video",
     AI_MENU_CB: "ai_modes",
+    "ai:menu": "ai_modes",
     CB_PROFILE_BACK: "balance",
     CB_MAIN_BACK: "root",
     CB_AI_MODES: "ai_modes",
     CB_PROFILE_TOPUP: "profile_topup",
     AI_TO_SIMPLE_CB: "dialog_default",
+    "dialog_default": "dialog_default",
     AI_TO_PROMPTMASTER_CB: "prompt_master",
+    "prompt_master": "prompt_master",
     CB_PAY_STARS: "pay_stars",
     CB_PAY_CARD: "pay_card",
     CB_PAY_CRYPTO: "pay_crypto",
+    "kb_examples": "kb_examples",
+    "kb_templates": "kb_templates",
+    "kb_lessons": "kb_lessons",
+    "kb_faq": "kb_faq",
+    "tpl_video": "video",
+    "tpl_image": "image",
+    "tpl_music": "music",
+    "tpl_banana": "tpl_banana",
+    "tpl_ai_photo": "image",
+    "menu_main": "root",
     "nav_video": "video",
     "nav_image": "image",
     "nav_music": "music",
@@ -5457,9 +5719,33 @@ async def _dispatch_home_action(
 
     state_dict = state(ctx)
 
+    if chat_id is not None and action != "root":
+        await hide_quick_keyboard(ctx, chat_id, state_dict=state_dict)
+
     if user_id is not None and action in _NAVIGATION_RESET_ACTIONS:
         input_state.clear(user_id, reason="home_nav")
         clear_wait(user_id, reason="home_nav")
+
+    disable_actions = {
+        "knowledge",
+        "balance",
+        "video",
+        "image",
+        "music",
+        "kb_examples",
+        "kb_templates",
+        "kb_lessons",
+        "kb_faq",
+        "tpl_banana",
+    }
+
+    if action in disable_actions and chat_id is not None:
+        await disable_chat_mode(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=state_dict,
+        )
 
     if action == "root":
         if chat_id is not None:
@@ -5467,30 +5753,42 @@ async def _dispatch_home_action(
         return
 
     if action == "knowledge":
-        knowledge_key = "last_ui_msg_id_knowledge"
-        existing = state_dict.get(knowledge_key)
-        current_mid = existing if isinstance(existing, int) else None
-        sent_id = await safe_edit_or_send(
-            ctx,
-            chat_id=chat_id,
-            message_id=current_mid,
-            text=TXT_KNOWLEDGE_INTRO,
-            reply_markup=faq_keyboard(),
-        )
-        if isinstance(sent_id, int):
-            state_dict[knowledge_key] = sent_id
+        if chat_id is not None:
+            await _kb_show_root(ctx, chat_id, state_dict)
+        return
+
+    if action == "kb_examples":
+        if chat_id is not None:
+            await _kb_show_examples(ctx, chat_id, state_dict)
+        return
+
+    if action == "kb_templates":
+        if chat_id is not None:
+            await _kb_show_templates(ctx, chat_id, state_dict)
+        return
+
+    if action == "kb_lessons":
+        if chat_id is not None:
+            await _kb_show_lessons(ctx, chat_id, state_dict)
+        return
+
+    if action == "kb_faq":
+        if chat_id is not None:
+            await _kb_show_root(ctx, chat_id, state_dict)
+            state_dict[STATE_ACTIVE_CARD] = "kb:faq"
+        await faq_command(update, ctx)
         return
 
     if action == "dialog_default":
         if user_id is None:
             return
-        await start_mode(update, ctx, "dialog_default")
+        await enable_chat_mode(update, ctx, "normal")
         return
 
     if action == "prompt_master":
         if user_id is None:
             return
-        await start_mode(update, ctx, "prompt_master")
+        await enable_chat_mode(update, ctx, "prompt_master")
         return
 
     if action == "ai_modes":
@@ -5526,8 +5824,6 @@ async def _dispatch_home_action(
             return
 
     if action == "video":
-        if user_id is not None:
-            set_mode(user_id, False)
         state_dict["mode"] = None
         try:
             await start_video_menu(update, ctx)
@@ -5539,8 +5835,6 @@ async def _dispatch_home_action(
         return
 
     if action == "image":
-        if user_id is not None:
-            set_mode(user_id, False)
         engine = state_dict.get("image_engine")
         if engine not in {"mj", "banana"}:
             await show_image_engine_selector(chat_id, ctx, force_new=True)
@@ -5560,8 +5854,6 @@ async def _dispatch_home_action(
         return
 
     if action == "music":
-        if user_id is not None:
-            set_mode(user_id, False)
         if not _suno_configured():
             if chat_id is not None:
                 await _suno_notify(
@@ -5589,16 +5881,33 @@ async def _dispatch_home_action(
                 pass
         return
 
+    if action == "tpl_banana":
+        if chat_id is None:
+            return
+        try:
+            await _open_image_engine(
+                chat_id,
+                ctx,
+                "banana",
+                user_id=user_id,
+                source="kb_template",
+                force_new=True,
+            )
+        except Exception:
+            log.exception("IMAGE_ENGINE_OPEN_FAIL | engine=banana chat=%s", chat_id)
+            await show_image_engine_selector(chat_id, ctx, force_new=True)
+        return
+
     if action == "prompt":
         if user_id is None:
             return
-        await start_mode(update, ctx, "prompt_master")
+        await enable_chat_mode(update, ctx, "prompt_master")
         return
 
     if action == "chat":
         if user_id is None:
             return
-        await start_mode(update, ctx, "dialog_default")
+        await enable_chat_mode(update, ctx, "normal")
         return
 
     if action == "balance":
@@ -5626,7 +5935,7 @@ async def dialog_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     if query is not None:
         with suppress(BadRequest):
             await query.answer()
-    await start_mode(update, ctx, "dialog_default")
+    await enable_chat_mode(update, ctx, "normal")
 
 
 async def prompt_master_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5635,7 +5944,7 @@ async def prompt_master_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_
     if query is not None:
         with suppress(BadRequest):
             await query.answer()
-    await start_mode(update, ctx, "prompt_master")
+    await enable_chat_mode(update, ctx, "prompt_master")
 
 
 async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12862,8 +13171,14 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = user.id if user else None
     await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
     _clear_pm_menu_state(chat_id, user_id=user_id)
+    state_dict = state(ctx)
     if user_id:
-        set_mode(user_id, False)
+        await disable_chat_mode(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=state_dict,
+        )
         clear_wait(user_id)
     if not guard_acquired:
         log.debug("menu.guard_skip", extra={"chat_id": chat_id})
@@ -13048,7 +13363,7 @@ async def faq_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 async def prompt_master_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await start_mode(update, ctx, "prompt_master")
+    await enable_chat_mode(update, ctx, "prompt_master")
 
 
 async def prompt_master_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -16727,7 +17042,7 @@ async def run_bot_async() -> None:
             try:
                 await application.bot.set_my_commands([
                     BotCommand("menu", "⭐ Главное меню"),
-                    BotCommand("profile", "👥 Профиль"),
+                    BotCommand("profile", "👤 Профиль"),
                     BotCommand("kb", "📚 База знаний"),
                     BotCommand("video", "📹 Режим видео"),
                     BotCommand("image", "📸 Режим фото"),

@@ -36,7 +36,7 @@ def test_main_menu_keyboard_layout():
     labels = [[button.text for button in row] for row in rows]
 
     assert labels == [
-        ["👥 Профиль"],
+        ["👤 Профиль"],
         ["📚 База знаний"],
         ["📸 Режим фото", "🎧 Режим музыки"],
         ["📹 Режим видео", "🧠 Диалог с ИИ"],
