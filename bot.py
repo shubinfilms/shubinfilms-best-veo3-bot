@@ -192,7 +192,6 @@ from keyboards import (
     suno_start_disabled_keyboard,
     kb_ai_dialog_modes,
     kb_profile_topup_entry,
-    menu_bottom_unified,
     menu_pay_unified,
 )
 from texts import (
@@ -206,7 +205,6 @@ from texts import (
     TXT_KB_AI_DIALOG,
     TXT_KB_PROFILE,
     TXT_KNOWLEDGE_INTRO,
-    TXT_MENU_TITLE,
     TXT_PROFILE_TITLE,
     TXT_TOPUP_CHOOSE,
     TXT_PAY_CRYPTO_OPEN_LINK,
@@ -2438,7 +2436,6 @@ async def chat_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as exc:
         log.warning("chat.command_hint_failed | chat=%s err=%s", chat.id, exc)
-    await _show_bottom_menu(chat.id, ctx)
 
 
 async def chat_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4736,9 +4733,6 @@ WELCOME = (
 )
 
 
-MAIN_MENU_TEXT = f"*{TXT_MENU_TITLE}*\nВыберите, что хотите сделать:"
-
-
 MENU_BTN_VIDEO = "🎬 Генерация видео"
 MENU_BTN_IMAGE = "🎨 Генерация изображений"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
@@ -4749,7 +4743,6 @@ MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
-BOTTOM_MENU_TEXT = "👇 Быстрые действия"
 BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
 
 VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
@@ -5011,34 +5004,6 @@ async def safe_edit_or_send_menu(
     return None
 
 
-async def _show_bottom_menu(
-    chat_id: int,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    *,
-    state_dict: Optional[Dict[str, Any]] = None,
-    text: str = BOTTOM_MENU_TEXT,
-) -> Optional[int]:
-    state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
-    try:
-        return await safe_edit_or_send_menu(
-            ctx,
-            chat_id=chat_id,
-            text=text,
-            reply_markup=menu_bottom_unified(),
-            state_key=BOTTOM_MENU_STATE_KEY,
-            state_dict=state_obj,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            log_label="ui.bottom_menu",
-        )
-    except Exception as exc:  # pragma: no cover - network issues
-        log.debug(
-            "ui.bottom_menu.error",
-            extra={"chat_id": chat_id, "error": str(exc)},
-        )
-        return None
-
-
 async def refresh_suno_card(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -5056,7 +5021,6 @@ async def refresh_suno_card(
         state_key=state_key,
         force_new=force_new,
     )
-    await _show_bottom_menu(chat_id, ctx, state_dict=state_dict)
     return result
 
 
@@ -5263,6 +5227,12 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
 
 
 _HUB_ACTION_ALIASES: Dict[str, str] = {
+    "home:profile": "balance",
+    "home:kb": "knowledge",
+    "home:photo": "image",
+    "home:music": "music",
+    "home:video": "video",
+    "home:chat": "ai_modes",
     CB_MAIN_PROFILE: "balance",
     CB_PROFILE_BACK: "balance",
     CB_MAIN_BACK: "root",
@@ -5456,7 +5426,6 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
-        await _show_bottom_menu(chat_id, ctx, state_dict=s)
         return
 
     if action == "balance":
@@ -6382,7 +6351,6 @@ async def _update_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: st
         s["_last_text_mj"] = text
     elif force:
         s["_last_text_mj"] = None
-    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 async def show_mj_format_card(
     chat_id: int,
@@ -7789,7 +7757,6 @@ async def suno_entry(
     save_suno_state(ctx, suno_state_obj)
     s["suno_state"] = suno_state_obj.to_dict()
     await _music_show_main_menu(chat_id, ctx, s)
-    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 
 async def _suno_notify(
@@ -12642,14 +12609,6 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         clear_wait(user_id)
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
-    menu_message = await safe_send(update, ctx, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
-    if isinstance(menu_message, Message):
-        try:
-            s["last_ui_msg_id_menu"] = menu_message.message_id
-        except Exception:
-            pass
-
-
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     uid = update.effective_user.id if update.effective_user else None
@@ -13562,7 +13521,6 @@ async def show_banana_card(
         s["_last_text_banana"] = text
     else:
         s["_last_text_banana"] = None
-    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = True) -> None:
     s = state(ctx)
@@ -13677,7 +13635,6 @@ async def show_veo_card(
         s["_last_text_veo"] = text
     else:
         s["_last_text_veo"] = None
-    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 async def veo_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
