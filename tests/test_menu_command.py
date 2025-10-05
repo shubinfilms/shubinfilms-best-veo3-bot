@@ -36,15 +36,11 @@ def test_main_menu_keyboard_layout():
     labels = [[button.text for button in row] for row in rows]
 
     assert labels == [
-        [bot_module.MENU_BTN_VIDEO],
-        [bot_module.MENU_BTN_IMAGE],
-        [bot_module.MENU_BTN_SUNO],
-        [bot_module.MENU_BTN_PM],
-        [bot_module.MENU_BTN_CHAT],
-        [bot_module.MENU_BTN_BALANCE],
+        ["👥 Профиль"],
+        ["📚 База знаний"],
+        ["📸 Режим фото", "🎧 Режим музыки"],
+        ["📹 Режим видео", "🧠 Диалог с ИИ"],
     ]
-    flattened = [text for row in labels for text in row]
-    assert bot_module.MENU_BTN_SUPPORT not in flattened
 
 
 def test_video_menu_keyboard_options():

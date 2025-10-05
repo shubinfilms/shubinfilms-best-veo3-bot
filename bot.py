@@ -46,7 +46,7 @@ import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, InputMediaVideo, LabeledPrice, ReplyKeyboardMarkup,
-    KeyboardButton, BotCommand, User, Message
+    KeyboardButton, BotCommand, User, Message, CallbackQuery
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -193,6 +193,7 @@ from keyboards import (
     kb_ai_dialog_modes,
     kb_profile_topup_entry,
     menu_pay_unified,
+    reply_kb_home,
 )
 from texts import (
     SUNO_MODE_PROMPT,
@@ -2418,24 +2419,7 @@ async def chatgpt_smalltalk(text: str, chat_id: int) -> str:
 
 
 async def chat_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    chat = update.effective_chat
-    user = update.effective_user
-    if not chat or not user:
-        return
-    set_mode(user.id, True)
-    _mode_set(chat.id, MODE_CHAT)
-    try:
-        await safe_send_text(
-            ctx.bot,
-            chat.id,
-            md2_escape(
-                "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
-                "🎙️ Можно присылать голосовые — я их распознаю."
-            ),
-        )
-    except Exception as exc:
-        log.warning("chat.command_hint_failed | chat=%s err=%s", chat.id, exc)
+    await route_home(update, ctx, "home:chat")
 
 
 async def chat_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5131,15 +5115,7 @@ def render_welcome_for(
     return WELCOME.format(balance=balance, prompts_url=PROMPTS_CHANNEL_URL)
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton(MENU_BTN_VIDEO)],
-        [KeyboardButton(MENU_BTN_IMAGE)],
-        [KeyboardButton(MENU_BTN_SUNO)],
-        [KeyboardButton(MENU_BTN_PM)],
-        [KeyboardButton(MENU_BTN_CHAT)],
-        [KeyboardButton(MENU_BTN_BALANCE)],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return reply_kb_home()
 
 
 async def show_emoji_hub_for_chat(
@@ -5226,6 +5202,42 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
     return await show_emoji_hub_for_chat(chat_id, ctx, replace=True)
 
 
+TEXT_ALIASES: Dict[str, str] = {
+    "👥 Профиль": "home:profile",
+    "📚 База знаний": "home:kb",
+    "📸 Режим фото": "home:photo",
+    "🎧 Режим музыки": "home:music",
+    "📹 Режим видео": "home:video",
+    "🧠 Диалог с ИИ": "home:chat",
+    "🎬 Генерация видео": "home:video",
+    "🎨 Генерация изображений": "home:photo",
+    "🎵 Генерация музыки": "home:music",
+    "🧠 Prompt-Master": "home:chat",
+    "💬 Обычный чат": "home:chat",
+}
+
+HOME_ROUTE_ACTIONS: Dict[str, str] = {
+    "profile": "balance",
+    "kb": "knowledge",
+    "photo": "image",
+    "music": "music",
+    "video": "video",
+    "chat": "chat",
+    "balance_command": "balance",
+}
+
+_NAVIGATION_RESET_ACTIONS = {
+    "balance",
+    "knowledge",
+    "image",
+    "music",
+    "video",
+    "chat",
+    "prompt",
+    "ai_modes",
+    "root",
+}
+
 _HUB_ACTION_ALIASES: Dict[str, str] = {
     "home:profile": "balance",
     "home:kb": "knowledge",
@@ -5258,54 +5270,84 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
 }
 
 
-async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def route_home(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    route: str,
+    *,
+    query: Optional[CallbackQuery] = None,
+) -> None:
     await ensure_user_record(update)
 
-    query = update.callback_query
-    if not query:
-        return
+    if query is None:
+        query = getattr(update, "callback_query", None)
 
-    data = (query.data or "").strip()
-    if not data:
-        await query.answer()
-        return
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer()
 
-    if data.startswith("hub:"):
-        action = data.split(":", 1)[1]
-    else:
-        action = _HUB_ACTION_ALIASES.get(data)
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    if chat is None and message is not None:
+        chat = getattr(message, "chat", None)
+    user = getattr(update, "effective_user", None)
+    if user is None and message is not None:
+        user = getattr(message, "from_user", None)
 
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    user_id = user.id if user else None
+
+    raw_action = route
+    if route.startswith("home:"):
+        raw_action = route.split(":", 1)[1]
+
+    action = HOME_ROUTE_ACTIONS.get(raw_action, raw_action)
+
+    await _dispatch_home_action(
+        action=action,
+        update=update,
+        ctx=ctx,
+        chat_id=chat_id,
+        user_id=user_id,
+        message=message,
+        query=query,
+        data=route,
+    )
+
+
+async def _dispatch_home_action(
+    *,
+    action: Optional[str],
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    user_id: Optional[int],
+    message: Optional[Message],
+    query: Optional[CallbackQuery],
+    data: str,
+) -> None:
     if not action:
-        await query.answer()
         return
-    message = query.message
-    chat = update.effective_chat
-    user = update.effective_user
 
-    chat_id = None
-    if message is not None:
-        chat_id = message.chat_id
-    elif chat is not None:
-        chat_id = chat.id
+    if chat_id is None and action != "root":
+        return
 
-    user_id = user.id if user is not None else None
+    state_dict = state(ctx)
+
+    if user_id is not None and action in _NAVIGATION_RESET_ACTIONS:
+        input_state.clear(user_id, reason="home_nav")
+        clear_wait(user_id, reason="home_nav")
 
     if action == "root":
-        await query.answer()
         if chat_id is not None:
             await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
         return
 
-    if chat_id is None:
-        await query.answer()
-        return
-
-    s = state(ctx)
-
     if action == "knowledge":
-        await query.answer()
         knowledge_key = "last_ui_msg_id_knowledge"
-        existing = s.get(knowledge_key)
+        existing = state_dict.get(knowledge_key)
         current_mid = existing if isinstance(existing, int) else None
         sent_id = await safe_edit_or_send(
             ctx,
@@ -5315,12 +5357,11 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=faq_keyboard(),
         )
         if isinstance(sent_id, int):
-            s[knowledge_key] = sent_id
+            state_dict[knowledge_key] = sent_id
         return
 
     if action == "ai_modes":
-        await query.answer()
-        if message is None:
+        if message is None or chat_id is None:
             return
         text = f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
         keyboard = kb_ai_dialog_modes()
@@ -5352,51 +5393,76 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     if action == "video":
-        log.debug(
-            "hub.video.clicked",
-            extra={"chat_id": chat_id, "user_id": user_id},
-        )
-        if user_id:
+        if user_id is not None:
             set_mode(user_id, False)
-        s["mode"] = None
-        await query.answer()
+        state_dict["mode"] = None
         try:
             await start_video_menu(update, ctx)
-        except Exception as exc:  # pragma: no cover - network issues
-            log.warning("hub.video_send_failed | chat=%s err=%s", chat_id, exc)
+        except MenuLocked:
+            log.info(
+                "ui.video_menu.nav_locked",
+                extra={"chat_id": chat_id, "user_id": user_id},
+            )
         return
 
     if action == "image":
-        if user_id:
+        if user_id is not None:
             set_mode(user_id, False)
-        s["mode"] = None
-        await query.answer()
+        engine = state_dict.get("image_engine")
+        if engine not in {"mj", "banana"}:
+            await show_image_engine_selector(chat_id, ctx, force_new=True)
+            return
         try:
-            await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
-                chat_id=chat_id,
-                text="🖼️ Выберите режим работы с изображениями:",
-                reply_markup=image_menu_kb(),
+            await _open_image_engine(
+                chat_id,
+                ctx,
+                engine,
+                user_id=user_id,
+                source="image_command",
+                force_new=True,
             )
-        except Exception as exc:  # pragma: no cover - network issues
-            log.warning("hub.image_send_failed | chat=%s err=%s", chat_id, exc)
+        except Exception:
+            log.exception("IMAGE_ENGINE_OPEN_FAIL | engine=%s chat=%s", engine, chat_id)
+            await show_image_engine_selector(chat_id, ctx, force_new=True)
         return
 
     if action == "music":
-        if user_id:
+        if user_id is not None:
             set_mode(user_id, False)
-        await query.answer()
+        if not _suno_configured():
+            if chat_id is not None:
+                await _suno_notify(
+                    ctx,
+                    chat_id,
+                    "⚠️ Suno API не настроен. Обратитесь к поддержке.",
+                    reply_to=message,
+                )
+            return
+        if chat_id is None:
+            return
         await suno_entry(chat_id, ctx, force_new=True)
+        if user_id is not None:
+            card_id = state_dict.get("last_ui_msg_id_suno")
+            card_msg_id = card_id if isinstance(card_id, int) else None
+            try:
+                set_wait(
+                    user_id,
+                    WaitKind.SUNO_TITLE.value,
+                    card_msg_id or 0,
+                    chat_id=chat_id,
+                    meta={"source": "command"},
+                )
+            except ValueError:
+                pass
         return
 
     if action == "prompt":
-        if user_id:
+        if user_id is not None:
             set_mode(user_id, False)
-        s["mode"] = None
+        state_dict["mode"] = None
+        if chat_id is None:
+            return
         _mode_set(chat_id, MODE_PM)
-        await query.answer()
         try:
             await tg_safe_send(
                 ctx.bot.send_message,
@@ -5405,16 +5471,17 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 text="Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
             )
-        except Exception as exc:  # pragma: no cover - network issues
+        except Exception as exc:
             log.warning("hub.prompt_send_failed | chat=%s err=%s", chat_id, exc)
         return
 
     if action == "chat":
-        if user_id:
+        if user_id is not None:
             set_mode(user_id, True)
-        s["mode"] = None
+        state_dict["mode"] = None
+        if chat_id is None:
+            return
         _mode_set(chat_id, MODE_CHAT)
-        await query.answer()
         try:
             await safe_send_text(
                 ctx.bot,
@@ -5424,17 +5491,74 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     "🎙️ Можно присылать голосовые — я их распознаю."
                 ),
             )
-        except Exception as exc:  # pragma: no cover - network issues
+        except Exception as exc:
             log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
         return
 
     if action == "balance":
-        await query.answer()
-        force_new = data in {"hub:balance", CB_MAIN_PROFILE}
+        force_new = data in {"hub:balance", CB_MAIN_PROFILE, "balance_command"}
         await show_balance_card(chat_id, ctx, force_new=force_new)
         return
 
-    await query.answer()
+
+async def on_text_nav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    route = TEXT_ALIASES.get(text)
+    if not route:
+        return
+    await route_home(update, ctx, route)
+
+
+async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    if not data:
+        with suppress(BadRequest):
+            await query.answer()
+        return
+
+    if data.startswith("home:"):
+        await route_home(update, ctx, data, query=query)
+        return
+
+    action = _HUB_ACTION_ALIASES.get(data)
+    if not action:
+        with suppress(BadRequest):
+            await query.answer()
+        return
+
+    message = getattr(query, "message", None)
+    chat_obj = getattr(message, "chat", None)
+    chat = chat_obj if chat_obj is not None else getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    user = getattr(query, "from_user", None) or getattr(update, "effective_user", None)
+    user_id = user.id if user else None
+
+    with suppress(BadRequest):
+        await query.answer()
+
+    await _dispatch_home_action(
+        action=action,
+        update=update,
+        ctx=ctx,
+        chat_id=chat_id,
+        user_id=user_id,
+        message=message,
+        query=query,
+        data=data,
+    )
 
 
 async def main_suggest_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12609,6 +12733,17 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         clear_wait(user_id)
     await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
+    if query is None:
+        source_message = update.effective_message
+        if source_message is not None:
+            try:
+                await source_message.reply_text("👇 Быстрый доступ:", reply_markup=reply_kb_home())
+            except Exception as exc:
+                log.debug(
+                    "menu.reply_keyboard_failed",
+                    extra={"chat_id": chat_id, "error": str(exc)},
+                )
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     uid = update.effective_user.id if update.effective_user else None
@@ -12647,40 +12782,7 @@ async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    message = update.effective_message
-    chat = update.effective_chat
-    if chat is None:
-        return
-    user = update.effective_user
-    if user:
-        set_mode(user.id, False)
-        clear_wait(user.id)
-
-    if not _suno_configured():
-        await _suno_notify(
-            ctx,
-            chat.id,
-            "⚠️ Suno API не настроен. Обратитесь к поддержке.",
-            reply_to=message,
-        )
-        return
-
-    await suno_entry(chat.id, ctx, force_new=True)
-
-    if user:
-        s = state(ctx)
-        card_id = s.get("last_ui_msg_id_suno") if isinstance(s.get("last_ui_msg_id_suno"), int) else None
-        try:
-            set_wait(
-                user.id,
-                WaitKind.SUNO_TITLE.value,
-                card_id,
-                chat_id=chat.id,
-                meta={"source": "command"},
-            )
-        except ValueError:
-            pass
+    await route_home(update, ctx, "home:music")
 
 
 async def _ensure_admin(update: Update) -> bool:
@@ -12771,54 +12873,11 @@ async def suno_retry_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def video_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    chat = update.effective_chat
-    if chat is None:
-        return
-    user = update.effective_user
-    user_id = user.id if user else None
-    log.debug(
-        "video.command",
-        extra={"chat_id": chat.id, "user_id": user_id},
-    )
-    try:
-        await start_video_menu(update, ctx)
-    except MenuLocked:
-        log.info(
-            "ui.video_menu.command_locked",
-            extra={"chat_id": chat.id, "user_id": user_id},
-        )
+    await route_home(update, ctx, "home:video")
 
 
 async def image_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    chat = update.effective_chat
-    if chat is None:
-        return
-    user = update.effective_user
-    user_id = user.id if user else None
-    if user_id:
-        input_state.clear(user_id, reason="card_opened")
-        set_mode(user_id, False)
-        clear_wait(user_id)
-
-    s = state(ctx)
-    engine = s.get("image_engine")
-    if engine not in {"mj", "banana"}:
-        await show_image_engine_selector(chat.id, ctx, force_new=True)
-        return
-    try:
-        await _open_image_engine(
-            chat.id,
-            ctx,
-            engine,
-            user_id=user_id,
-            source="image_command",
-            force_new=True,
-        )
-    except Exception:
-        log.exception("IMAGE_ENGINE_OPEN_FAIL | engine=%s chat=%s", engine, chat.id)
-        await show_image_engine_selector(chat.id, ctx, force_new=True)
+    await route_home(update, ctx, "home:photo")
 
 
 async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -12899,18 +12958,15 @@ async def promo_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # codex/fix-balance-reset-after-deploy
 async def balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_user_record(update)
-    chat = update.effective_chat
-    if chat is None:
-        return
-    mid = await show_balance_card(chat.id, ctx, force_new=True)
-    if mid is None:
-        user = update.effective_user
-        if user is None or update.message is None:
-            return
-        balance = _safe_get_balance(user.id)
-        _set_cached_balance(ctx, balance)
-        await update.message.reply_text(f"💎 Ваш баланс: {balance} 💎")
+    await route_home(update, ctx, "balance_command")
+
+
+async def profile_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "balance_command")
+
+
+async def kb_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "home:kb")
 
 
 async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -16283,6 +16339,8 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("video", "veo"), video_command),
     (("music", "suno"), suno_command),
     (("balance",), balance_command),
+    (("profile",), profile_command),
+    (("kb",), kb_command),
     (("help", "support"), help_command_entry),
 ]
 
@@ -16396,6 +16454,11 @@ def register_handlers(application: Any) -> None:
             )
         )
 
+    alias_pattern = "|".join(re.escape(label) for label in TEXT_ALIASES)
+    if alias_pattern:
+        nav_filter = filters.TEXT & ~filters.COMMAND & filters.Regex(rf"^(?:{alias_pattern})$")
+        application.add_handler(MessageHandler(nav_filter, on_text_nav), group=0)
+
     pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
     pm_handler.block = False
     application.add_handler(pm_handler, group=2)
@@ -16500,9 +16563,13 @@ async def run_bot_async() -> None:
             try:
                 await application.bot.set_my_commands([
                     BotCommand("menu", "⭐ Главное меню"),
+                    BotCommand("profile", "👥 Профиль"),
+                    BotCommand("kb", "📚 База знаний"),
+                    BotCommand("video", "📹 Режим видео"),
+                    BotCommand("image", "📸 Режим фото"),
+                    BotCommand("music", "🎧 Режим музыки"),
+                    BotCommand("chat", "🧠 Диалог с ИИ"),
                     BotCommand("buy", "💎 Купить генерации"),
-                    BotCommand("video", "🎬 Генерация видео"),
-                    BotCommand("image", "🎨 Генерация изображений"),
                     BotCommand("lang", "🌍 Изменить язык"),
                     BotCommand("help", "🆘 Поддержка"),
                     BotCommand("faq", "❓ FAQ"),
