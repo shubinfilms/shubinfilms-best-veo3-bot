@@ -209,7 +209,11 @@ from texts import (
     TXT_AI_DIALOG_CHOOSE,
     TXT_CRYPTO_COMING_SOON,
     TXT_KB_AI_DIALOG,
+    TXT_KB_KNOWLEDGE,
+    TXT_KB_MUSIC,
+    TXT_KB_PHOTO,
     TXT_KB_PROFILE,
+    TXT_KB_VIDEO,
     TXT_KNOWLEDGE_INTRO,
     TXT_MENU_TITLE,
     TXT_PROFILE_TITLE,
@@ -4994,6 +4998,31 @@ MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = TXT_KB_PROFILE
 MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
+
+# --- Reply keyboard (нижнее меню)
+REPLY_BUTTONS = [
+    [KeyboardButton(TXT_KB_PROFILE), KeyboardButton(TXT_KB_KNOWLEDGE)],
+    [KeyboardButton(TXT_KB_PHOTO), KeyboardButton(TXT_KB_MUSIC)],
+    [KeyboardButton(TXT_KB_VIDEO), KeyboardButton(TXT_KB_AI_DIALOG)],
+]
+
+
+def reply_main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        REPLY_BUTTONS,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
+    )
+
+
+def _norm_btn_text(t: Optional[str]) -> str:
+    if not t:
+        return ""
+    s = t.strip()
+    s = re.sub(r"^[\W_]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
@@ -13288,14 +13317,42 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
             _set_cached_balance(ctx, bonus_result.balance)
             if bonus_result.applied and update.message is not None:
-                await update.message.reply_text("🎁 Добро пожаловать! Начислил +10💎 на баланс.")
+                await update.message.reply_text(
+                    "🎁 Добро пожаловать! Начислил +10💎 на баланс.",
+                    reply_markup=reply_main_kb(),
+                )
         except Exception as exc:
             log.exception("Signup bonus failed for %s: %s", uid, exc)
+
+    chat_obj = update.effective_chat
+    chat_id = chat_obj.id if chat_obj is not None else (update.effective_user.id if update.effective_user else None)
+    if chat_id is not None:
+        try:
+            await ensure_main_reply_keyboard(
+                ctx,
+                chat_id,
+                state_dict=state(ctx),
+                text="⬇️ Быстрое меню снизу",
+            )
+        except Exception:
+            pass
 
     await handle_menu(update, ctx)
 
 
 async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_obj = update.effective_chat
+    chat_id = chat_obj.id if chat_obj is not None else (update.effective_user.id if update.effective_user else None)
+    if chat_id is not None:
+        try:
+            await ensure_main_reply_keyboard(
+                ctx,
+                chat_id,
+                state_dict=state(ctx),
+                text="Меню обновлено ⬇️",
+            )
+        except Exception:
+            pass
     await handle_menu(update, ctx)
 
 
@@ -14321,6 +14378,16 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     await set_veo_card_prompt(chat_id, kino_prompt, ctx)
     await q.answer("Промпт вставлен в карточку VEO")
+
+
+async def on_noop_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    try:
+        await query.answer("Скоро!", show_alert=False)
+    except Exception:
+        pass
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -15665,6 +15732,114 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
+    btn = _norm_btn_text(raw_text)
+    if btn in {"профиль", "база знаний", "фото", "музыка", "видео", "диалог"}:
+        s.update({**DEFAULT_STATE})
+        _apply_state_defaults(s)
+        if user_id is not None:
+            clear_wait(user_id)
+
+        if btn != "диалог":
+            await disable_chat_mode(
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                state_dict=s,
+                notify=False,
+            )
+            if user_id is not None:
+                try:
+                    set_mode(user_id, False)
+                except Exception:
+                    pass
+
+        if btn == "профиль":
+            if chat_id is not None:
+                _mode_set(chat_id, "nav:profile")
+            balance_value = get_user_balance_value(ctx)
+            await msg.reply_text(
+                f"👤 Профиль\nБаланс: {balance_value} 💎\n/help — список команд",
+                reply_markup=reply_main_kb(),
+            )
+            if user_id is not None and chat_id is not None:
+                await refresh_balance_card_if_open(
+                    user_id,
+                    chat_id,
+                    ctx=ctx,
+                    state_dict=s,
+                )
+            return
+
+        if btn == "база знаний":
+            if chat_id is not None:
+                _mode_set(chat_id, "nav:kb")
+            await msg.reply_text(
+                "📚 База знаний: скоро здесь будут гайды и примеры.\n"
+                f"Канал с промптами: {PROMPTS_CHANNEL_URL}",
+                reply_markup=reply_main_kb(),
+            )
+            return
+
+        if btn == "фото":
+            if chat_id is not None:
+                _mode_set(chat_id, "nav:photo")
+            s["mode"] = "banana"
+            s["banana_images"] = []
+            s["last_prompt"] = None
+            s["image_engine"] = "banana"
+            await msg.reply_text(
+                "🍌 Редактор изображений (Banana). Пришлите до 4 фото и опишите, что изменить.",
+                reply_markup=reply_main_kb(),
+            )
+            if chat_id is not None:
+                await banana_entry(chat_id, ctx, force_new=True)
+            return
+
+        if btn == "видео":
+            if chat_id is not None:
+                _mode_set(chat_id, "nav:video")
+            video_kb = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🎬 VEO", callback_data="mode:veo_text_fast")],
+                    [InlineKeyboardButton("🧠 Sora2 (скоро)", callback_data="noop")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+                ]
+            )
+            await msg.reply_text("🎥 Выберите тип генерации видео:", reply_markup=video_kb)
+            return
+
+        if btn == "музыка":
+            if chat_id is not None:
+                _mode_set(chat_id, "nav:music")
+            await msg.reply_text(
+                "🎧 Музыка: модуль в разработке. Напишите стиль/референс — подготовлю промпт.",
+                reply_markup=reply_main_kb(),
+            )
+            return
+
+        if btn == "диалог":
+            if chat_id is not None:
+                _mode_set(chat_id, MODE_CHAT)
+            if user_id is not None:
+                session_enable_regular_chat(ctx)
+                chat_mode_turn_on(user_id)
+                try:
+                    await set_active_mode(user_id, "dialog_default")
+                except Exception:
+                    pass
+                try:
+                    set_mode(user_id, True)
+                except Exception:
+                    pass
+            s["mode"] = None
+            s[STATE_CHAT_MODE] = "normal"
+            s[STATE_ACTIVE_CARD] = "chat:normal"
+            await msg.reply_text(
+                "💬 Диалог включён. Напишите сообщение.",
+                reply_markup=reply_main_kb(),
+            )
+            return
+
     waiting_for_input = _chat_state_waiting_input(s)
     if (
         waiting_for_input
@@ -16987,6 +17162,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^prompt_master$", prompt_master_mode_callback),
     (r"^dialog:choose_regular$", dialog_choose_regular_callback),
     (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
+    (r"^noop$", on_noop_callback),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
