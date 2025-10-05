@@ -1,11 +1,14 @@
-from typing import Optional
+from functools import lru_cache
+from typing import Iterable, List, Optional, Tuple
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
+
 
 
 EMOJI = {
@@ -19,15 +22,30 @@ EMOJI = {
     "pay": "💎",
 }
 
-AI_MENU_CB = "menu_chat_ai"
+HOME_CB_PROFILE = "home:profile"
+HOME_CB_KB = "home:kb"
+HOME_CB_PHOTO = "home:photo"
+HOME_CB_MUSIC = "home:music"
+HOME_CB_VIDEO = "home:video"
+HOME_CB_DIALOG = "home:dialog"
+
+def iter_home_menu_buttons() -> Iterable[Tuple[str, str]]:
+    """Yield flattened pairs of ``(text, callback_data)`` for the home layout."""
+
+    for row in _get_home_menu_layout():
+        for label, callback in row:
+            yield label, callback
+
+
+AI_MENU_CB = HOME_CB_DIALOG
 AI_TO_SIMPLE_CB = "chat_mode_normal"
 AI_TO_PROMPTMASTER_CB = "chat_mode_pm"
 
-VIDEO_MENU_CB = "video_menu"
-IMAGE_MENU_CB = "image_menu"
-MUSIC_MENU_CB = "music_menu"
-PROFILE_MENU_CB = "menu_profile"
-KNOWLEDGE_MENU_CB = "kb_entry"
+VIDEO_MENU_CB = HOME_CB_VIDEO
+IMAGE_MENU_CB = HOME_CB_PHOTO
+MUSIC_MENU_CB = HOME_CB_MUSIC
+PROFILE_MENU_CB = HOME_CB_PROFILE
+KNOWLEDGE_MENU_CB = HOME_CB_KB
 
 # Backward compatible aliases (deprecated)
 CB_PROFILE = PROFILE_MENU_CB
@@ -39,20 +57,7 @@ CB_CHAT = AI_MENU_CB
 
 
 def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(text="👤 Профиль", callback_data=PROFILE_MENU_CB)],
-            [InlineKeyboardButton(text="📚 База знаний", callback_data=KNOWLEDGE_MENU_CB)],
-            [
-                InlineKeyboardButton(text="📸 Режим фото", callback_data=IMAGE_MENU_CB),
-                InlineKeyboardButton(text="🎧 Режим музыки", callback_data=MUSIC_MENU_CB),
-            ],
-            [
-                InlineKeyboardButton(text="📹 Режим видео", callback_data=VIDEO_MENU_CB),
-                InlineKeyboardButton(text="🧠 Диалог с ИИ", callback_data=AI_MENU_CB),
-            ],
-        ]
-    )
+    return InlineKeyboardMarkup(_build_inline_home_rows())
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -64,21 +69,53 @@ def kb_home_menu() -> InlineKeyboardMarkup:
 
 
 def reply_kb_home() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="📚 База знаний")],
-            [
-                KeyboardButton(text="📸 Режим фото"),
-                KeyboardButton(text="🎧 Режим музыки"),
-            ],
-            [
-                KeyboardButton(text="📹 Режим видео"),
-                KeyboardButton(text="🧠 Диалог с ИИ"),
-            ],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
+    return build_main_reply_kb()
+
+
+def build_main_reply_kb() -> ReplyKeyboardMarkup:
+    layout = _get_home_menu_layout()
+    rows: List[List[KeyboardButton]] = []
+    for layout_row in layout:
+        rows.append([KeyboardButton(text=label) for label, _ in layout_row])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+def build_empty_reply_kb() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()
+
+
+def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:
+    layout = _get_home_menu_layout()
+    return [
+        [InlineKeyboardButton(text=label, callback_data=callback) for label, callback in row]
+        for row in layout
+    ]
+
+
+@lru_cache(maxsize=1)
+def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], Tuple[str, str]], ...]:
+    from texts import (
+        TXT_KB_AI_DIALOG,
+        TXT_KB_KNOWLEDGE,
+        TXT_KB_MUSIC,
+        TXT_KB_PHOTO,
+        TXT_KB_PROFILE,
+        TXT_KB_VIDEO,
+    )
+
+    return (
+        (
+            (TXT_KB_PROFILE, HOME_CB_PROFILE),
+            (TXT_KB_KNOWLEDGE, HOME_CB_KB),
+        ),
+        (
+            (TXT_KB_PHOTO, HOME_CB_PHOTO),
+            (TXT_KB_MUSIC, HOME_CB_MUSIC),
+        ),
+        (
+            (TXT_KB_VIDEO, HOME_CB_VIDEO),
+            (TXT_KB_AI_DIALOG, HOME_CB_DIALOG),
+        ),
     )
 
 
@@ -373,28 +410,7 @@ CB_PAY_CRYPTO = "pay_crypto"
 
 
 def kb_main_menu_profile_first() -> InlineKeyboardMarkup:
-    from texts import (
-        TXT_KB_AI_DIALOG,
-        TXT_KB_KNOWLEDGE,
-        TXT_KB_MUSIC,
-        TXT_KB_PHOTO,
-        TXT_KB_PROFILE,
-        TXT_KB_VIDEO,
-    )
-
-    rows = [
-        [InlineKeyboardButton(TXT_KB_PROFILE, callback_data=CB_MAIN_PROFILE)],
-        [InlineKeyboardButton(TXT_KB_KNOWLEDGE, callback_data=CB_MAIN_KNOWLEDGE)],
-        [
-            InlineKeyboardButton(TXT_KB_PHOTO, callback_data=CB_MAIN_PHOTO),
-            InlineKeyboardButton(TXT_KB_MUSIC, callback_data=CB_MAIN_MUSIC),
-        ],
-        [
-            InlineKeyboardButton(TXT_KB_VIDEO, callback_data=CB_MAIN_VIDEO),
-            InlineKeyboardButton(TXT_KB_AI_DIALOG, callback_data=CB_MAIN_AI_DIALOG),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(_build_inline_home_rows())
 
 
 def kb_profile_topup_entry() -> InlineKeyboardMarkup:

@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from telegram import ReplyKeyboardRemove
+from telegram import ReplyKeyboardMarkup
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -72,5 +72,7 @@ def test_quick_keyboard_sent_once(monkeypatch, ctx):
     query.data = bot_module.VIDEO_MENU_CB
     asyncio.run(bot_module.hub_router(update, ctx))
 
-    removals = [entry for entry in bot.sent if isinstance(entry.get("reply_markup"), ReplyKeyboardRemove)]
-    assert len(removals) == 1
+    reply_keyboards = [
+        entry for entry in bot.sent if isinstance(entry.get("reply_markup"), ReplyKeyboardMarkup)
+    ]
+    assert len(reply_keyboards) == 1

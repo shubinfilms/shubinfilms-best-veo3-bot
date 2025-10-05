@@ -36,10 +36,9 @@ def test_main_menu_keyboard_layout():
     labels = [[button.text for button in row] for row in rows]
 
     assert labels == [
-        ["👤 Профиль"],
-        ["📚 База знаний"],
-        ["📸 Режим фото", "🎧 Режим музыки"],
-        ["📹 Режим видео", "🧠 Диалог с ИИ"],
+        ["👤 Профиль", "📚 База знаний"],
+        ["📸 Фото", "🎧 Музыка"],
+        ["📹 Видео", "🧠 Диалог"],
     ]
 
 
@@ -87,7 +86,7 @@ def test_menu_command_always_sends_welcome_block(monkeypatch):
     assert isinstance(second_hub_id, int)
     assert second_hub_id != first_hub_id
 
-    welcome_texts = [entry["text"] for entry in bot.sent]
+    welcome_texts = [entry["text"] for entry in bot.sent if entry.get("text", "").strip()]
     assert len(welcome_texts) == 2
     assert all(text.startswith("👋 Добро пожаловать!") for text in welcome_texts)
 
