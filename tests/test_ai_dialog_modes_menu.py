@@ -37,7 +37,7 @@ def test_ai_dialog_submenu_render(monkeypatch):
         return None
 
     query = SimpleNamespace(
-        data=bot_module.CB_MAIN_AI_DIALOG,
+        data=bot_module.AI_MENU_CB,
         message=message,
         answer=fake_answer,
     )
@@ -52,5 +52,5 @@ def test_ai_dialog_submenu_render(monkeypatch):
     assert captured["text"] == f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
     markup = captured["markup"]
     rows = markup.inline_keyboard
-    assert rows[0][0].text == TXT_AI_DIALOG_NORMAL
-    assert rows[1][0].text == TXT_AI_DIALOG_PM
+    assert len(rows) == 1
+    assert [button.text for button in rows[0]] == [TXT_AI_DIALOG_NORMAL, TXT_AI_DIALOG_PM]
