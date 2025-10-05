@@ -83,6 +83,10 @@ _SORA2_LOCK_KEY_TMPL = f"{_PFX}:lock:sora2:{{}}"
 _SORA2_UNAVAILABLE_KEY = f"{_PFX}:sora2:unavailable"
 _MJ_GALLERY_KEY_TMPL = f"{_PFX}:mj:gallery:{{}}:{{}}"
 _MJ_GALLERY_TTL = 2 * 60 * 60
+_ACTIVE_MODE_KEY_TMPL = f"{_PFX}:user:active_mode:{{}}"
+ACTIVE_MODE_KEY = _ACTIVE_MODE_KEY_TMPL
+_PM_STEP_KEY_TMPL = f"{_PFX}:pm:step:{{}}"
+_PM_BUF_KEY_TMPL = f"{_PFX}:pm:buf:{{}}"
 
 
 class MenuLocked(RuntimeError):
@@ -191,11 +195,123 @@ def mark_sora2_unavailable(*, ttl: int = 60 * 60) -> None:
     if _r:
         try:
             _r.setex(key, max(1, int(ttl)), "1")
+            return
         except Exception as exc:  # pragma: no cover - network issues
             _logger.warning("redis.setex_failed | key=%s err=%s", key, exc)
-            _memory_set_with_ttl(key, "1", ttl)
+    _memory_set_with_ttl(key, "1", ttl)
+
+
+async def get_active_mode(user_id: int) -> Optional[str]:
+    """Return the last recorded exclusive mode for ``user_id``."""
+
+    key = _ACTIVE_MODE_KEY_TMPL.format(int(user_id))
+    raw: Optional[Any]
+    if _r:
+        try:
+            raw = await asyncio.to_thread(_r.get, key)
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.warning("active_mode.redis_get_failed | key=%s err=%s", key, exc)
+            raw = None
     else:
-        _memory_set_with_ttl(key, "1", ttl)
+        raw = None
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+
+    fallback = _memory_get(key)
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    return None
+
+
+async def set_active_mode(user_id: int, mode: Optional[str]) -> None:
+    """Persist the exclusive mode for ``user_id`` (or clear when ``mode`` is falsy)."""
+
+    key = _ACTIVE_MODE_KEY_TMPL.format(int(user_id))
+    if mode:
+        value = str(mode).strip()
+        if _r:
+            try:
+                await asyncio.to_thread(_r.setex, key, max(_TTL, 1), value)
+            except Exception as exc:  # pragma: no cover - network issues
+                _logger.warning("active_mode.redis_set_failed | key=%s err=%s", key, exc)
+        _memory_set(key, value)
+        return
+
+    if _r:
+        try:
+            await asyncio.to_thread(_r.delete, key)
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.warning("active_mode.redis_del_failed | key=%s err=%s", key, exc)
+    _memory_delete(key)
+
+
+async def clear_mode_state(user_id: int) -> None:
+    """Drop residual state for the user before switching to another mode."""
+
+    user_id_int = int(user_id)
+
+    await set_active_mode(user_id_int, None)
+
+    try:
+        from chat_service import clear_ctx as _clear_ctx, set_mode as _set_chat_mode
+    except Exception:  # pragma: no cover - import safety
+        _clear_ctx = None
+        _set_chat_mode = None
+
+    if _clear_ctx:
+        try:
+            _clear_ctx(user_id_int)
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.debug("active_mode.clear_ctx_failed | user_id=%s err=%s", user_id_int, exc)
+
+    if _set_chat_mode:
+        try:
+            _set_chat_mode(user_id_int, False)
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.debug("active_mode.set_mode_failed | user_id=%s err=%s", user_id_int, exc)
+
+    step_key = _PM_STEP_KEY_TMPL.format(user_id_int)
+    buf_key = _PM_BUF_KEY_TMPL.format(user_id_int)
+    if _r:
+        try:
+            await asyncio.to_thread(_r.delete, step_key, buf_key)
+        except Exception as exc:  # pragma: no cover - network issues
+            _logger.debug("active_mode.pm_del_failed | user_id=%s err=%s", user_id_int, exc)
+    else:
+        _memory_delete(step_key)
+        _memory_delete(buf_key)
+
+    try:
+        from utils.input_state import clear_wait_state as _clear_wait_state, input_state as _input_state
+    except Exception:  # pragma: no cover - import safety
+        _clear_wait_state = None
+        _input_state = None
+
+    if _clear_wait_state:
+        try:
+            _clear_wait_state(user_id_int, reason="mode_reset")
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.debug("active_mode.clear_wait_state_failed | user_id=%s err=%s", user_id_int, exc)
+
+    if _input_state:
+        try:
+            _input_state.clear(user_id_int, reason="mode_reset")
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.debug("active_mode.input_state_clear_failed | user_id=%s err=%s", user_id_int, exc)
+
+    try:
+        from stickers import pop_wait_sticker_id as _pop_wait_sticker_id
+    except Exception:  # pragma: no cover - import safety
+        _pop_wait_sticker_id = None
+
+    if _pop_wait_sticker_id:
+        try:
+            _pop_wait_sticker_id(user_id_int)
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.debug("active_mode.wait_sticker_clear_failed | user_id=%s err=%s", user_id_int, exc)
 
 
 def clear_sora2_unavailable() -> None:

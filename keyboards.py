@@ -20,8 +20,8 @@ EMOJI = {
 }
 
 AI_MENU_CB = "ai:menu"
-AI_TO_SIMPLE_CB = "ai:chat"
-AI_TO_PROMPTMASTER_CB = "ai:pm"
+AI_TO_SIMPLE_CB = "dialog_default"
+AI_TO_PROMPTMASTER_CB = "prompt_master"
 
 VIDEO_MENU_CB = "video:menu"
 IMAGE_MENU_CB = "image:menu"
