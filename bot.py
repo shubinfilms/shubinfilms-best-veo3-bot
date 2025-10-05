@@ -3374,14 +3374,7 @@ def _trim_caption_text(text: str, limit: int = 1024) -> str:
 
 
 def _banana_caption(prompt: str) -> str:
-    normalized = re.sub(r"\s+", " ", (prompt or "")).strip()
-    if not normalized:
-        snippet = "—"
-    else:
-        snippet = normalized[:120]
-        if len(normalized) > 120:
-            snippet = snippet[:117].rstrip() + "…"
-    return f"🍌 Banana\n• Промпт: \"{snippet}\""
+    return ""
 
 
 def _banana_guess_suffix(url: str, content_type: Optional[str]) -> str:
@@ -7026,42 +7019,38 @@ MJ_MODE_HINT_TEXT = (
     "🖼 Midjourney включён. Введите промпт сообщением и нажмите «Подтвердить»."
 )
 
-BANANA_HELPER_LINE = "Пришлите до 4 фото и текст-промпт, что изменить."
-
-
 def banana_card_text(s: Dict[str, Any]) -> str:
     n = len(s.get("banana_images") or [])
     prompt = (s.get("last_prompt") or "").strip()
-    prompt_html = html.escape(prompt)
     has_prompt = "есть" if prompt else "нет"
-    s["banana_helper_line"] = BANANA_HELPER_LINE
-    lines = [
-        "🍌 <b>Карточка Banana</b>",
-        f"🧩 Фото: <b>{n}/4</b>  •  Промпт: <b>{has_prompt}</b>",
-        "",
-        "🖊️ <b>Промпт:</b>",
-        f"<code>{prompt_html}</code>" if prompt else "<code></code>",
-        "",
-        BANANA_HELPER_LINE,
-    ]
+    snippet = html.escape(_short_prompt(prompt, 200)) if prompt else ""
+    lines = ["🍌 <b>Карточка Banana</b>"]
     balance = s.get("banana_balance")
     if balance is not None:
         lines.insert(1, f"💎 Баланс: <b>{balance}</b>")
+    lines.append(f"📸 Фото: <b>{n}/4</b> • Промпт: <b>{has_prompt}</b>")
+    if prompt:
+        lines.append(f"✏️ Промпт: \"{snippet}\"")
+    else:
+        lines.append("✏️ Промпт: —")
     return "\n".join(lines)
 
 def banana_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("➕ Добавить ещё фото", callback_data="banana:add_more")],
-        [InlineKeyboardButton("🧹 Очистить фото", callback_data="banana:reset_imgs")],
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("✍️ Изменить промпт", callback_data="banana:edit_prompt"),
-            InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana_templates"),
-        ],
-        [InlineKeyboardButton("🚀 Начать генерацию Banana", callback_data="banana:start")],
-        [InlineKeyboardButton("🔁 Сменить движок", callback_data="banana:switch_engine")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(rows)
+            [
+                InlineKeyboardButton("➕ Добавить фото", callback_data="banana:add_more"),
+                InlineKeyboardButton("✏️ Промпт", callback_data="banana:prompt"),
+                InlineKeyboardButton("🧹 Очистить", callback_data="banana:reset_all"),
+            ],
+            [InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana_templates")],
+            [InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")],
+            [
+                InlineKeyboardButton("🔄 Движок", callback_data="banana:switch_engine"),
+                InlineKeyboardButton("↩️ Назад", callback_data="back"),
+            ],
+        ]
+    )
 
 
 def banana_result_inline_keyboard() -> InlineKeyboardMarkup:
@@ -14886,25 +14875,46 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("banana:"):
         act = data.split(":",1)[1]
         if act == "add_more":
-            await q.message.reply_text("➕ Пришлите ещё фото (всего до 4)."); return
-        if act == "reset_imgs":
+            await q.message.reply_text("➕ Пришлите ещё фото (всего до 4).")
+            return
+        if act == "reset_all":
             s["banana_images"] = []
+            s["last_prompt"] = None
             s["_last_text_banana"] = None
-            await q.message.reply_text("🧹 Фото очищены."); await show_banana_card(update.effective_chat.id, ctx); return
-        if act == "edit_prompt":
-            user_obj = update.effective_user
-            uid_val = user_obj.id if user_obj else None
             chat_ctx = update.effective_chat
             chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
-            card_id = s.get("last_ui_msg_id_banana") if isinstance(s.get("last_ui_msg_id_banana"), int) else None
+            if chat_id_val is not None:
+                await show_banana_card(chat_id_val, ctx)
+            await q.answer("Карточка очищена ✅")
+            return
+        if act == "prompt":
+            chat_ctx = update.effective_chat
+            chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
+            current_prompt = (s.get("last_prompt") or "").strip()
+            if current_prompt:
+                s["last_prompt"] = None
+                s["_last_text_banana"] = None
+                if chat_id_val is not None:
+                    await show_banana_card(chat_id_val, ctx)
+                await q.answer("Промпт очищен ✅")
+                return
+            user_obj = update.effective_user
+            uid_val = user_obj.id if user_obj else None
+            card_id = (
+                s.get("last_ui_msg_id_banana")
+                if isinstance(s.get("last_ui_msg_id_banana"), int)
+                else None
+            )
             _activate_wait_state(
                 user_id=uid_val,
                 chat_id=chat_id_val,
                 card_msg_id=card_id,
                 kind=WaitKind.BANANA_PROMPT,
-                meta={"action": "edit"},
+                meta={"action": "prompt"},
             )
-            await q.message.reply_text("✍️ Пришлите новый промпт для Banana.")
+            if q.message:
+                await q.message.reply_text("✍️ Пришлите промпт для Banana.")
+            await q.answer()
             return
         if act == "switch_engine":
             user_obj = update.effective_user
