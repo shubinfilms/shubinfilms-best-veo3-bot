@@ -151,7 +151,12 @@ def test_prompt_master_open_uses_safe_send_html() -> None:
     ctx = SimpleNamespace(bot=bot, user_data={})
     asyncio.run(prompt_master_open(update, ctx))
     assert bot.sent
-    _, text, kwargs = bot.sent[-1]
+    card_entry = next(
+        ((chat_id, text, kwargs) for chat_id, text, kwargs in bot.sent if "<b>Prompt-Master</b>" in text),
+        None,
+    )
+    assert card_entry is not None
+    _, text, kwargs = card_entry
     assert "<b>Prompt-Master</b>" in text
     assert kwargs["parse_mode"] == "HTML"
     assert kwargs["reply_markup"].inline_keyboard == prompt_master_keyboard("ru").inline_keyboard
@@ -170,11 +175,20 @@ def test_prompt_master_callback_selects_engine_and_creates_card() -> None:
     state = ctx.user_data.get(PM_STATE_KEY)
     assert state["engine"] == "veo"
     assert bot.sent, "card must be rendered"
-    chat_id, card_html, kwargs = bot.sent[-1]
+    card_entry = None
+    for chat_id, card_html, kwargs in bot.sent:
+        markup = kwargs.get("reply_markup") if isinstance(kwargs, dict) else None
+        if markup and markup.inline_keyboard == prompt_master_mode_keyboard("ru").inline_keyboard:
+            card_entry = (chat_id, card_html, kwargs)
+            break
+    assert card_entry is not None, "prompt card should be present"
+    chat_id, card_html, kwargs = card_entry
     assert chat_id == 321
     assert kwargs["reply_markup"].inline_keyboard == prompt_master_mode_keyboard("ru").inline_keyboard
     assert "<br/>" not in card_html
     assert state["card_msg_id"]
+    bottom_menu = [entry for entry in bot.sent if entry[1] == "👇 Быстрые действия"]
+    assert bottom_menu, "bottom menu should be rendered"
 
 
 def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> None:
@@ -184,18 +198,35 @@ def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> Non
     message = SimpleNamespace(text="futuristic portrait", chat=SimpleNamespace(id=333, type=ChatType.PRIVATE))
     update = SimpleNamespace(message=message, effective_chat=message.chat)
     asyncio.run(prompt_master_text_handler(update, ctx))
-    # First send is card, second send is status
-    assert len(bot.sent) >= 2
-    card_chat, card_text, card_kwargs = bot.sent[0]
+    assert len(bot.sent) >= 3
+    card_entry = next(
+        (entry for entry in bot.sent if "<pre><code>" in entry[1]),
+        None,
+    )
+    assert card_entry is not None
+    card_chat, card_text, card_kwargs = card_entry
     assert card_chat == 333
     assert "<pre><code>" in card_text
-    status_chat, status_text, status_kwargs = bot.sent[1]
+    status_entry = next(
+        (
+            entry
+            for entry in bot.sent
+            if entry[1].startswith("🧠") or entry[1].startswith("⚙️")
+        ),
+        None,
+    )
+    assert status_entry is not None
+    status_chat, status_text, status_kwargs = status_entry
     assert status_text.startswith("🧠")
     assert status_kwargs["reply_markup"].inline_keyboard == prompt_master_mode_keyboard("en").inline_keyboard
     assert status_kwargs.get("parse_mode") == "HTML"
+    bottom_menu = [entry for entry in bot.sent if entry[1] == "👇 Быстрые действия"]
+    assert bottom_menu, "bottom menu should be rendered"
     # Final edit should include result keyboard
     assert bot.edited, "status message must be edited"
-    _chat, _mid, final_text, final_kwargs = bot.edited[-1]
+    final_entry = next((entry for entry in bot.edited if "Ready prompt" in entry[2]), None)
+    assert final_entry is not None
+    _chat, _mid, final_text, final_kwargs = final_entry
     assert "Ready prompt" in final_text
     assert "<pre><code>" in final_text
     assert "<br/>" not in final_text
@@ -217,9 +248,12 @@ def test_prompt_master_status_message_for_veo() -> None:
     message = SimpleNamespace(text="Два героя спорят у окна во время грозы.", chat=SimpleNamespace(id=555, type=ChatType.PRIVATE))
     update = SimpleNamespace(message=message, effective_chat=message.chat)
     asyncio.run(prompt_master_text_handler(update, ctx))
-    assert len(bot.sent) >= 2
-    status_text = bot.sent[1][1]
-    assert status_text.startswith("⚙️ Начинаю собирать промпт для VEO")
+    assert len(bot.sent) >= 3
+    status_entry = next(
+        (entry for entry in bot.sent if entry[1].startswith("⚙️ Начинаю собирать промпт для VEO")),
+        None,
+    )
+    assert status_entry is not None
 
 
 def test_prompt_master_insert_uses_cached_payload() -> None:
