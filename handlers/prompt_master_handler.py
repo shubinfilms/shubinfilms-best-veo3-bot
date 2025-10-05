@@ -21,6 +21,7 @@ from keyboards import (
     CB_PM_MENU,
     CB_PM_PREFIX,
     CB_PM_SWITCH,
+    menu_bottom_unified,
     prompt_master_keyboard,
     prompt_master_mode_keyboard,
     prompt_master_result_keyboard,
@@ -47,6 +48,8 @@ PM_ROOT_TEXT = {
     "ru": "🧠 <b>Prompt-Master</b>\nВыберите движок, под который нужно подготовить промпт.",
     "en": "🧠 <b>Prompt-Master</b>\nPick the engine you want a perfect prompt for.",
 }
+
+PM_BOTTOM_MENU_TEXT = "👇 Быстрые действия"
 
 PM_ENGINE_HINTS = {
     "veo": {
@@ -166,6 +169,50 @@ def _store_prompt(chat_id: int, engine: str, payload: PMResult) -> None:
     _LAST_PROMPTS[(chat_id, engine)] = payload
 
 
+async def _ensure_bottom_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+) -> None:
+    if chat_id is None:
+        return
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return
+    shared_state = user_data.get("state")
+    if not isinstance(shared_state, dict):
+        shared_state = {}
+        user_data["state"] = shared_state
+    message_id = shared_state.get("last_ui_msg_id_bottom")
+    markup = menu_bottom_unified()
+    text = PM_BOTTOM_MENU_TEXT
+    if isinstance(message_id, int):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except BadRequest:
+            shared_state["last_ui_msg_id_bottom"] = None
+        except Exception:
+            logger.debug("prompt_master.bottom_menu_edit_failed", exc_info=True)
+            shared_state["last_ui_msg_id_bottom"] = None
+    try:
+        message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.debug("prompt_master.bottom_menu_send_failed", exc_info=True)
+        return
+    shared_state["last_ui_msg_id_bottom"] = getattr(message, "message_id", None)
+
+
 def get_pm_prompt(chat_id: int, engine: str) -> Optional[PMResult]:
     return _LAST_PROMPTS.get((chat_id, engine))
 
@@ -233,6 +280,7 @@ async def _upsert_card(
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
             )
+            await _ensure_bottom_menu(context, chat_id)
             return
         except BadRequest:
             state["card_msg_id"] = None
@@ -242,6 +290,7 @@ async def _upsert_card(
     message = await safe_send(context.bot, chat_id, safe_text, reply_markup=keyboard)
     if message:
         state["card_msg_id"] = message.message_id
+    await _ensure_bottom_menu(context, chat_id)
 
 
 async def _edit_with_fallback(
@@ -250,6 +299,8 @@ async def _edit_with_fallback(
     message_id: int,
     html_text: str,
     reply_markup: InlineKeyboardMarkup,
+    *,
+    state: Optional[Dict[str, object]] = None,
 ) -> None:
     safe_html = sanitize_html(html_text)
     try:
@@ -261,6 +312,9 @@ async def _edit_with_fallback(
             disable_web_page_preview=True,
             reply_markup=reply_markup,
         )
+        if state is not None:
+            await _ensure_bottom_menu(context, chat_id)
+        return
     except BadRequest as exc:
         message = str(exc).lower()
         if "can't parse entities" not in message and "parse entities" not in message:
@@ -275,6 +329,8 @@ async def _edit_with_fallback(
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
+        if state is not None:
+            await _ensure_bottom_menu(context, chat_id)
 
 
 async def _safe_delete(message) -> None:
@@ -293,6 +349,8 @@ async def _handle_render_failure(
     engine: str,
     keyboard: InlineKeyboardMarkup,
     chat_id: Optional[int],
+    *,
+    state: Optional[Dict[str, object]] = None,
 ) -> None:
     error_text = PM_ERROR_TEXT.get(lang, PM_ERROR_TEXT["en"])
     safe_error = sanitize_html(error_text)
@@ -306,10 +364,14 @@ async def _handle_render_failure(
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
             )
+            if state is not None:
+                await _ensure_bottom_menu(context, status_message.chat_id)
         except Exception:
             logger.exception("pm.card.fail", extra={"engine": engine})
     elif chat_id is not None:
         await send_html_with_fallback(context.bot, chat_id, safe_error, reply_markup=keyboard)
+        if state is not None:
+            await _ensure_bottom_menu(context, chat_id)
 
 
 async def _notify_failure(
@@ -579,6 +641,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                         status.message_id,
                         f"{status_text}<br>{_slow_status(lang)}",
                         status_keyboard,
+                        state=state,
                     )
                 except asyncio.CancelledError:
                     return
@@ -607,6 +670,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                 engine,
                 status_keyboard,
                 chat_id,
+                state=state,
             )
             return
 
@@ -629,6 +693,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                 engine,
                 status_keyboard,
                 chat_id,
+                state=state,
             )
             return
         slow_state["done"] = True
@@ -657,6 +722,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                     status.message_id,
                     result_html,
                     markup,
+                    state=state,
                 )
                 logger.info("pm.card.sent", extra={"engine": engine})
                 if state.get("autodelete", True):
@@ -683,6 +749,7 @@ async def prompt_master_text_handler(update: Update, context: ContextTypes.DEFAU
                     await _safe_delete(message)
             else:
                 logger.error("pm.card.fail", extra={"engine": engine})
+            await _ensure_bottom_menu(context, chat_id)
     finally:
         if chat_id is not None:
             await delete_wait_sticker(context, chat_id=chat_id)
@@ -699,7 +766,13 @@ async def prompt_master_reset(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = "🧹 Prompt-Master сброшен." if lang == "ru" else "🧹 Prompt-Master reset."
     keyboard = prompt_master_keyboard(lang)
     if chat_id is not None:
-        await safe_send(context.bot, chat_id, f"{text}\n\n{PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT['en'])}", reply_markup=keyboard)
+        await safe_send(
+            context.bot,
+            chat_id,
+            f"{text}\n\n{PM_ROOT_TEXT.get(lang, PM_ROOT_TEXT['en'])}",
+            reply_markup=keyboard,
+        )
+        await _ensure_bottom_menu(context, chat_id)
 
 
 prompt_master_handle_text = prompt_master_text_handler

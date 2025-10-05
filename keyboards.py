@@ -2,6 +2,37 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+
+EMOJI = {
+    "video": "🎬",
+    "image": "🎨",
+    "music": "🎵",
+    "chat": "💬",
+    "prompt": "🧠",
+    "profile": "👥",
+    "back": "⬅️",
+    "pay": "💎",
+}
+
+
+def _row(*buttons: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
+    return [list(buttons)]
+
+
+def kb_btn(text: str, callback: str) -> InlineKeyboardButton:
+    """Единая фабрика кнопок для инлайн-клавиатуры."""
+
+    return InlineKeyboardButton(text=text, callback_data=callback)
+
+
+def build_menu(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    """Построить клавиатуру из строк ``(text, callback)``."""
+
+    markup_rows: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        markup_rows.append([kb_btn(text, cb) for text, cb in row])
+    return InlineKeyboardMarkup(markup_rows)
+
 CB_FAQ_PREFIX = "faq:"
 CB_PM_PREFIX = "pm:"
 
@@ -141,6 +172,55 @@ def suno_modes_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def menu_main_like() -> InlineKeyboardMarkup:
+    """Инлайн-меню, повторяющее расположение главного экрана."""
+
+    return build_menu(
+        [
+            [
+                (f"{EMOJI['profile']} Профиль", "profile"),
+                ("📚 База знаний", "kb_docs"),
+            ],
+            [
+                ("📸 Режим фото", "mode_photo"),
+                ("🎧 Режим музыки", "mode_music"),
+            ],
+            [
+                (f"{EMOJI['video']} Режим видео", "mode_video"),
+                (f"{EMOJI['prompt']} Диалог с ИИ", "mode_chat"),
+            ],
+        ]
+    )
+
+
+def menu_bottom_unified() -> InlineKeyboardMarkup:
+    """Единое меню для перехода между режимами внутри карточек."""
+
+    return build_menu(
+        [
+            [(f"{EMOJI['video']} Генерация видео", "nav_video")],
+            [(f"{EMOJI['image']} Генерация изображений", "nav_image")],
+            [(f"{EMOJI['music']} Генерация музыки", "nav_music")],
+            [(f"{EMOJI['prompt']} Prompt-Master", "nav_prompt")],
+            [(f"{EMOJI['chat']} Обычный чат", "nav_chat")],
+            [(f"{EMOJI['profile']} Профиль", "profile")],
+        ]
+    )
+
+
+def menu_pay_unified() -> InlineKeyboardMarkup:
+    """Инлайн-меню для способов оплаты."""
+
+    return build_menu(
+        [
+            [("⭐️ Телеграм Stars", "pay_stars")],
+            [("💳 Оплата картой", "pay_card")],
+            [("🔐 Crypto", "pay_crypto")],
+            [(f"{EMOJI['back']} Назад", "back_main")],
+        ]
+    )
+
+
 def suno_start_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="suno:start")]]
     return InlineKeyboardMarkup(rows)
@@ -247,21 +327,15 @@ def kb_profile_topup_entry() -> InlineKeyboardMarkup:
 
 
 def kb_topup_methods(*, crypto_url: Optional[str] = None) -> InlineKeyboardMarkup:
-    from texts import (
-        TXT_PAY_CARD,
-        TXT_PAY_CRYPTO,
-        TXT_PAY_CRYPTO_OPEN_LINK,
-        TXT_PAY_STARS,
-    )
-    from texts import common_text
+    from texts import TXT_PAY_CRYPTO_OPEN_LINK, common_text
 
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(TXT_PAY_STARS, callback_data=CB_PAY_STARS)],
-        [InlineKeyboardButton(TXT_PAY_CARD, callback_data=CB_PAY_CARD)],
-        [InlineKeyboardButton(TXT_PAY_CRYPTO, callback_data=CB_PAY_CRYPTO)],
-    ]
+    markup = menu_pay_unified()
+    rows = list(markup.inline_keyboard[:-1])
     if crypto_url:
-        rows.append([InlineKeyboardButton(TXT_PAY_CRYPTO_OPEN_LINK, url=crypto_url)])
+        rows.insert(
+            3,
+            [InlineKeyboardButton(TXT_PAY_CRYPTO_OPEN_LINK, url=crypto_url)],
+        )
     rows.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data=CB_PROFILE_BACK)])
     return InlineKeyboardMarkup(rows)
 

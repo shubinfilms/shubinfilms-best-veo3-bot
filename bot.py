@@ -98,7 +98,7 @@ import redis
 from ui_helpers import (
     upsert_card,
     refresh_balance_card_if_open,
-    refresh_suno_card,
+    refresh_suno_card as _refresh_suno_card_raw,
     show_referral_card,
     pm_main_kb,
     pm_result_kb,
@@ -192,7 +192,8 @@ from keyboards import (
     suno_start_disabled_keyboard,
     kb_ai_dialog_modes,
     kb_profile_topup_entry,
-    kb_topup_methods,
+    menu_bottom_unified,
+    menu_pay_unified,
 )
 from texts import (
     SUNO_MODE_PROMPT,
@@ -208,6 +209,7 @@ from texts import (
     TXT_MENU_TITLE,
     TXT_PROFILE_TITLE,
     TXT_TOPUP_CHOOSE,
+    TXT_PAY_CRYPTO_OPEN_LINK,
     common_text,
     t,
 )
@@ -2436,6 +2438,7 @@ async def chat_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as exc:
         log.warning("chat.command_hint_failed | chat=%s err=%s", chat.id, exc)
+    await _show_bottom_menu(chat.id, ctx)
 
 
 async def chat_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3666,6 +3669,7 @@ DEFAULT_STATE = {
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
     "last_ui_msg_id_menu": None,
+    "last_ui_msg_id_bottom": None,
     "last_ui_msg_id_balance": None,
     "last_ui_msg_id_veo": None, "last_ui_msg_id_banana": None, "last_ui_msg_id_mj": None,
     "last_ui_msg_id_image_engine": None,
@@ -4745,6 +4749,9 @@ MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
+BOTTOM_MENU_TEXT = "👇 Быстрые действия"
+BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
+
 VIDEO_MENU_TEXT = "🎬 Выберите тип генерации видео:"
 VIDEO_VEO_MENU_TEXT = "🎥 Режимы VEO:"
 CB_ADMIN_SORA2_HEALTH = "admin:sora2_health"
@@ -5004,6 +5011,74 @@ async def safe_edit_or_send_menu(
     return None
 
 
+async def _show_bottom_menu(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    state_dict: Optional[Dict[str, Any]] = None,
+    text: str = BOTTOM_MENU_TEXT,
+) -> Optional[int]:
+    state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
+    try:
+        return await safe_edit_or_send_menu(
+            ctx,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=menu_bottom_unified(),
+            state_key=BOTTOM_MENU_STATE_KEY,
+            state_dict=state_obj,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            log_label="ui.bottom_menu",
+        )
+    except Exception as exc:  # pragma: no cover - network issues
+        log.debug(
+            "ui.bottom_menu.error",
+            extra={"chat_id": chat_id, "error": str(exc)},
+        )
+        return None
+
+
+async def refresh_suno_card(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state_dict: Dict[str, Any],
+    *,
+    price: int,
+    state_key: str = "last_ui_msg_id_suno",
+    force_new: bool = False,
+) -> Optional[int]:
+    result = await _refresh_suno_card_raw(
+        ctx,
+        chat_id,
+        state_dict,
+        price=price,
+        state_key=state_key,
+        force_new=force_new,
+    )
+    await _show_bottom_menu(chat_id, ctx, state_dict=state_dict)
+    return result
+
+
+async def _clear_bottom_menu(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    state_dict: Optional[Dict[str, Any]] = None,
+) -> None:
+    state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
+    mid = state_obj.get(BOTTOM_MENU_STATE_KEY)
+    if isinstance(mid, int):
+        with suppress(Exception):
+            await ctx.bot.delete_message(chat_id, mid)
+    state_obj[BOTTOM_MENU_STATE_KEY] = None
+    msg_ids = state_obj.get("msg_ids")
+    if isinstance(msg_ids, dict):
+        for key, value in list(msg_ids.items()):
+            if value == mid:
+                msg_ids[key] = None
+
+
 async def replace_wait_with_docs(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -5136,6 +5211,8 @@ async def show_emoji_hub_for_chat(
 
     log.info("hub.show | user_id=%s balance=%s", resolved_uid, balance)
 
+    await _clear_bottom_menu(ctx, chat_id)
+
     hub_msg_id_val = ctx.user_data.get("hub_msg_id")
     hub_msg_id = hub_msg_id_val if isinstance(hub_msg_id_val, int) else None
     if replace and hub_msg_id:
@@ -5201,6 +5278,13 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     CB_PAY_STARS: "pay_stars",
     CB_PAY_CARD: "pay_card",
     CB_PAY_CRYPTO: "pay_crypto",
+    "nav_video": "video",
+    "nav_image": "image",
+    "nav_music": "music",
+    "nav_prompt": "prompt",
+    "nav_chat": "chat",
+    "profile": "balance",
+    "back_main": "profile_topup",
 }
 
 
@@ -5372,6 +5456,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception as exc:  # pragma: no cover - network issues
             log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
+        await _show_bottom_menu(chat_id, ctx, state_dict=s)
         return
 
     if action == "balance":
@@ -5801,7 +5886,7 @@ def inline_topup_keyboard() -> InlineKeyboardMarkup:
 
 
 def topup_menu_keyboard() -> InlineKeyboardMarkup:
-    return kb_topup_methods()
+    return menu_pay_unified()
 
 
 def yookassa_pack_keyboard() -> InlineKeyboardMarkup:
@@ -6297,6 +6382,7 @@ async def _update_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: st
         s["_last_text_mj"] = text
     elif force:
         s["_last_text_mj"] = None
+    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 async def show_mj_format_card(
     chat_id: int,
@@ -7703,6 +7789,7 @@ async def suno_entry(
     save_suno_state(ctx, suno_state_obj)
     s["suno_state"] = suno_state_obj.to_dict()
     await _music_show_main_menu(chat_id, ctx, s)
+    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 
 async def _suno_notify(
@@ -12344,9 +12431,14 @@ async def handle_topup_callback(
     elif data == CB_PAY_CARD:
         normalized = "topup:yookassa"
 
+    if data == "back_main":
+        await query.answer()
+        await show_balance_card(chat_id, ctx)
+        return True
+
     if normalized == "topup:open":
         await query.answer()
-        markup = kb_topup_methods()
+        markup = menu_pay_unified()
         text = TXT_TOPUP_CHOOSE
         if message is not None:
             try:
@@ -12375,7 +12467,13 @@ async def handle_topup_callback(
 
     if data == CB_PAY_CRYPTO:
         await query.answer()
-        markup = kb_topup_methods(crypto_url=CRYPTO_PAYMENT_URL)
+        base_markup = menu_pay_unified()
+        rows = [list(row) for row in base_markup.inline_keyboard]
+        rows.insert(
+            3,
+            [InlineKeyboardButton(TXT_PAY_CRYPTO_OPEN_LINK, url=CRYPTO_PAYMENT_URL)],
+        )
+        markup = InlineKeyboardMarkup(rows)
         if message is not None:
             try:
                 await safe_edit_message(
@@ -13464,6 +13562,7 @@ async def show_banana_card(
         s["_last_text_banana"] = text
     else:
         s["_last_text_banana"] = None
+    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 async def banana_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, force_new: bool = True) -> None:
     s = state(ctx)
@@ -13578,6 +13677,7 @@ async def show_veo_card(
         s["_last_text_veo"] = text
     else:
         s["_last_text_veo"] = None
+    await _show_bottom_menu(chat_id, ctx, state_dict=s)
 
 async def veo_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state(ctx)
@@ -16259,7 +16359,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
-    (r"^(?:hub:|main_|profile_|pay_|ai_modes$|chat_(?:normal|promptmaster)$)", hub_router),
+    (r"^(?:hub:|main_|profile_|pay_|nav_|back_main$|ai_modes$|chat_(?:normal|promptmaster)$)", hub_router),
     (r"^go:", main_suggest_router),
     (r"^s2_go_t2v$", sora2_start_t2v),
     (r"^s2_go_i2v$", sora2_start_i2v),
