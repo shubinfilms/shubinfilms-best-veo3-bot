@@ -19,26 +19,37 @@ EMOJI = {
     "pay": "💎",
 }
 
-CB_PROFILE = "mnu:profile"
-CB_KB = "mnu:kb"
-CB_PHOTO = "mnu:photo"
-CB_MUSIC = "mnu:music"
-CB_VIDEO = "mnu:video"
-CB_CHAT = "mnu:chat"
+AI_MENU_CB = "ai:menu"
+AI_TO_SIMPLE_CB = "ai:chat"
+AI_TO_PROMPTMASTER_CB = "ai:pm"
+
+VIDEO_MENU_CB = "video:menu"
+IMAGE_MENU_CB = "image:menu"
+MUSIC_MENU_CB = "music:menu"
+PROFILE_MENU_CB = "profile:menu"
+KNOWLEDGE_MENU_CB = "kb:menu"
+
+# Backward compatible aliases (deprecated)
+CB_PROFILE = PROFILE_MENU_CB
+CB_KB = KNOWLEDGE_MENU_CB
+CB_PHOTO = IMAGE_MENU_CB
+CB_MUSIC = MUSIC_MENU_CB
+CB_VIDEO = VIDEO_MENU_CB
+CB_CHAT = AI_MENU_CB
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(text="👥 Профиль", callback_data=CB_PROFILE)],
-            [InlineKeyboardButton(text="📚 База знаний", callback_data=CB_KB)],
+            [InlineKeyboardButton(text="👥 Профиль", callback_data=PROFILE_MENU_CB)],
+            [InlineKeyboardButton(text="📚 База знаний", callback_data=KNOWLEDGE_MENU_CB)],
             [
-                InlineKeyboardButton(text="📸 Режим фото", callback_data=CB_PHOTO),
-                InlineKeyboardButton(text="🎧 Режим музыки", callback_data=CB_MUSIC),
+                InlineKeyboardButton(text="📸 Режим фото", callback_data=IMAGE_MENU_CB),
+                InlineKeyboardButton(text="🎧 Режим музыки", callback_data=MUSIC_MENU_CB),
             ],
             [
-                InlineKeyboardButton(text="📹 Режим видео", callback_data=CB_VIDEO),
-                InlineKeyboardButton(text="🧠 Диалог с ИИ", callback_data=CB_CHAT),
+                InlineKeyboardButton(text="📹 Режим видео", callback_data=VIDEO_MENU_CB),
+                InlineKeyboardButton(text="🧠 Диалог с ИИ", callback_data=AI_MENU_CB),
             ],
         ]
     )
@@ -274,7 +285,7 @@ def menu_pay_unified() -> InlineKeyboardMarkup:
 
 
 def suno_start_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="suno:start")]]
+    rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="music:suno:start")]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -328,18 +339,18 @@ def mj_upscale_select_keyboard(grid_id: str, *, count: int) -> InlineKeyboardMar
         [InlineKeyboardButton("⬅️ Назад", callback_data=f"mj.upscale.menu:{grid_id}")]
     )
     return InlineKeyboardMarkup(rows)
-CB_MAIN_PROFILE = "main_profile"
-CB_MAIN_KNOWLEDGE = "main_knowledge"
-CB_MAIN_PHOTO = "main_photo"
-CB_MAIN_MUSIC = "main_music"
-CB_MAIN_VIDEO = "main_video"
-CB_MAIN_AI_DIALOG = "main_ai_dialog"
+CB_MAIN_PROFILE = PROFILE_MENU_CB
+CB_MAIN_KNOWLEDGE = KNOWLEDGE_MENU_CB
+CB_MAIN_PHOTO = IMAGE_MENU_CB
+CB_MAIN_MUSIC = MUSIC_MENU_CB
+CB_MAIN_VIDEO = VIDEO_MENU_CB
+CB_MAIN_AI_DIALOG = AI_MENU_CB
 CB_MAIN_BACK = "main_back"
 CB_PROFILE_TOPUP = "profile_topup"
 CB_PROFILE_BACK = "profile_back"
-CB_AI_MODES = "ai_modes"
-CB_CHAT_NORMAL = "chat_normal"
-CB_CHAT_PROMPTMASTER = "chat_promptmaster"
+CB_AI_MODES = AI_MENU_CB
+CB_CHAT_NORMAL = AI_TO_SIMPLE_CB
+CB_CHAT_PROMPTMASTER = AI_TO_PROMPTMASTER_CB
 CB_PAY_STARS = "pay_stars"
 CB_PAY_CARD = "pay_card"
 CB_PAY_CRYPTO = "pay_crypto"
@@ -397,9 +408,10 @@ def kb_ai_dialog_modes() -> InlineKeyboardMarkup:
     from texts import common_text
 
     rows = [
-        [InlineKeyboardButton(TXT_AI_DIALOG_NORMAL, callback_data=CB_CHAT_NORMAL)],
-        [InlineKeyboardButton(TXT_AI_DIALOG_PM, callback_data=CB_CHAT_PROMPTMASTER)],
-        [InlineKeyboardButton(common_text("topup.menu.back"), callback_data=CB_MAIN_BACK)],
+        [
+            InlineKeyboardButton(TXT_AI_DIALOG_NORMAL, callback_data=AI_TO_SIMPLE_CB),
+            InlineKeyboardButton(TXT_AI_DIALOG_PM, callback_data=AI_TO_PROMPTMASTER_CB),
+        ]
     ]
     return InlineKeyboardMarkup(rows)
 

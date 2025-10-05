@@ -26,12 +26,12 @@ def test_build_hub_keyboard_layout():
         "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
-        "mnu:profile",
-        "mnu:kb",
-        "mnu:photo",
-        "mnu:music",
-        "mnu:video",
-        "mnu:chat",
+        "profile:menu",
+        "kb:menu",
+        "image:menu",
+        "music:menu",
+        "video:menu",
+        "ai:menu",
     ]
 
 

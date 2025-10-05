@@ -32,7 +32,7 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self, chat_id: int, data: str = "suno:start") -> None:
+    def __init__(self, chat_id: int, data: str = "music:suno:start") -> None:
         self.data = data
         self.message = FakeMessage(chat_id)
         self._answered: list[tuple[str | None, bool]] = []
@@ -89,7 +89,7 @@ def test_click_sends_correct_sticker_and_not_prinyato_again(monkeypatch):
     monkeypatch.setattr(bot_module, "_suno_notify", fake_notify)
 
     update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id, data="suno:start"),
+        callback_query=FakeCallback(chat_id, data="music:suno:start"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )
@@ -167,7 +167,7 @@ def test_second_click_blocked(monkeypatch):
     monkeypatch.setattr(bot_module, "_suno_notify", fake_notify)
 
     update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id, data="suno:start"),
+        callback_query=FakeCallback(chat_id, data="music:suno:start"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )
@@ -216,7 +216,7 @@ def test_start_sticker_fallback_to_emoji(monkeypatch):
     monkeypatch.setattr(bot_module, "safe_send_sticker", failing_sticker)
 
     update = SimpleNamespace(
-        callback_query=FakeCallback(chat_id, data="suno:start"),
+        callback_query=FakeCallback(chat_id, data="music:suno:start"),
         effective_chat=SimpleNamespace(id=chat_id),
         effective_user=SimpleNamespace(id=user_id),
     )

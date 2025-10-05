@@ -270,7 +270,7 @@ def test_start_message_sent_when_ready() -> None:
     assert SUNO_START_READY_MESSAGE in texts, "start message should be sent when ready"
     last_markup = bot.sent[-1].get("reply_markup")
     assert isinstance(last_markup, InlineKeyboardMarkup)
-    assert last_markup.inline_keyboard[0][0].callback_data == "suno:start"
+    assert last_markup.inline_keyboard[0][0].callback_data == "music:suno:start"
 
 
 def test_refresh_skips_duplicate_payload() -> None:

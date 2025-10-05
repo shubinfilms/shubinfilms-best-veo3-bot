@@ -156,25 +156,16 @@ from utils.telegram_utils import build_photo_album_media, label_to_command, shou
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import (
+    AI_MENU_CB,
+    AI_TO_PROMPTMASTER_CB,
+    AI_TO_SIMPLE_CB,
     CB,
     CB_FAQ_PREFIX,
-    CB_MAIN_AI_DIALOG,
     CB_MAIN_BACK,
-    CB_MAIN_KNOWLEDGE,
-    CB_MAIN_MUSIC,
-    CB_MAIN_PHOTO,
-    CB_MAIN_PROFILE,
-    CB_MAIN_VIDEO,
     CB_PM_INSERT_PREFIX,
     CB_PM_PREFIX,
     CB_PROFILE_BACK,
     CB_PROFILE_TOPUP,
-    CB_CHAT,
-    CB_KB,
-    CB_MUSIC,
-    CB_PHOTO,
-    CB_PROFILE,
-    CB_VIDEO,
     CB_VIDEO_ENGINE_SORA2,
     CB_VIDEO_ENGINE_SORA2_DISABLED,
     CB_VIDEO_ENGINE_VEO,
@@ -186,11 +177,14 @@ from keyboards import (
     CB_VIDEO_MODE_SORA_IMAGE,
     CB_VIDEO_MODE_SORA_TEXT,
     CB_AI_MODES,
-    CB_CHAT_NORMAL,
-    CB_CHAT_PROMPTMASTER,
     CB_PAY_CARD,
     CB_PAY_CRYPTO,
     CB_PAY_STARS,
+    IMAGE_MENU_CB,
+    KNOWLEDGE_MENU_CB,
+    MUSIC_MENU_CB,
+    PROFILE_MENU_CB,
+    VIDEO_MENU_CB,
     mj_upscale_root_keyboard,
     mj_upscale_select_keyboard,
     faq_keyboard,
@@ -199,6 +193,7 @@ from keyboards import (
     kb_ai_dialog_modes,
     kb_profile_topup_entry,
     menu_pay_unified,
+    reply_kb_home,
 )
 from texts import (
     SUNO_MODE_PROMPT,
@@ -5250,24 +5245,18 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "home:music": "music",
     "home:video": "video",
     "home:chat": "ai_modes",
-    CB_PROFILE: "balance",
-    CB_KB: "knowledge",
-    CB_PHOTO: "image",
-    CB_MUSIC: "music",
-    CB_VIDEO: "video",
-    CB_CHAT: "ai_modes",
-    CB_MAIN_PROFILE: "balance",
+    PROFILE_MENU_CB: "balance",
+    KNOWLEDGE_MENU_CB: "knowledge",
+    IMAGE_MENU_CB: "image",
+    MUSIC_MENU_CB: "music",
+    VIDEO_MENU_CB: "video",
+    AI_MENU_CB: "ai_modes",
     CB_PROFILE_BACK: "balance",
     CB_MAIN_BACK: "root",
-    CB_MAIN_KNOWLEDGE: "knowledge",
-    CB_MAIN_PHOTO: "image",
-    CB_MAIN_MUSIC: "music",
-    CB_MAIN_VIDEO: "video",
-    CB_MAIN_AI_DIALOG: "ai_modes",
     CB_AI_MODES: "ai_modes",
     CB_PROFILE_TOPUP: "profile_topup",
-    CB_CHAT_NORMAL: "chat",
-    CB_CHAT_PROMPTMASTER: "prompt",
+    AI_TO_SIMPLE_CB: "chat",
+    AI_TO_PROMPTMASTER_CB: "prompt",
     CB_PAY_STARS: "pay_stars",
     CB_PAY_CARD: "pay_card",
     CB_PAY_CRYPTO: "pay_crypto",
@@ -5475,15 +5464,9 @@ async def _dispatch_home_action(
             return
         _mode_set(chat_id, MODE_PM)
         try:
-            await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
-                chat_id=chat_id,
-                text="Режим переключён: Prompt-Master. Пришлите идею/сцену — верну кинопромпт.",
-            )
+            await prompt_master_command(update, ctx)
         except Exception as exc:
-            log.warning("hub.prompt_send_failed | chat=%s err=%s", chat_id, exc)
+            log.warning("hub.prompt_open_failed | chat=%s err=%s", chat_id, exc)
         return
 
     if action == "chat":
@@ -5493,21 +5476,38 @@ async def _dispatch_home_action(
         if chat_id is None:
             return
         _mode_set(chat_id, MODE_CHAT)
+        hint_payload = md2_escape(
+            "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
+            "🎙️ Можно присылать голосовые — я их распознаю."
+        )
+        if message is not None:
+            try:
+                await safe_edit_message(
+                    ctx,
+                    chat_id,
+                    message.message_id,
+                    hint_payload,
+                    reply_markup=kb_ai_dialog_modes(),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+                return
+            except BadRequest as exc:
+                log.debug("hub.chat_edit_bad_request | chat=%s err=%s", chat_id, exc)
+            except Exception as exc:
+                log.debug("hub.chat_edit_failed | chat=%s err=%s", chat_id, exc)
         try:
             await safe_send_text(
                 ctx.bot,
                 chat_id,
-                md2_escape(
-                    "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
-                    "🎙️ Можно присылать голосовые — я их распознаю."
-                ),
+                hint_payload,
             )
         except Exception as exc:
             log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
         return
 
     if action == "balance":
-        force_new = data in {"hub:balance", CB_MAIN_PROFILE, "balance_command"}
+        force_new = data in {"hub:balance", PROFILE_MENU_CB, "balance_command"}
         await show_balance_card(chat_id, ctx, force_new=force_new)
         return
 
@@ -5537,6 +5537,11 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         with suppress(BadRequest):
             await query.answer()
         return
+
+    normalized_data = data
+    if data.startswith("music:suno:"):
+        _, _, tail = data.partition(":")
+        normalized_data = tail or data
 
     from_user = getattr(query, "from_user", None)
     log.debug("cb %s from %s", data, getattr(from_user, "id", None))
@@ -12747,10 +12752,10 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if user_id:
         set_mode(user_id, False)
         clear_wait(user_id)
-    if guard_acquired:
-        await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
-    else:
+    if not guard_acquired:
         log.debug("menu.guard_skip", extra={"chat_id": chat_id})
+
+    await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -13811,6 +13816,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif chat is not None:
         chat_id = chat.id
 
+    normalized_data = data
+    if data.startswith("music:suno:"):
+        _, _, tail = data.partition(":")
+        normalized_data = tail or data
+
     if data == CB_MODE_CHAT:
         if chat_id is not None:
             _mode_set(chat_id, MODE_CHAT)
@@ -14442,8 +14452,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             );
             return
 
-    if data.startswith("suno:"):
-        parts = data.split(":", 2)
+    if normalized_data.startswith("suno:"):
+        parts = normalized_data.split(":", 2)
         action = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else ""
         chat = update.effective_chat
@@ -16395,7 +16405,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
     (
-        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|back_main$|ai_modes$|chat_(?:normal|promptmaster)$)",
+        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
         hub_router,
     ),
     (r"^go:", main_suggest_router),
@@ -16659,3 +16669,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    """Compatibility helper exposing the reply keyboard layout."""
+
+    return reply_kb_home()
+
