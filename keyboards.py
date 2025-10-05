@@ -1,6 +1,11 @@
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 
 EMOJI = {
@@ -29,6 +34,25 @@ def kb_home_menu() -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def reply_kb_home() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👥 Профиль")],
+            [KeyboardButton(text="📚 База знаний")],
+            [
+                KeyboardButton(text="📸 Режим фото"),
+                KeyboardButton(text="🎧 Режим музыки"),
+            ],
+            [
+                KeyboardButton(text="📹 Режим видео"),
+                KeyboardButton(text="🧠 Диалог с ИИ"),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def _row(*buttons: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
