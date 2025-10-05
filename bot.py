@@ -73,6 +73,7 @@ from handlers import (
     prompt_master_open,
     prompt_master_process,
     prompt_master_reset,
+    clear_pm_prompts,
 )
 
 from prompt_master import (
@@ -276,6 +277,9 @@ from redis_utils import (
     release_user_lock,
     update_task_meta,
     acquire_main_menu_guard,
+    get_active_mode,
+    set_active_mode,
+    clear_mode_state,
 )
 
 from ledger import (
@@ -331,7 +335,6 @@ from chat_service import (
     append_ctx,
     build_messages,
     call_llm,
-    clear_ctx,
     estimate_tokens,
     load_ctx,
     rate_limit_hit,
@@ -1427,6 +1430,114 @@ def get_cached_pm_prompt(chat_id: int) -> Optional[str]:
     return _inmem_modes.get(f"pm:{chat_id}")
 
 
+def clear_cached_pm_prompt(chat_id: int) -> None:
+    from redis_utils import rds
+
+    key = CACHE_PM_KEY_FMT.format(chat_id=chat_id)
+    if rds:
+        try:
+            rds.delete(key)
+        except Exception as exc:
+            log.warning("pm-cache redis del error: %s", exc)
+    _inmem_modes.pop(f"pm:{chat_id}", None)
+
+
+async def _ensure_active_mode(user_id: Optional[int], expected: str) -> None:
+    if not user_id:
+        return
+
+    try:
+        current = await get_active_mode(user_id)
+    except Exception:
+        current = None
+
+    if current and current != expected:
+        await clear_mode_state(user_id)
+
+    if current != expected:
+        await set_active_mode(user_id, expected)
+
+
+async def start_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        message = getattr(update, "effective_message", None)
+        if message is not None:
+            user = getattr(message, "from_user", None)
+    if user is None or getattr(user, "id", None) is None:
+        return
+
+    user_id = int(user.id)
+    message = getattr(update, "effective_message", None)
+    chat_obj = getattr(update, "effective_chat", None)
+    if chat_obj is None and message is not None:
+        chat_obj = getattr(message, "chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+
+    await clear_mode_state(user_id)
+    _pm_clear_step(user_id)
+    _pm_clear_buffer(user_id)
+
+    if chat_id is not None:
+        clear_cached_pm_prompt(chat_id)
+        clear_pm_prompts(chat_id)
+        _clear_pm_menu_state(chat_id, user_id=user_id)
+
+    if isinstance(ctx.user_data, dict):
+        ctx.user_data.pop("pm_state", None)
+    if isinstance(ctx.chat_data, dict):
+        ctx.chat_data.pop("prompt_master", None)
+
+    state_dict = state(ctx)
+    state_dict["mode"] = None
+
+    normalized = (mode or "").strip().lower()
+    if normalized in {"chat", "dialog", "dialog_default"}:
+        normalized = "dialog_default"
+        chat_mode_turn_on(user_id)
+        await set_active_mode(user_id, normalized)
+        if chat_id is not None:
+            _mode_set(chat_id, MODE_CHAT)
+        state_dict["chat_hint_sent"] = False
+        hint_text = md2_escape("💬 Обычный чат включён. Пишите вопрос. /reset — очистить контекст.")
+        if message is not None and chat_id is not None:
+            try:
+                await safe_edit_message(
+                    ctx,
+                    chat_id,
+                    message.message_id,
+                    hint_text,
+                    reply_markup=None,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+                return
+            except BadRequest as exc:
+                log.debug("chat.start_mode.edit_failed | chat=%s err=%s", chat_id, exc)
+            except Exception as exc:
+                log.debug("chat.start_mode.edit_failed | chat=%s err=%s", chat_id, exc)
+        if chat_id is not None:
+            try:
+                await safe_send_text(ctx.bot, chat_id, hint_text)
+            except Exception as exc:
+                log.warning("chat.start_mode.send_failed | chat=%s err=%s", chat_id, exc)
+        return
+
+    if normalized == "prompt_master":
+        await set_active_mode(user_id, normalized)
+        if chat_id is not None:
+            _mode_set(chat_id, MODE_PM)
+        try:
+            await prompt_master_open(update, ctx)
+        except Exception:
+            log.exception("prompt_master.start_mode_failed", extra={"user_id": user_id})
+        return
+
+    await set_active_mode(user_id, normalized or None)
+    if normalized and chat_id is not None:
+        _mode_set(chat_id, normalized)
+
+
 PM_STEP_KEY_FMT = f"{REDIS_PREFIX}:pm:step:{{user_id}}"
 PM_BUF_KEY_FMT = f"{REDIS_PREFIX}:pm:buf:{{user_id}}"
 PM_STATE_TTL = 30 * 60
@@ -2429,8 +2540,16 @@ async def chat_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not chat or not user:
         return
-    clear_ctx(user.id)
-    set_mode(user.id, True)
+    await clear_mode_state(user.id)
+    _pm_clear_step(user.id)
+    _pm_clear_buffer(user.id)
+    clear_cached_pm_prompt(chat.id)
+    clear_pm_prompts(chat.id)
+    if isinstance(ctx.user_data, dict):
+        ctx.user_data.pop("pm_state", None)
+    if isinstance(ctx.chat_data, dict):
+        ctx.chat_data.pop("prompt_master", None)
+    chat_mode_turn_on(user.id)
     _mode_set(chat.id, MODE_CHAT)
     try:
         await safe_send_text(ctx.bot, chat.id, md2_escape("🧹 Контекст очищен."))
@@ -5234,6 +5353,8 @@ _NAVIGATION_RESET_ACTIONS = {
     "video",
     "chat",
     "prompt",
+    "dialog_default",
+    "prompt_master",
     "ai_modes",
     "root",
 }
@@ -5255,8 +5376,8 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     CB_MAIN_BACK: "root",
     CB_AI_MODES: "ai_modes",
     CB_PROFILE_TOPUP: "profile_topup",
-    AI_TO_SIMPLE_CB: "chat",
-    AI_TO_PROMPTMASTER_CB: "prompt",
+    AI_TO_SIMPLE_CB: "dialog_default",
+    AI_TO_PROMPTMASTER_CB: "prompt_master",
     CB_PAY_STARS: "pay_stars",
     CB_PAY_CARD: "pay_card",
     CB_PAY_CRYPTO: "pay_crypto",
@@ -5360,6 +5481,18 @@ async def _dispatch_home_action(
             state_dict[knowledge_key] = sent_id
         return
 
+    if action == "dialog_default":
+        if user_id is None:
+            return
+        await start_mode(update, ctx, "dialog_default")
+        return
+
+    if action == "prompt_master":
+        if user_id is None:
+            return
+        await start_mode(update, ctx, "prompt_master")
+        return
+
     if action == "ai_modes":
         if message is None or chat_id is None:
             return
@@ -5457,53 +5590,15 @@ async def _dispatch_home_action(
         return
 
     if action == "prompt":
-        if user_id is not None:
-            set_mode(user_id, False)
-        state_dict["mode"] = None
-        if chat_id is None:
+        if user_id is None:
             return
-        _mode_set(chat_id, MODE_PM)
-        try:
-            await prompt_master_command(update, ctx)
-        except Exception as exc:
-            log.warning("hub.prompt_open_failed | chat=%s err=%s", chat_id, exc)
+        await start_mode(update, ctx, "prompt_master")
         return
 
     if action == "chat":
-        if user_id is not None:
-            set_mode(user_id, True)
-        state_dict["mode"] = None
-        if chat_id is None:
+        if user_id is None:
             return
-        _mode_set(chat_id, MODE_CHAT)
-        hint_payload = md2_escape(
-            "💬 Обычный чат включён. Пишите вопрос! /reset — очистить контекст.\n"
-            "🎙️ Можно присылать голосовые — я их распознаю."
-        )
-        if message is not None:
-            try:
-                await safe_edit_message(
-                    ctx,
-                    chat_id,
-                    message.message_id,
-                    hint_payload,
-                    reply_markup=kb_ai_dialog_modes(),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    disable_web_page_preview=True,
-                )
-                return
-            except BadRequest as exc:
-                log.debug("hub.chat_edit_bad_request | chat=%s err=%s", chat_id, exc)
-            except Exception as exc:
-                log.debug("hub.chat_edit_failed | chat=%s err=%s", chat_id, exc)
-        try:
-            await safe_send_text(
-                ctx.bot,
-                chat_id,
-                hint_payload,
-            )
-        except Exception as exc:
-            log.warning("hub.chat_send_failed | chat=%s err=%s", chat_id, exc)
+        await start_mode(update, ctx, "dialog_default")
         return
 
     if action == "balance":
@@ -5523,6 +5618,24 @@ async def on_text_nav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not route:
         return
     await route_home(update, ctx, route)
+
+
+async def dialog_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer()
+    await start_mode(update, ctx, "dialog_default")
+
+
+async def prompt_master_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    query = update.callback_query
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer()
+    await start_mode(update, ctx, "prompt_master")
 
 
 async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12935,21 +13048,32 @@ async def faq_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 async def prompt_master_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    await prompt_master_open(update, ctx)
+    await start_mode(update, ctx, "prompt_master")
 
 
 async def prompt_master_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
+    user = update.effective_user
+    user_id = user.id if user else None
+    await _ensure_active_mode(user_id, "prompt_master")
     await prompt_master_reset(update, ctx)
 
 
 async def prompt_master_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
+    query = update.callback_query
+    user = getattr(query, "from_user", None) or update.effective_user
+    user_id = user.id if user else None
+    await _ensure_active_mode(user_id, "prompt_master")
     await prompt_master_callback(update, ctx)
 
 
 async def prompt_master_insert_callback_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
+    query = update.callback_query
+    user = getattr(query, "from_user", None) or update.effective_user
+    user_id = user.id if user else None
+    await _ensure_active_mode(user_id, "prompt_master")
     await prompt_master_insert_callback(update, ctx)
 
 
@@ -15140,6 +15264,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if user_mode == MODE_PM:
+        await _ensure_active_mode(user_id, "prompt_master")
         await prompt_master_process(update, ctx)
         return
 
@@ -15190,6 +15315,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_mode_turn_on(user_id)
         _mode_set(chat_id, MODE_CHAT)
         s["mode"] = None
+        await _ensure_active_mode(user_id, "dialog_default")
         await _handle_chat_message(
             ctx=ctx,
             chat_id=chat_id,
@@ -15208,6 +15334,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if not chat_mode_is_on(user_id):
             return
+        await _ensure_active_mode(user_id, "dialog_default")
         await _handle_chat_message(
             ctx=ctx,
             chat_id=chat_id,
@@ -15705,6 +15832,8 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (time.time() - start_time) * 1000.0
         )
         return
+
+    await _ensure_active_mode(user_id, "dialog_default")
 
     if rate_limit_hit(user_id):
         chat_messages_total.labels(outcome="rate_limited").inc()
@@ -16396,6 +16525,8 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
+    (r"^dialog_default$", dialog_mode_callback),
+    (r"^prompt_master$", prompt_master_mode_callback),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
