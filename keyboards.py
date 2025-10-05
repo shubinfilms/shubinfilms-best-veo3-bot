@@ -22,12 +22,19 @@ EMOJI = {
     "pay": "💎",
 }
 
-HOME_CB_PROFILE = "home:profile"
-HOME_CB_KB = "home:kb"
-HOME_CB_PHOTO = "home:photo"
-HOME_CB_MUSIC = "home:music"
-HOME_CB_VIDEO = "home:video"
-HOME_CB_DIALOG = "home:dialog"
+NAV_PROFILE = "nav:profile"
+NAV_KB = "nav:kbase"
+NAV_PHOTO = "nav:photo"
+NAV_MUSIC = "nav:music"
+NAV_VIDEO = "nav:video"
+NAV_DIALOG = "nav:dialog"
+
+HOME_CB_PROFILE = NAV_PROFILE
+HOME_CB_KB = NAV_KB
+HOME_CB_PHOTO = NAV_PHOTO
+HOME_CB_MUSIC = NAV_MUSIC
+HOME_CB_VIDEO = NAV_VIDEO
+HOME_CB_DIALOG = NAV_DIALOG
 
 def iter_home_menu_buttons() -> Iterable[Tuple[str, str]]:
     """Yield flattened pairs of ``(text, callback_data)`` for the home layout."""
@@ -40,6 +47,9 @@ def iter_home_menu_buttons() -> Iterable[Tuple[str, str]]:
 AI_MENU_CB = HOME_CB_DIALOG
 AI_TO_SIMPLE_CB = "chat_mode_normal"
 AI_TO_PROMPTMASTER_CB = "chat_mode_pm"
+
+DIALOG_PICK_REGULAR = "dialog:choose_regular"
+DIALOG_PICK_PM = "dialog:choose_promptmaster"
 
 VIDEO_MENU_CB = HOME_CB_VIDEO
 IMAGE_MENU_CB = HOME_CB_PHOTO
@@ -78,6 +88,17 @@ def build_main_reply_kb() -> ReplyKeyboardMarkup:
     for layout_row in layout:
         rows.append([KeyboardButton(text=label) for label, _ in layout_row])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+def dialog_picker_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💬 Обычный чат", callback_data=DIALOG_PICK_REGULAR),
+                InlineKeyboardButton("📝 Prompt-Master", callback_data=DIALOG_PICK_PM),
+            ]
+        ]
+    )
 
 
 def build_empty_reply_kb() -> ReplyKeyboardRemove:
