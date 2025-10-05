@@ -15,6 +15,22 @@ EMOJI = {
 }
 
 
+def kb_home_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="👥 Профиль", callback_data="home:profile")],
+        [InlineKeyboardButton(text="📚 База знаний", callback_data="home:kb")],
+        [
+            InlineKeyboardButton(text="📸 Режим фото", callback_data="home:photo"),
+            InlineKeyboardButton(text="🎧 Режим музыки", callback_data="home:music"),
+        ],
+        [
+            InlineKeyboardButton(text="📹 Режим видео", callback_data="home:video"),
+            InlineKeyboardButton(text="🧠 Диалог с ИИ", callback_data="home:chat"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def _row(*buttons: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
     return [list(buttons)]
 

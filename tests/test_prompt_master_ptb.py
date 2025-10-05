@@ -187,8 +187,6 @@ def test_prompt_master_callback_selects_engine_and_creates_card() -> None:
     assert kwargs["reply_markup"].inline_keyboard == prompt_master_mode_keyboard("ru").inline_keyboard
     assert "<br/>" not in card_html
     assert state["card_msg_id"]
-    bottom_menu = [entry for entry in bot.sent if entry[1] == "👇 Быстрые действия"]
-    assert bottom_menu, "bottom menu should be rendered"
 
 
 def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> None:
@@ -198,7 +196,8 @@ def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> Non
     message = SimpleNamespace(text="futuristic portrait", chat=SimpleNamespace(id=333, type=ChatType.PRIVATE))
     update = SimpleNamespace(message=message, effective_chat=message.chat)
     asyncio.run(prompt_master_text_handler(update, ctx))
-    assert len(bot.sent) >= 3
+    assert len(bot.sent) >= 2
+    assert all(entry[1] != "👇 Быстрые действия" for entry in bot.sent)
     card_entry = next(
         (entry for entry in bot.sent if "<pre><code>" in entry[1]),
         None,
@@ -220,8 +219,6 @@ def test_prompt_master_text_handler_generates_prompt_and_updates_status() -> Non
     assert status_text.startswith("🧠")
     assert status_kwargs["reply_markup"].inline_keyboard == prompt_master_mode_keyboard("en").inline_keyboard
     assert status_kwargs.get("parse_mode") == "HTML"
-    bottom_menu = [entry for entry in bot.sent if entry[1] == "👇 Быстрые действия"]
-    assert bottom_menu, "bottom menu should be rendered"
     # Final edit should include result keyboard
     assert bot.edited, "status message must be edited"
     final_entry = next((entry for entry in bot.edited if "Ready prompt" in entry[2]), None)
@@ -248,7 +245,8 @@ def test_prompt_master_status_message_for_veo() -> None:
     message = SimpleNamespace(text="Два героя спорят у окна во время грозы.", chat=SimpleNamespace(id=555, type=ChatType.PRIVATE))
     update = SimpleNamespace(message=message, effective_chat=message.chat)
     asyncio.run(prompt_master_text_handler(update, ctx))
-    assert len(bot.sent) >= 3
+    assert len(bot.sent) >= 2
+    assert all(entry[1] != "👇 Быстрые действия" for entry in bot.sent)
     status_entry = next(
         (entry for entry in bot.sent if entry[1].startswith("⚙️ Начинаю собирать промпт для VEO")),
         None,
