@@ -100,6 +100,18 @@ def build_menu(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
         markup_rows.append([kb_btn(text, cb) for text, cb in row])
     return InlineKeyboardMarkup(markup_rows)
 
+
+def kb_banana_templates() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🧼 Удалить фон", callback_data="btpl_bg_remove")],
+        [InlineKeyboardButton("🎨 Сменить фон на студию", callback_data="btpl_bg_studio")],
+        [InlineKeyboardButton("👕 Сменить одежду на чёрный пиджак", callback_data="btpl_outfit_black")],
+        [InlineKeyboardButton("💄 Лёгкий макияж, подчеркнуть глаза", callback_data="btpl_makeup_soft")],
+        [InlineKeyboardButton("🧼 Очистить стол от лишнего", callback_data="btpl_desk_clean")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="banana_back_to_card")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
 CB_FAQ_PREFIX = "faq:"
 CB_PM_PREFIX = "pm:"
 

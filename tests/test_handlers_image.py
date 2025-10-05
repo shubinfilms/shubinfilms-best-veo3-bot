@@ -49,7 +49,8 @@ def test_banana_deliver_photo_and_document(monkeypatch, tmp_path, bot_module):
             user_id=2,
             file_path=path,
             caption=caption,
-            reply_markup=None,
+            photo_reply_markup=None,
+            document_reply_markup=None,
             send_document=True,
         )
     )
@@ -90,7 +91,8 @@ def test_banana_deliver_skips_document(monkeypatch, tmp_path, bot_module):
             user_id=20,
             file_path=path,
             caption="Caption",
-            reply_markup=None,
+            photo_reply_markup=None,
+            document_reply_markup=None,
             send_document=False,
         )
     )
