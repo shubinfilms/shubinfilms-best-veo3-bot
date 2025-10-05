@@ -14,20 +14,20 @@ EMOJI = {
     "music": "🎵",
     "chat": "💬",
     "prompt": "🧠",
-    "profile": "👥",
+    "profile": "👤",
     "back": "⬅️",
     "pay": "💎",
 }
 
-AI_MENU_CB = "ai:menu"
-AI_TO_SIMPLE_CB = "dialog_default"
-AI_TO_PROMPTMASTER_CB = "prompt_master"
+AI_MENU_CB = "menu_chat_ai"
+AI_TO_SIMPLE_CB = "chat_mode_normal"
+AI_TO_PROMPTMASTER_CB = "chat_mode_pm"
 
-VIDEO_MENU_CB = "video:menu"
-IMAGE_MENU_CB = "image:menu"
-MUSIC_MENU_CB = "music:menu"
-PROFILE_MENU_CB = "profile:menu"
-KNOWLEDGE_MENU_CB = "kb:menu"
+VIDEO_MENU_CB = "video_menu"
+IMAGE_MENU_CB = "image_menu"
+MUSIC_MENU_CB = "music_menu"
+PROFILE_MENU_CB = "menu_profile"
+KNOWLEDGE_MENU_CB = "kb_entry"
 
 # Backward compatible aliases (deprecated)
 CB_PROFILE = PROFILE_MENU_CB
@@ -38,10 +38,10 @@ CB_VIDEO = VIDEO_MENU_CB
 CB_CHAT = AI_MENU_CB
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(text="👥 Профиль", callback_data=PROFILE_MENU_CB)],
+            [InlineKeyboardButton(text="👤 Профиль", callback_data=PROFILE_MENU_CB)],
             [InlineKeyboardButton(text="📚 База знаний", callback_data=KNOWLEDGE_MENU_CB)],
             [
                 InlineKeyboardButton(text="📸 Режим фото", callback_data=IMAGE_MENU_CB),
@@ -55,14 +55,18 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return kb_main()
+
+
 def kb_home_menu() -> InlineKeyboardMarkup:
-    return main_menu_kb()
+    return kb_main()
 
 
 def reply_kb_home() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="👥 Профиль")],
+            [KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="📚 База знаний")],
             [
                 KeyboardButton(text="📸 Режим фото"),
@@ -414,4 +418,29 @@ def kb_ai_dialog_modes() -> InlineKeyboardMarkup:
         ]
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def kb_kb_root() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🪄 Примеры генераций", callback_data="kb_examples")],
+            [InlineKeyboardButton("✨ Готовые шаблоны", callback_data="kb_templates")],
+            [InlineKeyboardButton("💡 Мини видео уроки", callback_data="kb_lessons")],
+            [InlineKeyboardButton("❓ Частые вопросы", callback_data="kb_faq")],
+            [InlineKeyboardButton("⬅️ Назад (в главное)", callback_data="menu_main")],
+        ]
+    )
+
+
+def kb_kb_templates() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎬 Генерация видео", callback_data="tpl_video")],
+            [InlineKeyboardButton("🖼️ Генерация фото", callback_data="tpl_image")],
+            [InlineKeyboardButton("🎵 Генерация музыки", callback_data="tpl_music")],
+            [InlineKeyboardButton("🍌 Редактор фото", callback_data="tpl_banana")],
+            [InlineKeyboardButton("🤖 ИИ-фотограф", callback_data="tpl_ai_photo")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="kb_entry")],
+        ]
+    )
 

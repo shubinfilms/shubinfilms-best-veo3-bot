@@ -7,8 +7,8 @@ from suno.cover_source import MAX_AUDIO_MB
 FAQ_INTRO = "🧾 *FAQ*\nВыберите раздел:"
 
 TXT_MENU_TITLE = "📋 Главное меню"
-TXT_PROFILE_TITLE = "👥 Профиль"
-TXT_KB_PROFILE = "👥 Профиль"
+TXT_PROFILE_TITLE = "👤 Профиль"
+TXT_KB_PROFILE = "👤 Профиль"
 TXT_KB_KNOWLEDGE = "📚 База знаний"
 TXT_KB_PHOTO = "📸 Режим фото"
 TXT_KB_MUSIC = "🎧 Режим музыки"
@@ -24,7 +24,7 @@ TXT_PAY_CRYPTO_OPEN_LINK = "Открыть оплату в браузере"
 TXT_AI_DIALOG_NORMAL = "💬 Обычный чат"
 TXT_AI_DIALOG_PM = "📝 Prompt-Master"
 TXT_AI_DIALOG_CHOOSE = "Выберите режим диалога:"
-TXT_KNOWLEDGE_INTRO = "📚 База знаний\nВыберите нужный раздел:"
+TXT_KNOWLEDGE_INTRO = "📚 База знаний\nВыберите раздел:"
 
 COMMON_TEXTS_RU = {
     "topup.menu.title": "Выберите способ пополнения:",

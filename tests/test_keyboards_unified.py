@@ -23,7 +23,7 @@ def test_kb_home_menu_layout():
     callbacks = [button.callback_data for row in rows for button in row]
 
     assert texts == [
-        "👥 Профиль",
+        "👤 Профиль",
         "📚 База знаний",
         "📸 Режим фото",
         "🎧 Режим музыки",
@@ -31,12 +31,12 @@ def test_kb_home_menu_layout():
         "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
-        "profile:menu",
-        "kb:menu",
-        "image:menu",
-        "music:menu",
-        "video:menu",
-        "ai:menu",
+        "menu_profile",
+        "kb_entry",
+        "image_menu",
+        "music_menu",
+        "video_menu",
+        "menu_chat_ai",
     ]
 
 
