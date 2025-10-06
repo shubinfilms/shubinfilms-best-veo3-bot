@@ -1,4 +1,5 @@
 """Shared configuration constants for Redis and Suno integrations."""
+
 from __future__ import annotations
 
 import logging
@@ -10,6 +11,35 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 load_dotenv()
+
+
+def _strip_optional(value: Optional[str]) -> Optional[str]:
+    """Return a trimmed string or ``None`` for empty values."""
+
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:  # pragma: no cover - defensive conversion
+        return None
+    return text or None
+
+
+_strip_optional_value = _strip_optional
+
+
+def _coerce_optional_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
 
 log = logging.getLogger("config")
 _CONFIG_WARNINGS: list[str] = []
@@ -119,8 +149,8 @@ class _AppSettings(BaseModel):
     def _strip_optional(cls, value: object) -> Optional[str]:
         if value is None:
             return None
-        text = str(value).strip()
-        return text or None
+        candidate = value if isinstance(value, str) else str(value)
+        return _strip_optional_value(candidate)
 
     @field_validator(
         "SUNO_GEN_PATH",
@@ -243,16 +273,11 @@ SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
 SUPPORT_USERNAME = _APP_SETTINGS.SUPPORT_USERNAME
 SUPPORT_USER_ID = int(_APP_SETTINGS.SUPPORT_USER_ID)
-BOT_USERNAME = _strip_optional(_APP_SETTINGS.BOT_USERNAME)
+_bot_username_candidate = getattr(_APP_SETTINGS, "BOT_USERNAME", None)
+if _bot_username_candidate is None:
+    _bot_username_candidate = os.getenv("BOT_USERNAME")
+BOT_USERNAME = _strip_optional(_bot_username_candidate)
 REF_BONUS_HINT_ENABLED = bool(_APP_SETTINGS.REF_BONUS_HINT_ENABLED)
-
-
-def _strip_optional(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    text = value.strip()
-    return text or None
-
 
 KIE_BASE_URL = (_strip_optional(_APP_SETTINGS.KIE_BASE_URL) or "https://api.kie.ai").rstrip("/")
 KIE_API_KEY = _strip_optional(_APP_SETTINGS.KIE_API_KEY)
@@ -324,6 +349,20 @@ SORA2_TIMEOUT_POOL = int(_APP_SETTINGS.SORA2_TIMEOUT_POOL)
 BANANA_SEND_AS_DOCUMENT = bool(_APP_SETTINGS.BANANA_SEND_AS_DOCUMENT)
 MJ_SEND_AS_ALBUM = bool(_APP_SETTINGS.MJ_SEND_AS_ALBUM)
 
+_telegram_token_prefix = (_strip_optional(os.getenv("TELEGRAM_TOKEN")) or "")[:6] or None
+DIALOG_ENABLED = _coerce_optional_bool(os.getenv("DIALOG_ENABLED"))
+
+log.info(
+    "config.startup",
+    extra={
+        "meta": {
+            "bot_username": BOT_USERNAME,
+            "telegram_token_prefix": _telegram_token_prefix,
+            "dialog_enabled": DIALOG_ENABLED,
+        }
+    },
+)
+
 
 def _emit_warnings() -> None:
     if not KIE_API_KEY:
@@ -394,6 +433,10 @@ __all__ = [
     "HTTP_POOL_CONNECTIONS",
     "HTTP_POOL_PER_HOST",
     "TMP_CLEANUP_HOURS",
+    "SUPPORT_USERNAME",
+    "SUPPORT_USER_ID",
+    "BOT_USERNAME",
+    "REF_BONUS_HINT_ENABLED",
     "KIE_BASE_URL",
     "KIE_API_KEY",
     "REDIS_PREFIX",
@@ -424,6 +467,7 @@ __all__ = [
     "UPLOAD_STREAM_PATH",
     "UPLOAD_URL_PATH",
     "UPLOAD_BASE64_PATH",
+    "UPLOAD_FALLBACK_ENABLED",
     "YOOKASSA_SHOP_ID",
     "YOOKASSA_SECRET_KEY",
     "YOOKASSA_RETURN_URL",
@@ -431,6 +475,7 @@ __all__ = [
     "CRYPTO_PAYMENT_URL",
     "BANANA_SEND_AS_DOCUMENT",
     "MJ_SEND_AS_ALBUM",
+    "DIALOG_ENABLED",
     "SORA2_ENABLED",
     "SORA2_API_KEY",
     "SORA2_GEN_PATH",
