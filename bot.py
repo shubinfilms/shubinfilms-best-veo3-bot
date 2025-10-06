@@ -313,6 +313,7 @@ from settings import (
     SORA2_WAIT_STICKER_ID as SETTINGS_SORA2_WAIT_STICKER_ID,
     BOT_USERNAME as SETTINGS_BOT_USERNAME,
     REF_BONUS_HINT_ENABLED,
+    DIALOG_ENABLED as SETTINGS_DIALOG_ENABLED,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -1107,6 +1108,18 @@ logging.getLogger("kie").setLevel(logging.INFO)
 log = logging.getLogger("veo3-bot")
 mj_log = logging.getLogger("mj_handler")
 singleton_log = logging.getLogger("veo3-bot.singleton")
+
+_startup_token_prefix = (TELEGRAM_TOKEN or "")[:6] or None
+log.info(
+    "startup.config",
+    extra={
+        "meta": {
+            "bot_username": SETTINGS_BOT_USERNAME,
+            "telegram_token_prefix": _startup_token_prefix,
+            "dialog_enabled": SETTINGS_DIALOG_ENABLED,
+        }
+    },
+)
 
 try:
     import telegram as _tg
@@ -4997,7 +5010,13 @@ async def _build_referral_link(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> 
     username = await _get_bot_username(ctx)
     if not username:
         return None
-    return f"https://t.me/{username}?start=ref_{int(user_id)}"
+    link = f"https://t.me/{username}?start=ref_{int(user_id)}"
+    log.debug(
+        "profile.invite_link | user=%s username=%s",
+        user_id,
+        username,
+    )
+    return link
 
 
 def _format_user_for_notification(user: Optional[User], fallback_id: int) -> str:
@@ -6904,11 +6923,13 @@ async def send_profile_card(
             "invite.url",
             extra={"user_id": resolved_user, "chat_id": chat_id, "url": referral_url},
         )
+    show_kwargs = {"force_new": force_new}
+    if referral_url:
+        show_kwargs["referral_url"] = referral_url
     mid = await show_balance_card(
         chat_id,
         ctx,
-        force_new=force_new,
-        referral_url=referral_url,
+        **show_kwargs,
     )
     if (
         REF_BONUS_HINT_ENABLED
@@ -14802,6 +14823,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = chat.id
 
     normalized_data = _normalize_music_callback_data(data)
+    user_id_value = user.id if user else None
+    log.debug(
+        "callback.received | user=%s chat=%s raw=%s normalized=%s",
+        user_id_value,
+        chat_id,
+        data,
+        normalized_data,
+    )
 
     if data == CB_MODE_CHAT:
         if chat_id is not None:
@@ -15845,6 +15874,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     return
 
             await q.answer()
+
+            log.debug(
+                "suno.start_button | user=%s chat=%s mode=%s generating=%s",
+                uid,
+                chat_id,
+                getattr(suno_state_obj, "mode", None),
+                bool(s.get("suno_generating")),
+            )
 
             log.info(
                 "music:start",

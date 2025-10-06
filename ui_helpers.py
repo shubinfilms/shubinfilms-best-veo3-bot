@@ -424,6 +424,14 @@ async def refresh_suno_card(
         generating=generating,
         waiting_enqueue=waiting_enqueue,
     )
+    logger.debug(
+        "suno.refresh_card | chat=%s mode=%s generating=%s waiting=%s ready=%s",
+        chat_id,
+        getattr(suno_state_obj, "mode", None),
+        generating,
+        waiting_enqueue,
+        ready,
+    )
     card_state_raw = state_dict.get("suno_card")
     card_state: MutableMapping[str, Any]
     if isinstance(card_state_raw, MutableMapping):
