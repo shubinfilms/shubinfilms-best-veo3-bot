@@ -549,6 +549,42 @@ def user_lock(user_id: Optional[int], key: str, ttl: int = 30) -> bool:
     return _memory_set_if_absent(lock_key, "1", ttl_value)
 
 
+def acquire_action_lock(
+    user_id: Optional[int],
+    action: str,
+    *,
+    ttl: int = 3,
+) -> bool:
+    """Attempt to acquire a short-lived idempotency lock for ``action``."""
+
+    if not user_id:
+        return True
+    normalized = str(action or "action").strip() or "action"
+    lock_key = _user_lock_key(int(user_id), f"act:{normalized}")
+    ttl_value = max(int(ttl), 1)
+    if _r:
+        try:
+            return bool(_r.set(lock_key, "1", nx=True, ex=ttl_value))
+        except Exception as exc:
+            _logger.warning("action_lock.acquire_error | key=%s err=%s", lock_key, exc)
+            return True
+    return _memory_set_if_absent(lock_key, "1", ttl_value)
+
+
+def release_action_lock(user_id: Optional[int], action: str) -> None:
+    if not user_id:
+        return
+    normalized = str(action or "action").strip() or "action"
+    lock_key = _user_lock_key(int(user_id), f"act:{normalized}")
+    if _r:
+        try:
+            _r.delete(lock_key)
+        except Exception as exc:
+            _logger.warning("action_lock.release_error | key=%s err=%s", lock_key, exc)
+    else:
+        _memory_delete(lock_key)
+
+
 def release_user_lock(user_id: Optional[int], key: str) -> None:
     if not user_id:
         return

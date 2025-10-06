@@ -32,6 +32,8 @@ class _AppSettings(BaseModel):
     MAX_IN_LOG_BODY: int = Field(default=2048, ge=256, le=65536)
     SUPPORT_USERNAME: str = Field(default="BestAi_Support")
     SUPPORT_USER_ID: int = Field(default=7223448532)
+    BOT_USERNAME: Optional[str] = Field(default=None)
+    REF_BONUS_HINT_ENABLED: bool = Field(default=False)
 
     HTTP_TIMEOUT_CONNECT: float = Field(default=10.0, ge=0.1, le=300.0)
     HTTP_TIMEOUT_READ: float = Field(default=60.0, ge=1.0, le=600.0)
@@ -190,6 +192,15 @@ class _AppSettings(BaseModel):
         text = text.lstrip("@")
         return text or "BestAi_Support"
 
+    @field_validator("BOT_USERNAME", mode="before")
+    def _normalize_bot_username(cls, value: object) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return text.lstrip("@") or None
+
 
 def _load_settings() -> _AppSettings:
     values: dict[str, str] = {}
@@ -232,6 +243,8 @@ SUNO_LOG_KEY = f"{REDIS_PREFIX}:suno:logs"
 UPLOAD_FALLBACK_ENABLED = bool(_APP_SETTINGS.UPLOAD_FALLBACK_ENABLED)
 SUPPORT_USERNAME = _APP_SETTINGS.SUPPORT_USERNAME
 SUPPORT_USER_ID = int(_APP_SETTINGS.SUPPORT_USER_ID)
+BOT_USERNAME = _strip_optional(_APP_SETTINGS.BOT_USERNAME)
+REF_BONUS_HINT_ENABLED = bool(_APP_SETTINGS.REF_BONUS_HINT_ENABLED)
 
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:

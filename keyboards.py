@@ -359,7 +359,7 @@ def menu_pay_unified() -> InlineKeyboardMarkup:
 
 
 def suno_start_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="music:suno:start")]]
+    rows = [[InlineKeyboardButton("▶️ Начать генерацию", callback_data="music:start")]]
     return InlineKeyboardMarkup(rows)
 
 
