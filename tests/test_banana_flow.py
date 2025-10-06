@@ -89,4 +89,4 @@ def test_banana_generate_flow(monkeypatch, tmp_path, bot_module):
     assert isinstance(markup, InlineKeyboardMarkup)
     buttons = markup.inline_keyboard
     assert buttons and buttons[0][0].text == "🔁 Сгенерировать ещё"
-    assert buttons[0][0].callback_data == "banana_regenerate_fresh"
+    assert buttons[0][0].callback_data == "banana:restart"

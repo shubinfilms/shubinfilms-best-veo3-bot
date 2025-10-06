@@ -22,12 +22,12 @@ EMOJI = {
     "pay": "💎",
 }
 
-NAV_PROFILE = "nav:profile"
-NAV_KB = "nav:kbase"
-NAV_PHOTO = "nav:photo"
-NAV_MUSIC = "nav:music"
-NAV_VIDEO = "nav:video"
-NAV_DIALOG = "nav:dialog"
+NAV_PROFILE = "menu:profile"
+NAV_KB = "menu:kb"
+NAV_PHOTO = "menu:photo"
+NAV_MUSIC = "menu:music"
+NAV_VIDEO = "menu:video"
+NAV_DIALOG = "menu:dialog"
 
 HOME_CB_PROFILE = NAV_PROFILE
 HOME_CB_KB = NAV_KB
@@ -161,12 +161,12 @@ def build_menu(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 def kb_banana_templates() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🧼 Удалить фон", callback_data="btpl_bg_remove")],
-        [InlineKeyboardButton("🎨 Сменить фон на студию", callback_data="btpl_bg_studio")],
-        [InlineKeyboardButton("👕 Сменить одежду на чёрный пиджак", callback_data="btpl_outfit_black")],
-        [InlineKeyboardButton("💄 Лёгкий макияж, подчеркнуть глаза", callback_data="btpl_makeup_soft")],
-        [InlineKeyboardButton("🧼 Очистить стол от лишнего", callback_data="btpl_desk_clean")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="banana_back_to_card")],
+        [InlineKeyboardButton("🧼 Удалить фон", callback_data="banana:tpl:bg_remove")],
+        [InlineKeyboardButton("🎨 Сменить фон на студию", callback_data="banana:tpl:bg_studio")],
+        [InlineKeyboardButton("👕 Сменить одежду на чёрный пиджак", callback_data="banana:tpl:outfit_black")],
+        [InlineKeyboardButton("💄 Лёгкий макияж, подчеркнуть глаза", callback_data="banana:tpl:makeup_soft")],
+        [InlineKeyboardButton("🧼 Очистить стол от лишнего", callback_data="banana:tpl:desk_clean")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="banana:back")],
     ]
     return InlineKeyboardMarkup(rows)
 

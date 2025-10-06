@@ -82,8 +82,8 @@ def test_banana_templates_menu(monkeypatch, bot_module):
     markup = payload["reply_markup"]
     assert isinstance(markup, InlineKeyboardMarkup)
     buttons = [button.callback_data for row in markup.inline_keyboard for button in row]
-    assert "btpl_bg_remove" in buttons
-    assert "banana_back_to_card" in buttons
+    assert "banana:tpl:bg_remove" in buttons
+    assert "banana:back" in buttons
     assert update._answers and update._answers[-1] == {}
 
 

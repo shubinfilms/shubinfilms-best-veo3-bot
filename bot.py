@@ -96,6 +96,15 @@ from kie_banana import (
 
 import redis
 
+from hub_router import (
+    CallbackContext as HubCallbackContext,
+    hub_router as _namespace_hub_router,
+    register as register_callback_action,
+    set_fallback as set_hub_fallback,
+)
+
+from state import state as redis_state
+
 from ui_helpers import (
     upsert_card,
     refresh_balance_card_if_open,
@@ -5883,7 +5892,6 @@ HOME_ROUTE_ACTIONS: Dict[str, str] = {
 _NAVIGATION_RESET_ACTIONS = {
     "balance",
     "knowledge",
-    "image",
     "music",
     "video",
     "chat",
@@ -6047,6 +6055,11 @@ async def _dispatch_home_action(
         "tpl_banana",
     }
 
+    preserved: Dict[str, Any] = {}
+    if action == "image":
+        if state_dict.get("image_engine") in {"mj", "banana"}:
+            preserved["image_engine"] = state_dict["image_engine"]
+
     if action in disable_actions and chat_id is not None:
         await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=True)
         await disable_chat_mode(
@@ -6056,6 +6069,9 @@ async def _dispatch_home_action(
             state_dict=state_dict,
             notify=False,
         )
+
+        for key, value in preserved.items():
+            state_dict[key] = value
 
     if action == "root":
         if chat_id is not None:
@@ -6303,7 +6319,7 @@ async def dialog_choose_promptmaster_callback(update: Update, ctx: ContextTypes.
     await enable_chat_mode(update, ctx, "prompt_master")
 
 
-async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _legacy_hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
 
     query = update.callback_query
@@ -6381,6 +6397,13 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         query=query,
         data=data,
     )
+
+
+set_hub_fallback(_legacy_hub_router)
+
+
+async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _namespace_hub_router(update, ctx)
 
 
 async def main_suggest_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6855,14 +6878,20 @@ async def show_topup_menu(
 def balance_menu_kb(*, referral_url: Optional[str] = None) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     keyboard.extend(kb_profile_topup_entry().inline_keyboard)
-    keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data="tx:open")])
+    keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data="profile:transactions")])
     if referral_url:
         keyboard.append([InlineKeyboardButton("👥 Пригласить друга", url=referral_url)])
     else:
-        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")])
-    keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")])
-    keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")])
+        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data="profile:invite")])
+    keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="profile:promo")])
+    keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="menu:root")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def spinner_markup(text: str = "⏳ Обновляем…") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data="noop")]]
+    )
 
 
 async def show_balance_card(
@@ -6957,6 +6986,96 @@ async def send_profile_card(
             except Exception as exc:
                 log.debug("invite.hint_failed | chat=%s err=%s", chat_id, exc)
     return mid
+
+
+@register_callback_action("menu", "profile", module="profile")
+async def handle_menu_profile(callback: HubCallbackContext) -> None:
+    ctx = callback.application_context
+    if callback.chat_id is not None:
+        await reset_user_state(
+            ctx,
+            callback.chat_id,
+            user_id=callback.user_id,
+            notify_chat_off=True,
+        )
+
+    legacy_state = state(ctx)
+    session = callback.session
+
+    session_disable_chat(ctx)
+
+    session[STATE_CHAT_MODE] = None
+    session["mode"] = "profile"
+    session["last_panel"] = "profile"
+
+    legacy_state[STATE_CHAT_MODE] = None
+    legacy_state["mode"] = "profile"
+    legacy_state["last_panel"] = "profile"
+    msg_ids = session.get("msg_ids")
+    if isinstance(msg_ids, dict) and callback.card_message_id:
+        msg_ids["profile"] = callback.card_message_id
+
+    if callback.card_message_id:
+        callback.schedule_markup(spinner_markup())
+
+    async def _render() -> None:
+        referral_url: Optional[str] = None
+        user_id = callback.user_id or callback.chat_id
+        if user_id is not None:
+            try:
+                referral_url = await _build_referral_link(int(user_id), callback.application_context)
+            except Exception as exc:
+                log.debug("profile.invite_link_failed | user=%s err=%s", user_id, exc)
+                referral_url = None
+
+        balance = _safe_get_balance(int(user_id or callback.chat_id))
+        text = f"{TXT_PROFILE_TITLE}\n💎 Ваш баланс: {balance}"
+        markup = balance_menu_kb(referral_url=referral_url)
+
+        message_id = callback.card_message_id
+        try:
+            if message_id is not None:
+                await callback.application_context.bot.edit_message_text(
+                    chat_id=callback.chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+                await redis_state.set_card(callback.chat_id, callback.module, message_id)
+                return
+
+            msg = await callback.application_context.bot.send_message(
+                chat_id=callback.chat_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            callback._card_message_id = msg.message_id
+            await redis_state.set_card(callback.chat_id, callback.module, msg.message_id)
+        except BadRequest as exc:
+            log.warning(
+                "profile.card_failed | chat=%s user=%s err=%s",
+                callback.chat_id,
+                callback.user_id,
+                exc,
+            )
+
+    callback.defer(_render, description="profile:render")
+    callback.defer(
+        lambda: _open_profile_card(
+            callback.update,
+            callback.application_context,
+            chat_id=callback.chat_id,
+            user_id=callback.user_id,
+            source="menu",
+            force_new=False,
+            query=callback.query,
+        ),
+        description="profile:legacy-open",
+    )
 
 
 async def _build_balance_menu_with_referral(
@@ -7524,15 +7643,15 @@ def banana_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("➕ Добавить фото", callback_data="banana:add_more"),
+                InlineKeyboardButton("➕ Добавить фото", callback_data="banana:add_photo"),
                 InlineKeyboardButton("✏️ Промпт", callback_data="banana:prompt"),
-                InlineKeyboardButton("🧹 Очистить", callback_data="banana:reset_all"),
+                InlineKeyboardButton("🧹 Очистить", callback_data="banana:clear"),
             ],
-            [InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana_templates")],
+            [InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana:templates")],
             [InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")],
             [
                 InlineKeyboardButton("🔄 Движок", callback_data="banana:switch_engine"),
-                InlineKeyboardButton("↩️ Назад", callback_data="back"),
+                InlineKeyboardButton("↩️ Назад", callback_data="banana:back"),
             ],
         ]
     )
@@ -7540,7 +7659,7 @@ def banana_kb() -> InlineKeyboardMarkup:
 
 def banana_result_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔁 Сгенерировать ещё", callback_data="banana_regenerate_fresh")]]
+        [[InlineKeyboardButton("🔁 Сгенерировать ещё", callback_data="banana:restart")]]
     )
 
 
@@ -14924,7 +15043,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Шаблон подставлен ✅")
         return
 
-    if data == "banana_regenerate_fresh":
+    if data in {"banana_regenerate_fresh", "banana:start"}:
         s["banana_images"] = []
         s["last_prompt"] = None
         s["_last_text_banana"] = None

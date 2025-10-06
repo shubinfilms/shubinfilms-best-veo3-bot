@@ -31,12 +31,12 @@ def test_kb_home_menu_layout():
         "🧠 Диалог",
     ]
     assert callbacks == [
-        "nav:profile",
-        "nav:kbase",
-        "nav:photo",
-        "nav:music",
-        "nav:video",
-        "nav:dialog",
+        "menu:profile",
+        "menu:kb",
+        "menu:photo",
+        "menu:music",
+        "menu:video",
+        "menu:dialog",
     ]
 
 

@@ -15,6 +15,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 from redis_utils import get_balance
+from state import state as redis_state
 
 import html
 
@@ -60,22 +61,11 @@ async def upsert_card(
     Returns the message id of the card on success, otherwise ``None``.
     """
 
-    mid = state_dict.get(state_key)
-    if force_new and isinstance(mid, int):
-        try:
-            await ctx.bot.delete_message(chat_id, mid)
-        except BadRequest as exc:
-            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-            app_logger.debug("delete %s bad request: %s", state_key, exc)
-        except Exception as exc:  # pragma: no cover - network issues
-            app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-            app_logger.warning("delete %s failed: %s", state_key, exc)
-        state_dict[state_key] = None
-        msg_ids = state_dict.get("msg_ids")
-        if isinstance(msg_ids, dict):
-            for key, value in list(msg_ids.items()):
-                if value == mid:
-                    msg_ids[key] = None
+    module_name = state_key
+    if module_name.startswith("last_ui_msg_id_"):
+        module_name = module_name[len("last_ui_msg_id_"):]
+    module_name = module_name.replace("_msg_id", "")
+
     mid = state_dict.get(state_key)
     if mid:
         try:
@@ -88,6 +78,7 @@ async def upsert_card(
                 parse_mode=parse_mode,
                 disable_web_page_preview=disable_web_page_preview,
             )
+            await redis_state.set_card(chat_id, module_name, mid)
             return mid
         except BadRequest as exc:
             app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
@@ -107,6 +98,7 @@ async def upsert_card(
             disable_web_page_preview=disable_web_page_preview,
         )
         state_dict[state_key] = msg.message_id
+        await redis_state.set_card(chat_id, module_name, msg.message_id)
         return msg.message_id
     except Exception as exc:  # pragma: no cover - network issues
         app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
