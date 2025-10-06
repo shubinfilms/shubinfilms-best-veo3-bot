@@ -1501,32 +1501,6 @@ async def disable_chat_mode(
                 extra={"user_id": user_id, "error": str(exc)},
             )
 
-    if notify and had_mode and chat_id is not None:
-        try:
-            sent_message = await tg_safe_send(
-                ctx.bot.send_message,
-                method_name="sendMessage",
-                kind="message",
-                chat_id=chat_id,
-                text="🛑 Режим диалога отключён.",
-                reply_markup=build_main_reply_kb(),
-            )
-        except Exception as exc:
-            log.debug(
-                "chat.disable.notify_failed",
-                extra={"chat_id": chat_id, "error": str(exc)},
-            )
-        else:
-            if isinstance(sent_message, Message):
-                state_obj[STATE_QUICK_KEYBOARD_CHAT] = chat_id
-                msg_ids = state_obj.get("msg_ids")
-                if isinstance(msg_ids, dict):
-                    msg_ids["quick_keyboard_remove"] = getattr(
-                        sent_message,
-                        "message_id",
-                        None,
-                    )
-
     return had_mode
 
 
@@ -4024,6 +3998,60 @@ def _apply_state_defaults(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return target
 
 
+# --- helper: мягкий сброс сцены/режима ---
+async def reset_user_state(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int] = None,
+    *,
+    user_id: Optional[int] = None,
+    notify_chat_off: bool = False,
+):
+    s = state(ctx)
+    was_chat = False
+    if s.get("mode") == "chat":
+        was_chat = True
+    chat_mode_value = s.get(STATE_CHAT_MODE)
+    if chat_mode_value in {"normal", "dialog", "chat"}:
+        was_chat = True
+    elif chat_mode_value:
+        was_chat = True
+    if session_is_chat_enabled(ctx):
+        was_chat = True
+    if chat_id is not None:
+        try:
+            current_mode = _mode_get(chat_id)
+        except Exception:
+            current_mode = None
+        if current_mode == MODE_CHAT:
+            was_chat = True
+    if not was_chat and user_id is not None:
+        try:
+            if chat_mode_is_on(user_id):
+                was_chat = True
+        except Exception:
+            pass
+
+    s.update({**DEFAULT_STATE})
+    _apply_state_defaults(s)
+    s.pop(STATE_CHAT_MODE, None)
+    s.pop(STATE_ACTIVE_CARD, None)
+
+    if notify_chat_off and was_chat and chat_id:
+        try:
+            sent_message = await ctx.bot.send_message(
+                chat_id=chat_id,
+                text="🛑 Режим диалога отключён.",
+                reply_markup=build_main_reply_kb(),
+            )
+        except Exception:
+            pass
+        else:
+            s[STATE_QUICK_KEYBOARD_CHAT] = chat_id
+            msg_ids = s.get("msg_ids")
+            if isinstance(msg_ids, dict):
+                msg_ids["quick_keyboard_remove"] = getattr(sent_message, "message_id", None)
+
+
 def _suno_log_preview(value: Optional[str], limit: int = 60) -> str:
     if not value:
         return "—"
@@ -5825,11 +5853,13 @@ async def _dispatch_home_action(
     }
 
     if action in disable_actions and chat_id is not None:
+        await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=True)
         await disable_chat_mode(
             ctx,
             chat_id=chat_id,
             user_id=user_id,
             state_dict=state_dict,
+            notify=False,
         )
 
     if action == "root":
@@ -13261,7 +13291,12 @@ async def handle_topup_callback(
 
     return False
 
-async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_menu(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    notify_chat_off: bool = True,
+) -> None:
     await ensure_user_record(update)
 
     query = update.callback_query
@@ -13269,19 +13304,17 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         with suppress(BadRequest):
             await query.answer()
 
-    s = state(ctx)
-    s.update({**DEFAULT_STATE})
-    _apply_state_defaults(s)
-
     chat = update.effective_chat
     user = update.effective_user
-    chat_id = chat.id if chat else (user.id if user else None)
+    user_id = user.id if user else None
+    chat_id = chat.id if chat else (user_id if user_id else None)
     if chat_id is None:
         return
 
+    await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=notify_chat_off)
+
     guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
 
-    user_id = user.id if user else None
     await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
     _clear_pm_menu_state(chat_id, user_id=user_id)
     state_dict = state(ctx)
@@ -13291,6 +13324,7 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             user_id=user_id,
             state_dict=state_dict,
+            notify=False,
         )
         clear_wait(user_id)
 
@@ -13308,7 +13342,12 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    uid = update.effective_user.id if update.effective_user else None
+
+    user_obj = update.effective_user
+    uid = user_obj.id if user_obj else None
+    chat_obj = update.effective_chat
+    chat_id = chat_obj.id if chat_obj is not None else (uid if uid else None)
+    await reset_user_state(ctx, chat_id, user_id=uid, notify_chat_off=False)
 
     await _handle_referral_deeplink(update, ctx)
 
@@ -13316,16 +13355,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             bonus_result = ledger_storage.grant_signup_bonus(uid, 10)
             _set_cached_balance(ctx, bonus_result.balance)
-            if bonus_result.applied and update.message is not None:
-                await update.message.reply_text(
-                    "🎁 Добро пожаловать! Начислил +10💎 на баланс.",
-                    reply_markup=reply_main_kb(),
-                )
+            if getattr(bonus_result, "applied", False):
+                pass  # ТИХО: бонус начисляется без отдельного сообщения
         except Exception as exc:
             log.exception("Signup bonus failed for %s: %s", uid, exc)
 
-    chat_obj = update.effective_chat
-    chat_id = chat_obj.id if chat_obj is not None else (update.effective_user.id if update.effective_user else None)
     if chat_id is not None:
         try:
             await ensure_main_reply_keyboard(
@@ -13337,12 +13371,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    await handle_menu(update, ctx)
+    await handle_menu(update, ctx, notify_chat_off=False)
 
 
 async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_obj = update.effective_chat
-    chat_id = chat_obj.id if chat_obj is not None else (update.effective_user.id if update.effective_user else None)
+    user_obj = update.effective_user
+    user_id = user_obj.id if user_obj else None
+    chat_id = chat_obj.id if chat_obj is not None else (user_id if user_id else None)
+    await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=False)
     if chat_id is not None:
         try:
             await ensure_main_reply_keyboard(
@@ -13353,7 +13390,7 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-    await handle_menu(update, ctx)
+    await handle_menu(update, ctx, notify_chat_off=False)
 
 
 configure_faq(
@@ -14445,8 +14482,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _mode_set(chat_id, MODE_CHAT)
         if user:
             set_mode(user.id, False)
-        s.update({**DEFAULT_STATE})
-        _apply_state_defaults(s)
+        await reset_user_state(ctx, chat_id, user_id=(user.id if user else None), notify_chat_off=False)
         await q.answer()
         if message is not None:
             with suppress(BadRequest):
@@ -14589,8 +14625,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "back":
-        s.update({**DEFAULT_STATE})
-        _apply_state_defaults(s)
+        await reset_user_state(ctx, chat_id, user_id=(user.id if user else None), notify_chat_off=False)
         target_chat = chat_id if chat_id is not None else (user.id if user else None)
         if target_chat is not None:
             await show_emoji_hub_for_chat(
@@ -14602,8 +14637,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "start_new_cycle":
-        s.update({**DEFAULT_STATE})
-        _apply_state_defaults(s)
+        await reset_user_state(ctx, chat_id, user_id=(user.id if user else None), notify_chat_off=False)
         target_chat = chat_id if chat_id is not None else (user.id if user else None)
         if target_chat is not None:
             await show_emoji_hub_for_chat(
@@ -15734,8 +15768,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     btn = _norm_btn_text(raw_text)
     if btn in {"профиль", "база знаний", "фото", "музыка", "видео", "диалог"}:
-        s.update({**DEFAULT_STATE})
-        _apply_state_defaults(s)
+        await reset_user_state(
+            ctx,
+            chat_id,
+            user_id=user_id,
+            notify_chat_off=(btn != "диалог"),
+        )
         if user_id is not None:
             clear_wait(user_id)
 
