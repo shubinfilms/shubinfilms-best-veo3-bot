@@ -274,6 +274,8 @@ from redis_utils import (
     with_menu_lock,
     acquire_sora2_lock,
     release_sora2_lock,
+    acquire_action_lock,
+    release_action_lock,
     mark_sora2_unavailable,
     clear_sora2_unavailable,
     is_sora2_unavailable,
@@ -309,6 +311,8 @@ from settings import (
     SORA2,
     SORA2_ENABLED,
     SORA2_WAIT_STICKER_ID as SETTINGS_SORA2_WAIT_STICKER_ID,
+    BOT_USERNAME as SETTINGS_BOT_USERNAME,
+    REF_BONUS_HINT_ENABLED,
 )
 from suno.cover_source import (
     MAX_AUDIO_MB as COVER_MAX_AUDIO_MB,
@@ -2592,7 +2596,13 @@ async def process_promo_submission(
             chat.id,
             ctx=ctx,
             state_dict=state_dict,
-            reply_markup=balance_menu_kb(),
+            reply_markup=(
+                await _build_balance_menu_with_referral(
+                    ctx,
+                    user.id,
+                    chat_id=chat.id,
+                )
+            )[0],
         )
     except Exception as exc:  # pragma: no cover - defensive logging
         log.warning("Failed to refresh balance card after promo for %s: %s", user.id, exc)
@@ -4892,7 +4902,66 @@ _BOT_USERNAME_CACHE_KEY = "_bot_username"
 _REF_SHARE_TEXT = "Присоединяйся к Best VEO3 Bot!"
 
 
+def _is_callback_processed(state_dict: Mapping[str, Any], callback_id: Optional[str]) -> bool:
+    if not callback_id:
+        return False
+    processed = state_dict.get("_processed_callbacks")
+    if isinstance(processed, list):
+        return callback_id in processed
+    return False
+
+
+def _mark_callback_processed(state_dict: MutableMapping[str, Any], callback_id: Optional[str]) -> None:
+    if not callback_id:
+        return
+    processed = state_dict.get("_processed_callbacks")
+    if not isinstance(processed, list):
+        processed = []
+    if callback_id in processed:
+        return
+    processed.append(callback_id)
+    if len(processed) > 20:
+        del processed[:-20]
+    state_dict["_processed_callbacks"] = processed
+
+
+def _normalize_music_callback_data(raw: str) -> str:
+    data = (raw or "").strip()
+    if not data.startswith("music:"):
+        return data
+    parts = data.split(":")
+    if len(parts) < 2:
+        return data
+    head = parts[1]
+    if head == "set_mode":
+        mode_value = parts[2] if len(parts) > 2 else ""
+        mode_map = {
+            "instrumental": "instrumental",
+            "inst": "instrumental",
+            "lyrics": "lyrics",
+            "vocal": "lyrics",
+            "cover": "cover",
+        }
+        mapped = mode_map.get(mode_value, mode_value or "instrumental")
+        return f"suno:mode:{mapped}"
+    if head == "open_card":
+        return "music:open_card"
+    if head == "start":
+        return "suno:start"
+    if head == "inst":
+        return "suno:mode:instrumental"
+    if head == "vocal":
+        return "suno:mode:lyrics"
+    if head == "cover":
+        return "suno:mode:cover"
+    if head == "suno" and len(parts) > 2:
+        return ":".join(parts[1:])
+    return data
+
+
 async def _get_bot_username(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    if SETTINGS_BOT_USERNAME:
+        return SETTINGS_BOT_USERNAME
     bot_username = None
     try:
         bot_username = ctx.bot.username
@@ -5658,26 +5727,6 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
 
 # --- Reply->Inline: экраны-меню ---
 
-async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    bal = get_user_balance_value(ctx)
-    text = f"👤 *Профиль*\nВаш баланс: *{bal}* 💎"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
-            [InlineKeyboardButton("🧾 История операций", callback_data="noop")],
-            [InlineKeyboardButton("👥 Пригласить друга", callback_data="noop")],
-            [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-
-
 async def show_kb_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = "📚 *База знаний*\nВыберите раздел:"
     kb = InlineKeyboardMarkup(
@@ -5751,8 +5800,10 @@ async def show_music_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = "🎧 *Музыка (Suno)*\nВыберите режим генерации:"
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎼 Инструментал", callback_data="music:inst")],
-            [InlineKeyboardButton("🎙 Вокал", callback_data="music:vocal")],
+            [InlineKeyboardButton("🎼 Инструментал", callback_data="music:set_mode:instrumental")],
+            [InlineKeyboardButton("🎙 Вокал", callback_data="music:set_mode:vocal")],
+            [InlineKeyboardButton("🎚️ Кавер", callback_data="music:set_mode:cover")],
+            [InlineKeyboardButton("📄 Открыть карточку", callback_data="music:open_card")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
         ]
     )
@@ -6171,7 +6222,16 @@ async def _dispatch_home_action(
 
     if action == "balance":
         force_new = data in {"hub:balance", PROFILE_MENU_CB, "balance_command"}
-        await show_balance_card(chat_id, ctx, force_new=force_new)
+        source = "command" if data == "balance_command" else ("inline" if query is not None else "menu")
+        await _open_profile_card(
+            update,
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            source=source,
+            force_new=force_new,
+            query=query,
+        )
         return
 
 
@@ -6237,10 +6297,24 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer()
         return
 
-    normalized_data = data
-    if data.startswith("music:suno:"):
-        _, _, tail = data.partition(":")
-        normalized_data = tail or data
+    normalized_data = _normalize_music_callback_data(data)
+
+    if normalized_data == "music:open_card":
+        target_chat = chat_id
+        if target_chat is None and message is not None:
+            target_chat = message.chat_id
+        if target_chat is None:
+            return
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        s["mode"] = "suno"
+        suno_state_obj = load_suno_state(ctx)
+        s["suno_state"] = suno_state_obj.to_dict()
+        await refresh_suno_card(ctx, target_chat, s, price=PRICE_SUNO)
+        _mark_callback_processed(s, getattr(q, "id", None))
+        return
 
     from_user = getattr(query, "from_user", None)
     log.debug("cb %s from %s", data, getattr(from_user, "id", None))
@@ -6748,11 +6822,14 @@ async def show_topup_menu(
         )
 
 
-def balance_menu_kb() -> InlineKeyboardMarkup:
+def balance_menu_kb(*, referral_url: Optional[str] = None) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     keyboard.extend(kb_profile_topup_entry().inline_keyboard)
     keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data="tx:open")])
-    keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")])
+    if referral_url:
+        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", url=referral_url)])
+    else:
+        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data="ref:open")])
     keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")])
     keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="back")])
     return InlineKeyboardMarkup(keyboard)
@@ -6763,6 +6840,7 @@ async def show_balance_card(
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
     force_new: bool = False,
+    referral_url: Optional[str] = None,
 ) -> Optional[int]:
     s = state(ctx)
     uid = get_user_id(ctx) or chat_id
@@ -6775,7 +6853,7 @@ async def show_balance_card(
         s,
         BALANCE_CARD_STATE_KEY,
         text,
-        reply_markup=balance_menu_kb(),
+        reply_markup=balance_menu_kb(referral_url=referral_url),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
         force_new=force_new,
@@ -6790,6 +6868,86 @@ async def show_balance_card(
     return mid
 
 
+async def send_profile_card(
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: Optional[int] = None,
+    force_new: bool = False,
+) -> Optional[int]:
+    state_dict = state(ctx)
+    resolved_user = user_id or get_user_id(ctx) or chat_id
+    referral_url: Optional[str] = None
+    if resolved_user is not None:
+        try:
+            referral_url = await _build_referral_link(int(resolved_user), ctx)
+        except Exception as exc:
+            log.warning(
+                "referral_link_failed | user=%s err=%s",
+                resolved_user,
+                exc,
+            )
+            referral_url = None
+    if referral_url:
+        log.info(
+            "invite.url",
+            extra={"user_id": resolved_user, "chat_id": chat_id, "url": referral_url},
+        )
+    mid = await show_balance_card(
+        chat_id,
+        ctx,
+        force_new=force_new,
+        referral_url=referral_url,
+    )
+    if (
+        REF_BONUS_HINT_ENABLED
+        and referral_url
+        and isinstance(state_dict, MutableMapping)
+    ):
+        hint_key = "referral_hint_ts"
+        last_hint = state_dict.get(hint_key)
+        now_ts = time.time()
+        should_send_hint = True
+        if isinstance(last_hint, (int, float)) and last_hint > 0:
+            should_send_hint = (now_ts - float(last_hint)) >= 30.0
+        if should_send_hint:
+            hint_text = (
+                "Отправь эту ссылку другу. За каждую оплату — бонус на баланс.\n"
+                f"{referral_url}"
+            )
+            try:
+                await ctx.bot.send_message(
+                    chat_id,
+                    hint_text,
+                    disable_web_page_preview=True,
+                )
+                state_dict[hint_key] = now_ts
+            except Exception as exc:
+                log.debug("invite.hint_failed | chat=%s err=%s", chat_id, exc)
+    return mid
+
+
+async def _build_balance_menu_with_referral(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: Optional[int],
+    *,
+    chat_id: Optional[int] = None,
+) -> tuple[InlineKeyboardMarkup, Optional[str]]:
+    referral_url: Optional[str] = None
+    if user_id is not None:
+        try:
+            referral_url = await _build_referral_link(int(user_id), ctx)
+        except Exception as exc:
+            log.debug("referral_link_hint_failed | user=%s err=%s", user_id, exc)
+            referral_url = None
+    if referral_url:
+        log.info(
+            "invite.url",
+            extra={"user_id": user_id, "chat_id": chat_id, "url": referral_url},
+        )
+    return balance_menu_kb(referral_url=referral_url), referral_url
+
+
 async def show_balance_notification(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -6799,6 +6957,13 @@ async def show_balance_notification(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     s = state(ctx)
+    referral_url = None
+    if reply_markup is None:
+        reply_markup, referral_url = await _build_balance_menu_with_referral(
+            ctx,
+            user_id,
+            chat_id=chat_id,
+        )
     await upsert_card(
         ctx,
         chat_id,
@@ -6814,8 +6979,52 @@ async def show_balance_notification(
         chat_id,
         ctx=ctx,
         state_dict=s,
-        reply_markup=balance_menu_kb(),
+        reply_markup=reply_markup or balance_menu_kb(referral_url=referral_url),
     )
+
+
+async def _open_profile_card(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int],
+    user_id: Optional[int],
+    source: str,
+    force_new: bool = False,
+    query: Optional[CallbackQuery] = None,
+) -> None:
+    if chat_id is None:
+        return
+    state_dict = state(ctx)
+    callback_id = getattr(query, "id", None)
+    if _is_callback_processed(state_dict, callback_id):
+        log.debug(
+            "profile.duplicate",
+            extra={"chat_id": chat_id, "user_id": user_id, "source": source},
+        )
+        return
+    locked = acquire_action_lock(user_id, "profile", ttl=3)
+    log.info(
+        "profile:incoming",
+        extra={
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "source": source,
+            "locked": locked,
+        },
+    )
+    if not locked:
+        return
+    try:
+        await send_profile_card(
+            chat_id,
+            ctx,
+            user_id=user_id,
+            force_new=force_new,
+        )
+    finally:
+        release_action_lock(user_id, "profile")
+    _mark_callback_processed(state_dict, callback_id)
 
 
 def _ledger_reason(entry: Dict[str, Any]) -> str:
@@ -6958,10 +7167,15 @@ async def _edit_balance_from_history(
 
     balance = _safe_get_balance(user_id)
     _set_cached_balance(ctx, balance)
+    reply_markup, _ = await _build_balance_menu_with_referral(
+        ctx,
+        user_id,
+        chat_id=getattr(message.chat, "id", None),
+    )
     await _safe_edit_message_text(
         query.edit_message_text,
         f"💎 Ваш баланс: {balance}",
-        reply_markup=balance_menu_kb(),
+        reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
@@ -13233,7 +13447,15 @@ async def handle_topup_callback(
 
     if data == "back_main":
         await query.answer()
-        await show_balance_card(chat_id, ctx)
+        await _open_profile_card(
+            update,
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            source="topup",
+            force_new=True,
+            query=query,
+        )
         return True
 
     if normalized == "topup:open":
@@ -14542,25 +14764,6 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await q.answer("Промпт вставлен в карточку VEO")
 
 
-async def on_music_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-    data = q.data or ""
-    await q.answer()
-    chat = q.message.chat if q.message else update.effective_chat
-    chat_id = getattr(chat, "id", None)
-    if chat_id is None and q.message is not None:
-        chat_id = getattr(q.message, "chat_id", None)
-    if chat_id is None:
-        return
-    mode = "Инструментал" if data.endswith("inst") else "Вокал"
-    await ctx.bot.send_message(
-        chat_id,
-        f"🎧 Suno: режим «{mode}». Напишите стиль/референс — подготовлю промпт.",
-    )
-
-
 async def on_noop_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -14587,10 +14790,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif chat is not None:
         chat_id = chat.id
 
-    normalized_data = data
-    if data.startswith("music:suno:"):
-        _, _, tail = data.partition(":")
-        normalized_data = tail or data
+    normalized_data = _normalize_music_callback_data(data)
 
     if data == CB_MODE_CHAT:
         if chat_id is not None:
@@ -14721,39 +14921,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
     if data == "ref:open":
         user = update.effective_user
-        if user is None:
-            return
-        uid = user.id
-        chat_for_card = chat_id if chat_id is not None else uid
+        uid = user.id if user else None
         try:
-            link = await _build_referral_link(uid, ctx)
-        except Exception as exc:
-            log.warning("referral_link_failed | user=%s err=%s", uid, exc)
-            link = None
-        if not link:
-            if q.message is not None:
-                await q.message.reply_text("⚠️ Не удалось получить ссылку. Попробуйте позже.")
-            return
-        try:
-            referrals, earned = get_ref_stats(uid)
-        except Exception as exc:
-            log.warning("referral_stats_failed | user=%s err=%s", uid, exc)
-            referrals, earned = 0, 0
-        await show_referral_card(
+            await q.answer("Кнопка устарела, обновите меню", show_alert=True)
+        except Exception:
+            pass
+        await _open_profile_card(
+            update,
             ctx,
-            chat_for_card,
-            s,
-            link=link,
-            referrals=referrals,
-            earned=earned,
-            share_text=_REF_SHARE_TEXT,
+            chat_id=chat_id,
+            user_id=uid,
+            source="legacy",
+            force_new=True,
+            query=q,
         )
         return
     if data == "ref:back":
+        user = update.effective_user
+        uid = user.id if user else None
         target_chat = chat_id if chat_id is not None else (update.effective_user.id if update.effective_user else None)
         if target_chat is None:
             return
-        await show_balance_card(target_chat, ctx, force_new=True)
+        await _open_profile_card(
+            update,
+            ctx,
+            chat_id=target_chat,
+            user_id=uid,
+            source="referral_back",
+            force_new=True,
+            query=q,
+        )
         return
 
     if data == "promo_open":
@@ -15290,6 +15487,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if normalized_data.startswith("suno:"):
+        callback_id = getattr(q, "id", None)
+        if _is_callback_processed(s, callback_id):
+            log.debug("music.duplicate", extra={"data": normalized_data})
+            return
+        _mark_callback_processed(s, callback_id)
+        log.info(
+            "music:cb",
+            extra={
+                "data": normalized_data,
+                "state_before": {
+                    "mode": s.get("suno_flow") or s.get("mode"),
+                    "waiting": s.get("suno_waiting_state"),
+                },
+            },
+        )
         parts = normalized_data.split(":", 2)
         action = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else ""
@@ -15315,6 +15527,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if argument not in {"instrumental", "lyrics", "cover"}:
                 await q.answer("Неизвестный режим", show_alert=True)
                 return
+            music_state = s.get("music")
+            if not isinstance(music_state, dict):
+                music_state = {}
+                s["music"] = music_state
+            music_state["mode"] = "vocal" if argument == "lyrics" else argument
             await q.answer()
             await _music_begin_flow(
                 chat_id,
@@ -15584,6 +15801,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     return
 
             await q.answer()
+
+            log.info(
+                "music:start",
+                extra={
+                    "mode": getattr(suno_state_obj, "mode", None),
+                    "card_rendered": bool(_music_card_message_id(s)),
+                },
+            )
 
             missing_fields = _suno_missing_fields(suno_state_obj)
             if missing_fields:
@@ -15937,14 +16162,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if btn == "профиль":
             if chat_id is not None:
                 _mode_set(chat_id, "nav:profile")
-            await show_profile_menu(chat_id, ctx)
-            if user_id is not None and chat_id is not None:
-                await refresh_balance_card_if_open(
-                    user_id,
-                    chat_id,
-                    ctx=ctx,
-                    state_dict=s,
-                )
+            await _open_profile_card(
+                update,
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                source="reply",
+                force_new=True,
+                query=update.callback_query,
+            )
             return
 
         if btn == "база знаний":
@@ -16920,7 +17146,13 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
                             inviter_id,
                             ctx=ctx,
                             state_dict=inviter_state,
-                            reply_markup=balance_menu_kb(),
+                            reply_markup=(
+                                await _build_balance_menu_with_referral(
+                                    ctx,
+                                    inviter_id,
+                                    chat_id=inviter_id,
+                                )
+                            )[0],
                         )
                     except Exception as exc:
                         log.warning(
@@ -16974,7 +17206,13 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
         chat_id,
         ctx=ctx,
         state_dict=s,
-        reply_markup=balance_menu_kb(),
+        reply_markup=(
+            await _build_balance_menu_with_referral(
+                ctx,
+                user_id,
+                chat_id=chat_id,
+            )
+        )[0],
     )
 
 # ==========================
@@ -17300,7 +17538,6 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog:choose_regular$", dialog_choose_regular_callback),
     (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
     (r"^noop$", on_noop_callback),
-    (r"^music:(inst|vocal)$", on_music_callback),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
