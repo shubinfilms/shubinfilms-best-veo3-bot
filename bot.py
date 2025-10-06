@@ -5656,6 +5656,131 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
     return await show_emoji_hub_for_chat(chat_id, ctx, replace=True)
 
 
+# --- Reply->Inline: экраны-меню ---
+
+async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    bal = get_user_balance_value(ctx)
+    text = f"👤 *Профиль*\nВаш баланс: *{bal}* 💎"
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
+            [InlineKeyboardButton("🧾 История операций", callback_data="noop")],
+            [InlineKeyboardButton("👥 Пригласить друга", callback_data="noop")],
+            [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+async def show_kb_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "📚 *База знаний*\nВыберите раздел:"
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✨ Примеры генераций", url=PROMPTS_CHANNEL_URL)],
+            [InlineKeyboardButton("🧩 Готовые шаблоны", callback_data="noop")],
+            [InlineKeyboardButton("💡 Мини видео-уроки", callback_data="noop")],
+            [InlineKeyboardButton("❓ Частые вопросы", callback_data="faq")],
+            [InlineKeyboardButton("⬅️ Назад (в главное)", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+async def show_images_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "🎨 *Выберите движок для изображений*"
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Midjourney", callback_data="mode:mj_txt")],
+            [InlineKeyboardButton("Banana", callback_data="mode:banana")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+async def show_video_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "🎬 *Режимы VEO:*"
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}",
+                    callback_data="mode:veo_text_fast",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Генерация видео (Veo Quality) 💎 {TOKEN_COSTS['veo_quality']}",
+                    callback_data="mode:veo_text_quality",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}",
+                    callback_data="mode:veo_photo",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+async def show_music_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "🎧 *Музыка (Suno)*\nВыберите режим генерации:"
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎼 Инструментал", callback_data="music:inst")],
+            [InlineKeyboardButton("🎙 Вокал", callback_data="music:vocal")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+async def show_dialog_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "🧠 *Диалог*\nВыберите режим:"
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💬 Обычный чат", callback_data="mode:chat")],
+            [InlineKeyboardButton("📄 Prompt-Master", callback_data="mode:prompt_master")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
 MAIN_MENU_GUARD_TTL = 3
 
 
@@ -14417,6 +14542,25 @@ async def handle_pm_insert_to_veo(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await q.answer("Промпт вставлен в карточку VEO")
 
 
+async def on_music_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    await q.answer()
+    chat = q.message.chat if q.message else update.effective_chat
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and q.message is not None:
+        chat_id = getattr(q.message, "chat_id", None)
+    if chat_id is None:
+        return
+    mode = "Инструментал" if data.endswith("inst") else "Вокал"
+    await ctx.bot.send_message(
+        chat_id,
+        f"🎧 Suno: режим «{mode}». Напишите стиль/референс — подготовлю промпт.",
+    )
+
+
 async def on_noop_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -15767,38 +15911,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_mode = _mode_get(chat_id) or MODE_CHAT
 
     btn = _norm_btn_text(raw_text)
-    if btn in {"профиль", "база знаний", "фото", "музыка", "видео", "диалог"}:
+    if btn in ("профиль", "база знаний", "фото", "музыка", "видео", "диалог"):
         await reset_user_state(
             ctx,
             chat_id,
             user_id=user_id,
-            notify_chat_off=(btn != "диалог"),
+            notify_chat_off=True,
         )
         if user_id is not None:
             clear_wait(user_id)
 
-        if btn != "диалог":
-            await disable_chat_mode(
-                ctx,
-                chat_id=chat_id,
-                user_id=user_id,
-                state_dict=s,
-                notify=False,
-            )
-            if user_id is not None:
-                try:
-                    set_mode(user_id, False)
-                except Exception:
-                    pass
+        await disable_chat_mode(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=s,
+            notify=False,
+        )
+        if user_id is not None:
+            try:
+                set_mode(user_id, False)
+            except Exception:
+                pass
 
         if btn == "профиль":
             if chat_id is not None:
                 _mode_set(chat_id, "nav:profile")
-            balance_value = get_user_balance_value(ctx)
-            await msg.reply_text(
-                f"👤 Профиль\nБаланс: {balance_value} 💎\n/help — список команд",
-                reply_markup=reply_main_kb(),
-            )
+            await show_profile_menu(chat_id, ctx)
             if user_id is not None and chat_id is not None:
                 await refresh_balance_card_if_open(
                     user_id,
@@ -15811,71 +15950,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if btn == "база знаний":
             if chat_id is not None:
                 _mode_set(chat_id, "nav:kb")
-            await msg.reply_text(
-                "📚 База знаний: скоро здесь будут гайды и примеры.\n"
-                f"Канал с промптами: {PROMPTS_CHANNEL_URL}",
-                reply_markup=reply_main_kb(),
-            )
+            await show_kb_menu(chat_id, ctx)
             return
 
         if btn == "фото":
             if chat_id is not None:
                 _mode_set(chat_id, "nav:photo")
-            s["mode"] = "banana"
-            s["banana_images"] = []
-            s["last_prompt"] = None
-            s["image_engine"] = "banana"
-            await msg.reply_text(
-                "🍌 Редактор изображений (Banana). Пришлите до 4 фото и опишите, что изменить.",
-                reply_markup=reply_main_kb(),
-            )
-            if chat_id is not None:
-                await banana_entry(chat_id, ctx, force_new=True)
-            return
-
-        if btn == "видео":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:video")
-            video_kb = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("🎬 VEO", callback_data="mode:veo_text_fast")],
-                    [InlineKeyboardButton("🧠 Sora2 (скоро)", callback_data="noop")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-                ]
-            )
-            await msg.reply_text("🎥 Выберите тип генерации видео:", reply_markup=video_kb)
+            await show_images_menu(chat_id, ctx)
             return
 
         if btn == "музыка":
             if chat_id is not None:
                 _mode_set(chat_id, "nav:music")
-            await msg.reply_text(
-                "🎧 Музыка: модуль в разработке. Напишите стиль/референс — подготовлю промпт.",
-                reply_markup=reply_main_kb(),
-            )
+            await show_music_menu(chat_id, ctx)
+            return
+
+        if btn == "видео":
+            if chat_id is not None:
+                _mode_set(chat_id, "nav:video")
+            await show_video_menu(chat_id, ctx)
             return
 
         if btn == "диалог":
             if chat_id is not None:
-                _mode_set(chat_id, MODE_CHAT)
-            if user_id is not None:
-                session_enable_regular_chat(ctx)
-                chat_mode_turn_on(user_id)
-                try:
-                    await set_active_mode(user_id, "dialog_default")
-                except Exception:
-                    pass
-                try:
-                    set_mode(user_id, True)
-                except Exception:
-                    pass
-            s["mode"] = None
-            s[STATE_CHAT_MODE] = "normal"
-            s[STATE_ACTIVE_CARD] = "chat:normal"
-            await msg.reply_text(
-                "💬 Диалог включён. Напишите сообщение.",
-                reply_markup=reply_main_kb(),
-            )
+                _mode_set(chat_id, "nav:dialog")
+            await show_dialog_menu(chat_id, ctx)
             return
 
     waiting_for_input = _chat_state_waiting_input(s)
@@ -17201,6 +17300,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog:choose_regular$", dialog_choose_regular_callback),
     (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
     (r"^noop$", on_noop_callback),
+    (r"^music:(inst|vocal)$", on_music_callback),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
