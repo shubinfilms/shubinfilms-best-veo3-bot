@@ -6297,6 +6297,13 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer()
         return
 
+    state_dict = state(ctx)
+    message = getattr(query, "message", None)
+    chat_obj = getattr(message, "chat", None) or getattr(update, "effective_chat", None)
+    chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+
     normalized_data = _normalize_music_callback_data(data)
 
     if normalized_data == "music:open_card":
@@ -6306,14 +6313,23 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if target_chat is None:
             return
         try:
-            await q.answer()
+            await query.answer()
         except Exception:
             pass
-        s["mode"] = "suno"
+        state_dict["mode"] = "suno"
         suno_state_obj = load_suno_state(ctx)
-        s["suno_state"] = suno_state_obj.to_dict()
-        await refresh_suno_card(ctx, target_chat, s, price=PRICE_SUNO)
-        _mark_callback_processed(s, getattr(q, "id", None))
+        state_dict["suno_state"] = suno_state_obj.to_dict()
+        await refresh_suno_card(ctx, target_chat, state_dict, price=PRICE_SUNO)
+        _mark_callback_processed(state_dict, getattr(query, "id", None))
+        return
+
+    if normalized_data.startswith("suno:") and normalized_data != data:
+        original_data = query.data
+        try:
+            query.data = normalized_data  # type: ignore[attr-defined]
+            await on_callback(update, ctx)
+        finally:
+            query.data = original_data  # type: ignore[attr-defined]
         return
 
     from_user = getattr(query, "from_user", None)
@@ -6329,12 +6345,7 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer()
         return
 
-    message = getattr(query, "message", None)
-    chat_obj = getattr(message, "chat", None)
     chat = chat_obj if chat_obj is not None else getattr(update, "effective_chat", None)
-    chat_id = getattr(chat, "id", None)
-    if chat_id is None and message is not None:
-        chat_id = getattr(message, "chat_id", None)
     user = from_user or getattr(update, "effective_user", None)
     user_id = user.id if user else None
 
@@ -14922,19 +14933,52 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "ref:open":
         user = update.effective_user
         uid = user.id if user else None
+        referral_url: Optional[str] = None
+        if uid is not None:
+            try:
+                referral_url = await _build_referral_link(uid, ctx)
+            except Exception as exc:
+                log.warning("referral_link_failed_callback | user=%s err=%s", uid, exc)
+                referral_url = None
+        callback_id = getattr(q, "id", None)
+        if referral_url:
+            try:
+                await q.answer(url=referral_url)
+            except BadRequest:
+                await q.answer("Ссылка скопирована ниже", show_alert=True)
+                target_chat = chat_id if chat_id is not None else uid
+                if target_chat is not None:
+                    await ctx.bot.send_message(
+                        target_chat,
+                        f"🔗 Пригласительная ссылка:\n{referral_url}",
+                        disable_web_page_preview=True,
+                    )
+            except Exception:
+                target_chat = chat_id if chat_id is not None else uid
+                if target_chat is not None:
+                    await ctx.bot.send_message(
+                        target_chat,
+                        f"🔗 Пригласительная ссылка:\n{referral_url}",
+                        disable_web_page_preview=True,
+                    )
+            _mark_callback_processed(s, callback_id)
+            return
         try:
-            await q.answer("Кнопка устарела, обновите меню", show_alert=True)
+            await q.answer("Не удалось получить ссылку, обновляю профиль…", show_alert=True)
         except Exception:
             pass
-        await _open_profile_card(
-            update,
-            ctx,
-            chat_id=chat_id,
-            user_id=uid,
-            source="legacy",
-            force_new=True,
-            query=q,
-        )
+        target_chat = chat_id if chat_id is not None else uid
+        if target_chat is not None:
+            await _open_profile_card(
+                update,
+                ctx,
+                chat_id=target_chat,
+                user_id=uid,
+                source="legacy",
+                force_new=False,
+                query=q,
+            )
+        _mark_callback_processed(s, callback_id)
         return
     if data == "ref:back":
         user = update.effective_user
@@ -16168,7 +16212,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 user_id=user_id,
                 source="reply",
-                force_new=True,
+                force_new=False,
                 query=update.callback_query,
             )
             return
