@@ -191,6 +191,7 @@ def init_logging(app_name: str, level: str | None = None, *, json_logs: bool | N
                 "pydantic",
             ):
                 logging.getLogger(noisy).setLevel(logging.WARNING)
+            logging.getLogger("httpcore").setLevel(logging.INFO)
             _CONFIGURED = True
         else:
             logging.getLogger().setLevel(effective_level)
