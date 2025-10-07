@@ -104,6 +104,7 @@ from hub_router import (
     CallbackContext as HubCallbackContext,
     hub_router as _namespace_hub_router,
     register as register_callback_action,
+    route_text as hub_route_text,
     set_fallback as set_hub_fallback,
 )
 
@@ -173,6 +174,7 @@ from utils.input_state import (
     touch_wait,
 )
 from utils.telegram_utils import build_photo_album_media, label_to_command, should_capture_to_prompt
+from utils.text_normalizer import normalize_btn_text
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
 from keyboards import (
@@ -206,6 +208,7 @@ from keyboards import (
     MUSIC_MENU_CB,
     PROFILE_MENU_CB,
     VIDEO_MENU_CB,
+    TEXT_ACTION_VARIANTS,
     build_empty_reply_kb,
     build_main_reply_kb,
     iter_home_menu_buttons,
@@ -243,6 +246,12 @@ from texts import (
 )
 
 from balance import ensure_tokens, insufficient_balance_keyboard
+from core.balance_provider import (
+    BALANCE_PLACEHOLDER,
+    BalanceSnapshot,
+    get_balance_snapshot,
+    set_ledger_storage as register_balance_storage,
+)
 from payments.yookassa import (
     YOOKASSA_PACKS_ORDER,
     YookassaError,
@@ -2794,6 +2803,7 @@ def _acquire_click_lock(user_id: Optional[int], action: str) -> bool:
 
 # Ledger storage (Postgres / memory)
 ledger_storage = LedgerStorage(DATABASE_URL, backend=LEDGER_BACKEND)
+register_balance_storage(ledger_storage)
 
 
 def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -2835,8 +2845,86 @@ def _clear_operation(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> None:
     _ops_state(ctx).pop(key, None)
 
 
-def _set_cached_balance(ctx: ContextTypes.DEFAULT_TYPE, value: int) -> None:
+def _set_cached_balance(ctx: ContextTypes.DEFAULT_TYPE, value: Optional[int]) -> None:
+    if value is None:
+        return
     ctx.user_data["balance"] = int(value)
+
+
+_BALANCE_MEMO_KEY = "balance_snapshot"
+_BALANCE_MEMO_TTL = 5.0
+
+
+def _cache_balance_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int, snapshot: BalanceSnapshot
+) -> None:
+    state_dict = state(ctx)
+    state_dict[_BALANCE_MEMO_KEY] = {
+        "user_id": int(user_id),
+        "ts": time.time(),
+        "value": snapshot.value,
+        "display": snapshot.display,
+        "warning": snapshot.warning,
+    }
+
+
+def _load_cached_balance_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> Optional[BalanceSnapshot]:
+    state_dict = state(ctx)
+    payload = state_dict.get(_BALANCE_MEMO_KEY)
+    if not isinstance(payload, dict):
+        return None
+
+    try:
+        cached_user = int(payload.get("user_id", 0))
+    except (TypeError, ValueError):
+        return None
+    if cached_user != int(user_id):
+        return None
+
+    ts_raw = payload.get("ts")
+    if not isinstance(ts_raw, (int, float)):
+        return None
+    if (time.time() - float(ts_raw)) > _BALANCE_MEMO_TTL:
+        return None
+
+    value_raw = payload.get("value")
+    value: Optional[int]
+    if value_raw is None:
+        value = None
+    else:
+        try:
+            value = int(value_raw)
+        except (TypeError, ValueError):
+            value = None
+
+    display = payload.get("display")
+    if not isinstance(display, str):
+        display = str(value) if value is not None else BALANCE_PLACEHOLDER
+
+    warning = payload.get("warning")
+    if not isinstance(warning, str) or not warning.strip():
+        warning = None
+
+    return BalanceSnapshot(value=value, display=display, warning=warning)
+
+
+def _resolve_balance_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    *,
+    prefer_cached: bool = True,
+) -> BalanceSnapshot:
+    if prefer_cached:
+        cached = _load_cached_balance_snapshot(ctx, user_id)
+        if cached is not None:
+            return cached
+
+    snapshot = get_balance_snapshot(user_id)
+    _cache_balance_snapshot(ctx, user_id, snapshot)
+    _set_cached_balance(ctx, snapshot.value)
+    return snapshot
 
 
 def get_user_id(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
@@ -2859,9 +2947,8 @@ def get_user_balance_value(ctx: ContextTypes.DEFAULT_TYPE, force_refresh: bool =
             except (TypeError, ValueError):
                 pass
 
-    balance = _safe_get_balance(uid)
-    _set_cached_balance(ctx, balance)
-    return balance
+    snapshot = _resolve_balance_snapshot(ctx, uid, prefer_cached=not force_refresh)
+    return snapshot.value if snapshot.value is not None else 0
 
 
 def credit_tokens(
@@ -5127,7 +5214,7 @@ WELCOME = (
     "💬 Обычный чат\n"
     "Живое общение и ответы на любые вопросы.\n\n"
     "⸻\n"
-    "💎 **Ваш баланс: {balance}**\n"
+    "{balance_block}\n"
     "📈 Больше идей и примеров: [канал с промптами]({prompts_url})\n\n"
     "👇 Выберите режим"
 )
@@ -5159,12 +5246,7 @@ def reply_main_kb() -> ReplyKeyboardMarkup:
 
 
 def _norm_btn_text(t: Optional[str]) -> str:
-    if not t:
-        return ""
-    s = t.strip()
-    s = re.sub(r"^[\W_]+", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.lower()
+    return normalize_btn_text(t)
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
@@ -5662,23 +5744,30 @@ _MJ_UPSCALE_LOCK_KEY_TMPL = "lock:mj:upscale:{grid_id}:{index}"
 _MJ_UPSCALE_LOCK_TTL = 60
 
 def _safe_get_balance(user_id: int) -> int:
-    try:
-        return get_balance(user_id)
-    except Exception as exc:
-        log.exception("get_balance failed for user %s: %s", user_id, exc)
-        return 0
+    snapshot = get_balance_snapshot(int(user_id))
+    return snapshot.value if snapshot.value is not None else 0
 
 
 def render_welcome_for(
     uid: int,
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
-    balance: Optional[int] = None,
+    balance: Optional[BalanceSnapshot] = None,
 ) -> str:
     if balance is None:
-        balance = _safe_get_balance(uid)
-    _set_cached_balance(ctx, balance)
-    return WELCOME.format(balance=balance, prompts_url=PROMPTS_CHANNEL_URL)
+        snapshot = _resolve_balance_snapshot(ctx, uid, prefer_cached=False)
+    else:
+        snapshot = balance
+        _cache_balance_snapshot(ctx, uid, snapshot)
+        _set_cached_balance(ctx, snapshot.value)
+
+    balance_line = f"💎 **Ваш баланс: {snapshot.display}**"
+    if snapshot.warning:
+        balance_block = f"{balance_line}\n{snapshot.warning}"
+    else:
+        balance_block = balance_line
+
+    return WELCOME.format(balance_block=balance_block, prompts_url=PROMPTS_CHANNEL_URL)
 
 async def show_emoji_hub_for_chat(
     chat_id: int,
@@ -5705,13 +5794,12 @@ async def show_emoji_hub_for_chat(
     if resolved_uid is None:
         resolved_uid = int(chat_id)
 
-    balance = _safe_get_balance(resolved_uid)
-    _set_cached_balance(ctx, balance)
+    snapshot = _resolve_balance_snapshot(ctx, resolved_uid, prefer_cached=False)
 
-    text = build_hub_text(balance)
+    text = build_hub_text(snapshot)
     keyboard = build_hub_keyboard()
 
-    log.info("hub.show | user_id=%s balance=%s", resolved_uid, balance)
+    log.info("hub.show | user_id=%s balance=%s", resolved_uid, snapshot.display)
 
     state_dict = state(ctx)
 
@@ -5774,8 +5862,11 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
 
 
 async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    bal = get_user_balance_value(ctx)
-    text = f"👤 *Профиль*\nВаш баланс: *{bal}* 💎"
+    resolved_uid = get_user_id(ctx) or chat_id
+    snapshot = _resolve_balance_snapshot(ctx, int(resolved_uid), prefer_cached=True)
+    text = f"👤 *Профиль*\nВаш баланс: *{snapshot.display}* 💎"
+    if snapshot.warning:
+        text = f"{text}\n{snapshot.warning}"
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
@@ -5899,7 +5990,7 @@ async def show_dialog_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None
 MAIN_MENU_GUARD_TTL = 3
 
 
-TEXT_ALIASES: Dict[str, str] = {text: callback for text, callback in iter_home_menu_buttons()}
+TEXT_ALIASES: Dict[str, str] = dict(TEXT_ACTION_VARIANTS)
 TEXT_ALIASES.update(
     {
         "📸 Режим фото": IMAGE_MENU_CB,
@@ -6307,6 +6398,12 @@ async def _dispatch_home_action(
 
 
 async def on_text_nav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+
+    handled = await hub_route_text(update, ctx)
+    if handled:
+        return
+
     message = update.effective_message
     if message is None:
         return
@@ -6924,6 +7021,13 @@ def balance_menu_kb(*, referral_url: Optional[str] = None) -> InlineKeyboardMark
     return InlineKeyboardMarkup(keyboard)
 
 
+def _profile_balance_text(snapshot: BalanceSnapshot) -> str:
+    text = f"{TXT_PROFILE_TITLE}\n💎 Ваш баланс: {snapshot.display}"
+    if snapshot.warning:
+        text = f"{text}\n{snapshot.warning}"
+    return text
+
+
 def spinner_markup(text: str = "⏳ Обновляем…") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text, callback_data="noop")]]
@@ -6939,9 +7043,9 @@ async def show_balance_card(
 ) -> Optional[int]:
     s = state(ctx)
     uid = get_user_id(ctx) or chat_id
-    balance = _safe_get_balance(uid)
-    _set_cached_balance(ctx, balance)
-    text = f"{TXT_PROFILE_TITLE}\n💎 Ваш баланс: {balance}"
+    resolved_uid = int(uid) if uid is not None else int(chat_id)
+    snapshot = _resolve_balance_snapshot(ctx, resolved_uid, prefer_cached=True)
+    text = _profile_balance_text(snapshot)
     mid = await upsert_card(
         ctx,
         chat_id,
@@ -7063,8 +7167,9 @@ async def handle_menu_profile(callback: HubCallbackContext) -> None:
                 log.debug("profile.invite_link_failed | user=%s err=%s", user_id, exc)
                 referral_url = None
 
-        balance = _safe_get_balance(int(user_id or callback.chat_id))
-        text = f"{TXT_PROFILE_TITLE}\n💎 Ваш баланс: {balance}"
+        resolved = int(user_id or callback.chat_id)
+        snapshot = _resolve_balance_snapshot(ctx, resolved, prefer_cached=True)
+        text = _profile_balance_text(snapshot)
         markup = balance_menu_kb(referral_url=referral_url)
 
         message_id = callback.card_message_id
@@ -7351,8 +7456,7 @@ async def _edit_balance_from_history(
     if message is None:
         return
 
-    balance = _safe_get_balance(user_id)
-    _set_cached_balance(ctx, balance)
+    snapshot = _resolve_balance_snapshot(ctx, user_id, prefer_cached=False)
     reply_markup, _ = await _build_balance_menu_with_referral(
         ctx,
         user_id,
@@ -7360,7 +7464,8 @@ async def _edit_balance_from_history(
     )
     await _safe_edit_message_text(
         query.edit_message_text,
-        f"💎 Ваш баланс: {balance}",
+        f"💎 Ваш баланс: {snapshot.display}"
+        + (f"\n{snapshot.warning}" if snapshot.warning else ""),
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
@@ -14353,8 +14458,11 @@ async def my_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     if message is None or user is None:
         return
-    balance = _safe_get_balance(user.id)
-    await message.reply_text(f"💎 Ваш баланс: {balance}")
+    snapshot = _resolve_balance_snapshot(ctx, user.id, prefer_cached=False)
+    text = f"💎 Ваш баланс: {snapshot.display}"
+    if snapshot.warning:
+        text = f"{text}\n{snapshot.warning}"
+    await message.reply_text(text)
 
 
 async def add_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

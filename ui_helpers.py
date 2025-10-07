@@ -14,7 +14,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
-from redis_utils import get_balance
+from core.balance_provider import get_balance_snapshot
 from state import state as redis_state
 
 import html
@@ -131,14 +131,10 @@ async def refresh_balance_card_if_open(
     if last_panel != "balance" and not balance_mid:
         return None
 
-    try:
-        balance = get_balance(user_id)
-    except Exception as exc:  # pragma: no cover - network/redis issues
-        app_logger = getattr(getattr(ctx, "application", None), "logger", logging.getLogger(__name__))
-        app_logger.warning("refresh_balance_card_if_open failed for %s: %s", user_id, exc)
-        return None
-
-    text = f"💎 Ваш баланс: {balance}"
+    snapshot = get_balance_snapshot(user_id)
+    text = f"💎 Ваш баланс: {snapshot.display}"
+    if snapshot.warning:
+        text = f"{text}\n{snapshot.warning}"
     mid = await upsert_card(
         ctx,
         chat_id,
@@ -156,8 +152,8 @@ async def refresh_balance_card_if_open(
         msg_ids["balance"] = mid
         state_dict["last_panel"] = "balance"
         try:
-            if hasattr(ctx, "user_data"):
-                ctx.user_data["balance"] = balance
+            if hasattr(ctx, "user_data") and snapshot.value is not None:
+                ctx.user_data["balance"] = snapshot.value
         except Exception:
             pass
     return mid

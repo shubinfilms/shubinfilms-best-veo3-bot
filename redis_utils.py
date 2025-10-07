@@ -552,6 +552,19 @@ def user_lock(user_id: Optional[int], key: str, ttl: int = 30) -> bool:
     return _memory_set_if_absent(lock_key, "1", ttl_value)
 
 
+def release_user_lock(user_id: Optional[int], key: str) -> None:
+    if not user_id:
+        return
+    lock_key = _user_lock_key(int(user_id), key)
+    if _r:
+        try:
+            _r.delete(lock_key)
+        except Exception as exc:  # pragma: no cover - network errors
+            _logger.debug("user_lock.release_error | key=%s err=%s", lock_key, exc)
+    else:
+        _memory_delete(lock_key)
+
+
 def acquire_action_lock(
     user_id: Optional[int],
     action: str,

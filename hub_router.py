@@ -1,16 +1,8 @@
-"""Callback router with namespace-aware actions.
-
-Each callback is expected to be formatted as ``"<namespace>:<action>"``.
-Handlers register themselves through :func:`register` and receive a
-``CallbackContext`` object that exposes the parsed payload together with
-helpers for scheduling UI updates.
-
-Backward compatibility is maintained via :data:`LEGACY_ALIASES`, allowing
-older callback payloads to be transparently translated into the new schema.
-"""
+"""Callback router with namespace-aware actions."""
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -21,7 +13,10 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+from keyboards import TEXT_TO_ACTION
+from redis_utils import release_user_lock, user_lock
 from state import CardInfo, StateLockTimeout, state
+from utils.text_normalizer import normalize_btn_text
 
 log = logging.getLogger(__name__)
 
@@ -184,6 +179,10 @@ class CallbackContext:
     def card_message_id(self) -> Optional[int]:
         return self._card_message_id
 
+    @property
+    def card_changed(self) -> bool:
+        return self._card_changed
+
 
 _ROUTES: Dict[str, Dict[str, _Route]] = {}
 _FALLBACK_HANDLER: Optional[Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]] = None
@@ -215,11 +214,6 @@ LEGACY_ALIASES: Dict[str, str] = {
     "nav:music": "menu:music",
     "nav:video": "menu:video",
     "nav:dialog": "menu:dialog",
-    "menu:kb": "home:kb",
-    "menu:photo": "home:photo",
-    "menu:music": "home:music",
-    "menu:video": "home:video",
-    "menu:dialog": "home:dialog",
     "menu:root": "menu_main",
     "banana:add_photo": "banana:add_more",
     "banana:clear": "banana:reset_all",
@@ -253,6 +247,170 @@ def _parse_callback(data: str) -> Optional[tuple[str, str]]:
     return namespace.lower(), action.lower()
 
 
+def resolve_text_action(text: str) -> Optional[tuple[str, str]]:
+    normalized = normalize_btn_text(text)
+    if not normalized:
+        return None
+    payload = TEXT_TO_ACTION.get(normalized)
+    if not payload:
+        return None
+    return _parse_callback(payload)
+
+
+def _log_dispatch(namespace: str, action: str, source: str) -> None:
+    try:
+        payload = json.dumps({"ns": namespace, "action": action, "source": source}, ensure_ascii=False)
+    except Exception:
+        payload = f'{{"ns": "{namespace}", "action": "{action}", "source": "{source}"}}'
+    log.info("router.dispatch %s", payload)
+
+
+def _log_result(ctx_obj: CallbackContext, *, source: str) -> None:
+    log.debug(
+        "router.result | ns=%s action=%s module=%s source=%s changed=%s mid=%s",
+        ctx_obj.namespace,
+        ctx_obj.action,
+        ctx_obj.module,
+        source,
+        ctx_obj.card_changed,
+        ctx_obj.card_message_id,
+    )
+
+
+async def _dispatch_route(
+    namespace: str,
+    action: str,
+    *,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    source: str,
+    query=None,
+    apply_text_lock: bool = False,
+) -> bool:
+    message = getattr(query, "message", None) if query is not None else None
+    if message is None:
+        message = getattr(update, "effective_message", None)
+    chat = getattr(message, "chat", None) if message is not None else None
+    if chat is None:
+        chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        if query is not None:
+            await _safe_answer(query)
+        return False
+
+    lock_acquired = False
+    try:
+        if apply_text_lock:
+            if not user_lock(chat_id, "reply-nav", ttl=1):
+                log.debug(
+                    "router.debounce | chat=%s ns=%s action=%s source=%s",
+                    chat_id,
+                    namespace,
+                    action,
+                    source,
+                )
+                return True
+            lock_acquired = True
+
+        _log_dispatch(namespace, action, source)
+
+        routes_for_ns = _ROUTES.get(namespace)
+        route = routes_for_ns.get(action) if routes_for_ns else None
+        module_name = route.module if route else namespace
+        card_info = await state.get_card(chat_id, module_name)
+        now = time.time()
+
+        if not route:
+            if query is not None:
+                if card_info.updated_at and (now - card_info.updated_at) < 0.5:
+                    await _safe_answer(query)
+                    return True
+                if _FALLBACK_HANDLER is not None:
+                    await _FALLBACK_HANDLER(update, ctx)
+                await _safe_answer(query)
+                return True
+            return False
+        user = None
+        if query is not None:
+            user = getattr(query, "from_user", None)
+        if user is None:
+            user = getattr(update, "effective_user", None)
+        if user is None and message is not None:
+            user = getattr(message, "from_user", None)
+        user_id = getattr(user, "id", None)
+
+        if card_info.updated_at and (now - card_info.updated_at) < 0.5:
+            if query is not None:
+                await _safe_answer(query)
+            return True
+
+        if query is not None:
+            await _safe_answer(query)
+
+        t0 = time.perf_counter()
+
+        try:
+            async with state.lock(chat_id):
+                session = await state.load(chat_id)
+                t_state_loaded = time.perf_counter()
+                ctx_obj = CallbackContext(
+                    update=update,
+                    app_context=ctx,
+                    namespace=namespace,
+                    action=action,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    query=query,
+                    session=session,
+                    module=route.module,
+                    card=card_info,
+                )
+                await route.handler(ctx_obj)
+                await state.save(chat_id, session)
+        except StateLockTimeout:
+            log.warning(
+                "router.lock_timeout | chat=%s ns=%s action=%s source=%s",
+                chat_id,
+                namespace,
+                action,
+                source,
+            )
+            return True
+        except Exception:
+            log.exception(
+                "router.handler_failed | chat=%s ns=%s action=%s source=%s",
+                chat_id,
+                namespace,
+                action,
+                source,
+            )
+            return True
+
+        await ctx_obj.execute_scheduled()
+        _log_result(ctx_obj, source=source)
+
+        t_done = time.perf_counter()
+        t_load_ms = (t_state_loaded - t0) * 1000
+        t_edit_ms = (t_done - t_state_loaded) * 1000
+        log.info(
+            "router.done | chat=%s ns=%s action=%s source=%s timing_ms=%.1f/%.1f/%.1f",
+            chat_id,
+            namespace,
+            action,
+            source,
+            t_load_ms,
+            t_edit_ms,
+            (t_done - t0) * 1000,
+        )
+        return True
+    finally:
+        if apply_text_lock and lock_acquired:
+            release_user_lock(chat_id, "reply-nav")
+
+
 async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Route callback queries to registered handlers."""
 
@@ -273,81 +431,36 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     namespace, action = parsed
-    message = getattr(query, "message", None)
-    chat_id = getattr(getattr(message, "chat", None), "id", None) or getattr(
-        getattr(update, "effective_chat", None), "id", None
-    )
-    if chat_id is None:
-        await _safe_answer(query)
-        return
-
-    routes_for_ns = _ROUTES.get(namespace)
-    route = routes_for_ns.get(action) if routes_for_ns else None
-    module_name = route.module if route else namespace
-    card_info = await state.get_card(chat_id, module_name)
-    now = time.time()
-
-    if not route:
-        if card_info.updated_at and (now - card_info.updated_at) < 0.5:
-            await _safe_answer(query)
-            return
-        if _FALLBACK_HANDLER is not None:
-            await _FALLBACK_HANDLER(update, ctx)
-        await _safe_answer(query)
-        return
-
-    user = getattr(query, "from_user", None) or getattr(update, "effective_user", None)
-    user_id = getattr(user, "id", None)
-
-    if card_info.updated_at and (now - card_info.updated_at) < 0.5:
-        await _safe_answer(query)
-        return
-
-    t0 = time.perf_counter()
-    await _safe_answer(query)
-
-    try:
-        async with state.lock(chat_id):
-            session = await state.load(chat_id)
-            t_state_loaded = time.perf_counter()
-            ctx_obj = CallbackContext(
-                update=update,
-                app_context=ctx,
-                namespace=namespace,
-                action=action,
-                chat_id=chat_id,
-                user_id=user_id,
-                query=query,
-                session=session,
-                module=route.module,
-                card=card_info,
-            )
-            await route.handler(ctx_obj)
-            await state.save(chat_id, session)
-    except StateLockTimeout:
-        log.warning(
-            "router.lock_timeout | chat=%s ns=%s action=%s", chat_id, namespace, action
-        )
-        return
-    except Exception:
-        log.exception(
-            "router.handler_failed | chat=%s ns=%s action=%s", chat_id, namespace, action
-        )
-        return
-
-    await ctx_obj.execute_scheduled()
-    t_done = time.perf_counter()
-    t_load_ms = (t_state_loaded - t0) * 1000
-    t_edit_ms = (t_done - t_state_loaded) * 1000
-    log.info(
-        "router.done | chat=%s ns=%s action=%s timing_ms=%.1f/%.1f/%.1f",
-        chat_id,
+    await _dispatch_route(
         namespace,
         action,
-        t_load_ms,
-        t_edit_ms,
-        (t_done - t0) * 1000,
+        update=update,
+        ctx=ctx,
+        source="callback",
+        query=query,
     )
+
+
+async def route_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return False
+    text = getattr(message, "text", None)
+    if not isinstance(text, str):
+        return False
+    parsed = resolve_text_action(text)
+    if not parsed:
+        return False
+    namespace, action = parsed
+    handled = await _dispatch_route(
+        namespace,
+        action,
+        update=update,
+        ctx=ctx,
+        source="text",
+        apply_text_lock=True,
+    )
+    return handled
 
 
 async def _safe_answer(query) -> None:
@@ -357,4 +470,12 @@ async def _safe_answer(query) -> None:
         pass
 
 
-__all__ = ["register", "hub_router", "CallbackContext", "LEGACY_ALIASES", "set_fallback"]
+__all__ = [
+    "register",
+    "hub_router",
+    "route_text",
+    "resolve_text_action",
+    "CallbackContext",
+    "LEGACY_ALIASES",
+    "set_fallback",
+]
