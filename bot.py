@@ -222,6 +222,10 @@ from keyboards import (
     dialog_picker_inline,
     menu_pay_unified,
 )
+
+PROFILE_CB_TRANSACTIONS = "PROFILE_TRANSACTIONS"
+PROFILE_CB_INVITE = "PROFILE_INVITE"
+PROFILE_CB_PROMO = "PROFILE_PROMO"
 from texts import (
     SUNO_MODE_PROMPT,
     SUNO_START_READY_MESSAGE,
@@ -5274,7 +5278,6 @@ VIDEO_CALLBACK_ALIASES = {
     "engine:sora2": CB.VIDEO_PICK_SORA2,
     "engine:sora2_disabled": CB.VIDEO_PICK_SORA2_DISABLED,
     "mode:veo_text_fast": CB.VIDEO_MODE_VEO_FAST,
-    "mode:veo_text_quality": CB.VIDEO_MODE_VEO_QUALITY,
     "mode:veo_photo": CB.VIDEO_MODE_VEO_PHOTO,
     "mode:sora2_ttv": CB.VIDEO_MODE_SORA_TEXT,
     "mode:sora2_itv": CB.VIDEO_MODE_SORA_IMAGE,
@@ -5282,7 +5285,6 @@ VIDEO_CALLBACK_ALIASES = {
 }
 VIDEO_MODE_CALLBACK_MAP = {
     CB.VIDEO_MODE_VEO_FAST: "veo_text_fast",
-    CB.VIDEO_MODE_VEO_QUALITY: "veo_text_quality",
     CB.VIDEO_MODE_VEO_PHOTO: "veo_photo",
     CB.VIDEO_MODE_SORA_TEXT: "sora2_ttv",
     CB.VIDEO_MODE_SORA_IMAGE: "sora2_itv",
@@ -5733,7 +5735,6 @@ async def _clear_video_menu_state(
 
 _VIDEO_MODE_HINTS: Dict[str, str] = {
     "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
-    "veo_text_quality": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
     "veo_photo": "📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.",
     "sora2_ttv": "✍️ Пришлите текст (до 5000 символов). Нажмите «🚀 Запустить Sora 2», когда будете готовы.",
     "sora2_itv": "📸 Пришлите 1–4 ссылок на изображения и текст (до 5000 символов). Для очистки ссылок отправьте слово clear.",
@@ -5879,18 +5880,15 @@ async def profile_open(
     has_existing = bool(stored_mid)
     force_new = not has_existing if edit_in_place else True
 
-    result_mid = await send_profile_card(
-        chat_id,
+    await _open_profile_card(
+        update,
         ctx,
+        chat_id=chat_id,
         user_id=user_id,
+        source="hub_button",
         force_new=force_new,
+        query=query,
     )
-    if result_mid is None:
-        return
-
-    _set_profile_card_message_id(chat_id, result_mid)
-    action = "edit" if has_existing and edit_in_place and result_mid == stored_mid else "send"
-    log.info("{\"profile\": %s, \"msg_id\": %s}", json.dumps(action), result_mid)
 
 
 async def kb_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6033,12 +6031,6 @@ async def show_video_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton(
                     f"Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}",
                     callback_data="mode:veo_text_fast",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Генерация видео (Veo Quality) 💎 {TOKEN_COSTS['veo_quality']}",
-                    callback_data="mode:veo_text_quality",
                 )
             ],
             [
@@ -6766,10 +6758,6 @@ def veo_modes_kb() -> InlineKeyboardMarkup:
             callback_data=CB_VIDEO_MODE_FAST,
         )],
         [InlineKeyboardButton(
-            f"🎬 Генерация видео (Veo Quality) — 💎 {TOKEN_COSTS['veo_quality']}",
-            callback_data=CB_VIDEO_MODE_QUALITY,
-        )],
-        [InlineKeyboardButton(
             f"🖼️ Оживить изображение (Veo) — 💎 {TOKEN_COSTS['veo_photo']}",
             callback_data=CB_VIDEO_MODE_PHOTO,
         )],
@@ -7025,8 +7013,6 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
 def _video_mode_config(mode: str) -> Optional[Tuple[str, str, str]]:
     if mode == "veo_text_fast":
         return "16:9", "veo3_fast", _VIDEO_MODE_HINTS[mode]
-    if mode == "veo_text_quality":
-        return "16:9", "veo3", _VIDEO_MODE_HINTS[mode]
     if mode == "veo_photo":
         return "9:16", "veo3_fast", _VIDEO_MODE_HINTS[mode]
     return None
@@ -7176,12 +7162,12 @@ async def show_topup_menu(
 def balance_menu_kb(*, referral_url: Optional[str] = None) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     keyboard.extend(kb_profile_topup_entry().inline_keyboard)
-    keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data="profile:transactions")])
+    keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data=PROFILE_CB_TRANSACTIONS)])
     if referral_url:
         keyboard.append([InlineKeyboardButton("👥 Пригласить друга", url=referral_url)])
     else:
-        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data="profile:invite")])
-    keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data="profile:promo")])
+        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data=PROFILE_CB_INVITE)])
+    keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data=PROFILE_CB_PROMO)])
     keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="menu:root")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -7449,9 +7435,9 @@ async def _open_profile_card(
     source: str,
     force_new: bool = False,
     query: Optional[CallbackQuery] = None,
-) -> None:
+) -> Optional[int]:
     if chat_id is None:
-        return
+        return None
     state_dict = state(ctx)
     callback_id = getattr(query, "id", None)
     if _is_callback_processed(state_dict, callback_id):
@@ -7472,8 +7458,9 @@ async def _open_profile_card(
     )
     if not locked:
         return
+    result_mid: Optional[int] = None
     try:
-        await send_profile_card(
+        result_mid = await send_profile_card(
             chat_id,
             ctx,
             user_id=user_id,
@@ -7482,6 +7469,16 @@ async def _open_profile_card(
     finally:
         release_action_lock(user_id, "profile")
     _mark_callback_processed(state_dict, callback_id)
+    if result_mid is not None:
+        _set_profile_card_message_id(chat_id, result_mid)
+        log.info(
+            "[PROFILE] opened | chat_id=%s user_id=%s source=%s msg_id=%s",
+            chat_id,
+            user_id,
+            source,
+            result_mid,
+        )
+    return result_mid
 
 
 def _ledger_reason(entry: Dict[str, Any]) -> str:
@@ -7949,15 +7946,15 @@ def banana_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("➕ Добавить фото", callback_data="banana:add_photo"),
+                InlineKeyboardButton("➕ Добавить фото", callback_data="banana:add_more"),
                 InlineKeyboardButton("✏️ Промпт", callback_data="banana:prompt"),
-                InlineKeyboardButton("🧹 Очистить", callback_data="banana:clear"),
+                InlineKeyboardButton("🧹 Очистить", callback_data="banana:reset_all"),
             ],
             [InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana:templates")],
             [InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")],
             [
                 InlineKeyboardButton("🔄 Движок", callback_data="banana:switch_engine"),
-                InlineKeyboardButton("↩️ Назад", callback_data="banana:back"),
+                InlineKeyboardButton("↩️ Назад", callback_data="back"),
             ],
         ]
     )
@@ -11583,7 +11580,11 @@ def veo_card_text(s: Dict[str, Any]) -> str:
     prompt_raw = (s.get("last_prompt") or "").strip()
     prompt_html = html.escape(prompt_raw) if prompt_raw else ""
     aspect = html.escape(s.get("aspect") or "16:9")
-    model = "Veo Quality" if s.get("model") == "veo3" else "Veo Fast"
+    mode_key = s.get("mode") or "veo_text_fast"
+    if mode_key == "veo_photo":
+        model = "Veo Animate"
+    else:
+        model = "Veo Fast"
     img = "есть" if s.get("last_image_url") else "нет"
     duration_hint = s.get("veo_duration_hint")
     lip_sync = bool(s.get("veo_lip_sync_required"))
@@ -11610,17 +11611,15 @@ def veo_card_text(s: Dict[str, Any]) -> str:
 
 def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     aspect = s.get("aspect") or "16:9"
-    model = s.get("model") or "veo3_fast"
     ar16 = "✅" if aspect == "16:9" else ""
     ar916 = "✅" if aspect == "9:16" else ""
-    fast = "✅" if model != "veo3" else ""
-    qual = "✅" if model == "veo3" else ""
     rows = [
         [InlineKeyboardButton("🖼 Добавить/Удалить референс", callback_data="veo:clear_img")],
-        [InlineKeyboardButton(f"16:9 {ar16}", callback_data="veo:set_ar:16:9"),
-         InlineKeyboardButton(f"9:16 {ar916}", callback_data="veo:set_ar:9:16")],
-        [InlineKeyboardButton(f"⚡ Fast {fast}", callback_data="veo:set_model:fast"),
-         InlineKeyboardButton(f"💎 Quality {qual}", callback_data="veo:set_model:quality")],
+        [InlineKeyboardButton("✏️ Изменить промпт", callback_data="veo:edit_prompt")],
+        [
+            InlineKeyboardButton(f"16:9 {ar16}", callback_data="veo:set_ar:16:9"),
+            InlineKeyboardButton(f"9:16 {ar916}", callback_data="veo:set_ar:9:16"),
+        ],
         [InlineKeyboardButton("🚀 Сгенерировать", callback_data="veo:start")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
@@ -13561,6 +13560,7 @@ async def poll_veo_and_send(
         delay = 2.0
         max_delay = 60.0
         deadline = time.monotonic() + 15 * 60
+        attempt = 0
         while True:
             if time.monotonic() > deadline:
                 raise TimeoutError("KIE polling timeout after 900s")
@@ -13568,6 +13568,7 @@ async def poll_veo_and_send(
                 ok, flag, message, url = await asyncio.to_thread(get_kie_veo_status, task_id)
             except Exception as exc:
                 ok, flag, message, url = False, None, str(exc), None
+            attempt += 1
             if ok:
                 if flag == 1:
                     status_label = "success"
@@ -13588,6 +13589,13 @@ async def poll_veo_and_send(
                 raise RuntimeError("KIE success without result url")
             if ok and flag in (2, 3):
                 raise RuntimeError(f"KIE task failed: {message or flag}")
+            log.info(
+                "[VEO] poll retry %s | task_id=%s status=%s message=%s",
+                attempt,
+                task_id,
+                status_label,
+                (message or ""),
+            )
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_delay)
 
@@ -13675,6 +13683,13 @@ async def poll_veo_and_send(
                 media_kind,
                 target_chat_id,
                 getattr(sent_message, "message_id", None),
+            )
+            log.info(
+                "[VEO] task success | task_id=%s chat_id=%s message_id=%s size=%s",
+                task_id,
+                target_chat_id,
+                getattr(sent_message, "message_id", None),
+                file_size,
             )
 
             await _send_message_with_retry(
@@ -15330,6 +15345,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif chat is not None:
         chat_id = chat.id
 
+    if data == PROFILE_CB_TRANSACTIONS:
+        data = "tx:open"
+    elif data == PROFILE_CB_INVITE:
+        data = "ref:open"
+    elif data == PROFILE_CB_PROMO:
+        data = "promo_open"
+    elif data == CB_PROFILE_BACK:
+        data = "back"
+
     normalized_data = _normalize_music_callback_data(data)
     user_id_value = user.id if user else None
     log.debug(
@@ -15391,26 +15415,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith(CB_PM_INSERT_VEO):
         await handle_pm_insert_to_veo(update, ctx, data)
-        return
-
-    if data == "banana_templates":
-        if message is None:
-            await q.answer("Карточка недоступна", show_alert=True)
-            return
-        s["_last_text_banana"] = None
-        await _safe_edit_message_text(
-            q.edit_message_text,
-            "✨ Готовые шаблоны для Banana\nВыберите заготовку, она подставится в поле промпта:",
-            reply_markup=kb_banana_templates(),
-        )
-        await q.answer()
-        return
-
-    if data == "banana_back_to_card":
-        s["_last_text_banana"] = None
-        if chat_id is not None:
-            await show_banana_card(chat_id, ctx, force_new=True)
-        await q.answer()
         return
 
     if data.startswith("btpl_"):
@@ -15972,14 +15976,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if act == "prompt":
             chat_ctx = update.effective_chat
             chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
-            current_prompt = (s.get("last_prompt") or "").strip()
-            if current_prompt:
-                s["last_prompt"] = None
-                s["_last_text_banana"] = None
-                if chat_id_val is not None:
-                    await show_banana_card(chat_id_val, ctx)
-                await q.answer("Промпт очищен ✅")
-                return
             user_obj = update.effective_user
             uid_val = user_obj.id if user_obj else None
             card_id = (
@@ -15987,6 +15983,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if isinstance(s.get("last_ui_msg_id_banana"), int)
                 else None
             )
+            current_prompt = (s.get("last_prompt") or "").strip()
+            prompt_message = "✍️ Пришлите промпт для Banana."
+            answer_text = None
+            if current_prompt:
+                s["last_prompt"] = None
+                s["_last_text_banana"] = None
+                if chat_id_val is not None:
+                    await show_banana_card(chat_id_val, ctx)
+                answer_text = "Промпт очищен ✅"
+                prompt_message = "✍️ Промпт очищен. Пришлите новый текст для Banana."
             _activate_wait_state(
                 user_id=uid_val,
                 chat_id=chat_id_val,
@@ -15995,7 +16001,30 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 meta={"action": "prompt"},
             )
             if q.message:
-                await q.message.reply_text("✍️ Пришлите промпт для Banana.")
+                await q.message.reply_text(prompt_message)
+            if answer_text:
+                await q.answer(answer_text)
+            else:
+                await q.answer()
+            return
+        if act == "templates":
+            if q.message is None:
+                await q.answer("Карточка недоступна", show_alert=True)
+                return
+            s["_last_text_banana"] = None
+            await _safe_edit_message_text(
+                q.edit_message_text,
+                "✨ Готовые шаблоны для Banana\nВыберите заготовку, она подставится в поле промпта:",
+                reply_markup=kb_banana_templates(),
+            )
+            await q.answer()
+            return
+        if act == "back":
+            s["_last_text_banana"] = None
+            chat_ctx = update.effective_chat
+            chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
+            if chat_id_val is not None:
+                await show_banana_card(chat_id_val, ctx, force_new=True)
             await q.answer()
             return
         if act == "switch_engine":
@@ -16055,7 +16084,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     pass
             with suppress(BadRequest):
                 await q.answer("Запускаю…")
-            log.info('{"banana":"start","card_preserved":true}')
+            log.info(
+                "[BANANA] start_generate | chat_id=%s user_id=%s images=%s",
+                chat_id,
+                uid,
+                len(imgs),
+            )
             await show_balance_notification(
                 chat_id,
                 ctx,
@@ -16582,6 +16616,32 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "veo:clear_img":
         s["last_image_url"] = None
         await show_veo_card(update.effective_chat.id, ctx); return
+    if data == "veo:edit_prompt":
+        chat_ctx = update.effective_chat
+        chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
+        user_obj = update.effective_user
+        uid_val = user_obj.id if user_obj else None
+        if chat_id_val is not None:
+            s["last_prompt"] = None
+            s["_last_text_veo"] = None
+            await show_veo_card(chat_id_val, ctx)
+        card_id = (
+            s.get("last_ui_msg_id_veo")
+            if isinstance(s.get("last_ui_msg_id_veo"), int)
+            else None
+        )
+        _activate_wait_state(
+            user_id=uid_val,
+            chat_id=chat_id_val,
+            card_msg_id=card_id,
+            kind=WaitKind.VEO_PROMPT,
+            meta={"action": "prompt_edit"},
+        )
+        if q.message is not None:
+            await q.message.reply_text("✍️ Пришлите новый промпт для VEO.")
+        log.info("[VEO] prompt_edit | chat_id=%s user_id=%s", chat_id_val, uid_val)
+        await q.answer()
+        return
     if data == "veo:start":
         prompt = (s.get("last_prompt") or "").strip()
         if not prompt:
@@ -16602,12 +16662,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if mode == "veo_photo":
             price = PRICE_VEO_ANIMATE
             service_name = "VEO_ANIMATE"
-        elif s.get("model") == "veo3":
-            price = PRICE_VEO_QUALITY
-            service_name = "VEO_QUALITY"
         else:
             price = PRICE_VEO_FAST
             service_name = "VEO_FAST"
+            if s.get("model") == "veo3":
+                s["model"] = "veo3_fast"
         try:
             ensure_user(uid)
         except Exception as exc:
@@ -16840,7 +16899,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         s["last_image_url"] = text.strip()
         await msg.reply_text("🧷 Ссылка на изображение принята.")
-        if state_mode in ("veo_text_fast", "veo_text_quality", "veo_photo"):
+        if state_mode in ("veo_text_fast", "veo_photo"):
             await show_veo_card(chat_id, ctx)
         return
 
@@ -16858,7 +16917,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await on_banana_prompt_saved(chat_id, ctx, text)
         return
 
-    if state_mode in ("veo_text_fast", "veo_text_quality", "veo_photo"):
+    if state_mode in ("veo_text_fast", "veo_photo"):
         s["last_prompt"] = text
         await show_veo_card(chat_id, ctx)
         return
@@ -17091,7 +17150,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     s["last_image_url"] = url
     await message.reply_text("🖼️ Фото принято как референс.")
-    if chat_id is not None and s.get("mode") in ("veo_text_fast", "veo_text_quality", "veo_photo"):
+    if chat_id is not None and s.get("mode") in ("veo_text_fast", "veo_photo"):
         await show_veo_card(chat_id, ctx)
 
 
