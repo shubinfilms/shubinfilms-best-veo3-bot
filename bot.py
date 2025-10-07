@@ -4051,33 +4051,23 @@ async def reset_user_state(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: Optional[int] = None,
     *,
-    user_id: Optional[int] = None,
     notify_chat_off: bool = False,
 ):
     s = state(ctx)
-    was_chat = False
-    if s.get("mode") == "chat":
-        was_chat = True
     chat_mode_value = s.get(STATE_CHAT_MODE)
-    if chat_mode_value in {"normal", "dialog", "chat"}:
+    was_chat = s.get("mode") == "chat" or bool(chat_mode_value)
+    if not was_chat and session_is_chat_enabled(ctx):
         was_chat = True
-    elif chat_mode_value:
-        was_chat = True
-    if session_is_chat_enabled(ctx):
-        was_chat = True
-    if chat_id is not None:
-        try:
-            current_mode = _mode_get(chat_id)
-        except Exception:
-            current_mode = None
-        if current_mode == MODE_CHAT:
-            was_chat = True
-    if not was_chat and user_id is not None:
-        try:
-            if chat_mode_is_on(user_id):
+    if not was_chat and chat_id is not None:
+        with suppress(Exception):
+            if _mode_get(chat_id) == MODE_CHAT:
                 was_chat = True
-        except Exception:
-            pass
+    if not was_chat:
+        user_id = get_user_id(ctx)
+        if user_id is not None:
+            with suppress(Exception):
+                if chat_mode_is_on(user_id):
+                    was_chat = True
 
     s.update({**DEFAULT_STATE})
     _apply_state_defaults(s)
@@ -4086,18 +4076,12 @@ async def reset_user_state(
 
     if notify_chat_off and was_chat and chat_id:
         try:
-            sent_message = await ctx.bot.send_message(
+            await ctx.bot.send_message(
                 chat_id=chat_id,
                 text="🛑 Режим диалога отключён.",
-                reply_markup=build_main_reply_kb(),
             )
         except Exception:
             pass
-        else:
-            s[STATE_QUICK_KEYBOARD_CHAT] = chat_id
-            msg_ids = s.get("msg_ids")
-            if isinstance(msg_ids, dict):
-                msg_ids["quick_keyboard_remove"] = getattr(sent_message, "message_id", None)
 
 
 def _suno_log_preview(value: Optional[str], limit: int = 60) -> str:
@@ -5771,6 +5755,27 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
 
 # --- Reply->Inline: экраны-меню ---
 
+
+async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    bal = get_user_balance_value(ctx)
+    text = f"👤 *Профиль*\nВаш баланс: *{bal}* 💎"
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
+            [InlineKeyboardButton("🧾 История операций", callback_data="noop")],
+            [InlineKeyboardButton("👥 Пригласить друга", callback_data="noop")],
+            [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+    await ctx.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
 async def show_kb_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = "📚 *База знаний*\nВыберите раздел:"
     kb = InlineKeyboardMarkup(
@@ -5841,13 +5846,11 @@ async def show_video_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def show_music_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "🎧 *Музыка (Suno)*\nВыберите режим генерации:"
+    text = "🎧 *Музыка (Suno)*\nВыберите режим:"
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎼 Инструментал", callback_data="music:set_mode:instrumental")],
-            [InlineKeyboardButton("🎙 Вокал", callback_data="music:set_mode:vocal")],
-            [InlineKeyboardButton("🎚️ Кавер", callback_data="music:set_mode:cover")],
-            [InlineKeyboardButton("📄 Открыть карточку", callback_data="music:open_card")],
+            [InlineKeyboardButton("🎼 Инструментал", callback_data="music:inst")],
+            [InlineKeyboardButton("🎙 Вокал", callback_data="music:vocal")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
         ]
     )
@@ -6077,7 +6080,7 @@ async def _dispatch_home_action(
             preserved["image_engine"] = state_dict["image_engine"]
 
     if action in disable_actions and chat_id is not None:
-        await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=True)
+        await reset_user_state(ctx, chat_id, notify_chat_off=True)
         await disable_chat_mode(
             ctx,
             chat_id=chat_id,
@@ -7011,7 +7014,6 @@ async def handle_menu_profile(callback: HubCallbackContext) -> None:
         await reset_user_state(
             ctx,
             callback.chat_id,
-            user_id=callback.user_id,
             notify_chat_off=True,
         )
 
@@ -13825,7 +13827,7 @@ async def handle_menu(
     if chat_id is None:
         return
 
-    await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=notify_chat_off)
+    await reset_user_state(ctx, chat_id, notify_chat_off=notify_chat_off)
 
     guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
 
@@ -13861,7 +13863,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = user_obj.id if user_obj else None
     chat_obj = update.effective_chat
     chat_id = chat_obj.id if chat_obj is not None else (uid if uid else None)
-    await reset_user_state(ctx, chat_id, user_id=uid, notify_chat_off=False)
+    await reset_user_state(ctx, chat_id, notify_chat_off=False)
 
     await _handle_referral_deeplink(update, ctx)
 
@@ -13893,7 +13895,7 @@ async def menu_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_obj = update.effective_user
     user_id = user_obj.id if user_obj else None
     chat_id = chat_obj.id if chat_obj is not None else (user_id if user_id else None)
-    await reset_user_state(ctx, chat_id, user_id=user_id, notify_chat_off=False)
+    await reset_user_state(ctx, chat_id, notify_chat_off=False)
     if chat_id is not None:
         try:
             await ensure_main_reply_keyboard(
@@ -14941,6 +14943,24 @@ async def on_noop_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def on_music_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    mode = "Инструментал" if (q.data or "").endswith("inst") else "Вокал"
+    message = getattr(q, "message", None)
+    if message is None:
+        return
+    try:
+        await ctx.bot.send_message(
+            message.chat_id,
+            f"🎧 Suno: режим «{mode}». Напишите стиль/референс — подготовлю промпт.",
+        )
+    except Exception:
+        pass
+
+
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
     q = update.callback_query
@@ -15001,7 +15021,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _mode_set(chat_id, MODE_CHAT)
         if user:
             set_mode(user.id, False)
-        await reset_user_state(ctx, chat_id, user_id=(user.id if user else None), notify_chat_off=False)
+        await reset_user_state(ctx, chat_id, notify_chat_off=False)
         await q.answer()
         if message is not None:
             with suppress(BadRequest):
@@ -15174,7 +15194,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "back":
-        await reset_user_state(ctx, chat_id, user_id=(user.id if user else None), notify_chat_off=False)
+        await reset_user_state(ctx, chat_id, notify_chat_off=False)
         target_chat = chat_id if chat_id is not None else (user.id if user else None)
         if target_chat is not None:
             await show_emoji_hub_for_chat(
@@ -15186,7 +15206,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "start_new_cycle":
-        await reset_user_state(ctx, chat_id, user_id=(user.id if user else None), notify_chat_off=False)
+        await reset_user_state(ctx, chat_id, notify_chat_off=False)
         target_chat = chat_id if chat_id is not None else (user.id if user else None)
         if target_chat is not None:
             await show_emoji_hub_for_chat(
@@ -16346,6 +16366,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw_text = msg.text or ""
     text = raw_text.strip()
     chat_id = msg.chat_id
+    if chat_id is None:
+        return
     user = update.effective_user
     user_id = user.id if user else None
     state_mode = s.get("mode")
@@ -16353,71 +16375,26 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     btn = _norm_btn_text(raw_text)
     if btn in ("профиль", "база знаний", "фото", "музыка", "видео", "диалог"):
-        await reset_user_state(
-            ctx,
-            chat_id,
-            user_id=user_id,
-            notify_chat_off=True,
-        )
-        if user_id is not None:
-            clear_wait(user_id)
-
-        await disable_chat_mode(
-            ctx,
-            chat_id=chat_id,
-            user_id=user_id,
-            state_dict=s,
-            notify=False,
-        )
-        if user_id is not None:
-            try:
-                set_mode(user_id, False)
-            except Exception:
-                pass
+        await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
         if btn == "профиль":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:profile")
-            await _open_profile_card(
-                update,
-                ctx,
-                chat_id=chat_id,
-                user_id=user_id,
-                source="reply",
-                force_new=False,
-                query=update.callback_query,
-            )
-            return
-
+            await show_profile_menu(chat_id, ctx)
+            raise ApplicationHandlerStop
         if btn == "база знаний":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:kb")
             await show_kb_menu(chat_id, ctx)
-            return
-
+            raise ApplicationHandlerStop
         if btn == "фото":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:photo")
             await show_images_menu(chat_id, ctx)
-            return
-
+            raise ApplicationHandlerStop
         if btn == "музыка":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:music")
             await show_music_menu(chat_id, ctx)
-            return
-
+            raise ApplicationHandlerStop
         if btn == "видео":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:video")
             await show_video_menu(chat_id, ctx)
-            return
-
+            raise ApplicationHandlerStop
         if btn == "диалог":
-            if chat_id is not None:
-                _mode_set(chat_id, "nav:dialog")
             await show_dialog_menu(chat_id, ctx)
-            return
+            raise ApplicationHandlerStop
 
     waiting_for_input = _chat_state_waiting_input(s)
     if (
@@ -17754,6 +17731,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog:choose_regular$", dialog_choose_regular_callback),
     (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
     (r"^noop$", on_noop_callback),
+    (r"^music:(inst|vocal)$", on_music_callback),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
@@ -17842,7 +17820,8 @@ def register_handlers(application: Any) -> None:
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
                 handler,
-            )
+            ),
+            group=20,
         )
 
     alias_pattern = "|".join(re.escape(label) for label in TEXT_ALIASES)
@@ -17899,58 +17878,6 @@ async def run_bot_async() -> None:
             except Exception as exc:
                 log.warning("SUNO probe execution failed: %s", exc)
 
-            loop = asyncio.get_running_loop()
-            stop_event = asyncio.Event()
-            manual_signal_handlers: List[signal.Signals] = []
-
-            graceful_task: Optional[asyncio.Task[None]] = None
-
-            async def _await_active_tasks() -> None:
-                deadline = time.time() + 10.0
-                while time.time() < deadline and ACTIVE_TASKS:
-                    await asyncio.sleep(0.1)
-                stop_event.set()
-
-            def _trigger_stop(sig: Optional[signal.Signals] = None, *, reason: str = "external") -> None:
-                nonlocal graceful_task
-                if stop_event.is_set():
-                    return
-                if sig is not None:
-                    sig_name = sig.name if hasattr(sig, "name") else str(sig)
-                    log.info("Stop signal received: %s. Triggering shutdown.", sig_name)
-                else:
-                    log.info("Stop requested (%s). Triggering shutdown.", reason)
-                SHUTDOWN_EVENT.set()
-                if application.updater:
-                    loop.create_task(application.updater.stop())
-                if graceful_task is None or graceful_task.done():
-                    graceful_task = loop.create_task(_await_active_tasks())
-
-            lock.add_stop_callback(lambda sig: _trigger_stop(sig))
-
-            if not lock.enabled:
-                for sig_name in ("SIGINT", "SIGTERM"):
-                    if not hasattr(signal, sig_name):
-                        continue
-                    sig_obj = getattr(signal, sig_name)
-                    try:
-                        loop.add_signal_handler(sig_obj, lambda s=sig_obj: _trigger_stop(s))
-                        manual_signal_handlers.append(sig_obj)
-                    except (NotImplementedError, RuntimeError):
-                        continue
-
-            previous_post_stop = application.post_stop
-
-            async def _post_stop(app) -> None:
-                _trigger_stop(reason="post_stop")
-                if previous_post_stop:
-                    await previous_post_stop(app)
-
-            application.post_stop = _post_stop
-
-            # ВАЖНО: полный async-жизненный цикл PTB — без run_polling()
-            await application.initialize()
-
             try:
                 await application.bot.set_my_commands([
                     BotCommand("menu", "⭐ Главное меню"),
@@ -17969,52 +17896,21 @@ async def run_bot_async() -> None:
                 log.warning("Failed to set bot commands: %s", exc)
 
             try:
-                try:
-                    await application.bot.delete_webhook(drop_pending_updates=True)
-                    event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-                    log.info("Webhook deleted")
-                except Exception as exc:
-                    event("WEBHOOK_DELETE_ERROR", error=str(exc))
-                    log.warning("Delete webhook failed: %s", exc)
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+                log.info("Webhook deleted")
+            except Exception as exc:
+                event("WEBHOOK_DELETE_ERROR", error=str(exc))
+                log.warning("Delete webhook failed: %s", exc)
 
-                await application.start()
-                await application.updater.start_polling(
+            try:
+                log.info("Starting polling")
+                await application.run_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                 )
-
-                log.info("Application started")
-
-                try:
-                    await stop_event.wait()
-                except asyncio.CancelledError:
-                    _trigger_stop(reason="cancelled")
-                    raise
             finally:
-                for sig_obj in manual_signal_handlers:
-                    try:
-                        loop.remove_signal_handler(sig_obj)
-                    except (NotImplementedError, RuntimeError):
-                        pass
-
-                if application.updater:
-                    try:
-                        await application.updater.stop()
-                    except RuntimeError as exc:
-                        log.warning("Updater stop failed: %s", exc)
-                    except Exception as exc:
-                        log.warning("Updater stop failed with unexpected error: %s", exc)
-
-                try:
-                    await application.stop()
-                except Exception as exc:
-                    log.warning("Application stop failed: %s", exc)
-
-                try:
-                    await application.shutdown()
-                except Exception as exc:
-                    log.warning("Application shutdown failed: %s", exc)
-                application.post_stop = previous_post_stop
+                SHUTDOWN_EVENT.set()
     except RedisLockBusy:
         log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
 
