@@ -4156,6 +4156,7 @@ async def reset_user_state(
     chat_id: Optional[int] = None,
     *,
     notify_chat_off: bool = False,
+    suppress_notification: bool = False,
 ):
     s = state(ctx)
     chat_mode_value = s.get(STATE_CHAT_MODE)
@@ -4178,7 +4179,7 @@ async def reset_user_state(
     s.pop(STATE_CHAT_MODE, None)
     s.pop(STATE_ACTIVE_CARD, None)
 
-    if notify_chat_off and was_chat and chat_id:
+    if notify_chat_off and not suppress_notification and was_chat and chat_id:
         try:
             await ctx.bot.send_message(
                 chat_id=chat_id,
@@ -6347,7 +6348,12 @@ async def _dispatch_home_action(
             preserved["image_engine"] = state_dict["image_engine"]
 
     if action in disable_actions and chat_id is not None:
-        await reset_user_state(ctx, chat_id, notify_chat_off=True)
+        await reset_user_state(
+            ctx,
+            chat_id,
+            notify_chat_off=True,
+            suppress_notification=query is not None,
+        )
         await disable_chat_mode(
             ctx,
             chat_id=chat_id,
@@ -7295,6 +7301,7 @@ async def handle_menu_profile(callback: HubCallbackContext) -> None:
             ctx,
             callback.chat_id,
             notify_chat_off=True,
+            suppress_notification=True,
         )
 
     legacy_state = state(ctx)
@@ -14114,7 +14121,12 @@ async def handle_menu(
     if chat_id is None:
         return
 
-    await reset_user_state(ctx, chat_id, notify_chat_off=notify_chat_off)
+    await reset_user_state(
+        ctx,
+        chat_id,
+        notify_chat_off=notify_chat_off,
+        suppress_notification=query is not None,
+    )
 
     guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
 
