@@ -58,7 +58,7 @@ def _build_update(data: str, chat_id: int = 777):
 
 def test_banana_templates_menu(monkeypatch, bot_module):
     ctx = _build_ctx()
-    update = _build_update("banana_templates")
+    update = _build_update("banana:templates")
     state_dict: dict[str, object] = {"_last_text_banana": "cached"}
 
     edits: list[dict[str, object]] = []
@@ -115,7 +115,7 @@ def test_banana_template_apply_sets_prompt(monkeypatch, bot_module):
 
 def test_banana_templates_back_to_card(monkeypatch, bot_module):
     ctx = _build_ctx()
-    update = _build_update("banana_back_to_card")
+    update = _build_update("banana:back")
     state_dict: dict[str, object] = {"_last_text_banana": "cached"}
 
     async def fake_ensure_user_record(_update):

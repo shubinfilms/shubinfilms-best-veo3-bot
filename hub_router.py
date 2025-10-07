@@ -223,9 +223,10 @@ LEGACY_ALIASES: Dict[str, str] = {
     "menu:root": "menu_main",
     "banana:add_photo": "banana:add_more",
     "banana:clear": "banana:reset_all",
-    "banana:templates": "banana_templates",
+    "banana:templates": "banana:templates",
     "banana:restart": "banana_regenerate_fresh",
-    "banana:back": "banana_back_to_card",
+    "banana:back": "banana:back",
+    "banana_back_to_card": "banana:back",
     "banana:tpl:bg_remove": "btpl_bg_remove",
     "banana:tpl:bg_studio": "btpl_bg_studio",
     "banana:tpl:outfit_black": "btpl_outfit_black",
@@ -236,9 +237,10 @@ LEGACY_ALIASES: Dict[str, str] = {
     "dialog_default": "dialog:plain",
     "dialog:menu": "hub:open:dialog",
     "menu_main": "menu:root",
-    "profile:transactions": "tx:open",
-    "profile:promo": "promo_open",
-    "profile:invite": "ref:open",
+    "PROFILE_TRANSACTIONS": "tx:open",
+    "PROFILE_PROMO": "promo_open",
+    "PROFILE_INVITE": "ref:open",
+    "PROFILE_BACK": "back",
 }
 
 
