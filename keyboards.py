@@ -39,6 +39,22 @@ HOME_CB_MUSIC = NAV_MUSIC
 HOME_CB_VIDEO = NAV_VIDEO
 HOME_CB_DIALOG = NAV_DIALOG
 
+HUB_INLINE_CB_PROFILE = "hub:open:profile"
+HUB_INLINE_CB_KB = "hub:open:kb"
+HUB_INLINE_CB_PHOTO = "hub:open:photo"
+HUB_INLINE_CB_MUSIC = "hub:open:music"
+HUB_INLINE_CB_VIDEO = "hub:open:video"
+HUB_INLINE_CB_DIALOG = "hub:open:dialog"
+
+_INLINE_CALLBACK_OVERRIDES = {
+    HOME_CB_PROFILE: HUB_INLINE_CB_PROFILE,
+    HOME_CB_KB: HUB_INLINE_CB_KB,
+    HOME_CB_PHOTO: HUB_INLINE_CB_PHOTO,
+    HOME_CB_MUSIC: HUB_INLINE_CB_MUSIC,
+    HOME_CB_VIDEO: HUB_INLINE_CB_VIDEO,
+    HOME_CB_DIALOG: HUB_INLINE_CB_DIALOG,
+}
+
 
 _PLAIN_PREFIX_RE = re.compile(r"^[\W_]+", re.UNICODE)
 
@@ -61,7 +77,7 @@ def _build_text_action_variants() -> Dict[str, str]:
     for label, callback in iter_home_menu_buttons():
         variants[label] = callback
         plain = _strip_prefix_symbols(label)
-        if plain and plain != label:
+        if plain and plain != label and callback != HOME_CB_PROFILE:
             variants.setdefault(plain, callback)
     return variants
 
@@ -225,10 +241,14 @@ def build_empty_reply_kb() -> ReplyKeyboardRemove:
 
 def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:
     layout = _get_home_menu_layout()
-    return [
-        [InlineKeyboardButton(text=label, callback_data=callback) for label, callback in row]
-        for row in layout
-    ]
+    rows: List[List[InlineKeyboardButton]] = []
+    for row in layout:
+        buttons: List[InlineKeyboardButton] = []
+        for label, callback in row:
+            inline_cb = _INLINE_CALLBACK_OVERRIDES.get(callback, callback)
+            buttons.append(InlineKeyboardButton(text=label, callback_data=inline_cb))
+        rows.append(buttons)
+    return rows
 
 
 @lru_cache(maxsize=1)
