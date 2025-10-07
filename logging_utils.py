@@ -9,7 +9,20 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from settings import LOG_JSON, LOG_LEVEL, MAX_IN_LOG_BODY
+from core.settings import settings
+
+MAX_IN_LOG_BODY = int(settings.MAX_IN_LOG_BODY)
+
+_LEVEL_MAP = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+
+_JSON_ENABLED = bool(settings.LOG_JSON)
+_DEFAULT_LEVEL = settings.LOG_LEVEL
 
 _SECRET_ENV_KEYS = {
     "DATABASE_URL",
@@ -140,35 +153,65 @@ def log_environment(logger: logging.Logger, *, redact: bool = True) -> None:
     logger.info("environment", extra={"meta": {"env": safe_env}})
 
 
-def configure_logging(app_name: str) -> None:
-    """Configure root logging to emit JSON logs with secret redaction."""
+def _resolve_level(name: str | None) -> int:
+    if not name:
+        name = _DEFAULT_LEVEL
+    normalized = str(name).strip().upper() or "INFO"
+    return _LEVEL_MAP.get(normalized, logging.INFO)
 
-    if not LOG_JSON:
-        logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-        return
+
+def init_logging(app_name: str, level: str | None = None, *, json_logs: bool | None = None) -> None:
+    """Configure root logging according to runtime configuration."""
+
+    effective_level = _resolve_level(level)
+    use_json = _JSON_ENABLED if json_logs is None else bool(json_logs)
 
     global _CONFIGURED
-    if _CONFIGURED:
-        return
-
     with _CONFIG_LOCK:
-        if _CONFIGURED:
-            return
-        handler = logging.StreamHandler()
-        handler.setFormatter(JsonFormatter())
-        root = logging.getLogger()
-        root.handlers.clear()
-        root.addHandler(handler)
-        root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-        logging.captureWarnings(True)
-        for noisy in ("httpx", "urllib3", "aiogram", "telegram", "uvicorn", "gunicorn", "pydantic"):
-            logging.getLogger(noisy).setLevel(logging.WARNING)
-        _CONFIGURED = True
+        if not _CONFIGURED:
+            handler = logging.StreamHandler()
+            if use_json:
+                handler.setFormatter(JsonFormatter())
+            else:
+                handler.setFormatter(
+                    logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+                )
+            root = logging.getLogger()
+            root.handlers.clear()
+            root.addHandler(handler)
+            root.setLevel(effective_level)
+            logging.captureWarnings(True)
+            for noisy in (
+                "httpx",
+                "urllib3",
+                "aiogram",
+                "telegram",
+                "uvicorn",
+                "gunicorn",
+                "pydantic",
+            ):
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+            _CONFIGURED = True
+        else:
+            logging.getLogger().setLevel(effective_level)
+
+    logger = logging.getLogger(app_name)
+    log_level = max(logging.INFO, effective_level)
+    logger.log(
+        log_level,
+        "configuration summary",
+        extra={"meta": settings.configuration_summary()},
+    )
+    logger.log(
+        log_level,
+        "configuration critical",
+        extra={"meta": settings.critical_variables()},
+    )
 
 
 __all__ = [
     "JsonFormatter",
-    "configure_logging",
+    "init_logging",
     "log_environment",
     "refresh_secret_cache",
 ]

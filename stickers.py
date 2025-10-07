@@ -1,12 +1,20 @@
 import logging
-import os
 import time
 from contextlib import suppress
 from threading import Lock
 from typing import Optional
 
 from redis_utils import rds
-from settings import REDIS_PREFIX
+from settings import (
+    MJ_WAIT_STICKER_ID,
+    PROMO_OK_STICKER_ID,
+    PROMPTMASTER_WAIT_STICKER_ID,
+    PURCHASE_OK_STICKER_ID,
+    REDIS_PREFIX,
+    SORA2_WAIT_STICKER_ID,
+    SUNO_WAIT_STICKER_ID,
+    VEO_WAIT_STICKER_ID,
+)
 
 _LOGGER = logging.getLogger("stickers")
 
@@ -17,18 +25,16 @@ _WAIT_MEMORY: dict[int, tuple[float, int]] = {}
 _WAIT_MEMORY_LOCK = Lock()
 
 _WAIT_STICKERS = {
-    "veo": os.getenv("VEO_WAIT_STICKER_ID", "5375464961822695044").strip() or "5375464961822695044",
-    "sora2": os.getenv("SORA2_WAIT_STICKER_ID", "5375464961822695044").strip() or "5375464961822695044",
-    "suno": os.getenv("SUNO_WAIT_STICKER_ID", "5188621441926438751").strip() or "5188621441926438751",
-    "mj": os.getenv("MJ_WAIT_STICKER_ID", "5375074927252621134").strip() or "5375074927252621134",
-    "promptmaster": os.getenv("PROMPTMASTER_WAIT_STICKER_ID", "5334882760735598374").strip()
-    or "5334882760735598374",
+    "veo": VEO_WAIT_STICKER_ID,
+    "sora2": SORA2_WAIT_STICKER_ID,
+    "suno": SUNO_WAIT_STICKER_ID,
+    "mj": MJ_WAIT_STICKER_ID,
+    "promptmaster": PROMPTMASTER_WAIT_STICKER_ID,
 }
 
 _OK_STICKERS = {
-    "purchase": os.getenv("PURCHASE_OK_STICKER_ID", "5471952986970267163").strip()
-    or "5471952986970267163",
-    "promo": os.getenv("PROMO_OK_STICKER_ID", "5199749070830197566").strip() or "5199749070830197566",
+    "purchase": PURCHASE_OK_STICKER_ID,
+    "promo": PROMO_OK_STICKER_ID,
 }
 
 
