@@ -208,12 +208,18 @@ def set_fallback(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitabl
 
 
 LEGACY_ALIASES: Dict[str, str] = {
-    "nav:profile": "menu:profile",
-    "nav:kbase": "menu:kb",
-    "nav:photo": "menu:photo",
-    "nav:music": "menu:music",
-    "nav:video": "menu:video",
-    "nav:dialog": "menu:dialog",
+    "nav:profile": "hub:open:profile",
+    "nav:kbase": "hub:open:kb",
+    "nav:photo": "hub:open:photo",
+    "nav:music": "hub:open:music",
+    "nav:video": "hub:open:video",
+    "nav:dialog": "hub:open:dialog",
+    "menu:profile": "hub:open:profile",
+    "menu:kb": "hub:open:kb",
+    "menu:photo": "hub:open:photo",
+    "menu:music": "hub:open:music",
+    "menu:video": "hub:open:video",
+    "menu:dialog": "hub:open:dialog",
     "menu:root": "menu_main",
     "banana:add_photo": "banana:add_more",
     "banana:clear": "banana:reset_all",
@@ -228,7 +234,7 @@ LEGACY_ALIASES: Dict[str, str] = {
     "music:mode_vocal": "music:vocal",
     "music:start_generation": "music:start",
     "dialog_default": "dialog:plain",
-    "dialog:menu": "menu:dialog",
+    "dialog:menu": "hub:open:dialog",
     "menu_main": "menu:root",
     "profile:transactions": "tx:open",
     "profile:promo": "promo_open",
@@ -422,6 +428,14 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not data_raw:
         await _safe_answer(query)
         return
+
+    chat_obj = getattr(query, "message", None)
+    if chat_obj is not None:
+        chat_obj = getattr(chat_obj, "chat", None)
+    if chat_obj is None:
+        chat_obj = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+    log.info("{\"cb\": %s, \"chat\": %s}", json.dumps(data_raw), "null" if chat_id is None else chat_id)
 
     parsed = _parse_callback(data_raw)
     if not parsed:

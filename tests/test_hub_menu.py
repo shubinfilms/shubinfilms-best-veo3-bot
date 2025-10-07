@@ -26,12 +26,12 @@ def test_build_hub_keyboard_layout():
         "🧠 Диалог",
     ]
     assert callbacks == [
-        "menu:profile",
-        "menu:kb",
-        "menu:photo",
-        "menu:music",
-        "menu:video",
-        "menu:dialog",
+        "hub:open:profile",
+        "hub:open:kb",
+        "hub:open:photo",
+        "hub:open:music",
+        "hub:open:video",
+        "hub:open:dialog",
     ]
 
 

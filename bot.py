@@ -5838,6 +5838,110 @@ async def show_emoji_hub_for_chat(
     return None
 
 
+async def profile_open(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit_in_place: bool = False,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    message = getattr(query, "message", None)
+    chat_obj = getattr(update, "effective_chat", None) or getattr(message, "chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+    if chat_id is None:
+        with suppress(BadRequest):
+            await query.answer()
+        return
+
+    message_id = getattr(message, "message_id", None)
+    if isinstance(message_id, int) and not _acquire_callback_lock(chat_id, message_id):
+        return
+
+    with suppress(BadRequest):
+        await query.answer()
+
+    state_dict = state(ctx)
+    stored_mid = _get_profile_card_message_id(chat_id)
+    state_mid = state_dict.get(BALANCE_CARD_STATE_KEY)
+    if stored_mid is None and isinstance(state_mid, int):
+        stored_mid = state_mid
+    if stored_mid:
+        state_dict[BALANCE_CARD_STATE_KEY] = stored_mid
+
+    session_disable_chat(ctx)
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    has_existing = bool(stored_mid)
+    force_new = not has_existing if edit_in_place else True
+
+    result_mid = await send_profile_card(
+        chat_id,
+        ctx,
+        user_id=user_id,
+        force_new=force_new,
+    )
+    if result_mid is None:
+        return
+
+    _set_profile_card_message_id(chat_id, result_mid)
+    action = "edit" if has_existing and edit_in_place and result_mid == stored_mid else "send"
+    log.info("{\"profile\": %s, \"msg_id\": %s}", json.dumps(action), result_mid)
+
+
+async def kb_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "menu:kb", query=update.callback_query)
+
+
+async def photo_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "menu:photo", query=update.callback_query)
+
+
+async def music_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "menu:music", query=update.callback_query)
+
+
+async def video_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "menu:video", query=update.callback_query)
+
+
+async def dialog_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await route_home(update, ctx, "menu:dialog", query=update.callback_query)
+
+
+async def handle_hub_open_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    if not data:
+        with suppress(BadRequest):
+            await query.answer()
+        return
+
+    if data == "hub:open:profile":
+        await profile_open(update, ctx, edit_in_place=True)
+        return
+
+    route = {
+        "hub:open:kb": "menu:kb",
+        "hub:open:photo": "menu:photo",
+        "hub:open:music": "menu:music",
+        "hub:open:video": "menu:video",
+        "hub:open:dialog": "menu:dialog",
+    }.get(data)
+    if not route:
+        with suppress(BadRequest):
+            await query.answer()
+        return
+
+    await route_home(update, ctx, route, query=query)
+
+
 async def show_emoji_hub(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, replace: bool = False
 ) -> Optional[int]:
@@ -6089,6 +6193,61 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "profile": "balance",
     "back_main": "profile_topup",
 }
+
+
+_PROFILE_CARD_KEY_TMPL = f"{REDIS_PREFIX}:profile:card_msg_id:{{chat_id}}"
+_CALLBACK_LOCK_KEY_TMPL = f"{REDIS_PREFIX}:lock:cb:{{chat_id}}:{{message_id}}"
+_profile_card_memory: Dict[int, int] = {}
+_callback_lock_memory: Dict[tuple[int, int], float] = {}
+
+
+def _profile_card_key(chat_id: int) -> str:
+    return _PROFILE_CARD_KEY_TMPL.format(chat_id=int(chat_id))
+
+
+def _callback_lock_key(chat_id: int, message_id: int) -> str:
+    return _CALLBACK_LOCK_KEY_TMPL.format(chat_id=int(chat_id), message_id=int(message_id))
+
+
+def _get_profile_card_message_id(chat_id: int) -> Optional[int]:
+    key = _profile_card_key(chat_id)
+    if rds is not None:
+        try:
+            value = rds.get(key)
+        except Exception:
+            value = None
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return _profile_card_memory.get(int(chat_id))
+
+
+def _set_profile_card_message_id(chat_id: int, message_id: int) -> None:
+    key = _profile_card_key(chat_id)
+    if rds is not None:
+        try:
+            rds.set(key, int(message_id))
+        except Exception:
+            pass
+    _profile_card_memory[int(chat_id)] = int(message_id)
+
+
+def _acquire_callback_lock(chat_id: int, message_id: int, *, ttl: int = 2) -> bool:
+    key = _callback_lock_key(chat_id, message_id)
+    if rds is not None:
+        try:
+            return bool(rds.set(key, "1", nx=True, ex=max(1, int(ttl))))
+        except Exception:
+            pass
+    now = time.monotonic()
+    cache_key = (int(chat_id), int(message_id))
+    expires = _callback_lock_memory.get(cache_key)
+    if expires and expires > now:
+        return False
+    _callback_lock_memory[cache_key] = now + max(1, float(ttl))
+    return True
 
 
 async def route_home(
@@ -7794,6 +7953,12 @@ def banana_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("↩️ Назад", callback_data="banana:back"),
             ],
         ]
+    )
+
+
+def banana_generating_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏳ Генерация…", callback_data="noop")]]
     )
 
 
@@ -15255,7 +15420,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Шаблон подставлен ✅")
         return
 
-    if data in {"banana_regenerate_fresh", "banana:start"}:
+    if data in {"banana_regenerate_fresh", "banana:restart"}:
         s["banana_images"] = []
         s["last_prompt"] = None
         s["_last_text_banana"] = None
@@ -15871,7 +16036,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["banana_balance"] = new_balance
             s["_last_text_banana"] = None
             clear_wait_state(uid, reason="banana_confirm")
-            await show_banana_card(chat_id, ctx)
+            if q.message is not None:
+                try:
+                    await q.edit_message_reply_markup(reply_markup=banana_generating_markup())
+                except Exception:
+                    pass
+            with suppress(BadRequest):
+                await q.answer("Запускаю…")
+            log.info('{"banana":"start","card_preserved":true}')
             await show_balance_notification(
                 chat_id,
                 ctx,
@@ -17875,7 +18047,6 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("video", "veo"), video_command),
     (("music", "suno"), suno_command),
     (("balance",), balance_command),
-    (("profile",), profile_command),
     (("kb", "knowledge_base"), kb_command),
     (("help", "support"), help_command_entry),
 ]
@@ -17917,6 +18088,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
+    (r"^(hub:open:(profile|kb|photo|music|video|dialog))$", handle_hub_open_callback),
     (
         r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
         hub_router,
