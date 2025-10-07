@@ -67,9 +67,6 @@ def mask_tokens(text: Any) -> str:
             cleaned = cleaned.replace(token, "***")
     return cleaned
 
-_DEFAULT_PROMPTS_URL = "https://t.me/bestveo3promts"
-_HUB_PROMPTS_URL = (os.getenv("PROMPTS_CHANNEL_URL") or _DEFAULT_PROMPTS_URL).strip() or _DEFAULT_PROMPTS_URL
-
 _ALLOWED_HTML_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "blockquote", "tg-spoiler"}
 _ALLOWED_HTML_ATTRS = {"a": {"href"}}
 _HTML_REMAP = {"strong": "b", "em": "i"}
@@ -175,32 +172,14 @@ def sanitize_html(text: str) -> str:
 
 
 def build_hub_text(balance: Union[int, BalanceSnapshot]) -> str:
-    """Render the main hub text with the current balance."""
+    """Return the formatted text for the main menu card."""
 
-    warning: Optional[str]
-    if isinstance(balance, BalanceSnapshot):
-        display = balance.display
-        warning = balance.warning
-    else:
-        try:
-            display = str(int(balance))
-        except (TypeError, ValueError):
-            display = "0"
-        warning = None
-
-    text = (
-        "👋 Добро пожаловать!\n"
-        f"💎 Ваш баланс: {display}💎\n"
-        f"🧾 Больше идей и примеров — [канал с промптами]({_HUB_PROMPTS_URL})\n\n"
-        "Выберите, что хотите сделать:"
-    )
-    if warning:
-        text = f"{text}\n{warning}"
-    return text
+    return "<b>📋 Главное меню</b>\n<i>Выберите раздел:</i>"
 
 
 def build_hub_keyboard() -> InlineKeyboardMarkup:
-    """Return a compact 2x3 inline keyboard for the emoji hub."""
+    """Return the inline keyboard markup for the main menu card."""
+
     return main_menu_kb()
 
 

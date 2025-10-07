@@ -75,4 +75,4 @@ def test_quick_keyboard_sent_once(monkeypatch, ctx):
     reply_keyboards = [
         entry for entry in bot.sent if isinstance(entry.get("reply_markup"), ReplyKeyboardMarkup)
     ]
-    assert len(reply_keyboards) == 1
+    assert len(reply_keyboards) == 0

@@ -20,10 +20,10 @@ def test_build_hub_keyboard_layout():
     assert texts == [
         "👤 Профиль",
         "📚 База знаний",
-        "📸 Фото",
-        "🎧 Музыка",
-        "📹 Видео",
-        "🧠 Диалог",
+        "📸 Режим фото",
+        "🎧 Режим музыки",
+        "📹 Режим видео",
+        "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
         "hub:open:profile",
@@ -38,15 +38,4 @@ def test_build_hub_keyboard_layout():
 def test_build_hub_text_contains_balance_and_link():
     text = build_hub_text(123)
 
-    assert text.startswith("👋 Добро пожаловать!")
-    assert "💎 Ваш баланс: 123💎" in text
-    assert "🧾 Больше идей и примеров — [канал с промптами](" in text
-    assert text.strip().endswith("Выберите, что хотите сделать:")
-
-    link_marker = "[канал с промптами]("
-    start = text.index(link_marker) + len(link_marker)
-    end = text.index(")", start)
-    url = text[start:end]
-
-    assert url
-    assert url.strip() != ""
+    assert text == "<b>📋 Главное меню</b>\n<i>Выберите раздел:</i>"

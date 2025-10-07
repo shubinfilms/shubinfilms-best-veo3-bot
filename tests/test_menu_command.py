@@ -37,8 +37,8 @@ def test_main_menu_keyboard_layout():
 
     assert labels == [
         ["👤 Профиль", "📚 База знаний"],
-        ["📸 Фото", "🎧 Музыка"],
-        ["📹 Видео", "🧠 Диалог"],
+        ["📸 Режим фото", "🎧 Режим музыки"],
+        ["📹 Режим видео", "🧠 Диалог с ИИ"],
     ]
 
 
@@ -78,7 +78,7 @@ def test_menu_command_always_sends_welcome_block(monkeypatch):
 
     assert isinstance(first_hub_id, int)
     assert bot.sent
-    assert bot.sent[0]["text"].startswith("👋 Добро пожаловать!")
+    assert bot.sent[0]["text"].startswith("<b>📋 Главное меню</b>")
 
     asyncio.run(bot_module.handle_menu(update, ctx))
     second_hub_id = ctx.user_data.get("hub_msg_id")
@@ -88,7 +88,7 @@ def test_menu_command_always_sends_welcome_block(monkeypatch):
 
     welcome_texts = [entry["text"] for entry in bot.sent if entry.get("text", "").strip()]
     assert len(welcome_texts) == 2
-    assert all(text.startswith("👋 Добро пожаловать!") for text in welcome_texts)
+    assert all(text.startswith("<b>📋 Главное меню</b>") for text in welcome_texts)
 
     assert bot.deleted
     deleted_ids = {payload.get("message_id") for payload in bot.deleted}
