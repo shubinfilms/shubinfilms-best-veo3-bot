@@ -15,7 +15,7 @@ from asyncio.subprocess import PIPE
 from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence, Union
 
 from pathlib import Path
 from io import BytesIO
@@ -31,6 +31,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from metrics import telegram_send_total
+from core.balance_provider import BalanceSnapshot
 from keyboards import CB_VIDEO_MENU, main_menu_kb
 
 log = logging.getLogger("telegram.utils")
@@ -173,20 +174,29 @@ def sanitize_html(text: str) -> str:
     return parser.get_text()
 
 
-def build_hub_text(user_balance: int) -> str:
+def build_hub_text(balance: Union[int, BalanceSnapshot]) -> str:
     """Render the main hub text with the current balance."""
 
-    try:
-        balance_value = int(user_balance)
-    except (TypeError, ValueError):
-        balance_value = 0
+    warning: Optional[str]
+    if isinstance(balance, BalanceSnapshot):
+        display = balance.display
+        warning = balance.warning
+    else:
+        try:
+            display = str(int(balance))
+        except (TypeError, ValueError):
+            display = "0"
+        warning = None
 
-    return (
+    text = (
         "👋 Добро пожаловать!\n"
-        f"💎 Ваш баланс: {balance_value}💎\n"
+        f"💎 Ваш баланс: {display}💎\n"
         f"🧾 Больше идей и примеров — [канал с промптами]({_HUB_PROMPTS_URL})\n\n"
         "Выберите, что хотите сделать:"
     )
+    if warning:
+        text = f"{text}\n{warning}"
+    return text
 
 
 def build_hub_keyboard() -> InlineKeyboardMarkup:

@@ -1,5 +1,6 @@
 from functools import lru_cache
-from typing import Iterable, List, Optional, Tuple
+import re
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from telegram import (
     InlineKeyboardButton,
@@ -8,6 +9,8 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+
+from utils.text_normalizer import normalize_btn_text
 
 
 
@@ -36,12 +39,127 @@ HOME_CB_MUSIC = NAV_MUSIC
 HOME_CB_VIDEO = NAV_VIDEO
 HOME_CB_DIALOG = NAV_DIALOG
 
+
+_PLAIN_PREFIX_RE = re.compile(r"^[\W_]+", re.UNICODE)
+
+
+def _strip_prefix_symbols(label: str) -> str:
+    return _PLAIN_PREFIX_RE.sub("", label or "").strip()
+
+
 def iter_home_menu_buttons() -> Iterable[Tuple[str, str]]:
     """Yield flattened pairs of ``(text, callback_data)`` for the home layout."""
 
     for row in _get_home_menu_layout():
         for label, callback in row:
             yield label, callback
+
+
+@lru_cache(maxsize=1)
+def _build_text_action_variants() -> Dict[str, str]:
+    variants: Dict[str, str] = {}
+    for label, callback in iter_home_menu_buttons():
+        variants[label] = callback
+        plain = _strip_prefix_symbols(label)
+        if plain and plain != label:
+            variants.setdefault(plain, callback)
+    return variants
+
+
+class _LazyTextActionVariants(dict[str, str]):
+    """Lazily materialized map of reply labels to callback payloads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._loaded = False
+
+    def _ensure(self) -> None:
+        if not self._loaded:
+            super().update(_build_text_action_variants())
+            self._loaded = True
+
+    def __getitem__(self, key: str) -> str:  # type: ignore[override]
+        self._ensure()
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:  # type: ignore[override]
+        self._ensure()
+        return super().get(key, default)
+
+    def items(self):  # type: ignore[override]
+        self._ensure()
+        return super().items()
+
+    def keys(self):  # type: ignore[override]
+        self._ensure()
+        return super().keys()
+
+    def values(self):  # type: ignore[override]
+        self._ensure()
+        return super().values()
+
+    def __iter__(self):  # type: ignore[override]
+        self._ensure()
+        return super().__iter__()
+
+    def __len__(self) -> int:  # type: ignore[override]
+        self._ensure()
+        return super().__len__()
+
+    def __contains__(self, key: object) -> bool:  # type: ignore[override]
+        self._ensure()
+        return super().__contains__(key)
+
+
+class _LazyTextToAction(dict[str, str]):
+    """Lazily normalized map for reply button dispatch."""
+
+    def __init__(self, source: _LazyTextActionVariants) -> None:
+        super().__init__()
+        self._source = source
+        self._loaded = False
+
+    def _ensure(self) -> None:
+        if not self._loaded:
+            for label, callback in self._source.items():
+                normalized = normalize_btn_text(label)
+                if normalized:
+                    self.setdefault(normalized, callback)
+            self._loaded = True
+
+    def __getitem__(self, key: str) -> str:  # type: ignore[override]
+        self._ensure()
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:  # type: ignore[override]
+        self._ensure()
+        return super().get(key, default)
+
+    def items(self):  # type: ignore[override]
+        self._ensure()
+        return super().items()
+
+    def keys(self):  # type: ignore[override]
+        self._ensure()
+        return super().keys()
+
+    def values(self):  # type: ignore[override]
+        self._ensure()
+        return super().values()
+
+    def __iter__(self):  # type: ignore[override]
+        self._ensure()
+        return super().__iter__()
+
+    def __len__(self) -> int:  # type: ignore[override]
+        self._ensure()
+        return super().__len__()
+
+    def __contains__(self, key: object) -> bool:  # type: ignore[override]
+        self._ensure()
+        return super().__contains__(key)
+
+
 
 
 AI_MENU_CB = HOME_CB_DIALOG
@@ -138,6 +256,10 @@ def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], Tuple[str, str]], ..
             (TXT_KB_AI_DIALOG, HOME_CB_DIALOG),
         ),
     )
+
+
+TEXT_ACTION_VARIANTS: Dict[str, str] = _LazyTextActionVariants()
+TEXT_TO_ACTION: Dict[str, str] = _LazyTextToAction(TEXT_ACTION_VARIANTS)  # type: ignore[arg-type]
 
 
 def _row(*buttons: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
