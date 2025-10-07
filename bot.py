@@ -8,6 +8,7 @@
 # odex/fix-balance-reset-after-deploy
 import logging
 import os
+import functools
 
 import settings as _app_settings
 from logging_utils import init_logging, log_environment
@@ -456,6 +457,7 @@ GIT_REVISION = _detect_git_revision()
 ACTIVE_TASKS: Dict[int, str] = {}
 _SORA2_POLLERS: Dict[str, asyncio.Task[None]] = {}
 SHUTDOWN_EVENT = threading.Event()
+APPLICATION_READY = threading.Event()
 
 SUNO_SERVICE = SunoService()
 
@@ -14444,10 +14446,13 @@ async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, A
     else:
         telegram_user = me.to_dict()
 
+    ready = APPLICATION_READY.is_set()
     payload: Dict[str, Any] = {
         "status": "ok"
         if telegram_status == "ok" and redis_status in {"ok", "disabled"}
         else "error",
+        "state": "ready" if ready else "starting",
+        "ready": ready,
         "uptime": f"{uptime_seconds}s",
         "redis": redis_status,
         "telegram": telegram_status,
@@ -17929,102 +17934,134 @@ async def run_bot_async() -> None:
 
     lock = RedisRunnerLock(REDIS_URL, _rk("lock", "runner"), REDIS_LOCK_ENABLED, APP_VERSION)
 
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def request_shutdown(sig: Optional[signal.Signals]) -> None:
+        signal_name = getattr(sig, "name", None) or (str(sig) if sig else "external")
+        log.info("shutdown.requested", extra={"signal": signal_name})
+        if not stop_event.is_set():
+            loop.call_soon_threadsafe(stop_event.set)
+
+    lock.add_stop_callback(request_shutdown)
+
+    managed_signals: list[signal.Signals] = []
+    for sig_name in ("SIGTERM", "SIGINT", "SIGABRT"):
+        if not hasattr(signal, sig_name):
+            continue
+        sig = getattr(signal, sig_name)
+        try:
+            loop.add_signal_handler(sig, functools.partial(request_shutdown, sig))
+            managed_signals.append(sig)
+        except (NotImplementedError, RuntimeError):
+            continue
+
     try:
-        async with lock:
-            log.info(
-                "Bot starting… (Redis=%s, lock=%s)",
-                "on" if redis_client else "off",
-                "enabled" if lock.enabled else "disabled",
-            )
-
-            initialized = False
-            started = False
-            updater = application.updater
-
-            try:
-                await application.initialize()
-                initialized = True
-
-                try:
-                    await _run_suno_probe()
-                except Exception as exc:
-                    log.warning("SUNO probe execution failed: %s", exc)
-
-                try:
-                    await application.bot.set_my_commands([
-                        BotCommand("menu", "⭐ Главное меню"),
-                        BotCommand("profile", "👤 Профиль"),
-                        BotCommand("kb", "📚 База знаний"),
-                        BotCommand("video", "📹 Режим видео"),
-                        BotCommand("image", "📸 Режим фото"),
-                        BotCommand("music", "🎧 Режим музыки"),
-                        BotCommand("chat", "🧠 Диалог с ИИ"),
-                        BotCommand("buy", "💎 Купить генерации"),
-                        BotCommand("lang", "🌍 Изменить язык"),
-                        BotCommand("help", "🆘 Поддержка"),
-                        BotCommand("faq", "❓ FAQ"),
-                    ])
-                except Exception as exc:
-                    log.warning("Failed to set bot commands: %s", exc)
-
-                try:
-                    await application.bot.delete_webhook(drop_pending_updates=True)
-                    event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-                    log.info("Webhook deleted")
-                except Exception as exc:
-                    event("WEBHOOK_DELETE_ERROR", error=str(exc))
-                    log.warning("Delete webhook failed: %s", exc)
-
-                await application.start()
-                started = True
-
-                if updater is None:
-                    raise RuntimeError("Application updater is not available")
-
-                log.info("Starting polling")
-
-                await updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                )
-
-                handler_count = sum(len(group) for group in application.handlers.values())
-                ptb_version = getattr(_tg, "__version__", "unknown") if _tg else "unknown"
+        try:
+            async with lock:
                 log.info(
-                    "[BOT READY] PTB=%s handlers=%d mode=polling",
-                    ptb_version,
-                    handler_count,
-                    extra={
-                        "app_version": APP_VERSION,
-                        "git": GIT_REVISION,
-                        "redis": "on" if redis_client else "off",
-                    },
+                    "Bot starting… (Redis=%s, lock=%s)",
+                    "on" if redis_client else "off",
+                    "enabled" if lock.enabled else "disabled",
                 )
 
-                await updater.wait_until_closed()
-            except asyncio.CancelledError:
-                log.info("run_bot_async.cancelled")
-                raise
-            finally:
-                if updater is not None:
+                initialized = False
+                started = False
+                updater = application.updater
+
+                try:
+                    await application.initialize()
+                    initialized = True
+
                     try:
-                        await updater.stop()
-                    except RuntimeError:
-                        pass
-                    except Exception:
-                        log.warning("Updater stop raised", exc_info=True)
+                        await _run_suno_probe()
+                    except Exception as exc:
+                        log.warning("SUNO probe execution failed: %s", exc)
 
-                if started:
-                    with suppress(Exception):
-                        await application.stop()
+                    try:
+                        await application.bot.set_my_commands([
+                            BotCommand("menu", "⭐ Главное меню"),
+                            BotCommand("profile", "👤 Профиль"),
+                            BotCommand("kb", "📚 База знаний"),
+                            BotCommand("video", "📹 Режим видео"),
+                            BotCommand("image", "📸 Режим фото"),
+                            BotCommand("music", "🎧 Режим музыки"),
+                            BotCommand("chat", "🧠 Диалог с ИИ"),
+                            BotCommand("buy", "💎 Купить генерации"),
+                            BotCommand("lang", "🌍 Изменить язык"),
+                            BotCommand("help", "🆘 Поддержка"),
+                            BotCommand("faq", "❓ FAQ"),
+                        ])
+                    except Exception as exc:
+                        log.warning("Failed to set bot commands: %s", exc)
 
-                if initialized:
-                    with suppress(Exception):
-                        await application.shutdown()
+                    try:
+                        await application.bot.delete_webhook(drop_pending_updates=True)
+                        event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+                        log.info("Webhook deleted")
+                    except Exception as exc:
+                        event("WEBHOOK_DELETE_ERROR", error=str(exc))
+                        log.warning("Delete webhook failed: %s", exc)
 
-                SHUTDOWN_EVENT.set()
-    except RedisLockBusy:
-        log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+                    await application.start()
+                    started = True
+
+                    if updater is None:
+                        raise RuntimeError("Application updater is not available")
+
+                    log.info("Starting polling")
+
+                    await updater.start_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True,
+                    )
+
+                    handler_count = sum(len(group) for group in application.handlers.values())
+                    ptb_version = getattr(_tg, "__version__", "unknown") if _tg else "unknown"
+                    log.info(
+                        "[BOT READY] PTB=%s handlers=%d mode=polling",
+                        ptb_version,
+                        handler_count,
+                        extra={
+                            "app_version": APP_VERSION,
+                            "git": GIT_REVISION,
+                            "redis": "on" if redis_client else "off",
+                        },
+                    )
+
+                    APPLICATION_READY.set()
+
+                    try:
+                        await stop_event.wait()
+                    except asyncio.CancelledError:
+                        request_shutdown(None)
+                        raise
+                except asyncio.CancelledError:
+                    log.info("run_bot_async.cancelled")
+                    raise
+                finally:
+                    APPLICATION_READY.clear()
+                    if updater is not None and updater.running:
+                        try:
+                            await updater.stop()
+                        except Exception:
+                            log.warning("Updater stop raised", exc_info=True)
+
+                    if started:
+                        with suppress(Exception):
+                            await application.stop()
+
+                    if initialized:
+                        with suppress(Exception):
+                            await application.shutdown()
+
+                    SHUTDOWN_EVENT.set()
+        except RedisLockBusy:
+            log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
+    finally:
+        for sig in managed_signals:
+            with suppress(Exception):
+                loop.remove_signal_handler(sig)
 
 
 def main() -> None:
