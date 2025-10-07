@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tests.suno_test_utils import FakeBot, bot_module
-from texts import TXT_KNOWLEDGE_INTRO
+from handlers.knowledge_base import KB_TEMPLATES, KB_TEMPLATE_VIDEO
 
 
 @pytest.fixture
@@ -46,18 +46,12 @@ def _make_update(chat_id: int, user_id: int):
 
 def test_kb_templates_to_video(monkeypatch, ctx):
     bot = ctx.bot
-    edit_calls = []
     video_calls = []
-
-    async def fake_safe_edit_message(ctx_param, chat_id_param, message_id_param, text_param, reply_markup_param, **kwargs):
-        edit_calls.append(text_param)
-        return True
 
     async def fake_start_video_menu(update, context):
         video_calls.append(True)
         return None
 
-    monkeypatch.setattr(bot_module, "safe_edit_message", fake_safe_edit_message)
     monkeypatch.setattr(bot_module, "start_video_menu", fake_start_video_menu)
 
     update, query = _make_update(chat_id=555, user_id=777)
@@ -66,12 +60,14 @@ def test_kb_templates_to_video(monkeypatch, ctx):
     asyncio.run(bot_module.hub_router(update, ctx))
 
     meaningful = [entry for entry in bot.sent if (entry.get("text") or "").strip()]
-    assert any(entry.get("text") == TXT_KNOWLEDGE_INTRO for entry in meaningful)
+    assert any(entry.get("text") == "<b>📚 База знаний</b>\n<i>Выберите раздел:</i>" for entry in meaningful)
 
-    query.data = "kb_templates"
+    query.data = KB_TEMPLATES
     asyncio.run(bot_module.hub_router(update, ctx))
-    assert edit_calls and "✨ Готовые шаблоны" in edit_calls[-1]
+    state_obj = ctx.user_data.get("state", {})
+    assert state_obj.get("active_card") == "kb:templates"
 
-    query.data = "tpl_video"
+    query.data = KB_TEMPLATE_VIDEO
     asyncio.run(bot_module.hub_router(update, ctx))
-    assert video_calls, "Video menu should be triggered from templates"
+    assert not video_calls, "Templates should not trigger video menu automatically"
+    assert any(entry.get("text", "").startswith("🎬 Шаблон генерации видео") for entry in bot.sent)

@@ -49,8 +49,9 @@ def test_ai_dialog_submenu_render(monkeypatch):
 
     asyncio.run(bot_module.hub_router(update, ctx))
 
-    assert captured["text"] == f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
+    assert captured["text"] == f"<b>{TXT_KB_AI_DIALOG}</b>\n<i>{TXT_AI_DIALOG_CHOOSE}</i>"
     markup = captured["markup"]
     rows = markup.inline_keyboard
-    assert len(rows) == 1
+    assert len(rows) == 2
     assert [button.text for button in rows[0]] == [TXT_AI_DIALOG_NORMAL, TXT_AI_DIALOG_PM]
+    assert [button.text for button in rows[1]] == ["⬅️ Назад"]

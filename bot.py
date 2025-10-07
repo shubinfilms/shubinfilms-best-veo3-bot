@@ -216,8 +216,6 @@ from keyboards import (
     mj_upscale_select_keyboard,
     suno_modes_keyboard,
     suno_start_disabled_keyboard,
-    kb_kb_root,
-    kb_kb_templates,
     kb_profile_topup_entry,
     dialog_picker_inline,
     menu_pay_unified,
@@ -240,13 +238,31 @@ from texts import (
     TXT_KB_PHOTO,
     TXT_KB_PROFILE,
     TXT_KB_VIDEO,
-    TXT_KNOWLEDGE_INTRO,
     TXT_MENU_TITLE,
     TXT_PROFILE_TITLE,
     TXT_TOPUP_CHOOSE,
     TXT_PAY_CRYPTO_OPEN_LINK,
     common_text,
     t,
+)
+
+from handlers.menu import (
+    build_dialog_card,
+    build_main_menu_card,
+    build_music_card,
+    build_photo_card,
+    build_profile_card,
+    build_video_card,
+)
+from handlers.knowledge_base import (
+    KB_PREFIX,
+    KB_ROOT,
+    configure as configure_knowledge_base,
+    handle_callback as knowledge_base_callback,
+    open_root as knowledge_base_open_root,
+    show_examples as knowledge_base_show_examples,
+    show_lessons as knowledge_base_show_lessons,
+    show_templates as knowledge_base_show_templates,
 )
 
 from balance import ensure_tokens, insufficient_balance_keyboard
@@ -418,8 +434,6 @@ from metrics import (
     faq_views_total,
 )
 from telegram_utils import (
-    build_hub_keyboard,
-    build_hub_text,
     safe_send as tg_safe_send,
     safe_edit,
     safe_edit_text,
@@ -5256,8 +5270,6 @@ BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
 BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
-KB_MENU_STATE_KEY = "last_ui_msg_id_kb"
-KB_MENU_MSG_IDS_KEY = "kb"
 STATE_CHAT_MODE = "chat_mode"
 STATE_ACTIVE_CARD = "active_card"
 STATE_QUICK_KEYBOARD_CHAT = "quick_keyboard_hidden_for"
@@ -5530,29 +5542,7 @@ async def ensure_main_reply_keyboard(
         return
 
     state_obj = state_dict if isinstance(state_dict, dict) else state(ctx)
-    already_sent = state_obj.get(STATE_QUICK_KEYBOARD_CHAT)
-    if already_sent == chat_id:
-        return
-
-    payload_text = text if isinstance(text, str) and text.strip() else " "
-
-    try:
-        message = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=payload_text,
-            reply_markup=build_main_reply_kb(),
-        )
-    except Exception as exc:
-        log.debug(
-            "ui.reply_keyboard.restore_failed",
-            extra={"chat_id": chat_id, "error": str(exc)},
-        )
-        return
-
     state_obj[STATE_QUICK_KEYBOARD_CHAT] = chat_id
-    msg_ids = state_obj.get("msg_ids")
-    if isinstance(msg_ids, dict):
-        msg_ids["quick_keyboard_remove"] = getattr(message, "message_id", None)
 
 
 async def hide_quick_keyboard(
@@ -5563,81 +5553,6 @@ async def hide_quick_keyboard(
 ) -> None:
     await ensure_main_reply_keyboard(ctx, chat_id, state_dict=state_dict)
 
-
-async def _kb_show_root(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    state_dict: Dict[str, Any],
-) -> Optional[int]:
-    message_id = await safe_edit_or_send_menu(
-        ctx,
-        chat_id=chat_id,
-        text=TXT_KNOWLEDGE_INTRO,
-        reply_markup=kb_kb_root(),
-        state_key=KB_MENU_STATE_KEY,
-        msg_ids_key=KB_MENU_MSG_IDS_KEY,
-        state_dict=state_dict,
-        log_label="ui.kb.root",
-    )
-    state_dict[STATE_ACTIVE_CARD] = "kb:root"
-    return message_id
-
-
-async def _kb_show_examples(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    state_dict: Dict[str, Any],
-) -> Optional[int]:
-    message_id = await safe_edit_or_send_menu(
-        ctx,
-        chat_id=chat_id,
-        text="🪄 Примеры генераций: (скоро)",
-        reply_markup=kb_kb_root(),
-        state_key=KB_MENU_STATE_KEY,
-        msg_ids_key=KB_MENU_MSG_IDS_KEY,
-        state_dict=state_dict,
-        log_label="ui.kb.examples",
-    )
-    state_dict[STATE_ACTIVE_CARD] = "kb:examples"
-    return message_id
-
-
-async def _kb_show_lessons(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    state_dict: Dict[str, Any],
-) -> Optional[int]:
-    message_id = await safe_edit_or_send_menu(
-        ctx,
-        chat_id=chat_id,
-        text="💡 Мини видео уроки: (скоро)",
-        reply_markup=kb_kb_root(),
-        state_key=KB_MENU_STATE_KEY,
-        msg_ids_key=KB_MENU_MSG_IDS_KEY,
-        state_dict=state_dict,
-        log_label="ui.kb.lessons",
-    )
-    state_dict[STATE_ACTIVE_CARD] = "kb:lessons"
-    return message_id
-
-
-async def _kb_show_templates(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    state_dict: Dict[str, Any],
-) -> Optional[int]:
-    message_id = await safe_edit_or_send_menu(
-        ctx,
-        chat_id=chat_id,
-        text="✨ Готовые шаблоны\nВыберите шаблон:",
-        reply_markup=kb_kb_templates(),
-        state_key=KB_MENU_STATE_KEY,
-        msg_ids_key=KB_MENU_MSG_IDS_KEY,
-        state_dict=state_dict,
-        log_label="ui.kb.templates",
-    )
-    state_dict[STATE_ACTIVE_CARD] = "kb:templates"
-    return message_id
 
 async def refresh_suno_card(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -5798,10 +5713,9 @@ async def show_emoji_hub_for_chat(
 
     snapshot = _resolve_balance_snapshot(ctx, resolved_uid, prefer_cached=False)
 
-    text = build_hub_text(snapshot)
-    keyboard = build_hub_keyboard()
+    card = build_main_menu_card()
 
-    log.info("hub.show | user_id=%s balance=%s", resolved_uid, snapshot.display)
+    log.info("[UI] menu opened", extra={"chat_id": chat_id, "user_id": resolved_uid})
 
     state_dict = state(ctx)
 
@@ -5814,16 +5728,15 @@ async def show_emoji_hub_for_chat(
             await ctx.bot.delete_message(chat_id=chat_id, message_id=hub_msg_id)
         ctx.user_data["hub_msg_id"] = None
 
+    send_payload = dict(card)
+    send_payload["chat_id"] = chat_id
+
     try:
         message = await tg_safe_send(
             ctx.bot.send_message,
             method_name="sendMessage",
             kind="message",
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
+            **send_payload,
         )
     except Exception as exc:  # pragma: no cover - network issues
         log.warning("hub.send_failed | user_id=%s err=%s", resolved_uid, exc)
@@ -5832,8 +5745,6 @@ async def show_emoji_hub_for_chat(
     message_id = getattr(message, "message_id", None)
     if isinstance(message_id, int):
         ctx.user_data["hub_msg_id"] = message_id
-
-    await ensure_main_reply_keyboard(ctx, chat_id, state_dict=state_dict)
 
     if isinstance(message_id, int):
         return message_id
@@ -5967,121 +5878,30 @@ async def show_main_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Option
 async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     resolved_uid = get_user_id(ctx) or chat_id
     snapshot = _resolve_balance_snapshot(ctx, int(resolved_uid), prefer_cached=True)
-    text = f"👤 *Профиль*\nВаш баланс: *{snapshot.display}* 💎"
-    if snapshot.warning:
-        text = f"{text}\n{snapshot.warning}"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💎 Пополнить баланс", callback_data="topup_open")],
-            [InlineKeyboardButton("🧾 История операций", callback_data="noop")],
-            [InlineKeyboardButton("👥 Пригласить друга", callback_data="noop")],
-            [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_open")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    card = build_profile_card(snapshot.display, snapshot.warning)
+    await ctx.bot.send_message(chat_id, **card)
 
 
 async def show_kb_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "📚 *База знаний*\nВыберите раздел:"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✨ Примеры генераций", url=PROMPTS_CHANNEL_URL)],
-            [InlineKeyboardButton("🧩 Готовые шаблоны", callback_data="noop")],
-            [InlineKeyboardButton("💡 Мини видео-уроки", callback_data="noop")],
-            [InlineKeyboardButton("❓ Частые вопросы", callback_data="faq")],
-            [InlineKeyboardButton("⬅️ Назад (в главное)", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    await knowledge_base_open_root(ctx, chat_id)
 
 
 async def show_images_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "🎨 *Выберите движок для изображений*"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Midjourney", callback_data="mode:mj_txt")],
-            [InlineKeyboardButton("Banana", callback_data="mode:banana")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    await ctx.bot.send_message(chat_id, **build_photo_card())
 
 
 async def show_video_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "🎬 *Режимы VEO:*"
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"Генерация видео (Veo Fast) 💎 {TOKEN_COSTS['veo_fast']}",
-                    callback_data="mode:veo_text_fast",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Оживить изображение (Veo) 💎 {TOKEN_COSTS['veo_photo']}",
-                    callback_data="mode:veo_photo",
-                )
-            ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    card = build_video_card(veo_fast_cost=TOKEN_COSTS["veo_fast"], veo_photo_cost=TOKEN_COSTS["veo_photo"])
+    await ctx.bot.send_message(chat_id, **card)
 
 
 async def show_music_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "🎧 *Музыка (Suno)*\nВыберите режим:"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🎼 Инструментал", callback_data="music:inst")],
-            [InlineKeyboardButton("🎙 Вокал", callback_data="music:vocal")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    await ctx.bot.send_message(chat_id, **build_music_card())
 
 
 async def show_dialog_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "🧠 *Диалог*\nВыберите режим:"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💬 Обычный чат", callback_data="mode:chat")],
-            [InlineKeyboardButton("📄 Prompt-Master", callback_data="mode:prompt_master")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-        ]
-    )
-    await ctx.bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    log.info("[Dialog] chooser opened", extra={"chat_id": chat_id})
+    await ctx.bot.send_message(chat_id, **build_dialog_card())
 
 
 MAIN_MENU_GUARD_TTL = 3
@@ -6124,10 +5944,6 @@ _NAVIGATION_RESET_ACTIONS = {
     "prompt_master",
     "ai_modes",
     "root",
-    "kb_examples",
-    "kb_templates",
-    "kb_lessons",
-    "kb_faq",
     "tpl_banana",
 }
 
@@ -6162,15 +5978,6 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     CB_PAY_STARS: "pay_stars",
     CB_PAY_CARD: "pay_card",
     CB_PAY_CRYPTO: "pay_crypto",
-    "kb_examples": "kb_examples",
-    "kb_templates": "kb_templates",
-    "kb_lessons": "kb_lessons",
-    "kb_faq": "kb_faq",
-    "tpl_video": "video",
-    "tpl_image": "image",
-    "tpl_music": "music",
-    "tpl_banana": "tpl_banana",
-    "tpl_ai_photo": "image",
     "menu_main": "root",
     "nav_video": "video",
     "nav_image": "image",
@@ -6321,18 +6128,7 @@ async def _dispatch_home_action(
         input_state.clear(user_id, reason="home_nav")
         clear_wait(user_id, reason="home_nav")
 
-    disable_actions = {
-        "knowledge",
-        "balance",
-        "video",
-        "image",
-        "music",
-        "kb_examples",
-        "kb_templates",
-        "kb_lessons",
-        "kb_faq",
-        "tpl_banana",
-    }
+    disable_actions = {"knowledge", "balance", "video", "image", "music", "tpl_banana"}
 
     preserved: Dict[str, Any] = {}
     if action == "image":
@@ -6364,29 +6160,8 @@ async def _dispatch_home_action(
 
     if action == "knowledge":
         if chat_id is not None:
-            await _kb_show_root(ctx, chat_id, state_dict)
-        return
-
-    if action == "kb_examples":
-        if chat_id is not None:
-            await _kb_show_examples(ctx, chat_id, state_dict)
-        return
-
-    if action == "kb_templates":
-        if chat_id is not None:
-            await _kb_show_templates(ctx, chat_id, state_dict)
-        return
-
-    if action == "kb_lessons":
-        if chat_id is not None:
-            await _kb_show_lessons(ctx, chat_id, state_dict)
-        return
-
-    if action == "kb_faq":
-        if chat_id is not None:
-            await _kb_show_root(ctx, chat_id, state_dict)
-            state_dict[STATE_ACTIVE_CARD] = "kb:faq"
-        await faq_command(update, ctx)
+            await knowledge_base_open_root(ctx, chat_id)
+            state_dict[STATE_ACTIVE_CARD] = "kb:root"
         return
 
     if action == "dialog_default":
@@ -6404,9 +6179,11 @@ async def _dispatch_home_action(
     if action == "ai_modes":
         if message is None or chat_id is None:
             return
-        text = f"{TXT_KB_AI_DIALOG}\n{TXT_AI_DIALOG_CHOOSE}"
+        card = build_dialog_card()
+        text = card["text"]
         session_disable_chat(ctx)
-        keyboard = dialog_picker_inline()
+        keyboard = card.get("reply_markup") or dialog_picker_inline()
+        parse_mode = card.get("parse_mode", ParseMode.HTML)
         try:
             await safe_edit_message(
                 ctx,
@@ -6414,14 +6191,13 @@ async def _dispatch_home_action(
                 message.message_id,
                 text,
                 keyboard,
-                parse_mode=ParseMode.HTML,
+                parse_mode=parse_mode,
                 disable_web_page_preview=True,
             )
         except Exception:
             sent = await ctx.bot.send_message(
                 chat_id=chat_id,
-                text=text,
-                reply_markup=keyboard,
+                **card,
             )
             if isinstance(ctx.user_data, dict):
                 mid = getattr(sent, "message_id", None)
@@ -6630,6 +6406,10 @@ async def _legacy_hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         chat_id = getattr(message, "chat_id", None)
 
     normalized_data = _normalize_music_callback_data(data)
+
+    if data.startswith(KB_PREFIX):
+        await knowledge_base_callback(update, ctx)
+        return
 
     if normalized_data == "music:open_card":
         target_chat = chat_id
@@ -14229,6 +14009,12 @@ configure_faq(
     on_section_view=_faq_track_section,
 )
 
+configure_knowledge_base(
+    send_menu=safe_edit_or_send_menu,
+    faq_handler=faq_command,
+    state_getter=state,
+)
+
 
 async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
@@ -18154,6 +17940,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
+    (rf"^{KB_PREFIX}", knowledge_base_callback),
     (r"^(?:cb:|video_menu$|engine:|mode:(?:veo|sora2)_|video:back$)", video_menu_callback),
     (r"^mj\.gallery\.again:", handle_mj_gallery_repeat),
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
