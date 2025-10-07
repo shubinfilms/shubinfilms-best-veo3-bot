@@ -10,6 +10,29 @@ DEV_MODE=false
 SUPPORT_USERNAME=BestAi_Support
 SUPPORT_USER_ID=7223448532
 
+## Required ENV & defaults
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `TELEGRAM_TOKEN` | — | **Required.** Telegram bot token. |
+| `REDIS_URL` | — | **Required.** Connection string for Redis cache. |
+| `KIE_API_KEY` | — | **Required.** KIE platform API key (used for Sora/Veo/MJ). |
+| `KIE_BASE_URL` | `https://api.kie.ai` | Base URL for all KIE API calls. |
+| `SORA2_GEN_PATH` | `https://api.kie.ai/api/v1/jobs/createTask` | Task creation endpoint. |
+| `SORA2_STATUS_PATH` | `https://api.kie.ai/api/v1/jobs/recordInfo` | **Must stay on `/recordInfo`** for polling. |
+| `SUNO_API_BASE` | `https://api.kie.ai` | Suno API host (defaults to `KIE_BASE_URL`). |
+| `SUNO_GEN_PATH` | `/api/v1/generate` | Generation endpoint for Suno. |
+| `SUNO_TASK_STATUS_PATH` | `/api/v1/generate/record-info` | Suno status endpoint. |
+| `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARN`, `ERROR`). |
+| `LOG_JSON` | `true` | Enable JSON logs for both web and worker processes. |
+| `SORA2_TIMEOUT_CONNECT` | `20` | HTTP connect timeout (seconds). |
+| `SORA2_TIMEOUT_READ` | `30` | HTTP read timeout (seconds). |
+| `SORA2_TIMEOUT_WRITE` | `30` | HTTP write timeout (seconds). |
+| `SORA2_TIMEOUT_POOL` | `10` | HTTP pool timeout (seconds). |
+| `VEO_WAIT_STICKER_ID` | `5375464961822695044` | Telegram sticker IDs are configured via ENV and validated as ints. |
+| `SUNO_WAIT_STICKER_ID` | `5188621441926438751` |  |
+| `MJ_WAIT_STICKER_ID` | `5375074927252621134` |  |
+
 # OpenAI / Prompt Master (optional)
 OPENAI_API_KEY=
 

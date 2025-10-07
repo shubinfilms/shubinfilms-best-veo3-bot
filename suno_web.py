@@ -6,6 +6,7 @@ import logging
 import base64
 import os
 import signal
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -13,13 +14,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
+import redis
 import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from requests.adapters import HTTPAdapter
 from urllib3.util import Timeout
 
-from logging_utils import configure_logging, log_environment
+from logging_utils import init_logging, log_environment
 from metrics import (
     render_metrics,
     suno_callback_download_fail_total,
@@ -33,6 +35,7 @@ from settings import (
     HTTP_TIMEOUT_CONNECT,
     HTTP_TIMEOUT_READ,
     HTTP_TIMEOUT_TOTAL,
+    REDIS_URL,
     REDIS_PREFIX,
     SUNO_API_BASE,
     SUNO_API_TOKEN,
@@ -57,12 +60,26 @@ from suno.service import SunoService
 from suno.tempfiles import cleanup_old_directories, task_directory
 from payments.yookassa_callback import process_callback as process_yookassa_callback
 
-configure_logging("suno-web")
+init_logging("suno-web")
 log = logging.getLogger("suno-web")
 log_environment(log)
 
 app = FastAPI(title="Suno Callback Web", docs_url=None, redoc_url=None)
 service = SunoService()
+
+
+def _detect_git_sha() -> str:
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+        )
+        return output.decode("utf-8").strip()
+    except Exception:
+        return os.getenv("GIT_SHA", "unknown")
+
+
+GIT_SHA = _detect_git_sha()
 
 _SUNO_AVAILABLE = bool(SUNO_READY)
 _OUTBOUND_IP: Optional[str] = None
@@ -263,7 +280,13 @@ def root() -> dict[str, bool]:
 
 @app.get("/healthz")
 def healthz() -> JSONResponse:
-    payload = {"ok": True, "suno_enabled": _SUNO_AVAILABLE, "base": KIE_BASE_URL}
+    if not REDIS_URL.startswith("memory://"):
+        try:
+            redis.from_url(REDIS_URL)
+        except Exception as exc:  # pragma: no cover - configuration issues
+            log.error("health.redis.invalid", extra={"error": str(exc)})
+            raise HTTPException(status_code=503, detail="invalid redis configuration") from exc
+    payload = {"ok": True, "version": GIT_SHA}
     return JSONResponse(payload)
 
 

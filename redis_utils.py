@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -20,12 +19,16 @@ else:  # pragma: no cover - fallback alias to avoid runtime dependency
 
 import redis
 
-from settings import REDIS_PREFIX
+from settings import REDIS_PREFIX, REDIS_URL
 
 _logger = logging.getLogger("redis-utils")
 
-_redis_url = os.getenv("REDIS_URL")
-_r = redis.from_url(_redis_url) if _redis_url else None
+_redis_url = REDIS_URL
+_use_memory_only = bool(_redis_url and _redis_url.startswith("memory://"))
+if _use_memory_only:
+    _r = None
+else:
+    _r = redis.from_url(_redis_url) if _redis_url else None
 rds = _r
 _PFX = REDIS_PREFIX
 _TTL = 24 * 60 * 60
@@ -120,7 +123,7 @@ def _user_lock_key(user_id: int, key: str) -> str:
 def _sora2_lock_key(user_id: int) -> str:
     return _SORA2_LOCK_KEY_TMPL.format(int(user_id))
 
-if not _redis_url:
+if not _redis_url or _use_memory_only:
     _logger.warning(
         "REDIS_URL is not configured; falling back to in-memory task-meta store"
     )

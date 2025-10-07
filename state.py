@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -35,9 +34,10 @@ try:  # pragma: no cover - optional dependency in some environments
 except Exception:  # pragma: no cover - redis is optional for tests
     redis_asyncio = None
 
-from settings import REDIS_PREFIX
+from settings import REDIS_PREFIX, REDIS_URL
 
-_REDIS_URL = os.getenv("REDIS_URL")
+_REDIS_URL = REDIS_URL
+_MEMORY_ONLY = bool(_REDIS_URL and _REDIS_URL.startswith("memory://"))
 _STATE_KEY_TMPL = f"{REDIS_PREFIX}:state:{{chat_id}}"
 _CARD_KEY_TMPL = f"{REDIS_PREFIX}:card:{{chat_id}}:{{module}}"
 _LOCK_KEY_TMPL = f"{REDIS_PREFIX}:lock:state:{{chat_id}}"
@@ -100,7 +100,7 @@ class StateManager:
     """Redis-based session manager with cooperative locking."""
 
     def __init__(self) -> None:
-        if _REDIS_URL and redis_asyncio is not None:
+        if _REDIS_URL and not _MEMORY_ONLY and redis_asyncio is not None:
             self._redis = redis_asyncio.from_url(
                 _REDIS_URL,
                 decode_responses=True,

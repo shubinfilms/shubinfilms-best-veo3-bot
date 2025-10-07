@@ -9,11 +9,14 @@
 import logging
 import os
 
-from logging_utils import configure_logging, log_environment
+import settings as _app_settings
+from logging_utils import init_logging, log_environment
+
+_app_settings.reload_settings()
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-configure_logging("bot")
+init_logging("bot")
 log_environment(logging.getLogger("bot"))
 
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata
@@ -116,6 +119,12 @@ from ui_helpers import (
 )
 from stickers import delete_wait_sticker, send_ok_sticker, send_wait_sticker
 
+from core.constants import (
+    SORA2_MODE_IMAGE_TO_VIDEO,
+    SORA2_MODE_TEXT_TO_VIDEO,
+    SORA2_MODEL_IMAGE_TO_VIDEO,
+    SORA2_MODEL_TEXT_TO_VIDEO,
+)
 from utils.suno_state import (
     LYRICS_MAX_LENGTH,
     LyricsSource,
@@ -311,7 +320,10 @@ from ledger import (
 from settings import (
     BANANA_SEND_AS_DOCUMENT,
     CRYPTO_PAYMENT_URL,
+    TELEGRAM_TOKEN as SETTINGS_TELEGRAM_TOKEN,
     REDIS_PREFIX,
+    REDIS_URL as SETTINGS_REDIS_URL,
+    BOT_SINGLETON_DISABLED as SETTINGS_BOT_SINGLETON_DISABLED,
     SUNO_CALLBACK_URL as SETTINGS_SUNO_CALLBACK_URL,
     SUNO_ENABLED as SETTINGS_SUNO_ENABLED,
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
@@ -321,6 +333,7 @@ from settings import (
     SORA2_ENABLED,
     SORA2_WAIT_STICKER_ID as SETTINGS_SORA2_WAIT_STICKER_ID,
     BOT_USERNAME as SETTINGS_BOT_USERNAME,
+    ENABLE_VERTICAL_NORMALIZE as SETTINGS_ENABLE_VERTICAL_NORMALIZE,
     REF_BONUS_HINT_ENABLED,
     DIALOG_ENABLED as SETTINGS_DIALOG_ENABLED,
 )
@@ -997,11 +1010,11 @@ SUNO_POLL_BACKGROUND_LIMIT = max(
     _env_float("SUNO_POLL_BACKGROUND_LIMIT", 600.0),
 )
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
-BOT_SINGLETON_DISABLED = _env("BOT_SINGLETON_DISABLED", "false").lower() == "true"
+BOT_SINGLETON_DISABLED = bool(SETTINGS_BOT_SINGLETON_DISABLED)
 BOT_LEADER_TTL_MS   = 30_000
 BOT_LEADER_STALE_MS = 45_000
 BOT_LEADER_HEARTBEAT_INTERVAL_SEC = max(0.01, _env_float("BOT_LEADER_HEARTBEAT_INTERVAL_SEC", 10.0))
-TELEGRAM_TOKEN      = _env("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN      = SETTINGS_TELEGRAM_TOKEN
 TELEGRAM_TOKEN_HASH = hashlib.sha256(TELEGRAM_TOKEN.encode("utf-8")).hexdigest() if TELEGRAM_TOKEN else "no-token"
 PROMPTS_CHANNEL_URL = _env("PROMPTS_CHANNEL_URL", "https://t.me/bestveo3promts")
 STARS_BUY_URL       = _env("STARS_BUY_URL", "https://t.me/PremiumBot")
@@ -1106,7 +1119,7 @@ else:
 
 # Видео
 FFMPEG_BIN                = _env("FFMPEG_BIN", "ffmpeg")
-ENABLE_VERTICAL_NORMALIZE = _env("ENABLE_VERTICAL_NORMALIZE", "true").lower() == "true"
+ENABLE_VERTICAL_NORMALIZE = bool(SETTINGS_ENABLE_VERTICAL_NORMALIZE)
 ALWAYS_FORCE_FHD          = _env("ALWAYS_FORCE_FHD", "true").lower() == "true"
 MAX_TG_VIDEO_MB           = int(_env("MAX_TG_VIDEO_MB", "48"))
 POLL_INTERVAL_SECS = int(_env("POLL_INTERVAL_SECS", "6"))
@@ -1149,9 +1162,12 @@ async def _safe_edit_message_text(
         return exc
 
 # Redis
-REDIS_URL           = _env("REDIS_URL")
+REDIS_URL           = SETTINGS_REDIS_URL
 REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+if REDIS_URL and not REDIS_URL.startswith("memory://"):
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+else:
+    redis_client = None
 
 
 def _build_leader_key() -> str:
@@ -1289,7 +1305,7 @@ def acquire_singleton_lock(ttl_sec: int = 3600) -> None:
         singleton_log.warning("BOT_SINGLETON_DISABLED=true — leader election disabled")
         return
 
-    if not REDIS_URL or redis is None:
+    if not REDIS_URL or REDIS_URL.startswith("memory://") or redis is None:
         singleton_log.warning("No REDIS_URL/redis — leader election disabled")
         return
 
@@ -6744,11 +6760,11 @@ async def _start_video_mode(
 ) -> bool:
     if chat_id is None:
         return False
-    if mode in {"sora2_ttv", "sora2_itv"}:
+    if mode in {SORA2_MODE_TEXT_TO_VIDEO, SORA2_MODE_IMAGE_TO_VIDEO}:
         s = state(ctx)
         s["mode"] = mode
         s["sora2_prompt"] = None
-        if mode == "sora2_ttv":
+        if mode == SORA2_MODE_TEXT_TO_VIDEO:
             s["sora2_image_urls"] = []
         elif not isinstance(s.get("sora2_image_urls"), list):
             s["sora2_image_urls"] = []
@@ -10368,13 +10384,13 @@ async def sora2_entry(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --------- Sora2 Generation ----------
 _SORA2_MODEL_IDS = {
-    "sora2_ttv": "sora-2-text-to-video",
-    "sora2_itv": "sora-2-image-to-video",
+    SORA2_MODE_TEXT_TO_VIDEO: SORA2_MODEL_TEXT_TO_VIDEO,
+    SORA2_MODE_IMAGE_TO_VIDEO: SORA2_MODEL_IMAGE_TO_VIDEO,
 }
 
 _SORA2_SERVICE_CODES = {
-    "sora2_ttv": "SORA2_TTV",
-    "sora2_itv": "SORA2_ITV",
+    SORA2_MODE_TEXT_TO_VIDEO: "SORA2_TTV",
+    SORA2_MODE_IMAGE_TO_VIDEO: "SORA2_ITV",
 }
 
 
