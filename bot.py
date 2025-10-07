@@ -436,6 +436,21 @@ except Exception:  # pragma: no cover - fallback if asyncio interface unavailabl
 #   ENV / INIT
 # ==========================
 APP_VERSION = "2025-09-14r4"
+BOT_START_TIME = time.monotonic()
+
+
+def _detect_git_revision() -> str:
+    env_rev = os.getenv("GIT_REVISION") or os.getenv("GIT_COMMIT") or os.getenv("RENDER_GIT_COMMIT")
+    if env_rev:
+        return env_rev
+    try:
+        output = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
+    except Exception:
+        return "unknown"
+    return output.decode("utf-8", "ignore").strip() or "unknown"
+
+
+GIT_REVISION = _detect_git_revision()
 
 
 ACTIVE_TASKS: Dict[int, str] = {}
@@ -14402,25 +14417,73 @@ async def balance_recalc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"✅ Баланс актуален: {result.calculated} 💎")
 
+
+async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    uptime_seconds = max(0, int(time.monotonic() - BOT_START_TIME))
+
+    redis_status: str
+    redis_latency_ms: Optional[float] = None
+    if redis_client is None:
+        redis_status = "disabled"
+    else:
+        start = time.perf_counter()
+        try:
+            await asyncio.to_thread(redis_client.ping)
+        except Exception as exc:
+            redis_status = f"error: {exc}"
+        else:
+            redis_status = "ok"
+            redis_latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    telegram_status = "ok"
+    telegram_user: Optional[Dict[str, Any]] = None
+    try:
+        me = await ctx.bot.get_me()
+    except Exception as exc:
+        telegram_status = f"error: {exc}"
+    else:
+        telegram_user = me.to_dict()
+
+    payload: Dict[str, Any] = {
+        "status": "ok"
+        if telegram_status == "ok" and redis_status in {"ok", "disabled"}
+        else "error",
+        "uptime": f"{uptime_seconds}s",
+        "redis": redis_status,
+        "telegram": telegram_status,
+        "app_version": APP_VERSION,
+        "git": GIT_REVISION,
+        "mode": "polling",
+        "ptb": getattr(_tg, "__version__", "unknown") if _tg else "unknown",
+    }
+
+    if redis_latency_ms is not None:
+        payload["redis_latency_ms"] = redis_latency_ms
+    if telegram_user is not None:
+        payload["telegram_user"] = telegram_user
+
+    return payload
+
+
+async def _reply_with_health_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    payload = await _collect_health_payload(ctx)
+    text = json.dumps(payload, ensure_ascii=False)
+
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(text)
+    else:
+        log.info("health.payload", extra={"payload": payload})
+
+
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    parts = [
-        f"PTB: `{getattr(_tg, '__version__', 'unknown')}`" if _tg else "PTB: `unknown`",
-        f"KIEBASEURL: `{KIE_BASE_URL}`",
-        f"OPENAI: `{'set' if OPENAI_API_KEY else 'missing'}`",
-        f"KIE: `{'set' if KIE_API_KEY else 'missing'}`",
-        f"REDIS: `{'on' if REDIS_URL else 'off'}`",
-        f"FFMPEG: `{FFMPEG_BIN}`",
-    ]
-    parts.append(f"DB: `{'ok' if ledger_storage.ping() else 'error'}`")
-    lock_status = "disabled"
-    if runner_lock_state.get("enabled"):
-        lock_status = "owned" if runner_lock_state.get("owned") else "free"
-    lock_payload: Dict[str, Any] = {"ok": True, "lock": lock_status}
-    if runner_lock_state.get("heartbeat_at"):
-        lock_payload["hb"] = runner_lock_state.get("heartbeat_at")
-    parts.append(f"LOCK: `{json.dumps(lock_payload, ensure_ascii=False)}`")
-    await update.message.reply_text("🩺 *Health*\n" + "\n".join(parts), parse_mode=ParseMode.MARKDOWN)
+    await _reply_with_health_payload(update, ctx)
+
+
+async def healthz_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    await _reply_with_health_payload(update, ctx)
 
 
 async def users_count_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -17711,6 +17774,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("suno_retry",), suno_retry_command),
     (("lang",), lang_command),
     (("health",), health),
+    (("healthz",), healthz_command),
     (("topup",), topup),
     (("promo",), promo_command),
     (("users_count",), users_count_command),
@@ -17873,43 +17937,91 @@ async def run_bot_async() -> None:
                 "enabled" if lock.enabled else "disabled",
             )
 
-            try:
-                await _run_suno_probe()
-            except Exception as exc:
-                log.warning("SUNO probe execution failed: %s", exc)
+            initialized = False
+            started = False
+            updater = application.updater
 
             try:
-                await application.bot.set_my_commands([
-                    BotCommand("menu", "⭐ Главное меню"),
-                    BotCommand("profile", "👤 Профиль"),
-                    BotCommand("kb", "📚 База знаний"),
-                    BotCommand("video", "📹 Режим видео"),
-                    BotCommand("image", "📸 Режим фото"),
-                    BotCommand("music", "🎧 Режим музыки"),
-                    BotCommand("chat", "🧠 Диалог с ИИ"),
-                    BotCommand("buy", "💎 Купить генерации"),
-                    BotCommand("lang", "🌍 Изменить язык"),
-                    BotCommand("help", "🆘 Поддержка"),
-                    BotCommand("faq", "❓ FAQ"),
-                ])
-            except Exception as exc:
-                log.warning("Failed to set bot commands: %s", exc)
+                await application.initialize()
+                initialized = True
 
-            try:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
-                log.info("Webhook deleted")
-            except Exception as exc:
-                event("WEBHOOK_DELETE_ERROR", error=str(exc))
-                log.warning("Delete webhook failed: %s", exc)
+                try:
+                    await _run_suno_probe()
+                except Exception as exc:
+                    log.warning("SUNO probe execution failed: %s", exc)
 
-            try:
+                try:
+                    await application.bot.set_my_commands([
+                        BotCommand("menu", "⭐ Главное меню"),
+                        BotCommand("profile", "👤 Профиль"),
+                        BotCommand("kb", "📚 База знаний"),
+                        BotCommand("video", "📹 Режим видео"),
+                        BotCommand("image", "📸 Режим фото"),
+                        BotCommand("music", "🎧 Режим музыки"),
+                        BotCommand("chat", "🧠 Диалог с ИИ"),
+                        BotCommand("buy", "💎 Купить генерации"),
+                        BotCommand("lang", "🌍 Изменить язык"),
+                        BotCommand("help", "🆘 Поддержка"),
+                        BotCommand("faq", "❓ FAQ"),
+                    ])
+                except Exception as exc:
+                    log.warning("Failed to set bot commands: %s", exc)
+
+                try:
+                    await application.bot.delete_webhook(drop_pending_updates=True)
+                    event("WEBHOOK_DELETE_OK", drop_pending_updates=True)
+                    log.info("Webhook deleted")
+                except Exception as exc:
+                    event("WEBHOOK_DELETE_ERROR", error=str(exc))
+                    log.warning("Delete webhook failed: %s", exc)
+
+                await application.start()
+                started = True
+
+                if updater is None:
+                    raise RuntimeError("Application updater is not available")
+
                 log.info("Starting polling")
-                await application.run_polling(
+
+                await updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                 )
+
+                handler_count = sum(len(group) for group in application.handlers.values())
+                ptb_version = getattr(_tg, "__version__", "unknown") if _tg else "unknown"
+                log.info(
+                    "[BOT READY] PTB=%s handlers=%d mode=polling",
+                    ptb_version,
+                    handler_count,
+                    extra={
+                        "app_version": APP_VERSION,
+                        "git": GIT_REVISION,
+                        "redis": "on" if redis_client else "off",
+                    },
+                )
+
+                await updater.wait_until_closed()
+            except asyncio.CancelledError:
+                log.info("run_bot_async.cancelled")
+                raise
             finally:
+                if updater is not None:
+                    try:
+                        await updater.stop()
+                    except RuntimeError:
+                        pass
+                    except Exception:
+                        log.warning("Updater stop raised", exc_info=True)
+
+                if started:
+                    with suppress(Exception):
+                        await application.stop()
+
+                if initialized:
+                    with suppress(Exception):
+                        await application.shutdown()
+
                 SHUTDOWN_EVENT.set()
     except RedisLockBusy:
         log.error("Another instance is running (redis lock present). Exiting to avoid 409 conflict.")
