@@ -38,7 +38,7 @@ def _chat_data(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any] | Non
 def _set_nav_event(ctx: ContextTypes.DEFAULT_TYPE) -> tuple[MutableMapping[str, Any] | None, bool]:
     chat_data = _chat_data(ctx)
     if chat_data is not None:
-        chat_data["nav_event"] = True
+        chat_data["nav_in_progress"] = True
         log.info("nav.event (source=callback)")
         return chat_data, True
     return None, False
@@ -46,7 +46,7 @@ def _set_nav_event(ctx: ContextTypes.DEFAULT_TYPE) -> tuple[MutableMapping[str, 
 
 def _clear_nav_event(chat_data: MutableMapping[str, Any] | None, flag: bool) -> None:
     if flag and isinstance(chat_data, MutableMapping):
-        chat_data.pop("nav_event", None)
+        chat_data["nav_in_progress"] = False
 
 
 def _callback_target(update: Update) -> tuple[Optional[int], Optional[int]]:

@@ -141,7 +141,7 @@ def test_profile_buttons_route(monkeypatch):
 
 def test_nav_suppresses_dialog_notice(monkeypatch):
     bot = FakeBot()
-    ctx = SimpleNamespace(bot=bot, chat_data={"nav_event": True}, user_data={})
+    ctx = SimpleNamespace(bot=bot, chat_data={"nav_in_progress": True}, user_data={})
 
     async def fake_ensure(update):  # pragma: no cover - helper
         return None
@@ -154,5 +154,5 @@ def test_nav_suppresses_dialog_notice(monkeypatch):
 
     asyncio.run(bot_module.on_text(update, ctx))
 
-    assert ctx.chat_data.get("nav_event") is None
+    assert ctx.chat_data.get("nav_in_progress") is False
     assert not bot.sent

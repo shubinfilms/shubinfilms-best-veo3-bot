@@ -101,7 +101,7 @@ def test_menu_callbacks_route_ok(monkeypatch):
             assert calls and calls[0][0] == item
             assert calls[0][2]["suppress_nav"] is True
             assert ctx.chat_data.get(key) == mid
-            assert ctx.chat_data.get("nav_event") is None
+            assert ctx.chat_data.get("nav_in_progress") is False
 
     asyncio.run(scenario())
 
@@ -145,7 +145,7 @@ def test_menu_suppresses_dialog_notice(monkeypatch):
     ctx = SimpleNamespace(bot=bot, chat_data={}, user_data={}, application=SimpleNamespace(bot_data={}))
 
     async def fake_photo(context, chat_id, *, suppress_nav, fallback_message_id=None):
-        assert context.chat_data.get("nav_event") is True
+        assert context.chat_data.get("nav_in_progress") is True
         return 888
 
     async def fake_answer():
@@ -169,7 +169,7 @@ def test_menu_suppresses_dialog_notice(monkeypatch):
         await bot_module.handle_main_menu_callback(update, ctx)
 
         assert ctx.chat_data.get(bot_module._PHOTO_MSG_ID_KEY) == 888
-        assert ctx.chat_data.get("nav_event") is None
+        assert ctx.chat_data.get("nav_in_progress") is False
 
         text_message = SimpleNamespace(text="привет", chat_id=77, chat=SimpleNamespace(id=77))
         text_update = SimpleNamespace(message=text_message, effective_message=text_message, effective_user=None)
