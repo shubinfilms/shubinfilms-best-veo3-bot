@@ -1595,6 +1595,11 @@ async def disable_chat_mode(
                 extra={"user_id": user_id, "error": str(exc)},
             )
 
+    if notify and had_mode:
+        chat_data_obj = getattr(ctx, "chat_data", None)
+        if isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj["just_exited_plain_chat"] = True
+
     return had_mode
 
 
@@ -4177,6 +4182,18 @@ def _apply_state_defaults(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # --- helper: мягкий сброс сцены/режима ---
+def should_show_dialog_disabled(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    if not isinstance(chat_data_obj, MutableMapping):
+        return False
+    if chat_data_obj.pop("suppress_dialog_notice", False):
+        return False
+    if chat_data_obj.get("just_exited_plain_chat"):
+        chat_data_obj["just_exited_plain_chat"] = False
+        return True
+    return False
+
+
 async def reset_user_state(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: Optional[int] = None,
@@ -4223,7 +4240,7 @@ async def reset_user_state(
                     "source": "ctx" if nav_event_flag else "callback",
                 },
             )
-        else:
+        elif should_show_dialog_disabled(ctx):
             try:
                 await ctx.bot.send_message(
                     chat_id=chat_id,
@@ -6238,6 +6255,7 @@ async def handle_quick_profile_button(
     try:
         if isinstance(chat_data_obj, MutableMapping):
             chat_data_obj["nav_event"] = True
+            chat_data_obj["suppress_dialog_notice"] = True
         await reset_user_state(ctx, chat_id, notify_chat_off=True)
         state_dict = state(ctx)
         await disable_chat_mode(
@@ -6247,13 +6265,11 @@ async def handle_quick_profile_button(
             state_dict=state_dict,
             notify=False,
         )
-        await profile_handlers.open_profile_card(
-            chat_id,
-            user_id,
-            update=update,
-            ctx=ctx,
-            suppress_nav=True,
+        await profile_handlers.open_profile(
+            update,
+            ctx,
             source="quick",
+            suppress_nav=True,
         )
     finally:
         log.info("nav.finish", extra={"kind": "profile", "chat_id": chat_id})
@@ -6574,6 +6590,8 @@ async def _dispatch_home_action(
 
         try:
             if chat_id is not None:
+                if isinstance(nav_chat_data, MutableMapping):
+                    nav_chat_data["suppress_dialog_notice"] = True
                 await reset_user_state(
                     ctx,
                     chat_id,
@@ -6589,14 +6607,15 @@ async def _dispatch_home_action(
                 )
 
             force_new = data in {"hub:balance", PROFILE_MENU_CB, "balance_command"}
-            await _open_profile_card(
+            if force_new and isinstance(nav_chat_data, MutableMapping):
+                nav_chat_data.pop("profile_msg_id", None)
+                nav_chat_data.pop("profile_rendered_hash", None)
+
+            await profile_handlers.open_profile(
                 update,
                 ctx,
-                chat_id=chat_id,
-                user_id=user_id,
                 source=source,
-                force_new=force_new,
-                query=query,
+                suppress_nav=True,
             )
         finally:
             _nav_finish(nav_chat_data, started=nav_started)
@@ -6767,14 +6786,18 @@ async def _dispatch_home_action(
     if action == "balance":
         force_new = data in {"hub:balance", PROFILE_MENU_CB, "balance_command"}
         source = "command" if data == "balance_command" else ("inline" if query is not None else "menu")
-        await _open_profile_card(
+        chat_data_obj = getattr(ctx, "chat_data", None)
+        if isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj["suppress_dialog_notice"] = True
+            if force_new:
+                chat_data_obj.pop("profile_msg_id", None)
+                chat_data_obj.pop("profile_rendered_hash", None)
+
+        await profile_handlers.open_profile(
             update,
             ctx,
-            chat_id=chat_id,
-            user_id=user_id,
             source=source,
-            force_new=force_new,
-            query=query,
+            suppress_nav=True,
         )
         return
 
@@ -7586,11 +7609,22 @@ async def open_profile_card(
             if stored_msg_id is None:
                 stored_msg_id = _get_profile_card_message_id(chat_id)
 
+        chat_hash: Optional[int] = None
+        if isinstance(chat_data, MutableMapping):
+            chat_hash_raw = chat_data.get("profile_rendered_hash")
+            try:
+                chat_hash = int(chat_hash_raw) if chat_hash_raw is not None else None
+            except (TypeError, ValueError):
+                chat_hash = None
+
         raw_hash = profile_state.get("hash")
-        try:
-            last_hash = int(raw_hash)
-        except (TypeError, ValueError):
-            last_hash = None
+        if chat_hash is not None:
+            last_hash = chat_hash
+        else:
+            try:
+                last_hash = int(raw_hash)
+            except (TypeError, ValueError):
+                last_hash = None
 
         referral_url: Optional[str] = None
         if resolved_user is not None:
@@ -7655,6 +7689,9 @@ async def open_profile_card(
 
         profile_state["message_id"] = message_id
         profile_state["hash"] = content_hash
+
+        if isinstance(chat_data, MutableMapping):
+            chat_data["profile_rendered_hash"] = int(content_hash)
 
         _profile_store_message_id(chat_data, message_id)
         if isinstance(chat_data, MutableMapping):
@@ -17386,6 +17423,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             setattr(ctx, "nav_event", True)
             if isinstance(nav_chat_data, MutableMapping):
                 nav_chat_data["nav_event"] = True
+                nav_chat_data["suppress_dialog_notice"] = True
         try:
             await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
@@ -17398,13 +17436,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     state_dict=s,
                     notify=False,
                 )
-                await profile_handlers.open_profile_card(
-                    chat_id,
-                    user_id,
-                    update=update,
-                    ctx=ctx,
-                    suppress_nav=True,
+                await profile_handlers.open_profile(
+                    update,
+                    ctx,
                     source="quick",
+                    suppress_nav=True,
                 )
                 return
             if btn == "база знаний":

@@ -25,6 +25,7 @@ os.environ.setdefault("LOG_JSON", "false")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 
 import bot as bot_module
+import handlers.profile as profile_handlers
 from handlers import prompt_master_handle_text
 from utils.input_state import (
     WaitInputState,
@@ -761,27 +762,30 @@ def test_balance_command_force_new() -> None:
         effective_message=message,
     )
 
-    calls: list[tuple[int, bool]] = []
+    calls: list[dict[str, object]] = []
 
-    async def fake_show(chat_id: int, ctx_param, *, force_new: bool = False) -> int:
-        calls.append((chat_id, force_new))
-        return 101
+    async def fake_open(update_param, ctx_param, *, source: str, suppress_nav: bool = True):
+        calls.append({
+            "chat_id": getattr(update_param.effective_chat, "id", None),
+            "source": source,
+            "suppress_nav": suppress_nav,
+        })
 
     async def fake_ensure(update_param):
         return None
 
-    original_show = bot_module.show_balance_card
+    original_open = profile_handlers.open_profile
     original_ensure = bot_module.ensure_user_record
-    bot_module.show_balance_card = fake_show  # type: ignore[assignment]
+    profile_handlers.open_profile = fake_open  # type: ignore[assignment]
     bot_module.ensure_user_record = fake_ensure  # type: ignore[assignment]
 
     try:
         asyncio.run(bot_module.balance_command(update, ctx))
     finally:
-        bot_module.show_balance_card = original_show  # type: ignore[assignment]
+        profile_handlers.open_profile = original_open  # type: ignore[assignment]
         bot_module.ensure_user_record = original_ensure  # type: ignore[assignment]
 
-    assert calls == [(555, True)]
+    assert calls and calls[0]["chat_id"] == 555
 
 
 def test_suno_command_force_new_card() -> None:

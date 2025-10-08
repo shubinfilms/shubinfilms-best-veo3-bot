@@ -61,6 +61,16 @@ def test_quick_button_reuses_message(monkeypatch):
     monkeypatch.setattr(bot_module, "disable_chat_mode", fake_disable)
     monkeypatch.setattr(bot_module, "ensure_user_record", fake_ensure)
     monkeypatch.setattr(bot_module, "open_profile_card", fake_core_open)
+    time_values = [100.0, 101.0, 102.0, 103.0]
+    times = iter(time_values)
+
+    def fake_monotonic():
+        try:
+            return next(times)
+        except StopIteration:
+            return time_values[-1]
+
+    monkeypatch.setattr(profile_handlers.time, "monotonic", fake_monotonic)
 
     update = _build_update(chat_id=100, user_id=777)
 
