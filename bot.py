@@ -4209,9 +4209,17 @@ async def reset_user_state(
     s.pop(STATE_CHAT_MODE, None)
     s.pop(STATE_ACTIVE_CARD, None)
 
+    nav_event_flag = getattr(ctx, "nav_event", False)
+
     if notify_chat_off and not suppress_notification and was_chat and chat_id:
-        if nav_suppressed:
-            log.info("nav.suppress_dialog_notice", extra={"chat_id": chat_id})
+        if nav_suppressed or nav_event_flag:
+            log.info(
+                "nav.suppress_dialog_notice",
+                extra={
+                    "chat_id": chat_id,
+                    "source": "ctx" if nav_event_flag else "callback",
+                },
+            )
         else:
             try:
                 await ctx.bot.send_message(
@@ -7874,25 +7882,7 @@ async def handle_profile_menu(callback: HubCallbackContext) -> None:
 
 @register_callback_action("profile", "back", module="profile")
 async def handle_profile_back(callback: HubCallbackContext) -> None:
-    ctx = callback.application_context
-    chat_id = callback.chat_id
-    if chat_id is None:
-        return
-
-    profile_handlers.clear_promo_wait(ctx)
-
-    await reset_user_state(
-        ctx,
-        chat_id,
-        notify_chat_off=False,
-        suppress_notification=True,
-    )
-    await show_emoji_hub_for_chat(
-        chat_id,
-        ctx,
-        user_id=callback.user_id,
-        replace=True,
-    )
+    await profile_handlers.on_profile_back(callback.update, callback.application_context)
 
 
 async def _build_balance_menu_with_referral(
@@ -17369,10 +17359,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if btn in ("профиль", "база знаний", "фото", "музыка", "видео", "диалог"):
         nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
         nav_started = _nav_start(nav_chat_data)
+        is_profile_btn = btn == "профиль"
+        nav_prev_attr = getattr(ctx, "nav_event", False)
+        if is_profile_btn:
+            setattr(ctx, "nav_event", True)
         try:
             await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
-            if btn == "профиль":
+            if is_profile_btn:
                 log.info("nav.event (source=quick)")
                 await disable_chat_mode(
                     ctx,
@@ -17381,8 +17375,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     state_dict=s,
                     notify=False,
                 )
-                await open_profile_card(update, ctx, suppress_nav=True, force_new=False)
-                raise ApplicationHandlerStop
+                await profile_handlers.open_profile_card(
+                    chat_id,
+                    user_id,
+                    update=update,
+                    ctx=ctx,
+                    suppress_nav=True,
+                    reused_msg=True,
+                    source="quick",
+                )
+                return
             if btn == "база знаний":
                 await open_kb_card(update, ctx, suppress_nav=True)
                 raise ApplicationHandlerStop
@@ -17399,7 +17401,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await show_dialog_menu(chat_id, ctx)
                 raise ApplicationHandlerStop
         finally:
+            if is_profile_btn:
+                setattr(ctx, "nav_event", nav_prev_attr)
             _nav_finish(nav_chat_data, started=nav_started)
+        # continue processing if button handled via raises above
+        return
+    # end btn nav block
 
     waiting_for_input = _chat_state_waiting_input(s)
     if (

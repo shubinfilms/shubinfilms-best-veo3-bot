@@ -14,13 +14,22 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from ui.card import build_card
+from utils.input_state import (
+    WaitInputState,
+    WaitKind,
+    clear_wait_state,
+    get_wait_state,
+    input_state,
+    set_wait_state,
+)
 from utils.telegram_safe import safe_edit_message
 
 log = logging.getLogger(__name__)
 
-PROMO_WAIT_KIND = "promo"
+PROMO_WAIT_KIND = WaitKind.PROMO_CODE.value
 _PROMO_WAIT_KEY = "profile_wait_state"
 _PROMO_WAIT_UNTIL_KEY = "profile_wait_until"
+_PROMO_WAIT_USER_KEY = "profile_wait_user_id"
 PROMO_WAIT_TTL = 180
 
 _HISTORY_TYPE_LABELS = {
@@ -35,18 +44,34 @@ def _chat_data(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any] | Non
     return obj if isinstance(obj, MutableMapping) else None
 
 
-def _set_nav_event(ctx: ContextTypes.DEFAULT_TYPE) -> tuple[MutableMapping[str, Any] | None, bool]:
+def _set_nav_event(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    source: str | None = None,
+) -> tuple[MutableMapping[str, Any] | None, bool, bool]:
     chat_data = _chat_data(ctx)
-    if chat_data is not None:
+    previous_flag = getattr(ctx, "nav_event", False)
+    setattr(ctx, "nav_event", True)
+    if isinstance(chat_data, MutableMapping):
         chat_data["nav_in_progress"] = True
-        log.info("nav.event (source=callback)")
-        return chat_data, True
-    return None, False
+    if source:
+        log.info("nav.event (source=%s)", source)
+    return (
+        chat_data if isinstance(chat_data, MutableMapping) else None,
+        isinstance(chat_data, MutableMapping),
+        previous_flag,
+    )
 
 
-def _clear_nav_event(chat_data: MutableMapping[str, Any] | None, flag: bool) -> None:
+def _clear_nav_event(
+    chat_data: MutableMapping[str, Any] | None,
+    flag: bool,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    previous_nav: bool,
+) -> None:
     if flag and isinstance(chat_data, MutableMapping):
         chat_data["nav_in_progress"] = False
+    setattr(ctx, "nav_event", previous_nav)
 
 
 def _callback_target(update: Update) -> tuple[Optional[int], Optional[int]]:
@@ -91,15 +116,121 @@ async def _edit_card(
     return False
 
 
-async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag = _set_nav_event(ctx)
-    try:
-        from bot import open_profile_card  # lazy import to avoid circular deps
+async def open_profile_card(
+    chat_id: Optional[int],
+    user_id: Optional[int],
+    *,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    suppress_nav: bool = True,
+    reused_msg: bool = True,
+    source: str = "inline",
+) -> Optional[int]:
+    log.info(
+        "profile.open(chat_id=%s, user_id=%s, source=%s, suppress_nav=%s, reused_msg=%s)",
+        chat_id,
+        user_id,
+        source,
+        suppress_nav,
+        reused_msg,
+    )
 
-        await open_profile_card(update, ctx, suppress_nav=False, edit=True)
-        log.info("profile.action", extra={"action": "menu", "result": "opened"})
+    if user_id is not None:
+        try:
+            input_state.clear(int(user_id), reason="profile_nav")
+        except Exception:
+            log.debug(
+                "profile.input_state_clear_failed",
+                exc_info=True,
+                extra={"user_id": user_id},
+            )
+
+    resolved_chat_id = chat_id
+    if resolved_chat_id is None:
+        chat = getattr(update, "effective_chat", None)
+        if chat is None:
+            message = getattr(update, "effective_message", None)
+            chat = getattr(message, "chat", None)
+        resolved_chat_id = getattr(chat, "id", None)
+
+    chat_data = _chat_data(ctx)
+    prev_nav_flag = getattr(ctx, "nav_event", False)
+    setattr(ctx, "nav_event", True)
+
+    prev_mid: Optional[int] = None
+    prev_nav_value: Any = None
+    if isinstance(chat_data, MutableMapping):
+        raw_mid = chat_data.get("profile_msg_id")
+        try:
+            prev_mid = int(raw_mid)
+        except (TypeError, ValueError):
+            prev_mid = None
+        prev_nav_value = chat_data.get("nav_in_progress")
+        chat_data["nav_in_progress"] = True
+
+    try:
+        from bot import open_profile_card as _core_open_profile_card  # lazy import
+
+        message_id = await _core_open_profile_card(
+            update,
+            ctx,
+            suppress_nav=suppress_nav,
+            edit=reused_msg,
+            force_new=not reused_msg,
+        )
     finally:
-        _clear_nav_event(chat_data, flag)
+        if isinstance(chat_data, MutableMapping):
+            if prev_nav_value is None:
+                chat_data.pop("nav_in_progress", None)
+            else:
+                chat_data["nav_in_progress"] = prev_nav_value
+        setattr(ctx, "nav_event", prev_nav_flag)
+
+    reused_actual = False
+    if isinstance(chat_data, MutableMapping):
+        raw_current = chat_data.get("profile_msg_id")
+        try:
+            current_mid = int(raw_current)
+        except (TypeError, ValueError):
+            current_mid = None
+        else:
+            reused_actual = prev_mid is not None and current_mid == prev_mid
+
+    log.info(
+        "profile.open.result(chat_id=%s, user_id=%s, source=%s, suppress_nav=%s, reused_msg=%s)",
+        resolved_chat_id,
+        user_id,
+        source,
+        suppress_nav,
+        reused_actual,
+    )
+    return message_id
+
+
+async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    query = update.callback_query
+    if chat is None and query is not None and query.message is not None:
+        chat = query.message.chat
+
+    chat_id = getattr(chat, "id", None)
+    user_id = getattr(user, "id", None)
+
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source="inline")
+    try:
+        await open_profile_card(
+            chat_id,
+            user_id,
+            update=update,
+            ctx=ctx,
+            suppress_nav=True,
+            reused_msg=True,
+            source="inline",
+        )
+        log.info("profile.click action=menu")
+    finally:
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
 def _topup_url() -> Optional[str]:
@@ -111,8 +242,9 @@ def _topup_url() -> Optional[str]:
 
 
 async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag = _set_nav_event(ctx)
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_topup")
     try:
+        log.info("profile.click action=topup")
         query = update.callback_query
         if query is not None:
             with suppress(BadRequest):
@@ -120,16 +252,8 @@ async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
         chat_id, message_id = _callback_target(update)
 
-        url = _topup_url()
-        if url:
-            subtitle = "Пополнить баланс можно по кнопке ниже."
-            rows = [
-                [InlineKeyboardButton("Перейти к оплате", url=url)],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")],
-            ]
-        else:
-            subtitle = "Пополнить баланс — в разработке."
-            rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")]]
+        subtitle = "Пополнить баланс — в разработке."
+        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")]]
         payload = build_card("💎 Пополнение", subtitle, rows)
 
         success = await _edit_card(ctx, chat_id, message_id, payload)
@@ -138,7 +262,7 @@ async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             extra={"action": "topup", "result": "ok" if success else "skipped"},
         )
     finally:
-        _clear_nav_event(chat_data, flag)
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
 async def _billing_history(user_id: int) -> list[dict[str, Any]]:
@@ -221,8 +345,9 @@ def _format_history_entry(entry: dict[str, Any]) -> Optional[str]:
 
 
 async def on_profile_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag = _set_nav_event(ctx)
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_history")
     try:
+        log.info("profile.click action=history")
         user = update.effective_user
         uid = user.id if user else None
         if uid is None:
@@ -249,7 +374,7 @@ async def on_profile_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             extra={"action": "history", "result": "ok" if success else "skipped"},
         )
     finally:
-        _clear_nav_event(chat_data, flag)
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
 def _bot_name() -> Optional[str]:
@@ -267,8 +392,9 @@ def _bot_name() -> Optional[str]:
 
 
 async def on_profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag = _set_nav_event(ctx)
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_invite")
     try:
+        log.info("profile.click action=invite")
         query = update.callback_query
         if query is not None:
             with suppress(BadRequest):
@@ -285,6 +411,11 @@ async def on_profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         link = f"https://t.me/{bot_name}?start=ref_{user.id}"
+        log.info(
+            "profile.invite_link | user=%s username=%s",
+            user.id,
+            getattr(user, "username", None),
+        )
         text = (
             "Пригласите друга — получите бонус после его первой оплаты.\n\n"
             f"Ваша ссылка: {link}"
@@ -301,23 +432,46 @@ async def on_profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         log.info("profile.invite.sent", extra={"user": user.id})
         log.info("profile.action", extra={"action": "invite", "result": "sent"})
     finally:
-        _clear_nav_event(chat_data, flag)
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
-def _activate_promo_wait(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+def _activate_promo_wait(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+) -> None:
     chat_data = _chat_data(ctx)
-    if chat_data is None:
-        return
-    chat_data[_PROMO_WAIT_KEY] = PROMO_WAIT_KIND
-    chat_data[_PROMO_WAIT_UNTIL_KEY] = time.time() + PROMO_WAIT_TTL
+    expires_at = time.time() + PROMO_WAIT_TTL
+    if chat_data is not None:
+        chat_data[_PROMO_WAIT_KEY] = PROMO_WAIT_KIND
+        chat_data[_PROMO_WAIT_UNTIL_KEY] = expires_at
+        chat_data[_PROMO_WAIT_USER_KEY] = int(user_id)
+
+    wait_state = WaitInputState(
+        kind=WaitKind.PROMO_CODE,
+        card_msg_id=int(message_id),
+        chat_id=int(chat_id),
+        meta={"source": "profile"},
+        expires_at=expires_at,
+    )
+    set_wait_state(int(user_id), wait_state, ttl_seconds=PROMO_WAIT_TTL)
 
 
 def clear_promo_wait(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_data = _chat_data(ctx)
-    if chat_data is None:
-        return
-    chat_data.pop(_PROMO_WAIT_KEY, None)
-    chat_data.pop(_PROMO_WAIT_UNTIL_KEY, None)
+    user_id: Optional[int] = None
+    if isinstance(chat_data, MutableMapping):
+        chat_data.pop(_PROMO_WAIT_KEY, None)
+        chat_data.pop(_PROMO_WAIT_UNTIL_KEY, None)
+        raw_user = chat_data.pop(_PROMO_WAIT_USER_KEY, None)
+        try:
+            user_id = int(raw_user)
+        except (TypeError, ValueError):
+            user_id = None
+    if user_id is not None:
+        clear_wait_state(int(user_id), reason="profile_nav")
 
 
 def is_waiting_for_promo(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -327,15 +481,34 @@ def is_waiting_for_promo(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     if chat_data.get(_PROMO_WAIT_KEY) != PROMO_WAIT_KIND:
         return False
     deadline = chat_data.get(_PROMO_WAIT_UNTIL_KEY)
+    now = time.time()
+    expired: bool
     try:
-        return float(deadline) > time.time()
+        expired = float(deadline) <= now
     except (TypeError, ValueError):
+        expired = True
+    if expired:
+        clear_promo_wait(ctx)
         return False
+
+    raw_user = chat_data.get(_PROMO_WAIT_USER_KEY)
+    user_id: Optional[int]
+    try:
+        user_id = int(raw_user) if raw_user is not None else None
+    except (TypeError, ValueError):
+        user_id = None
+
+    if user_id is not None:
+        state = get_wait_state(int(user_id))
+        if state and state.kind == WaitKind.PROMO_CODE and not state.is_expired(now=now):
+            return True
+    return True
 
 
 async def on_profile_promo_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag = _set_nav_event(ctx)
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_promo")
     try:
+        log.info("profile.click action=promo")
         query = update.callback_query
         if query is not None:
             with suppress(BadRequest):
@@ -352,15 +525,34 @@ async def on_profile_promo_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         chat_id, message_id = _callback_target(update)
         success = await _edit_card(ctx, chat_id, message_id, payload)
         if success:
-            _activate_promo_wait(ctx)
             user = update.effective_user
-            log.info("profile.promo.wait", extra={"user": getattr(user, "id", None)})
+            user_id = getattr(user, "id", None)
+            if user_id is not None and chat_id is not None and message_id is not None:
+                _activate_promo_wait(
+                    ctx,
+                    user_id=int(user_id),
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                )
+                log.info("profile.promo.wait", extra={"user": user_id})
         log.info(
             "profile.action",
             extra={"action": "promo", "result": "waiting" if success else "skipped"},
         )
     finally:
-        _clear_nav_event(chat_data, flag)
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+
+
+async def on_profile_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_back")
+    try:
+        log.info("profile.click action=back")
+        clear_promo_wait(ctx)
+        from bot import handle_menu  # lazy import
+
+        await handle_menu(update, ctx, notify_chat_off=False)
+    finally:
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
 async def _apply_promo(user_id: int, code: str) -> bool:
@@ -431,9 +623,11 @@ __all__ = [
     "clear_promo_wait",
     "handle_promo_timeout",
     "is_waiting_for_promo",
+    "open_profile_card",
     "on_profile_history",
     "on_profile_invite",
     "on_profile_menu",
+    "on_profile_back",
     "on_profile_promo_apply",
     "on_profile_promo_start",
     "on_profile_topup",
