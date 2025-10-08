@@ -258,6 +258,10 @@ from handlers.menu import (
     build_profile_card,
     build_video_card,
 )
+from handlers.music import configure as configure_music_menu, open_menu as music_open_menu
+from handlers.photo import configure as configure_photo_menu, open_menu as photo_open_menu
+from handlers.dialog import configure as configure_dialog_menu, open_menu as dialog_open_menu
+from handlers.video import configure_menu as configure_video_menu, open_menu as video_open_menu
 from handlers.knowledge_base import (
     KB_PREFIX,
     KB_ROOT,
@@ -5286,6 +5290,21 @@ _PROFILE_CHATDATA_HASH_KEY = "hash"
 _PROFILE_MSG_ID_KEY = "profile_msg_id"
 _PROFILE_MSG_HASH_KEY = "profile_msg_hash"
 
+_KB_MSG_ID_KEY = "kb_msg_id"
+_PHOTO_MSG_ID_KEY = "photo_msg_id"
+_MUSIC_MSG_ID_KEY = "music_msg_id"
+_VIDEO_MSG_ID_KEY = "video_msg_id"
+_DIALOG_MSG_ID_KEY = "dialog_msg_id"
+
+_MENU_CHATDATA_KEYS = {
+    "profile": _PROFILE_MSG_ID_KEY,
+    "kb": _KB_MSG_ID_KEY,
+    "photo": _PHOTO_MSG_ID_KEY,
+    "music": _MUSIC_MSG_ID_KEY,
+    "video": _VIDEO_MSG_ID_KEY,
+    "dialog": _DIALOG_MSG_ID_KEY,
+}
+
 BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
 STATE_CHAT_MODE = "chat_mode"
 STATE_ACTIVE_CARD = "active_card"
@@ -5820,24 +5839,235 @@ async def profile_open(
     )
 
 
+def _chat_data_mapping(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any] | None:
+    obj = getattr(ctx, "chat_data", None)
+    return obj if isinstance(obj, MutableMapping) else None
+
+
+def _chat_data_get_int(
+    chat_data: MutableMapping[str, Any] | None,
+    key: Optional[str],
+) -> Optional[int]:
+    if chat_data is None or not key:
+        return None
+    value = chat_data.get(key)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chat_data_store(
+    chat_data: MutableMapping[str, Any] | None,
+    key: Optional[str],
+    message_id: Optional[int],
+) -> None:
+    if chat_data is None or not key:
+        return
+    if isinstance(message_id, int):
+        chat_data[key] = message_id
+    else:
+        chat_data.pop(key, None)
+
+
+async def _perform_menu_open(
+    item: str,
+    *,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    query: Optional[CallbackQuery],
+    log_click: bool,
+) -> Optional[int]:
+    if item not in _MENU_CHATDATA_KEYS:
+        return None
+
+    query_obj = query or update.callback_query
+    if query_obj is not None:
+        with suppress(BadRequest):
+            await query_obj.answer()
+
+    message = getattr(query_obj, "message", None) if query_obj is not None else None
+    chat_obj = getattr(message, "chat", None) if message is not None else None
+    if chat_obj is None:
+        chat_obj = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+
+    user = getattr(query_obj, "from_user", None) if query_obj is not None else None
+    if user is None:
+        user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+
+    chat_data = _chat_data_mapping(ctx)
+    nav_was_set = False
+    if chat_data is not None:
+        nav_was_set = bool(chat_data.get("nav_event"))
+        chat_data["nav_event"] = True
+
+    fallback_key = _MENU_CHATDATA_KEYS.get(item)
+    fallback_message_id = _chat_data_get_int(chat_data, fallback_key)
+
+    try:
+        if log_click:
+            log.info(
+                "menu.click",
+                extra={"item": item, "chat_id": chat_id, "user_id": user_id},
+            )
+
+        message_id = await _open_menu_section(
+            item,
+            update=update,
+            ctx=ctx,
+            chat_id=chat_id,
+            fallback_message_id=fallback_message_id,
+            suppress_nav=True,
+        )
+
+        _chat_data_store(chat_data, fallback_key, message_id)
+
+        reused = bool(
+            fallback_message_id is not None and message_id == fallback_message_id
+        )
+        log.info(
+            "menu.opened",
+            extra={
+                "item": item,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "reused_msg": reused,
+            },
+        )
+        return message_id
+    finally:
+        if chat_data is not None:
+            if nav_was_set:
+                chat_data["nav_event"] = True
+            else:
+                chat_data.pop("nav_event", None)
+
+
+async def _open_menu_section(
+    item: str,
+    *,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    fallback_message_id: Optional[int],
+    suppress_nav: bool,
+) -> Optional[int]:
+    if item == "profile":
+        return await open_profile_card(
+            update,
+            ctx,
+            suppress_nav=suppress_nav,
+            edit=True,
+        )
+
+    if chat_id is None:
+        return None
+
+    if item == "kb":
+        return await knowledge_base_open_root(
+            ctx,
+            chat_id,
+            suppress_nav=suppress_nav,
+            fallback_message_id=fallback_message_id,
+        )
+    if item == "photo":
+        return await photo_open_menu(
+            ctx,
+            chat_id,
+            suppress_nav=suppress_nav,
+            fallback_message_id=fallback_message_id,
+        )
+    if item == "music":
+        return await music_open_menu(
+            ctx,
+            chat_id,
+            suppress_nav=suppress_nav,
+            fallback_message_id=fallback_message_id,
+        )
+    if item == "video":
+        return await video_open_menu(
+            ctx,
+            chat_id,
+            veo_fast_cost=TOKEN_COSTS.get("veo_fast", 0),
+            veo_photo_cost=TOKEN_COSTS.get("veo_photo", 0),
+            suppress_nav=suppress_nav,
+            fallback_message_id=fallback_message_id,
+        )
+    if item == "dialog":
+        return await dialog_open_menu(
+            ctx,
+            chat_id,
+            suppress_nav=suppress_nav,
+            fallback_message_id=fallback_message_id,
+        )
+    return None
+
+
 async def kb_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await route_home(update, ctx, "menu:kb", query=update.callback_query)
+    await _perform_menu_open(
+        "kb",
+        update=update,
+        ctx=ctx,
+        query=update.callback_query,
+        log_click=False,
+    )
 
 
 async def photo_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await route_home(update, ctx, "menu:photo", query=update.callback_query)
+    await _perform_menu_open(
+        "photo",
+        update=update,
+        ctx=ctx,
+        query=update.callback_query,
+        log_click=False,
+    )
 
 
 async def music_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await route_home(update, ctx, "menu:music", query=update.callback_query)
+    await _perform_menu_open(
+        "music",
+        update=update,
+        ctx=ctx,
+        query=update.callback_query,
+        log_click=False,
+    )
 
 
 async def video_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await route_home(update, ctx, "menu:video", query=update.callback_query)
+    await _perform_menu_open(
+        "video",
+        update=update,
+        ctx=ctx,
+        query=update.callback_query,
+        log_click=False,
+    )
 
 
 async def dialog_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await route_home(update, ctx, "menu:dialog", query=update.callback_query)
+    await _perform_menu_open(
+        "dialog",
+        update=update,
+        ctx=ctx,
+        query=update.callback_query,
+        log_click=False,
+    )
+
+
+async def handle_main_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    if not data.startswith("menu:"):
+        return
+
+    item = data.split(":", 1)[1]
+    await _perform_menu_open(item, update=update, ctx=ctx, query=query, log_click=True)
 
 
 async def handle_hub_open_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5855,19 +6085,19 @@ async def handle_hub_open_callback(update: Update, ctx: ContextTypes.DEFAULT_TYP
         await profile_open(update, ctx, edit_in_place=True)
         return
 
-    route = {
-        "hub:open:kb": "menu:kb",
-        "hub:open:photo": "menu:photo",
-        "hub:open:music": "menu:music",
-        "hub:open:video": "menu:video",
-        "hub:open:dialog": "menu:dialog",
+    item = {
+        "hub:open:kb": "kb",
+        "hub:open:photo": "photo",
+        "hub:open:music": "music",
+        "hub:open:video": "video",
+        "hub:open:dialog": "dialog",
     }.get(data)
-    if not route:
+    if not item:
         with suppress(BadRequest):
             await query.answer()
         return
 
-    await route_home(update, ctx, route, query=query)
+    await _perform_menu_open(item, update=update, ctx=ctx, query=query, log_click=True)
 
 
 async def show_emoji_hub(
@@ -14386,6 +14616,11 @@ configure_knowledge_base(
     state_getter=state,
 )
 
+configure_photo_menu(send_menu=safe_edit_or_send_menu, state_getter=state)
+configure_music_menu(send_menu=safe_edit_or_send_menu, state_getter=state)
+configure_dialog_menu(send_menu=safe_edit_or_send_menu, state_getter=state)
+configure_video_menu(send_menu=safe_edit_or_send_menu, state_getter=state)
+
 
 async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
@@ -18382,6 +18617,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
+    (r"^menu:(profile|kb|photo|music|video|dialog)$", handle_main_menu_callback),
     (r"^(hub:open:(profile|kb|photo|music|video|dialog))$", handle_hub_open_callback),
     (
         r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|menu:|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
