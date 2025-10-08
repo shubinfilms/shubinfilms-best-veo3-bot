@@ -2648,8 +2648,8 @@ async def process_promo_submission(
     ctx: ContextTypes.DEFAULT_TYPE,
     code_input: str,
 ) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
     user = update.effective_user
     state_dict = state(ctx)
     state_dict["mode"] = None
@@ -4185,8 +4185,8 @@ async def reset_user_state(
     suppress_notification: bool = False,
 ):
     chat_data_obj = getattr(ctx, "chat_data", None)
-    nav_suppressed = isinstance(chat_data_obj, MutableMapping) and bool(
-        chat_data_obj.get("nav_event")
+    nav_suppressed = isinstance(chat_data_obj, MutableMapping) and (
+        chat_data_obj.get("nav_in_progress") is True
     )
     s = state(ctx)
     chat_mode_value = s.get(STATE_CHAT_MODE)
@@ -4994,8 +4994,8 @@ async def safe_send(
 ) -> Optional[Message]:
     """Safely deliver text to the chat, falling back to send_message on edit errors."""
 
-    message = update.effective_message
-    chat = update.effective_chat
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
     user = update.effective_user
     chat_id: Optional[int] = None
     if chat is not None:
@@ -5844,6 +5844,19 @@ def _chat_data_mapping(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, An
     return obj if isinstance(obj, MutableMapping) else None
 
 
+def _nav_start(chat_data: MutableMapping[str, Any] | None) -> bool:
+    if chat_data is None:
+        return False
+    chat_data["nav_in_progress"] = True
+    return True
+
+
+def _nav_finish(chat_data: MutableMapping[str, Any] | None, *, started: bool) -> None:
+    if not started or chat_data is None:
+        return
+    chat_data["nav_in_progress"] = False
+
+
 def _chat_data_get_int(
     chat_data: MutableMapping[str, Any] | None,
     key: Optional[str],
@@ -5900,10 +5913,7 @@ async def _perform_menu_open(
     user_id = getattr(user, "id", None)
 
     chat_data = _chat_data_mapping(ctx)
-    nav_was_set = False
-    if chat_data is not None:
-        nav_was_set = bool(chat_data.get("nav_event"))
-        chat_data["nav_event"] = True
+    nav_started = _nav_start(chat_data)
 
     fallback_key = _MENU_CHATDATA_KEYS.get(item)
     fallback_message_id = _chat_data_get_int(chat_data, fallback_key)
@@ -5940,11 +5950,7 @@ async def _perform_menu_open(
         )
         return message_id
     finally:
-        if chat_data is not None:
-            if nav_was_set:
-                chat_data["nav_event"] = True
-            else:
-                chat_data.pop("nav_event", None)
+        _nav_finish(chat_data, started=nav_started)
 
 
 async def _open_menu_section(
@@ -5968,9 +5974,9 @@ async def _open_menu_section(
         return None
 
     if item == "kb":
-        return await knowledge_base_open_root(
+        return await open_kb_card(
+            update,
             ctx,
-            chat_id,
             suppress_nav=suppress_nav,
             fallback_message_id=fallback_message_id,
         )
@@ -6131,7 +6137,146 @@ async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def show_kb_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await knowledge_base_open_root(ctx, chat_id)
+    message_id = await knowledge_base_open_root(ctx, chat_id)
+    chat_data = _chat_data_mapping(ctx)
+    if isinstance(chat_data, MutableMapping) and isinstance(message_id, int):
+        chat_data["last_card"] = {
+            "kind": "kb",
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+
+
+async def open_kb_card(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    suppress_nav: bool = True,
+    fallback_message_id: Optional[int] = None,
+) -> Optional[int]:
+    chat = getattr(update, "effective_chat", None)
+    message = getattr(update, "effective_message", None)
+    if chat is None and message is not None:
+        chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        return None
+
+    chat_data = _chat_data_mapping(ctx)
+    nav_started = _nav_start(chat_data) if suppress_nav else False
+
+    effective_fallback = fallback_message_id
+    if (
+        effective_fallback is None
+        and isinstance(chat_data, MutableMapping)
+    ):
+        last_card = chat_data.get("last_card")
+        if (
+            isinstance(last_card, MutableMapping)
+            and last_card.get("kind") == "kb"
+            and last_card.get("chat_id") == chat_id
+        ):
+            raw_mid = last_card.get("message_id")
+            try:
+                effective_fallback = int(raw_mid)
+            except (TypeError, ValueError, OverflowError):
+                effective_fallback = None
+
+    try:
+        message_id = await knowledge_base_open_root(
+            ctx,
+            chat_id,
+            suppress_nav=suppress_nav,
+            fallback_message_id=effective_fallback,
+        )
+        if isinstance(chat_data, MutableMapping) and isinstance(message_id, int):
+            chat_data["last_card"] = {
+                "kind": "kb",
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
+        return message_id
+    finally:
+        if suppress_nav:
+            _nav_finish(chat_data, started=nav_started)
+
+
+async def handle_quick_profile_button(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await ensure_user_record(update)
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None and chat is not None:
+        chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+    nav_started = _nav_start(nav_chat_data)
+
+    log.info(
+        "[UI] quick_button: profile",
+        extra={"chat_id": chat_id, "user_id": user_id},
+    )
+    log.info("nav.start", extra={"kind": "profile", "chat_id": chat_id})
+
+    try:
+        await reset_user_state(ctx, chat_id, notify_chat_off=True)
+        state_dict = state(ctx)
+        await disable_chat_mode(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=state_dict,
+            notify=False,
+        )
+        await open_profile_card(update, ctx, suppress_nav=True, force_new=False)
+    finally:
+        log.info("nav.finish", extra={"kind": "profile", "chat_id": chat_id})
+        _nav_finish(nav_chat_data, started=nav_started)
+
+    raise ApplicationHandlerStop
+
+
+async def handle_quick_kb_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None and chat is not None:
+        chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+    nav_started = _nav_start(nav_chat_data)
+
+    log.info(
+        "[UI] quick_button: knowledge_base",
+        extra={"chat_id": chat_id, "user_id": user_id},
+    )
+    log.info("nav.start", extra={"kind": "kb", "chat_id": chat_id})
+
+    try:
+        await reset_user_state(ctx, chat_id, notify_chat_off=True)
+        await open_kb_card(update, ctx, suppress_nav=True)
+    finally:
+        log.info("nav.finish", extra={"kind": "kb", "chat_id": chat_id})
+        _nav_finish(nav_chat_data, started=nav_started)
+
+    raise ApplicationHandlerStop
 
 
 async def show_images_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6404,10 +6549,7 @@ async def _dispatch_home_action(
     if action == "balance":
         chat_data_obj = getattr(ctx, "chat_data", None)
         nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
-        nav_was_set = False
-        if nav_chat_data is not None:
-            nav_was_set = bool(nav_chat_data.get("nav_event"))
-            nav_chat_data["nav_event"] = True
+        nav_started = _nav_start(nav_chat_data)
 
         source = "command" if data == "balance_command" else ("callback" if query is not None else "menu")
         log.info("nav.event (source=%s)", source)
@@ -6439,11 +6581,7 @@ async def _dispatch_home_action(
                 query=query,
             )
         finally:
-            if nav_chat_data is not None:
-                if nav_was_set:
-                    nav_chat_data["nav_event"] = True
-                else:
-                    nav_chat_data.pop("nav_event", None)
+            _nav_finish(nav_chat_data, started=nav_started)
         return
 
     if action == "root":
@@ -6453,7 +6591,7 @@ async def _dispatch_home_action(
 
     if action == "knowledge":
         if chat_id is not None:
-            await knowledge_base_open_root(ctx, chat_id)
+            await open_kb_card(update, ctx, suppress_nav=True)
             state_dict[STATE_ACTIVE_CARD] = "kb:root"
         return
 
@@ -6630,7 +6768,7 @@ async def on_text_nav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if handled:
         chat_data_obj = getattr(ctx, "chat_data", None)
         if isinstance(chat_data_obj, MutableMapping):
-            chat_data_obj["nav_event"] = True
+            chat_data_obj["nav_in_progress"] = True
         return
 
     message = update.effective_message
@@ -7309,10 +7447,19 @@ async def open_profile_card(
             profile_state = {}
             chat_data[_PROFILE_CHATDATA_KEY] = profile_state
 
-    nav_was_set = False
-    if chat_data is not None:
-        nav_was_set = bool(chat_data.get("nav_event"))
-        chat_data["nav_event"] = True
+    nav_started = _nav_start(chat_data) if suppress_nav else False
+
+    last_card_info = chat_data.get("last_card") if isinstance(chat_data, MutableMapping) else None
+    same_last_card = False
+    fallback_last_mid: Optional[int] = None
+    if isinstance(last_card_info, MutableMapping):
+        if last_card_info.get("kind") == "profile" and last_card_info.get("chat_id") == chat_id:
+            same_last_card = True
+            raw_mid = last_card_info.get("message_id")
+            try:
+                fallback_last_mid = int(raw_mid)
+            except (TypeError, ValueError, OverflowError):
+                fallback_last_mid = None
 
     state_dict = state(ctx)
 
@@ -7366,7 +7513,12 @@ async def open_profile_card(
         if isinstance(raw_hash_new, int):
             last_hash = raw_hash_new
 
-    if not edit:
+    if fallback_last_mid is not None and last_msg_id is None:
+        last_msg_id = fallback_last_mid
+
+    edit_mode = edit or (same_last_card and not force_new)
+
+    if not edit_mode:
         last_msg_id = None
     if force_new:
         last_msg_id = None
@@ -7374,7 +7526,7 @@ async def open_profile_card(
     reused_message = False
 
     try:
-        if edit and last_msg_id and last_hash == content_hash:
+        if edit_mode and last_msg_id and last_hash == content_hash:
             reused_message = True
             log.info(
                 "profile.open (chat_id=%s, user_id=%s, suppress_nav=%s, reused_msg=%s)",
@@ -7390,7 +7542,7 @@ async def open_profile_card(
         bot_obj = getattr(ctx, "bot", None)
         send_message = getattr(bot_obj, "send_message", None) if bot_obj is not None else None
 
-        if edit and last_msg_id:
+        if edit_mode and last_msg_id:
             try:
                 if callable(send_message):
                     await safe_edit_message(
@@ -7462,7 +7614,7 @@ async def open_profile_card(
                 )
                 message_id = getattr(sent, "message_id", None)
             if message_id is not None:
-                if edit and last_msg_id and message_id == last_msg_id:
+                if edit_mode and last_msg_id and message_id == last_msg_id:
                     reused_message = True
                     log.debug("ui.edit ok msg_id=%s", message_id)
                 else:
@@ -7471,7 +7623,7 @@ async def open_profile_card(
         if message_id is None:
             return None
 
-        reused_message = reused_message or (edit and last_msg_id and message_id == last_msg_id)
+        reused_message = reused_message or (edit_mode and last_msg_id and message_id == last_msg_id)
 
         state_dict[BALANCE_CARD_STATE_KEY] = message_id
         msg_ids = state_dict.get("msg_ids")
@@ -7488,6 +7640,11 @@ async def open_profile_card(
         if chat_data is not None:
             chat_data[_PROFILE_MSG_ID_KEY] = message_id
             chat_data[_PROFILE_MSG_HASH_KEY] = content_hash
+            chat_data["last_card"] = {
+                "kind": "profile",
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
 
         _set_profile_card_message_id(chat_id, message_id)
 
@@ -7527,11 +7684,8 @@ async def open_profile_card(
 
         return message_id
     finally:
-        if chat_data is not None:
-            if nav_was_set:
-                chat_data["nav_event"] = True
-            else:
-                chat_data.pop("nav_event", None)
+        if suppress_nav:
+            _nav_finish(chat_data, started=nav_started)
 
 
 async def show_balance_card(
@@ -14272,10 +14426,8 @@ async def handle_topup_callback(
     data: str,
 ) -> bool:
     chat_data_obj = getattr(ctx, "chat_data", None)
-    nav_flag_set = False
-    if isinstance(chat_data_obj, MutableMapping):
-        chat_data_obj["nav_event"] = True
-        nav_flag_set = True
+    chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+    nav_started = _nav_start(chat_data)
 
     try:
         query = update.callback_query
@@ -14494,8 +14646,7 @@ async def handle_topup_callback(
 
         return False
     finally:
-        if nav_flag_set and isinstance(chat_data_obj, MutableMapping):
-            chat_data_obj.pop("nav_event", None)
+        _nav_finish(chat_data, started=nav_started)
 
 async def handle_menu(
     update: Update,
@@ -15016,16 +15167,7 @@ async def handle_chat_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
-    chat_data_obj = getattr(ctx, "chat_data", None)
-    nav_flag_set = False
-    if isinstance(chat_data_obj, MutableMapping):
-        chat_data_obj["nav_event"] = True
-        nav_flag_set = True
-    try:
-        await open_profile_card(update, ctx, edit=True)
-    finally:
-        if nav_flag_set and isinstance(chat_data_obj, MutableMapping):
-            chat_data_obj.pop("nav_event", None)
+    await open_profile_card(update, ctx, edit=True)
     raise ApplicationHandlerStop
 
 
@@ -17190,7 +17332,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     raw_text = msg.text or ""
     chat_data_obj = getattr(ctx, "chat_data", None)
-    if isinstance(chat_data_obj, MutableMapping) and chat_data_obj.pop("nav_event", False):
+    if (
+        isinstance(chat_data_obj, MutableMapping)
+        and chat_data_obj.get("nav_in_progress") is True
+    ):
+        chat_data_obj["nav_in_progress"] = False
         log.info(
             "nav.suppress_dialog_notice",
             extra={"chat_id": msg.chat_id, "source": "text"},
@@ -17222,10 +17368,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btn = _norm_btn_text(raw_text)
     if btn in ("профиль", "база знаний", "фото", "музыка", "видео", "диалог"):
         nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
-        nav_was_set = False
-        if nav_chat_data is not None:
-            nav_was_set = bool(nav_chat_data.get("nav_event"))
-            nav_chat_data["nav_event"] = True
+        nav_started = _nav_start(nav_chat_data)
         try:
             await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
@@ -17238,18 +17381,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     state_dict=s,
                     notify=False,
                 )
-                await _open_profile_card(
-                    update,
-                    ctx,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    source="quick",
-                    force_new=False,
-                    query=None,
-                )
+                await open_profile_card(update, ctx, suppress_nav=True, force_new=False)
                 raise ApplicationHandlerStop
             if btn == "база знаний":
-                await show_kb_menu(chat_id, ctx)
+                await open_kb_card(update, ctx, suppress_nav=True)
                 raise ApplicationHandlerStop
             if btn == "фото":
                 await show_images_menu(chat_id, ctx)
@@ -17264,11 +17399,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await show_dialog_menu(chat_id, ctx)
                 raise ApplicationHandlerStop
         finally:
-            if nav_chat_data is not None:
-                if nav_was_set:
-                    nav_chat_data["nav_event"] = True
-                else:
-                    nav_chat_data.pop("nav_event", None)
+            _nav_finish(nav_chat_data, started=nav_started)
 
     waiting_for_input = _chat_state_waiting_input(s)
     if (
@@ -18641,6 +18772,12 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
 ]
 
 
+QUICK_BUTTON_PATTERNS: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
+    (r"^(?:👤\s*)?Профиль$", handle_quick_profile_button),
+    (r"^(?:📚\s*)?База знаний$", handle_quick_kb_button),
+]
+
+
 LABEL_COMMAND_ROUTES: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]] = {
     "veo.card": handle_video_entry,
     "mj.card": handle_image_entry,
@@ -18692,6 +18829,14 @@ def register_handlers(application: Any) -> None:
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, on_document))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
+    for pattern, handler in QUICK_BUTTON_PATTERNS:
+        quick_button_handler = MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
+            handler,
+        )
+        quick_button_handler.block = False
+        application.add_handler(quick_button_handler, group=0)
 
     for text, handler in REPLY_BUTTON_ROUTES:
         pattern = rf"^{re.escape(text)}$"
