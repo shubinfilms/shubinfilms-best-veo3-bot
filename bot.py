@@ -4188,6 +4188,9 @@ async def reset_user_state(
     nav_suppressed = isinstance(chat_data_obj, MutableMapping) and (
         chat_data_obj.get("nav_in_progress") is True
     )
+    chat_nav_flag = False
+    if isinstance(chat_data_obj, MutableMapping):
+        chat_nav_flag = bool(chat_data_obj.pop("nav_event", False))
     s = state(ctx)
     chat_mode_value = s.get(STATE_CHAT_MODE)
     was_chat = s.get("mode") == "chat" or bool(chat_mode_value)
@@ -4209,7 +4212,7 @@ async def reset_user_state(
     s.pop(STATE_CHAT_MODE, None)
     s.pop(STATE_ACTIVE_CARD, None)
 
-    nav_event_flag = getattr(ctx, "nav_event", False)
+    nav_event_flag = getattr(ctx, "nav_event", False) or chat_nav_flag
 
     if notify_chat_off and not suppress_notification and was_chat and chat_id:
         if nav_suppressed or nav_event_flag:
@@ -6237,6 +6240,8 @@ async def handle_quick_profile_button(
     log.info("nav.start", extra={"kind": "profile", "chat_id": chat_id})
 
     try:
+        if isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj["nav_event"] = True
         await reset_user_state(ctx, chat_id, notify_chat_off=True)
         state_dict = state(ctx)
         await disable_chat_mode(
@@ -6246,7 +6251,14 @@ async def handle_quick_profile_button(
             state_dict=state_dict,
             notify=False,
         )
-        await open_profile_card(update, ctx, suppress_nav=True, force_new=False)
+        await profile_handlers.open_profile_card(
+            chat_id,
+            user_id,
+            update=update,
+            ctx=ctx,
+            suppress_nav=True,
+            source="quick",
+        )
     finally:
         log.info("nav.finish", extra={"kind": "profile", "chat_id": chat_id})
         _nav_finish(nav_chat_data, started=nav_started)
@@ -6278,6 +6290,8 @@ async def handle_quick_kb_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     log.info("nav.start", extra={"kind": "kb", "chat_id": chat_id})
 
     try:
+        if isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj["nav_event"] = True
         await reset_user_state(ctx, chat_id, notify_chat_off=True)
         await open_kb_card(update, ctx, suppress_nav=True)
     finally:
@@ -17322,6 +17336,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     raw_text = msg.text or ""
     chat_data_obj = getattr(ctx, "chat_data", None)
+    if isinstance(chat_data_obj, MutableMapping) and chat_data_obj.pop("nav_event", False):
+        setattr(ctx, "nav_event", False)
     if (
         isinstance(chat_data_obj, MutableMapping)
         and chat_data_obj.get("nav_in_progress") is True
@@ -17381,7 +17397,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     update=update,
                     ctx=ctx,
                     suppress_nav=True,
-                    reused_msg=True,
                     source="quick",
                 )
                 return
