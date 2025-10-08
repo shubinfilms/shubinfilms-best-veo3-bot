@@ -39,6 +39,7 @@ def _set_nav_event(ctx: ContextTypes.DEFAULT_TYPE) -> tuple[MutableMapping[str, 
     chat_data = _chat_data(ctx)
     if chat_data is not None:
         chat_data["nav_event"] = True
+        log.info("nav.event (source=callback)")
         return chat_data, True
     return None, False
 
@@ -96,6 +97,7 @@ async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         from bot import open_profile_card  # lazy import to avoid circular deps
 
         await open_profile_card(update, ctx, suppress_nav=False, edit=True)
+        log.info("profile.action", extra={"action": "menu", "result": "opened"})
     finally:
         _clear_nav_event(chat_data, flag)
 
@@ -130,7 +132,11 @@ async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")]]
         payload = build_card("💎 Пополнение", subtitle, rows)
 
-        await _edit_card(ctx, chat_id, message_id, payload)
+        success = await _edit_card(ctx, chat_id, message_id, payload)
+        log.info(
+            "profile.action",
+            extra={"action": "topup", "result": "ok" if success else "skipped"},
+        )
     finally:
         _clear_nav_event(chat_data, flag)
 
@@ -237,7 +243,11 @@ async def on_profile_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         payload = build_card("🧾 История операций", "Последние операции", rows, body_lines=body)
 
         chat_id, message_id = _callback_target(update)
-        await _edit_card(ctx, chat_id, message_id, payload)
+        success = await _edit_card(ctx, chat_id, message_id, payload)
+        log.info(
+            "profile.action",
+            extra={"action": "history", "result": "ok" if success else "skipped"},
+        )
     finally:
         _clear_nav_event(chat_data, flag)
 
@@ -289,6 +299,7 @@ async def on_profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             disable_web_page_preview=True,
         )
         log.info("profile.invite.sent", extra={"user": user.id})
+        log.info("profile.action", extra={"action": "invite", "result": "sent"})
     finally:
         _clear_nav_event(chat_data, flag)
 
@@ -339,10 +350,15 @@ async def on_profile_promo_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         )
 
         chat_id, message_id = _callback_target(update)
-        if await _edit_card(ctx, chat_id, message_id, payload):
+        success = await _edit_card(ctx, chat_id, message_id, payload)
+        if success:
             _activate_promo_wait(ctx)
             user = update.effective_user
             log.info("profile.promo.wait", extra={"user": getattr(user, "id", None)})
+        log.info(
+            "profile.action",
+            extra={"action": "promo", "result": "waiting" if success else "skipped"},
+        )
     finally:
         _clear_nav_event(chat_data, flag)
 
@@ -391,9 +407,11 @@ async def on_profile_promo_apply(
     if ok:
         await message.reply_text("✅ Промокод активирован")
         log.info("profile.promo.ok", extra={"user": user.id, "code": clean_code})
+        log.info("profile.action", extra={"action": "promo_apply", "result": "ok"})
     else:
         await message.reply_text("❌ Неверный промокод")
         log.info("profile.promo.bad", extra={"user": user.id, "code": clean_code})
+        log.info("profile.action", extra={"action": "promo_apply", "result": "bad"})
 
     await on_profile_menu(update, ctx)
 
@@ -403,6 +421,7 @@ async def handle_promo_timeout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     message = update.effective_message
     if message is not None:
         await message.reply_text("⏳ Ожидание промокода истекло.")
+    log.info("profile.action", extra={"action": "promo_timeout", "result": "expired"})
     await on_profile_menu(update, ctx)
 
 
