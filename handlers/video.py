@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from helpers.errors import send_user_error
+from helpers.progress import PROGRESS_STORAGE_KEY, send_progress_message
 from settings import (
     HTTP_TIMEOUT_CONNECT,
     HTTP_TIMEOUT_READ,
@@ -281,7 +282,9 @@ async def _start_animation(image_url: str, prompt: Optional[str]) -> str:
     return str(job_id)
 
 
-async def _wait_for_result(job_id: str) -> tuple[list[str], Mapping[str, Any]]:
+async def _wait_for_result(
+    job_id: str, *, context: Optional[ContextTypes.DEFAULT_TYPE] = None
+) -> tuple[list[str], Mapping[str, Any]]:
     deadline = time.monotonic() + _POLL_TIMEOUT
     async with httpx.AsyncClient(base_url=KIE_BASE_URL, timeout=_http_timeout()) as client:
         while time.monotonic() < deadline:
@@ -302,6 +305,8 @@ async def _wait_for_result(job_id: str) -> tuple[list[str], Mapping[str, Any]]:
                 await asyncio.sleep(_POLL_INTERVAL)
                 continue
             if normalized == "processing":
+                if context is not None:
+                    await send_progress_message(context, "render")
                 await asyncio.sleep(_POLL_INTERVAL)
                 continue
             if normalized in {"done", "success", "succeed", "completed"}:
@@ -443,10 +448,32 @@ async def veo_animate(
 
     state[_WAIT_FLAG] = False
 
+    progress: Optional[MutableMapping[str, Any]] = None
+    chat_data = getattr(context, "chat_data", None)
+    message = update.effective_message
+    reply_to = message.message_id if message else None
+    if (
+        isinstance(chat_data, MutableMapping)
+        and chat_id is not None
+        and reply_to is not None
+    ):
+        progress = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "mode": "veo_animate",
+            "reply_to_message_id": reply_to,
+            "success": False,
+        }
+        chat_data[PROGRESS_STORAGE_KEY] = progress
+        await send_progress_message(context, "start")
+
     try:
         job_id = await _start_animation(source_url, prompt)
     except VeoAnimateBadRequest:
         logger.info("veo.anim.fail user=%s reason=bad_request", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,
@@ -457,6 +484,9 @@ async def veo_animate(
         return
     except VeoAnimateError:
         logger.info("veo.anim.fail user=%s reason=error", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,
@@ -470,11 +500,16 @@ async def veo_animate(
     if user_id is not None:
         remember_veo_anim_job(user_id, job_id)
     logger.info("veo.anim.request user=%s job=%s", user_id, job_id)
+    if progress is not None:
+        progress["job_id"] = job_id
 
     try:
-        urls, _payload = await _wait_for_result(job_id)
+        urls, _payload = await _wait_for_result(job_id, context=context)
     except VeoAnimateTimeout:
         logger.info("veo.anim.fail user=%s reason=timeout", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,
@@ -487,6 +522,9 @@ async def veo_animate(
         return
     except VeoAnimateBadRequest:
         logger.info("veo.anim.fail user=%s reason=bad_request", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,
@@ -498,6 +536,9 @@ async def veo_animate(
         return
     except VeoAnimateError:
         logger.info("veo.anim.fail user=%s reason=error", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,
@@ -511,6 +552,9 @@ async def veo_animate(
 
     if not urls:
         logger.info("veo.anim.fail user=%s reason=error", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,
@@ -533,8 +577,14 @@ async def veo_animate(
             await context.bot.send_document(chat_id=chat_id, document=result_url)
         else:
             await context.bot.send_video(chat_id=chat_id, video=result_url)
+        if progress is not None:
+            progress["success"] = True
+            await send_progress_message(context, "finish")
     except Exception:  # pragma: no cover - defensive guard
         logger.exception("veo.anim.telegram_send_fail user=%s", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
         await _emit_user_error(
             context,
             chat_id=chat_id,

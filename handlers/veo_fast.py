@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional
 from telegram.ext import ContextTypes
 
 from helpers.errors import send_user_error
+from helpers.progress import PROGRESS_STORAGE_KEY, send_progress_message
 
 logger = logging.getLogger("veo.fast")
 
@@ -111,6 +112,13 @@ async def handle_veo_fast_error(
     mode: str = "veo_fast",
 ) -> None:
     """Map backend errors to user-facing messages and send them."""
+
+    chat_data = getattr(context, "chat_data", None)
+    if isinstance(chat_data, MutableMapping):
+        progress = chat_data.get(PROGRESS_STORAGE_KEY)
+        if isinstance(progress, MutableMapping):
+            progress["success"] = False
+    await send_progress_message(context, "finish")
 
     kind = "backend_fail"
     reason: Optional[str] = None
