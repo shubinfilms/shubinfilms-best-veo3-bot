@@ -33,6 +33,7 @@ def _populate_from_settings() -> None:
     g["SUPPORT_USERNAME"] = settings.SUPPORT_USERNAME
     g["SUPPORT_USER_ID"] = int(settings.SUPPORT_USER_ID)
     g["BOT_USERNAME"] = settings.BOT_USERNAME
+    g["BOT_NAME"] = settings.BOT_NAME or settings.BOT_USERNAME
     g["REF_BONUS_HINT_ENABLED"] = bool(settings.REF_BONUS_HINT_ENABLED)
 
     g["KIE_BASE_URL"] = settings.KIE_BASE_URL
@@ -72,6 +73,8 @@ def _populate_from_settings() -> None:
     g["UPLOAD_URL_PATH"] = settings.UPLOAD_URL_PATH
     g["UPLOAD_BASE64_PATH"] = settings.UPLOAD_BASE64_PATH
     g["UPLOAD_FALLBACK_ENABLED"] = bool(settings.UPLOAD_FALLBACK_ENABLED)
+
+    g["TOPUP_URL"] = settings.TOPUP_URL
 
     g["YOOKASSA_SHOP_ID"] = settings.YOOKASSA_SHOP_ID
     g["YOOKASSA_SECRET_KEY"] = settings.YOOKASSA_SECRET_KEY

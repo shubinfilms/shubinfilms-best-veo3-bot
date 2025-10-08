@@ -4180,6 +4180,10 @@ async def reset_user_state(
     notify_chat_off: bool = False,
     suppress_notification: bool = False,
 ):
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    nav_suppressed = isinstance(chat_data_obj, MutableMapping) and bool(
+        chat_data_obj.get("nav_event")
+    )
     s = state(ctx)
     chat_mode_value = s.get(STATE_CHAT_MODE)
     was_chat = s.get("mode") == "chat" or bool(chat_mode_value)
@@ -4202,13 +4206,16 @@ async def reset_user_state(
     s.pop(STATE_ACTIVE_CARD, None)
 
     if notify_chat_off and not suppress_notification and was_chat and chat_id:
-        try:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text="🛑 Режим диалога отключён.",
-            )
-        except Exception:
-            pass
+        if nav_suppressed:
+            log.info("nav.suppress_dialog_notice", extra={"chat_id": chat_id})
+        else:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text="🛑 Режим диалога отключён.",
+                )
+            except Exception:
+                pass
 
 
 def _suno_log_preview(value: Optional[str], limit: int = 60) -> str:
@@ -6145,19 +6152,29 @@ async def _dispatch_home_action(
             preserved["image_engine"] = state_dict["image_engine"]
 
     if action in disable_actions and chat_id is not None:
-        await reset_user_state(
-            ctx,
-            chat_id,
-            notify_chat_off=True,
-            suppress_notification=query is not None,
-        )
-        await disable_chat_mode(
-            ctx,
-            chat_id=chat_id,
-            user_id=user_id,
-            state_dict=state_dict,
-            notify=False,
-        )
+        chat_data_obj = getattr(ctx, "chat_data", None)
+        nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+        nav_flag = False
+        if nav_chat_data is not None:
+            nav_chat_data["nav_event"] = True
+            nav_flag = True
+        try:
+            await reset_user_state(
+                ctx,
+                chat_id,
+                notify_chat_off=True,
+                suppress_notification=query is not None,
+            )
+            await disable_chat_mode(
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                state_dict=state_dict,
+                notify=False,
+            )
+        finally:
+            if nav_flag and nav_chat_data is not None:
+                nav_chat_data.pop("nav_event", None)
 
         for key, value in preserved.items():
             state_dict[key] = value
@@ -6344,6 +6361,9 @@ async def on_text_nav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     handled = await hub_route_text(update, ctx)
     if handled:
+        chat_data_obj = getattr(ctx, "chat_data", None)
+        if isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj["nav_event"] = True
         return
 
     message = update.effective_message
@@ -6997,6 +7017,7 @@ async def open_profile_card(
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
     edit: bool = True,
+    suppress_nav: bool = True,
 ) -> Optional[int]:
     chat = update.effective_chat
     message = update.effective_message
@@ -7024,10 +7045,9 @@ async def open_profile_card(
             chat_data[_PROFILE_CHATDATA_KEY] = profile_state
 
     nav_flag_set = False
-    if chat_data is not None:
-        if not chat_data.get("nav_event"):
-            chat_data["nav_event"] = True
-            nav_flag_set = True
+    if suppress_nav and chat_data is not None:
+        chat_data["nav_event"] = True
+        nav_flag_set = True
 
     state_dict = state(ctx)
 
@@ -7074,7 +7094,7 @@ async def open_profile_card(
         last_msg_id = None
 
     log.info(
-        "nav:profile open uid=%s",
+        "profile.open user=%s",
         resolved_user,
         extra={"chat_id": chat_id, "user_id": resolved_user},
     )
@@ -16866,6 +16886,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw_text = msg.text or ""
     chat_data_obj = getattr(ctx, "chat_data", None)
     if isinstance(chat_data_obj, MutableMapping) and chat_data_obj.pop("nav_event", False):
+        log.info(
+            "nav.suppress_dialog_notice",
+            extra={"chat_id": msg.chat_id, "source": "text"},
+        )
         return
 
     if profile_handlers.is_waiting_for_promo(ctx):
@@ -16892,26 +16916,35 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     btn = _norm_btn_text(raw_text)
     if btn in ("профиль", "база знаний", "фото", "музыка", "видео", "диалог"):
-        await reset_user_state(ctx, chat_id, notify_chat_off=True)
+        nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+        nav_flag = False
+        if nav_chat_data is not None:
+            nav_chat_data["nav_event"] = True
+            nav_flag = True
+        try:
+            await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
-        if btn == "профиль":
-            await show_profile_menu(chat_id, ctx)
-            raise ApplicationHandlerStop
-        if btn == "база знаний":
-            await show_kb_menu(chat_id, ctx)
-            raise ApplicationHandlerStop
-        if btn == "фото":
-            await show_images_menu(chat_id, ctx)
-            raise ApplicationHandlerStop
-        if btn == "музыка":
-            await show_music_menu(chat_id, ctx)
-            raise ApplicationHandlerStop
-        if btn == "видео":
-            await show_video_menu(chat_id, ctx)
-            raise ApplicationHandlerStop
-        if btn == "диалог":
-            await show_dialog_menu(chat_id, ctx)
-            raise ApplicationHandlerStop
+            if btn == "профиль":
+                await show_profile_menu(chat_id, ctx)
+                raise ApplicationHandlerStop
+            if btn == "база знаний":
+                await show_kb_menu(chat_id, ctx)
+                raise ApplicationHandlerStop
+            if btn == "фото":
+                await show_images_menu(chat_id, ctx)
+                raise ApplicationHandlerStop
+            if btn == "музыка":
+                await show_music_menu(chat_id, ctx)
+                raise ApplicationHandlerStop
+            if btn == "видео":
+                await show_video_menu(chat_id, ctx)
+                raise ApplicationHandlerStop
+            if btn == "диалог":
+                await show_dialog_menu(chat_id, ctx)
+                raise ApplicationHandlerStop
+        finally:
+            if nav_flag and nav_chat_data is not None:
+                nav_chat_data.pop("nav_event", None)
 
     waiting_for_input = _chat_state_waiting_input(s)
     if (
