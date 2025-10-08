@@ -5283,6 +5283,8 @@ LEDGER_PAGE_SIZE = 10
 _PROFILE_CHATDATA_KEY = "profile_card"
 _PROFILE_CHATDATA_MSG_KEY = "msg_id"
 _PROFILE_CHATDATA_HASH_KEY = "hash"
+_PROFILE_MSG_ID_KEY = "profile_msg_id"
+_PROFILE_MSG_HASH_KEY = "profile_msg_hash"
 
 BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
 STATE_CHAT_MODE = "chat_mode"
@@ -6144,7 +6146,7 @@ async def _dispatch_home_action(
         input_state.clear(user_id, reason="home_nav")
         clear_wait(user_id, reason="home_nav")
 
-    disable_actions = {"knowledge", "balance", "video", "image", "music", "tpl_banana"}
+    disable_actions = {"knowledge", "video", "image", "music", "tpl_banana"}
 
     preserved: Dict[str, Any] = {}
     if action == "image":
@@ -6168,6 +6170,51 @@ async def _dispatch_home_action(
 
         for key, value in preserved.items():
             state_dict[key] = value
+
+    if action == "balance":
+        chat_data_obj = getattr(ctx, "chat_data", None)
+        nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+        nav_was_set = False
+        if nav_chat_data is not None:
+            nav_was_set = bool(nav_chat_data.get("nav_event"))
+            nav_chat_data["nav_event"] = True
+
+        source = "command" if data == "balance_command" else ("callback" if query is not None else "menu")
+        log.info("nav.event (source=%s)", source)
+
+        try:
+            if chat_id is not None:
+                await reset_user_state(
+                    ctx,
+                    chat_id,
+                    notify_chat_off=True,
+                    suppress_notification=False,
+                )
+                await disable_chat_mode(
+                    ctx,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    state_dict=state_dict,
+                    notify=False,
+                )
+
+            force_new = data in {"hub:balance", PROFILE_MENU_CB, "balance_command"}
+            await _open_profile_card(
+                update,
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                source=source,
+                force_new=force_new,
+                query=query,
+            )
+        finally:
+            if nav_chat_data is not None:
+                if nav_was_set:
+                    nav_chat_data["nav_event"] = True
+                else:
+                    nav_chat_data.pop("nav_event", None)
+        return
 
     if action == "root":
         if chat_id is not None:
@@ -6962,10 +7009,7 @@ def balance_menu_kb(*, referral_url: Optional[str] = None) -> InlineKeyboardMark
     keyboard: list[list[InlineKeyboardButton]] = []
     keyboard.extend(kb_profile_topup_entry().inline_keyboard)
     keyboard.append([InlineKeyboardButton("🧾 История операций", callback_data=PROFILE_CB_TRANSACTIONS)])
-    if referral_url:
-        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", url=referral_url)])
-    else:
-        keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data=PROFILE_CB_INVITE)])
+    keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data=PROFILE_CB_INVITE)])
     keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data=PROFILE_CB_PROMO)])
     keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data=CB_PROFILE_BACK)])
     return InlineKeyboardMarkup(keyboard)
@@ -7035,10 +7079,10 @@ async def open_profile_card(
             profile_state = {}
             chat_data[_PROFILE_CHATDATA_KEY] = profile_state
 
-    nav_flag_set = False
-    if suppress_nav and chat_data is not None:
+    nav_was_set = False
+    if chat_data is not None:
+        nav_was_set = bool(chat_data.get("nav_event"))
         chat_data["nav_event"] = True
-        nav_flag_set = True
 
     state_dict = state(ctx)
 
@@ -7081,19 +7125,34 @@ async def open_profile_card(
         if isinstance(raw_hash, int):
             last_hash = raw_hash
 
+    if chat_data is not None:
+        raw_mid_new = chat_data.get(_PROFILE_MSG_ID_KEY)
+        if last_msg_id is None and raw_mid_new is not None:
+            try:
+                last_msg_id = int(raw_mid_new)
+            except (TypeError, ValueError):
+                last_msg_id = None
+        raw_hash_new = chat_data.get(_PROFILE_MSG_HASH_KEY)
+        if isinstance(raw_hash_new, int):
+            last_hash = raw_hash_new
+
     if not edit:
         last_msg_id = None
     if force_new:
         last_msg_id = None
 
-    log.info(
-        "profile.open user=%s",
-        resolved_user,
-        extra={"chat_id": chat_id, "user_id": resolved_user},
-    )
+    reused_message = False
 
     try:
         if edit and last_msg_id and last_hash == content_hash:
+            reused_message = True
+            log.info(
+                "profile.open (chat_id=%s, user_id=%s, suppress_nav=%s, reused_msg=%s)",
+                chat_id,
+                resolved_user,
+                suppress_nav,
+                True,
+            )
             return last_msg_id
 
         message_id: Optional[int] = None
@@ -7114,6 +7173,7 @@ async def open_profile_card(
                         disable_web_page_preview=True,
                     )
                     message_id = last_msg_id
+                    reused_message = True
                     log.debug("ui.edit ok msg_id=%s", message_id)
                 else:
                     edited_mid = await show_balance_card(
@@ -7127,6 +7187,7 @@ async def open_profile_card(
             except BadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     message_id = last_msg_id
+                    reused_message = True
                     log.debug("ui.edit ok msg_id=%s", message_id)
                 else:
                     log.debug(
@@ -7172,12 +7233,15 @@ async def open_profile_card(
                 message_id = getattr(sent, "message_id", None)
             if message_id is not None:
                 if edit and last_msg_id and message_id == last_msg_id:
+                    reused_message = True
                     log.debug("ui.edit ok msg_id=%s", message_id)
                 else:
                     log.debug("ui.send new msg_id=%s", message_id)
 
         if message_id is None:
             return None
+
+        reused_message = reused_message or (edit and last_msg_id and message_id == last_msg_id)
 
         state_dict[BALANCE_CARD_STATE_KEY] = message_id
         msg_ids = state_dict.get("msg_ids")
@@ -7191,7 +7255,19 @@ async def open_profile_card(
             profile_state[_PROFILE_CHATDATA_MSG_KEY] = message_id
             profile_state[_PROFILE_CHATDATA_HASH_KEY] = content_hash
 
+        if chat_data is not None:
+            chat_data[_PROFILE_MSG_ID_KEY] = message_id
+            chat_data[_PROFILE_MSG_HASH_KEY] = content_hash
+
         _set_profile_card_message_id(chat_id, message_id)
+
+        log.info(
+            "profile.open (chat_id=%s, user_id=%s, suppress_nav=%s, reused_msg=%s)",
+            chat_id,
+            resolved_user,
+            suppress_nav,
+            reused_message,
+        )
 
         if (
             REF_BONUS_HINT_ENABLED
@@ -7221,8 +7297,11 @@ async def open_profile_card(
 
         return message_id
     finally:
-        if nav_flag_set and chat_data is not None:
-            chat_data.pop("nav_event", None)
+        if chat_data is not None:
+            if nav_was_set:
+                chat_data["nav_event"] = True
+            else:
+                chat_data.pop("nav_event", None)
 
 
 async def show_balance_card(
@@ -16908,15 +16987,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btn = _norm_btn_text(raw_text)
     if btn in ("профиль", "база знаний", "фото", "музыка", "видео", "диалог"):
         nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
-        nav_flag = False
+        nav_was_set = False
         if nav_chat_data is not None:
+            nav_was_set = bool(nav_chat_data.get("nav_event"))
             nav_chat_data["nav_event"] = True
-            nav_flag = True
         try:
             await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
             if btn == "профиль":
-                await show_profile_menu(chat_id, ctx)
+                log.info("nav.event (source=quick)")
+                await disable_chat_mode(
+                    ctx,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    state_dict=s,
+                    notify=False,
+                )
+                await _open_profile_card(
+                    update,
+                    ctx,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    source="quick",
+                    force_new=False,
+                    query=None,
+                )
                 raise ApplicationHandlerStop
             if btn == "база знаний":
                 await show_kb_menu(chat_id, ctx)
@@ -16934,8 +17029,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await show_dialog_menu(chat_id, ctx)
                 raise ApplicationHandlerStop
         finally:
-            if nav_flag and nav_chat_data is not None:
-                nav_chat_data.pop("nav_event", None)
+            if nav_chat_data is not None:
+                if nav_was_set:
+                    nav_chat_data["nav_event"] = True
+                else:
+                    nav_chat_data.pop("nav_event", None)
 
     waiting_for_input = _chat_state_waiting_input(s)
     if (
