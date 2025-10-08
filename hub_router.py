@@ -214,13 +214,7 @@ LEGACY_ALIASES: Dict[str, str] = {
     "nav:music": "hub:open:music",
     "nav:video": "hub:open:video",
     "nav:dialog": "hub:open:dialog",
-    "menu:profile": "hub:open:profile",
-    "menu:kb": "hub:open:kb",
-    "menu:photo": "hub:open:photo",
-    "menu:music": "hub:open:music",
-    "menu:video": "hub:open:video",
-    "menu:dialog": "hub:open:dialog",
-    "menu:root": "menu_main",
+    "menu:root": "menu:root",
     "banana:add_photo": "banana:add_more",
     "banana:clear": "banana:reset_all",
     "banana:templates": "banana:templates",
@@ -237,10 +231,10 @@ LEGACY_ALIASES: Dict[str, str] = {
     "dialog_default": "dialog:plain",
     "dialog:menu": "hub:open:dialog",
     "menu_main": "menu:root",
-    "PROFILE_TRANSACTIONS": "tx:open",
-    "PROFILE_PROMO": "promo_open",
-    "PROFILE_INVITE": "ref:open",
-    "PROFILE_BACK": "back",
+    "PROFILE_TRANSACTIONS": "profile:history",
+    "PROFILE_PROMO": "profile:promo",
+    "PROFILE_INVITE": "profile:invite",
+    "PROFILE_BACK": "profile:back",
 }
 
 
@@ -430,6 +424,10 @@ async def hub_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not data_raw:
         await _safe_answer(query)
         return
+
+    user = getattr(query, "from_user", None)
+    user_id = getattr(user, "id", None)
+    log.info("[CALLBACK] %s from %s", data_raw, user_id if user_id is not None else "unknown")
 
     chat_obj = getattr(query, "message", None)
     if chat_obj is not None:
