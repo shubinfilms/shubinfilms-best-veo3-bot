@@ -182,7 +182,8 @@ def _resolve_ui_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
     if isinstance(lang, str) and lang in {"ru", "en"}:
         return lang
     user = update.effective_user
-    if user and isinstance(user.language_code, str) and user.language_code.lower().startswith("ru"):
+    lang_code = getattr(user, "language_code", None)
+    if isinstance(lang_code, str) and lang_code.lower().startswith("ru"):
         return "ru"
     return "en"
 

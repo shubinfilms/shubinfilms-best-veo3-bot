@@ -237,6 +237,13 @@ LEGACY_ALIASES: Dict[str, str] = {
     "PROFILE_BACK": "profile:back",
 }
 
+_TEXT_ACTION_FALLBACKS: Dict[str, str] = {
+    "фото": "режим фото",
+    "музыка": "режим музыки",
+    "видео": "режим видео",
+    "диалог": "диалог с ии",
+}
+
 
 def _parse_callback(data: str) -> Optional[tuple[str, str]]:
     payload = data.strip()
@@ -254,6 +261,10 @@ def resolve_text_action(text: str) -> Optional[tuple[str, str]]:
     if not normalized:
         return None
     payload = TEXT_TO_ACTION.get(normalized)
+    if not payload:
+        alias_key = _TEXT_ACTION_FALLBACKS.get(normalized)
+        if alias_key:
+            payload = TEXT_TO_ACTION.get(alias_key)
     if not payload:
         return None
     return _parse_callback(payload)

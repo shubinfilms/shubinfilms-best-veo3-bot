@@ -6,14 +6,15 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 from urllib.parse import urlparse
 
 import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
-from telegram.error import TelegramError
 
+from helpers.errors import send_user_error
 from settings import (
     HTTP_TIMEOUT_CONNECT,
     HTTP_TIMEOUT_READ,
@@ -33,13 +34,7 @@ _POLL_INTERVAL = 2.0
 _POLL_TIMEOUT = 240.0
 _MAX_VIDEO_BYTES = 50 * 1024 * 1024
 _WAIT_FLAG = "veo_animate_waiting_photo"
-
-_ERROR_TIMEOUT = "Не удалось оживить изображение вовремя. Попробуйте ещё раз."
-_ERROR_BAD_REQUEST = (
-    "Запрос отклонён. Измените описание и избегайте запрещённого контента."
-)
-_ERROR_GENERIC = "Что-то пошло не так. Попробуйте другой кадр или запрос."
-_PROMPT_PHOTO = "📸 Отправьте фото, и я сразу попробую его оживить."
+_RETRY_STORAGE_KEY = "veo_anim_retries"
 
 
 class VeoAnimateError(RuntimeError):
@@ -352,15 +347,71 @@ def _shorten_url(url: str) -> str:
     return url[:60]
 
 
-async def _send_error(bot: Any, chat_id: Optional[int], text: str) -> None:
-    if chat_id is None:
+def _generate_retry_id(chat_id: Optional[int]) -> str:
+    base = str(chat_id) if chat_id is not None else "chat"
+    return f"veo_anim:retry:{base}:{uuid.uuid4().hex}"
+
+
+def _store_retry_payload(
+    context: ContextTypes.DEFAULT_TYPE, retry_id: str, payload: Mapping[str, Any]
+) -> None:
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, MutableMapping):
         return
-    try:
-        await bot.send_message(chat_id=chat_id, text=text)
-    except TelegramError:  # pragma: no cover - defensive guard
-        logger.exception("veo.anim.error_message_fail chat=%s", chat_id)
-    except Exception:  # pragma: no cover - defensive guard
-        logger.exception("veo.anim.error_message_fail chat=%s", chat_id)
+    storage = chat_data.get(_RETRY_STORAGE_KEY)
+    if not isinstance(storage, MutableMapping):
+        storage = {}
+        chat_data[_RETRY_STORAGE_KEY] = storage
+    storage[retry_id] = dict(payload)
+
+
+def _prepare_retry(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    payload: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    if chat_id is None or not payload:
+        return None
+    retry_id = _generate_retry_id(chat_id)
+    _store_retry_payload(context, retry_id, payload)
+    return retry_id
+
+
+def _pop_retry_payload(
+    context: ContextTypes.DEFAULT_TYPE, retry_id: str
+) -> Optional[Mapping[str, Any]]:
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, MutableMapping):
+        return None
+    storage = chat_data.get(_RETRY_STORAGE_KEY)
+    if not isinstance(storage, MutableMapping):
+        return None
+    return storage.pop(retry_id, None)
+
+
+async def _emit_user_error(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int],
+    user_id: Optional[int],
+    kind: str,
+    reason: str,
+    retry_payload: Optional[Mapping[str, Any]] = None,
+    req_id: Optional[str] = None,
+) -> None:
+    retry_cb = _prepare_retry(context, chat_id, retry_payload)
+    await send_user_error(
+        context,
+        kind,
+        details={
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "mode": "veo_animate",
+            "reason": reason,
+            "req_id": req_id,
+        },
+        retry_cb=retry_cb,
+    )
 
 
 async def veo_animate(
@@ -381,7 +432,13 @@ async def veo_animate(
     if not source_url:
         state[_WAIT_FLAG] = True
         if not auto_started:
-            await _send_error(context.bot, chat_id, _PROMPT_PHOTO)
+            await _emit_user_error(
+                context,
+                chat_id=chat_id,
+                user_id=user_id,
+                kind="invalid_input",
+                reason="missing_image",
+            )
         return
 
     state[_WAIT_FLAG] = False
@@ -390,11 +447,24 @@ async def veo_animate(
         job_id = await _start_animation(source_url, prompt)
     except VeoAnimateBadRequest:
         logger.info("veo.anim.fail user=%s reason=bad_request", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_BAD_REQUEST)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="content_policy",
+            reason="start_bad_request",
+        )
         return
     except VeoAnimateError:
         logger.info("veo.anim.fail user=%s reason=error", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_GENERIC)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="backend_fail",
+            reason="start_error",
+            retry_payload={"image_url": source_url, "prompt": prompt},
+        )
         return
 
     if user_id is not None:
@@ -405,20 +475,51 @@ async def veo_animate(
         urls, _payload = await _wait_for_result(job_id)
     except VeoAnimateTimeout:
         logger.info("veo.anim.fail user=%s reason=timeout", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_TIMEOUT)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="timeout",
+            reason="wait_timeout",
+            retry_payload={"image_url": source_url, "prompt": prompt},
+            req_id=job_id,
+        )
         return
     except VeoAnimateBadRequest:
         logger.info("veo.anim.fail user=%s reason=bad_request", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_BAD_REQUEST)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="content_policy",
+            reason="wait_bad_request",
+            req_id=job_id,
+        )
         return
     except VeoAnimateError:
         logger.info("veo.anim.fail user=%s reason=error", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_GENERIC)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="backend_fail",
+            reason="wait_error",
+            retry_payload={"image_url": source_url, "prompt": prompt},
+            req_id=job_id,
+        )
         return
 
     if not urls:
         logger.info("veo.anim.fail user=%s reason=error", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_GENERIC)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="backend_fail",
+            reason="empty_urls",
+            retry_payload={"image_url": source_url, "prompt": prompt},
+            req_id=job_id,
+        )
         return
 
     result_url = urls[0]
@@ -432,12 +533,17 @@ async def veo_animate(
             await context.bot.send_document(chat_id=chat_id, document=result_url)
         else:
             await context.bot.send_video(chat_id=chat_id, video=result_url)
-    except TelegramError:
-        logger.exception("veo.anim.telegram_send_fail user=%s", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_GENERIC)
     except Exception:  # pragma: no cover - defensive guard
         logger.exception("veo.anim.telegram_send_fail user=%s", user_id)
-        await _send_error(context.bot, chat_id, _ERROR_GENERIC)
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="backend_fail",
+            reason="telegram_send_fail",
+            retry_payload={"image_url": source_url, "prompt": prompt},
+            req_id=job_id,
+        )
 
 
 async def veo_animate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -457,11 +563,29 @@ async def handle_veo_animate_photo(
     await veo_animate(update, context, image_url=image_url, auto_started=True)
 
 
+async def trigger_veo_animation_retry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, retry_id: str
+) -> bool:
+    payload = _pop_retry_payload(context, retry_id)
+    if not payload:
+        return False
+    image_url = payload.get("image_url")
+    prompt = payload.get("prompt")
+    state = _ensure_state(context)
+    if image_url:
+        state["last_image_url"] = image_url
+    if prompt is not None:
+        state["last_prompt"] = prompt
+    await veo_animate(update, context, image_url=image_url, auto_started=True)
+    return True
+
+
 __all__ = [
     "VeoAnimateBadRequest",
     "VeoAnimateError",
     "VeoAnimateTimeout",
     "handle_veo_animate_photo",
+    "trigger_veo_animation_retry",
     "veo_animate",
     "veo_animate_command",
 ]
