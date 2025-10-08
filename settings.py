@@ -37,6 +37,9 @@ def _populate_from_settings() -> None:
 
     g["KIE_BASE_URL"] = settings.KIE_BASE_URL
     g["KIE_API_KEY"] = settings.KIE_API_KEY
+    g["KIE_GEN_PATH"] = settings.KIE_GEN_PATH
+    g["KIE_STATUS_PATH"] = settings.KIE_STATUS_PATH
+    g["KIE_HD_PATH"] = settings.KIE_HD_PATH
 
     g["TELEGRAM_TOKEN"] = settings.TELEGRAM_TOKEN
     g["REDIS_URL"] = settings.REDIS_URL

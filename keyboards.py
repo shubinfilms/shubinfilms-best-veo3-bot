@@ -323,6 +323,7 @@ class CB:
     VIDEO_MODE_VEO_PHOTO = "cb:video:veo:mode:photo"
     VIDEO_MODE_SORA_TEXT = "cb:video:sora2:mode:ttv"
     VIDEO_MODE_SORA_IMAGE = "cb:video:sora2:mode:itv"
+    VIDEO_VEO_ANIMATE = "cb:video:veo:animate"
 
 
 # Backwards compatibility constants (to be removed once call sites migrate).

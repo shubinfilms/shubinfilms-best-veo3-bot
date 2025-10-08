@@ -72,12 +72,15 @@ from handlers import (
     faq_command,
     help_command,
     get_pm_prompt,
+    handle_veo_animate_photo,
     prompt_master_callback,
     prompt_master_handle_text,
     prompt_master_open,
     prompt_master_process,
     prompt_master_reset,
     clear_pm_prompts,
+    veo_animate,
+    veo_animate_command,
 )
 
 from prompt_master import (
@@ -5299,6 +5302,7 @@ VIDEO_CALLBACK_ALIASES = {
     "mode:sora2_ttv": CB.VIDEO_MODE_SORA_TEXT,
     "mode:sora2_itv": CB.VIDEO_MODE_SORA_IMAGE,
     "video:back": CB.VIDEO_MENU_BACK,
+    "video:veo_animate": CB.VIDEO_VEO_ANIMATE,
 }
 VIDEO_MODE_CALLBACK_MAP = {
     CB.VIDEO_MODE_VEO_FAST: "veo_text_fast",
@@ -14588,6 +14592,10 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 answer_payload["text"] = "Обрабатываю…"
             return
 
+        if data in {CB.VIDEO_VEO_ANIMATE, "video:veo_animate"}:
+            await veo_animate(update, ctx)
+            return
+
         if data == CB.VIDEO_PICK_VEO:
             if chat_id is None:
                 return
@@ -17242,6 +17250,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("🖼️ Фото принято как референс.")
     if chat_id is not None and s.get("mode") in ("veo_text_fast", "veo_photo"):
         await show_veo_card(chat_id, ctx)
+    await handle_veo_animate_photo(update, ctx, image_url=url)
 
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -18206,6 +18215,7 @@ PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("history",), chat_history_command),
     (("image", "mj"), image_command),
     (("video", "veo"), video_command),
+    (("veo_animate", "animate"), veo_animate_command),
     (("music", "suno"), suno_command),
     (("balance",), balance_command),
     (("kb", "knowledge_base"), kb_command),
