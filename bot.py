@@ -6152,29 +6152,19 @@ async def _dispatch_home_action(
             preserved["image_engine"] = state_dict["image_engine"]
 
     if action in disable_actions and chat_id is not None:
-        chat_data_obj = getattr(ctx, "chat_data", None)
-        nav_chat_data = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
-        nav_flag = False
-        if nav_chat_data is not None:
-            nav_chat_data["nav_event"] = True
-            nav_flag = True
-        try:
-            await reset_user_state(
-                ctx,
-                chat_id,
-                notify_chat_off=True,
-                suppress_notification=query is not None,
-            )
-            await disable_chat_mode(
-                ctx,
-                chat_id=chat_id,
-                user_id=user_id,
-                state_dict=state_dict,
-                notify=False,
-            )
-        finally:
-            if nav_flag and nav_chat_data is not None:
-                nav_chat_data.pop("nav_event", None)
+        await reset_user_state(
+            ctx,
+            chat_id,
+            notify_chat_off=True,
+            suppress_notification=False,
+        )
+        await disable_chat_mode(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            state_dict=state_dict,
+            notify=False,
+        )
 
         for key, value in preserved.items():
             state_dict[key] = value
@@ -7018,6 +7008,7 @@ async def open_profile_card(
     *,
     edit: bool = True,
     suppress_nav: bool = True,
+    force_new: bool = False,
 ) -> Optional[int]:
     chat = update.effective_chat
     message = update.effective_message
@@ -7092,6 +7083,8 @@ async def open_profile_card(
 
     if not edit:
         last_msg_id = None
+    if force_new:
+        last_msg_id = None
 
     log.info(
         "profile.open user=%s",
@@ -7151,7 +7144,21 @@ async def open_profile_card(
                 message_id = None
 
         if message_id is None:
-            if callable(send_message):
+            try:
+                fallback_mid = await show_balance_card(
+                    chat_id,
+                    ctx,
+                    force_new=force_new,
+                    referral_url=referral_url,
+                )
+            except TypeError:
+                fallback_mid = await show_balance_card(
+                    chat_id,
+                    ctx,
+                    force_new=force_new,
+                )
+            message_id = fallback_mid
+            if message_id is None and callable(send_message):
                 sent = await tg_safe_send(
                     send_message,
                     method_name="sendMessage",
@@ -7163,28 +7170,11 @@ async def open_profile_card(
                     disable_web_page_preview=True,
                 )
                 message_id = getattr(sent, "message_id", None)
-                if message_id is not None:
+            if message_id is not None:
+                if edit and last_msg_id and message_id == last_msg_id:
+                    log.debug("ui.edit ok msg_id=%s", message_id)
+                else:
                     log.debug("ui.send new msg_id=%s", message_id)
-            else:
-                try:
-                    fallback_mid = await show_balance_card(
-                        chat_id,
-                        ctx,
-                        force_new=not edit,
-                        referral_url=referral_url,
-                    )
-                except TypeError:
-                    fallback_mid = await show_balance_card(
-                        chat_id,
-                        ctx,
-                        force_new=not edit,
-                    )
-                message_id = fallback_mid
-                if message_id is not None:
-                    if edit and last_msg_id and message_id == last_msg_id:
-                        log.debug("ui.edit ok msg_id=%s", message_id)
-                    else:
-                        log.debug("ui.send new msg_id=%s", message_id)
 
         if message_id is None:
             return None
@@ -7276,7 +7266,7 @@ async def handle_menu_profile(callback: HubCallbackContext) -> None:
             ctx,
             callback.chat_id,
             notify_chat_off=True,
-            suppress_notification=True,
+            suppress_notification=False,
         )
 
     legacy_state = state(ctx)
@@ -7536,6 +7526,7 @@ async def _open_profile_card(
             update,
             ctx,
             edit=not force_new,
+            force_new=force_new,
         )
     finally:
         release_action_lock(user_id, "profile")

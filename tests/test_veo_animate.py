@@ -21,12 +21,16 @@ from handlers import video as video_module
 
 class DummyBot:
     def __init__(self) -> None:
-        self.sent_messages: list[tuple[int, str]] = []
+        self.sent_messages: list[SimpleNamespace] = []
         self.sent_videos: list[tuple[int, str]] = []
         self.sent_documents: list[tuple[int, str]] = []
 
-    async def send_message(self, *, chat_id: int, text: str) -> SimpleNamespace:  # type: ignore[override]
-        self.sent_messages.append((chat_id, text))
+    async def send_message(
+        self, *, chat_id: int, text: str, reply_markup=None
+    ) -> SimpleNamespace:  # type: ignore[override]
+        self.sent_messages.append(
+            SimpleNamespace(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        )
         return SimpleNamespace(message_id=len(self.sent_messages))
 
     async def send_video(self, *, chat_id: int, video: str) -> SimpleNamespace:  # type: ignore[override]
@@ -48,7 +52,7 @@ def _make_update(chat_id: int = 101, user_id: int = 202) -> SimpleNamespace:
 
 
 def _make_context(bot: DummyBot, state: dict | None = None) -> SimpleNamespace:
-    return SimpleNamespace(bot=bot, user_data={"state": state or {}})
+    return SimpleNamespace(bot=bot, user_data={"state": state or {}}, chat_data={})
 
 
 def test_veo_animate_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,7 +115,16 @@ def test_veo_animate_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert bot.sent_videos == []
     assert bot.sent_documents == []
-    assert bot.sent_messages == [(101, video_module._ERROR_TIMEOUT)]
+    assert len(bot.sent_messages) == 1
+    message = bot.sent_messages[0]
+    assert message.chat_id == 101
+    assert (
+        message.text
+        == "Сервис сейчас отвечает дольше обычного. Нажмите «Повторить» или попробуйте позже."
+    )
+    assert message.reply_markup is not None
+    button = message.reply_markup.inline_keyboard[0][0]
+    assert button.text == "🔁 Повторить"
 
 
 def test_veo_animate_bad_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,7 +144,15 @@ def test_veo_animate_bad_request(monkeypatch: pytest.MonkeyPatch) -> None:
 
     asyncio.run(video_module.veo_animate(update, ctx))
 
-    assert bot.sent_messages == [(101, video_module._ERROR_BAD_REQUEST)]
+    assert len(bot.sent_messages) == 1
+    message = bot.sent_messages[0]
+    assert message.chat_id == 101
+    assert (
+        message.text
+        == "Не получилось выполнить запрос. Похоже, в тексте есть запрещённый или "
+        "негативный контент. Попробуйте переформулировать короче и нейтральнее."
+    )
+    assert message.reply_markup is None
     assert bot.sent_videos == []
 
 
@@ -184,7 +205,14 @@ def test_veo_animate_waits_for_photo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(video_module, "remember_veo_anim_job", lambda *args, **kwargs: None)
 
     asyncio.run(video_module.veo_animate(update, ctx))
-    assert bot.sent_messages == [(101, video_module._PROMPT_PHOTO)]
+    assert len(bot.sent_messages) == 1
+    message = bot.sent_messages[0]
+    assert message.chat_id == 101
+    assert (
+        message.text
+        == "Нужна фотография или корректный промт. Пришлите изображение и повторите."
+    )
+    assert message.reply_markup is None
     assert video_module._WAIT_FLAG in ctx.user_data["state"]
 
     asyncio.run(
