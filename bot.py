@@ -107,6 +107,7 @@ from hub_router import (
     route_text as hub_route_text,
     set_fallback as set_hub_fallback,
 )
+from handlers import profile as profile_handlers
 
 from state import state as redis_state
 
@@ -7357,82 +7358,41 @@ async def handle_menu_root(callback: HubCallbackContext) -> None:
 
 @register_callback_action("profile", "topup", module="profile")
 async def handle_profile_topup(callback: HubCallbackContext) -> None:
-    chat_id = callback.chat_id
-    if chat_id is None:
-        return
-    await callback.application_context.bot.send_message(
-        chat_id,
-        "Пополнить баланс — в разработке",
-    )
+    await profile_handlers.on_profile_topup(callback.update, callback.application_context)
 
 
 @register_callback_action("profile", "history", module="profile")
 async def handle_profile_history(callback: HubCallbackContext) -> None:
-    chat_id = callback.chat_id
-    if chat_id is None:
-        return
-    await callback.application_context.bot.send_message(
-        chat_id,
-        "История операций пока пуста.",
-    )
+    await profile_handlers.on_profile_history(callback.update, callback.application_context)
 
 
 @register_callback_action("profile", "invite", module="profile")
 async def handle_profile_invite(callback: HubCallbackContext) -> None:
-    ctx = callback.application_context
-    chat_id = callback.chat_id
-    user_id = callback.user_id or callback.chat_id
-
-    referral_url: Optional[str] = None
-    if user_id is not None:
-        try:
-            referral_url = await _build_referral_link(int(user_id), ctx)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log.debug("profile.invite_link_failed | user=%s err=%s", user_id, exc)
-            referral_url = None
-
-    if not referral_url:
-        if chat_id is not None:
-            await ctx.bot.send_message(
-                chat_id,
-                "Не удалось получить ссылку, попробуйте позже.",
-            )
-        return
-
-    query = callback.query
-    if query is not None:
-        try:
-            await query.answer(url=referral_url)
-            return
-        except BadRequest:
-            pass
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log.debug("profile.invite_answer_failed | user=%s err=%s", user_id, exc)
-
-    if chat_id is not None:
-        await ctx.bot.send_message(
-            chat_id,
-            f"🔗 Пригласительная ссылка:\n{referral_url}",
-            disable_web_page_preview=True,
-        )
+    await profile_handlers.on_profile_invite(callback.update, callback.application_context)
 
 
 @register_callback_action("profile", "promo", module="profile")
 async def handle_profile_promo(callback: HubCallbackContext) -> None:
-    ctx = callback.application_context
-    chat_id = callback.chat_id
-
     if not PROMO_ENABLED:
+        chat_id = callback.chat_id
         if chat_id is not None:
-            await ctx.bot.send_message(chat_id, "🎟️ Промокоды временно отключены.")
+            await callback.application_context.bot.send_message(
+                chat_id,
+                "🎟️ Промокоды временно отключены.",
+            )
         return
 
-    state_dict = state(ctx)
+    state_dict = state(callback.application_context)
     state_dict["mode"] = "promo"
     callback.session["mode"] = "promo"
 
-    if chat_id is not None:
-        await ctx.bot.send_message(chat_id, "Введите промокод одним сообщением…")
+    await profile_handlers.on_profile_promo_start(callback.update, callback.application_context)
+
+
+@register_callback_action("profile", "menu", module="profile")
+async def handle_profile_menu(callback: HubCallbackContext) -> None:
+    profile_handlers.clear_promo_wait(callback.application_context)
+    await profile_handlers.on_profile_menu(callback.update, callback.application_context)
 
 
 @register_callback_action("profile", "back", module="profile")
@@ -7441,6 +7401,8 @@ async def handle_profile_back(callback: HubCallbackContext) -> None:
     chat_id = callback.chat_id
     if chat_id is None:
         return
+
+    profile_handlers.clear_promo_wait(ctx)
 
     await reset_user_state(
         ctx,
@@ -13985,221 +13947,231 @@ async def handle_topup_callback(
     ctx: ContextTypes.DEFAULT_TYPE,
     data: str,
 ) -> bool:
-    query = update.callback_query
-    chat = update.effective_chat
-    message = query.message if query else None
-    chat_id = None
-    if message is not None:
-        chat_id = message.chat_id
-    elif chat is not None:
-        chat_id = chat.id
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    nav_flag_set = False
+    if isinstance(chat_data_obj, MutableMapping):
+        chat_data_obj["nav_event"] = True
+        nav_flag_set = True
 
-    if chat_id is None or query is None:
-        return False
-
-    user = update.effective_user
-    user_id = user.id if user else None
-
-    normalized = data
-    if data == CB_PROFILE_TOPUP:
-        normalized = "topup:open"
-    elif data == CB_PAY_STARS:
-        normalized = "topup:stars"
-    elif data == CB_PAY_CARD:
-        normalized = "topup:yookassa"
-
-    if data == "back_main":
-        await query.answer()
-        await _open_profile_card(
-            update,
-            ctx,
-            chat_id=chat_id,
-            user_id=user_id,
-            source="topup",
-            force_new=True,
-            query=query,
-        )
-        return True
-
-    if normalized == "topup:open":
-        await query.answer()
-        markup = menu_pay_unified()
-        text = TXT_TOPUP_CHOOSE
+    try:
+        query = update.callback_query
+        chat = update.effective_chat
+        message = query.message if query else None
+        chat_id = None
         if message is not None:
-            try:
-                await safe_edit_message(
-                    ctx,
-                    chat_id,
-                    message.message_id,
-                    text,
-                    markup,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
+            chat_id = message.chat_id
+        elif chat is not None:
+            chat_id = chat.id
+
+        if chat_id is None or query is None:
+            return False
+
+        user = update.effective_user
+        user_id = user.id if user else None
+
+        normalized = data
+        if data == CB_PROFILE_TOPUP:
+            normalized = "topup:open"
+        elif data == CB_PAY_STARS:
+            normalized = "topup:stars"
+        elif data == CB_PAY_CARD:
+            normalized = "topup:yookassa"
+
+        if data == "back_main":
+            await query.answer()
+            await _open_profile_card(
+                update,
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                source="topup",
+                force_new=False,
+                query=query,
+            )
+            return True
+
+        if normalized == "topup:open":
+            await query.answer()
+            markup = menu_pay_unified()
+            text = TXT_TOPUP_CHOOSE
+            if message is not None:
+                try:
+                    await safe_edit_message(
+                        ctx,
+                        chat_id,
+                        message.message_id,
+                        text,
+                        markup,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    await ctx.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=markup,
+                    )
+            else:
                 await ctx.bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     reply_markup=markup,
                 )
-        else:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=markup,
-            )
-        return True
+            return True
 
-    if data == CB_PAY_CRYPTO:
-        await query.answer()
-        base_markup = menu_pay_unified()
-        rows = [list(row) for row in base_markup.inline_keyboard]
-        rows.insert(
-            3,
-            [InlineKeyboardButton(TXT_PAY_CRYPTO_OPEN_LINK, url=CRYPTO_PAYMENT_URL)],
-        )
-        markup = InlineKeyboardMarkup(rows)
-        if message is not None:
-            try:
-                await safe_edit_message(
-                    ctx,
-                    chat_id,
-                    message.message_id,
-                    TXT_CRYPTO_COMING_SOON,
-                    markup,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
+        if data == CB_PAY_CRYPTO:
+            await query.answer()
+            base_markup = menu_pay_unified()
+            rows = [list(row) for row in base_markup.inline_keyboard]
+            rows.insert(
+                3,
+                [InlineKeyboardButton(TXT_PAY_CRYPTO_OPEN_LINK, url=CRYPTO_PAYMENT_URL)],
+            )
+            markup = InlineKeyboardMarkup(rows)
+            if message is not None:
+                try:
+                    await safe_edit_message(
+                        ctx,
+                        chat_id,
+                        message.message_id,
+                        TXT_CRYPTO_COMING_SOON,
+                        markup,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    await ctx.bot.send_message(
+                        chat_id=chat_id,
+                        text=TXT_CRYPTO_COMING_SOON,
+                        reply_markup=markup,
+                    )
+            else:
                 await ctx.bot.send_message(
                     chat_id=chat_id,
                     text=TXT_CRYPTO_COMING_SOON,
                     reply_markup=markup,
                 )
-        else:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=TXT_CRYPTO_COMING_SOON,
-                reply_markup=markup,
-            )
-        return True
+            return True
 
-    if normalized == "topup:stars":
-        await query.answer()
-        text = "\n".join(
-            filter(
-                None,
+        if normalized == "topup:stars":
+            await query.answer()
+            text = "\n".join(
+                filter(
+                    None,
+                    [
+                        common_text("topup.stars.title"),
+                        common_text("topup.stars.info"),
+                    ],
+                )
+            )
+            edit_callable = getattr(query, "edit_message_text", None)
+            try:
+                if callable(edit_callable):
+                    await _safe_edit_message_text(
+                        edit_callable,
+                        text,
+                        reply_markup=stars_topup_kb(),
+                    )
+                elif message is not None and getattr(ctx.bot, "edit_message_text", None):
+                    await _safe_edit_message_text(
+                        ctx.bot.edit_message_text,
+                        chat_id=chat_id,
+                        message_id=message.message_id,
+                        text=text,
+                        reply_markup=stars_topup_kb(),
+                    )
+                else:
+                    raise AttributeError("edit_message_text not available")
+            except Exception:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=stars_topup_kb(),
+                )
+            return True
+
+        if normalized == "topup:yookassa":
+            await query.answer()
+            text = common_text("topup.yookassa.title")
+            edit_callable = getattr(query, "edit_message_text", None)
+            try:
+                if callable(edit_callable):
+                    await _safe_edit_message_text(
+                        edit_callable,
+                        text,
+                        reply_markup=yookassa_pack_keyboard(),
+                    )
+                elif message is not None and getattr(ctx.bot, "edit_message_text", None):
+                    await _safe_edit_message_text(
+                        ctx.bot.edit_message_text,
+                        chat_id=chat_id,
+                        message_id=message.message_id,
+                        text=text,
+                        reply_markup=yookassa_pack_keyboard(),
+                    )
+                else:
+                    raise AttributeError("edit_message_text not available")
+            except Exception:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=yookassa_pack_keyboard(),
+                )
+            return True
+
+        if normalized.startswith("yk:"):
+            pack_id = normalized.split(":", 1)[1]
+            await query.answer()
+            error_keyboard = InlineKeyboardMarkup(
                 [
-                    common_text("topup.stars.title"),
-                    common_text("topup.stars.info"),
-                ],
+                    [InlineKeyboardButton(common_text("topup.yookassa.retry"), callback_data="topup:yookassa")],
+                    [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")],
+                ]
             )
-        )
-        edit_callable = getattr(query, "edit_message_text", None)
-        try:
-            if callable(edit_callable):
-                await _safe_edit_message_text(
-                    edit_callable,
-                    text,
-                    reply_markup=stars_topup_kb(),
+            if user_id is None:
+                error_text = common_text("topup.yookassa.error")
+                try:
+                    await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+                except Exception:
+                    await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+                return True
+            try:
+                payment = yookassa_create_payment(user_id, pack_id)
+            except YookassaError as exc:
+                log.warning(
+                    "topup.yookassa.error",
+                    extra={"meta": {"user_id": user_id, "pack_id": pack_id, "err": str(exc)}},
                 )
-            elif message is not None and getattr(ctx.bot, "edit_message_text", None):
-                await _safe_edit_message_text(
-                    ctx.bot.edit_message_text,
-                    chat_id=chat_id,
-                    message_id=message.message_id,
-                    text=text,
-                    reply_markup=stars_topup_kb(),
+                error_text = common_text("topup.yookassa.error")
+                try:
+                    await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+                except Exception:
+                    await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+                return True
+            except Exception as exc:  # pragma: no cover - unexpected failure
+                log.exception(
+                    "topup.yookassa.exception",
+                    extra={"meta": {"user_id": user_id, "pack_id": pack_id, "err": str(exc)}},
                 )
-            else:
-                raise AttributeError("edit_message_text not available")
-        except Exception:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=stars_topup_kb(),
-            )
-        return True
+                error_text = common_text("topup.yookassa.error")
+                try:
+                    await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+                except Exception:
+                    await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+                return True
 
-    if normalized == "topup:yookassa":
-        await query.answer()
-        text = common_text("topup.yookassa.title")
-        edit_callable = getattr(query, "edit_message_text", None)
-        try:
-            if callable(edit_callable):
-                await _safe_edit_message_text(
-                    edit_callable,
-                    text,
-                    reply_markup=yookassa_pack_keyboard(),
-                )
-            elif message is not None and getattr(ctx.bot, "edit_message_text", None):
-                await _safe_edit_message_text(
-                    ctx.bot.edit_message_text,
-                    chat_id=chat_id,
-                    message_id=message.message_id,
-                    text=text,
-                    reply_markup=yookassa_pack_keyboard(),
-                )
-            else:
-                raise AttributeError("edit_message_text not available")
-        except Exception:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=yookassa_pack_keyboard(),
-            )
-        return True
-
-    if normalized.startswith("yk:"):
-        pack_id = normalized.split(":", 1)[1]
-        await query.answer()
-        error_keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton(common_text("topup.yookassa.retry"), callback_data="topup:yookassa")],
-                [InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")],
-            ]
-        )
-        if user_id is None:
-            error_text = common_text("topup.yookassa.error")
+            text = common_text("topup.yookassa.created")
+            keyboard = yookassa_payment_keyboard(payment.confirmation_url)
             try:
-                await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
+                await _safe_edit_message_text(query.edit_message_text, text, reply_markup=keyboard)
             except Exception:
-                await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
-            return True
-        try:
-            payment = yookassa_create_payment(user_id, pack_id)
-        except YookassaError as exc:
-            log.warning(
-                "topup.yookassa.error",
-                extra={"meta": {"user_id": user_id, "pack_id": pack_id, "err": str(exc)}},
-            )
-            error_text = common_text("topup.yookassa.error")
-            try:
-                await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
-            except Exception:
-                await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
-            return True
-        except Exception as exc:  # pragma: no cover - unexpected failure
-            log.exception(
-                "topup.yookassa.exception",
-                extra={"meta": {"user_id": user_id, "pack_id": pack_id, "err": str(exc)}},
-            )
-            error_text = common_text("topup.yookassa.error")
-            try:
-                await _safe_edit_message_text(query.edit_message_text, error_text, reply_markup=error_keyboard)
-            except Exception:
-                await ctx.bot.send_message(chat_id, error_text, reply_markup=error_keyboard)
+                await ctx.bot.send_message(chat_id, text, reply_markup=keyboard)
             return True
 
-        text = common_text("topup.yookassa.created")
-        keyboard = yookassa_payment_keyboard(payment.confirmation_url)
-        try:
-            await _safe_edit_message_text(query.edit_message_text, text, reply_markup=keyboard)
-        except Exception:
-            await ctx.bot.send_message(chat_id, text, reply_markup=keyboard)
-        return True
-
-    return False
+        return False
+    finally:
+        if nav_flag_set and isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj.pop("nav_event", None)
 
 async def handle_menu(
     update: Update,
@@ -16883,12 +16855,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None:
         return
 
+    raw_text = msg.text or ""
     chat_data_obj = getattr(ctx, "chat_data", None)
     if isinstance(chat_data_obj, MutableMapping) and chat_data_obj.pop("nav_event", False):
         return
 
+    if profile_handlers.is_waiting_for_promo(ctx):
+        deadline = chat_data_obj.get("wait_until") if isinstance(chat_data_obj, MutableMapping) else None
+        try:
+            expired = float(deadline) <= time.time() if deadline is not None else False
+        except (TypeError, ValueError):
+            expired = True
+        if expired:
+            await profile_handlers.handle_promo_timeout(update, ctx)
+            return
+        await profile_handlers.on_profile_promo_apply(update, ctx, raw_text)
+        return
+
     s = state(ctx)
-    raw_text = msg.text or ""
     text = raw_text.strip()
     chat_id = msg.chat_id
     if chat_id is None:
