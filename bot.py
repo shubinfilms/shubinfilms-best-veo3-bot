@@ -5269,6 +5269,10 @@ def _norm_btn_text(t: Optional[str]) -> str:
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
+_PROFILE_CHATDATA_KEY = "profile_card"
+_PROFILE_CHATDATA_MSG_KEY = "msg_id"
+_PROFILE_CHATDATA_HASH_KEY = "hash"
+
 BOTTOM_MENU_STATE_KEY = "last_ui_msg_id_bottom"
 STATE_CHAT_MODE = "chat_mode"
 STATE_ACTIVE_CARD = "active_card"
@@ -6965,6 +6969,247 @@ def spinner_markup(text: str = "⏳ Обновляем…") -> InlineKeyboardMar
     )
 
 
+def _profile_keyboard_signature(markup: InlineKeyboardMarkup) -> tuple[tuple[tuple[str, Optional[str], Optional[str]], ...], ...]:
+    rows = getattr(markup, "inline_keyboard", None)
+    if not isinstance(rows, list):
+        return tuple()
+    signature_rows: list[tuple[tuple[str, Optional[str], Optional[str]], ...]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            continue
+        row_signature: list[tuple[str, Optional[str], Optional[str]]] = []
+        for button in row:
+            text = getattr(button, "text", "")
+            callback_data = getattr(button, "callback_data", None)
+            url = getattr(button, "url", None)
+            row_signature.append((str(text), callback_data, url))
+        signature_rows.append(tuple(row_signature))
+    return tuple(signature_rows)
+
+
+async def open_profile_card(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool = True,
+) -> Optional[int]:
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None and message is not None:
+        chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        return None
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    resolved_user = user_id or get_user_id(ctx) or chat_id
+
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    chat_data: Optional[MutableMapping[str, Any]] = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
+    profile_state: Optional[MutableMapping[str, Any]] = None
+    if chat_data is not None:
+        stored = chat_data.get(_PROFILE_CHATDATA_KEY)
+        if isinstance(stored, MutableMapping):
+            profile_state = stored
+        else:
+            profile_state = {}
+            chat_data[_PROFILE_CHATDATA_KEY] = profile_state
+
+    nav_flag_set = False
+    if chat_data is not None:
+        if not chat_data.get("nav_event"):
+            chat_data["nav_event"] = True
+            nav_flag_set = True
+
+    state_dict = state(ctx)
+
+    referral_url: Optional[str] = None
+    if resolved_user is not None:
+        try:
+            referral_url = await _build_referral_link(int(resolved_user), ctx)
+        except Exception as exc:
+            log.warning(
+                "referral_link_failed | user=%s err=%s",
+                resolved_user,
+                exc,
+            )
+            referral_url = None
+
+    if referral_url:
+        log.info(
+            "invite.url",
+            extra={"user_id": resolved_user, "chat_id": chat_id, "url": referral_url},
+        )
+
+    snapshot_target = int(resolved_user) if resolved_user is not None else int(chat_id)
+    snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
+    text = _profile_balance_text(snapshot)
+    reply_markup = balance_menu_kb(referral_url=referral_url)
+    keyboard_signature = _profile_keyboard_signature(reply_markup)
+    snapshot_value = snapshot.value if snapshot.value is not None else "__none__"
+    snapshot_warning = snapshot.warning or ""
+    content_hash = hash((snapshot_value, snapshot.display, snapshot_warning, keyboard_signature))
+
+    last_msg_id: Optional[int] = None
+    last_hash: Optional[int] = None
+    if profile_state is not None:
+        raw_mid = profile_state.get(_PROFILE_CHATDATA_MSG_KEY)
+        try:
+            last_msg_id = int(raw_mid)
+        except (TypeError, ValueError):
+            last_msg_id = None
+        raw_hash = profile_state.get(_PROFILE_CHATDATA_HASH_KEY)
+        if isinstance(raw_hash, int):
+            last_hash = raw_hash
+
+    if not edit:
+        last_msg_id = None
+
+    log.info(
+        "nav:profile open uid=%s",
+        resolved_user,
+        extra={"chat_id": chat_id, "user_id": resolved_user},
+    )
+
+    try:
+        if edit and last_msg_id and last_hash == content_hash:
+            return last_msg_id
+
+        message_id: Optional[int] = None
+
+        bot_obj = getattr(ctx, "bot", None)
+        send_message = getattr(bot_obj, "send_message", None) if bot_obj is not None else None
+
+        if edit and last_msg_id:
+            try:
+                if callable(send_message):
+                    await safe_edit_message(
+                        ctx,
+                        chat_id,
+                        last_msg_id,
+                        text,
+                        reply_markup,
+                        parse_mode=ParseMode.MARKDOWN,
+                        disable_web_page_preview=True,
+                    )
+                    message_id = last_msg_id
+                    log.debug("ui.edit ok msg_id=%s", message_id)
+                else:
+                    edited_mid = await show_balance_card(
+                        chat_id,
+                        ctx,
+                        force_new=False,
+                        referral_url=referral_url,
+                    )
+                    message_id = edited_mid if isinstance(edited_mid, int) else last_msg_id
+                    log.debug("ui.edit ok msg_id=%s", message_id)
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    message_id = last_msg_id
+                    log.debug("ui.edit ok msg_id=%s", message_id)
+                else:
+                    log.debug(
+                        "ui.edit fail msg_id=%s err=%s",
+                        last_msg_id,
+                        exc,
+                    )
+                    message_id = None
+            except Exception as exc:
+                log.debug(
+                    "ui.edit fail msg_id=%s err=%s",
+                    last_msg_id,
+                    exc,
+                )
+                message_id = None
+
+        if message_id is None:
+            if callable(send_message):
+                sent = await tg_safe_send(
+                    send_message,
+                    method_name="sendMessage",
+                    kind="message",
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+                message_id = getattr(sent, "message_id", None)
+                if message_id is not None:
+                    log.debug("ui.send new msg_id=%s", message_id)
+            else:
+                try:
+                    fallback_mid = await show_balance_card(
+                        chat_id,
+                        ctx,
+                        force_new=not edit,
+                        referral_url=referral_url,
+                    )
+                except TypeError:
+                    fallback_mid = await show_balance_card(
+                        chat_id,
+                        ctx,
+                        force_new=not edit,
+                    )
+                message_id = fallback_mid
+                if message_id is not None:
+                    if edit and last_msg_id and message_id == last_msg_id:
+                        log.debug("ui.edit ok msg_id=%s", message_id)
+                    else:
+                        log.debug("ui.send new msg_id=%s", message_id)
+
+        if message_id is None:
+            return None
+
+        state_dict[BALANCE_CARD_STATE_KEY] = message_id
+        msg_ids = state_dict.get("msg_ids")
+        if not isinstance(msg_ids, dict):
+            msg_ids = {}
+            state_dict["msg_ids"] = msg_ids
+        msg_ids["balance"] = message_id
+        state_dict["last_panel"] = "balance"
+
+        if profile_state is not None:
+            profile_state[_PROFILE_CHATDATA_MSG_KEY] = message_id
+            profile_state[_PROFILE_CHATDATA_HASH_KEY] = content_hash
+
+        _set_profile_card_message_id(chat_id, message_id)
+
+        if (
+            REF_BONUS_HINT_ENABLED
+            and referral_url
+            and isinstance(state_dict, MutableMapping)
+        ):
+            hint_key = "referral_hint_ts"
+            last_hint = state_dict.get(hint_key)
+            now_ts = time.time()
+            should_send_hint = True
+            if isinstance(last_hint, (int, float)) and last_hint > 0:
+                should_send_hint = (now_ts - float(last_hint)) >= 30.0
+            if should_send_hint:
+                hint_text = (
+                    "Отправь эту ссылку другу. За каждую оплату — бонус на баланс.\n"
+                    f"{referral_url}"
+                )
+                try:
+                    await ctx.bot.send_message(
+                        chat_id,
+                        hint_text,
+                        disable_web_page_preview=True,
+                    )
+                    state_dict[hint_key] = now_ts
+                except Exception as exc:
+                    log.debug("invite.hint_failed | chat=%s err=%s", chat_id, exc)
+
+        return message_id
+    finally:
+        if nav_flag_set and chat_data is not None:
+            chat_data.pop("nav_event", None)
+
+
 async def show_balance_card(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -6995,67 +7240,6 @@ async def show_balance_card(
             s["msg_ids"] = msg_ids
         msg_ids["balance"] = mid
         s["last_panel"] = "balance"
-    return mid
-
-
-async def send_profile_card(
-    chat_id: int,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    *,
-    user_id: Optional[int] = None,
-    force_new: bool = False,
-) -> Optional[int]:
-    state_dict = state(ctx)
-    resolved_user = user_id or get_user_id(ctx) or chat_id
-    referral_url: Optional[str] = None
-    if resolved_user is not None:
-        try:
-            referral_url = await _build_referral_link(int(resolved_user), ctx)
-        except Exception as exc:
-            log.warning(
-                "referral_link_failed | user=%s err=%s",
-                resolved_user,
-                exc,
-            )
-            referral_url = None
-    if referral_url:
-        log.info(
-            "invite.url",
-            extra={"user_id": resolved_user, "chat_id": chat_id, "url": referral_url},
-        )
-    show_kwargs = {"force_new": force_new}
-    if referral_url:
-        show_kwargs["referral_url"] = referral_url
-    mid = await show_balance_card(
-        chat_id,
-        ctx,
-        **show_kwargs,
-    )
-    if (
-        REF_BONUS_HINT_ENABLED
-        and referral_url
-        and isinstance(state_dict, MutableMapping)
-    ):
-        hint_key = "referral_hint_ts"
-        last_hint = state_dict.get(hint_key)
-        now_ts = time.time()
-        should_send_hint = True
-        if isinstance(last_hint, (int, float)) and last_hint > 0:
-            should_send_hint = (now_ts - float(last_hint)) >= 30.0
-        if should_send_hint:
-            hint_text = (
-                "Отправь эту ссылку другу. За каждую оплату — бонус на баланс.\n"
-                f"{referral_url}"
-            )
-            try:
-                await ctx.bot.send_message(
-                    chat_id,
-                    hint_text,
-                    disable_web_page_preview=True,
-                )
-                state_dict[hint_key] = now_ts
-            except Exception as exc:
-                log.debug("invite.hint_failed | chat=%s err=%s", chat_id, exc)
     return mid
 
 
@@ -7362,11 +7546,10 @@ async def _open_profile_card(
         return
     result_mid: Optional[int] = None
     try:
-        result_mid = await send_profile_card(
-            chat_id,
+        result_mid = await open_profile_card(
+            update,
             ctx,
-            user_id=user_id,
-            force_new=force_new,
+            edit=not force_new,
         )
     finally:
         release_action_lock(user_id, "profile")
@@ -14527,7 +14710,18 @@ async def handle_chat_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await balance_command(update, ctx)
+    await ensure_user_record(update)
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    nav_flag_set = False
+    if isinstance(chat_data_obj, MutableMapping):
+        chat_data_obj["nav_event"] = True
+        nav_flag_set = True
+    try:
+        await open_profile_card(update, ctx, edit=True)
+    finally:
+        if nav_flag_set and isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj.pop("nav_event", None)
+    raise ApplicationHandlerStop
 
 
 
@@ -16689,6 +16883,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None:
         return
 
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    if isinstance(chat_data_obj, MutableMapping) and chat_data_obj.pop("nav_event", False):
+        return
+
     s = state(ctx)
     raw_text = msg.text or ""
     text = raw_text.strip()
@@ -18145,12 +18343,14 @@ def register_handlers(application: Any) -> None:
 
     for text, handler in REPLY_BUTTON_ROUTES:
         pattern = rf"^{re.escape(text)}$"
+        quick_handler = MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
+            handler,
+        )
+        quick_handler.block = False
         application.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
-                handler,
-            ),
-            group=20,
+            quick_handler,
+            group=3,
         )
 
     alias_pattern = "|".join(re.escape(label) for label in TEXT_ALIASES)
