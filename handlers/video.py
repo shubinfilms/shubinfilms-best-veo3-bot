@@ -7,13 +7,14 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
 from urllib.parse import urlparse
 
 import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from handlers.menu import build_video_card
 from helpers.errors import send_user_error
 from helpers.progress import PROGRESS_STORAGE_KEY, send_progress_message
 from settings import (
@@ -30,6 +31,64 @@ from settings import (
 from redis_utils import remember_veo_anim_job
 
 logger = logging.getLogger("veo.anim")
+
+_CARD_STATE_KEY = "video_menu_card"
+_MSG_IDS_KEY = "video"
+
+_send_menu: Optional[Callable[..., Awaitable[Optional[int]]]] = None
+_state_getter: Optional[Callable[[ContextTypes.DEFAULT_TYPE], MutableMapping[str, Any]]] = None
+
+
+def configure_menu(
+    *,
+    send_menu: Callable[..., Awaitable[Optional[int]]],
+    state_getter: Callable[[ContextTypes.DEFAULT_TYPE], MutableMapping[str, Any]],
+) -> None:
+    global _send_menu
+    global _state_getter
+    _send_menu = send_menu
+    _state_getter = state_getter
+
+
+async def open_menu(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    veo_fast_cost: int,
+    veo_photo_cost: int,
+    suppress_nav: bool = False,
+    fallback_message_id: Optional[int] = None,
+) -> Optional[int]:
+    if _send_menu is None or _state_getter is None:
+        raise RuntimeError("video menu handler is not configured")
+
+    state_dict = _state_getter(ctx)
+    card = build_video_card(veo_fast_cost=veo_fast_cost, veo_photo_cost=veo_photo_cost)
+
+    message_id = await _send_menu(
+        ctx,
+        chat_id=chat_id,
+        text=card["text"],
+        reply_markup=card["reply_markup"],
+        state_key=_CARD_STATE_KEY,
+        msg_ids_key=_MSG_IDS_KEY,
+        state_dict=state_dict,
+        fallback_message_id=fallback_message_id,
+        parse_mode=card.get("parse_mode"),
+        disable_web_page_preview=card.get("disable_web_page_preview", True),
+        log_label="ui.video.menu",
+    )
+
+    logger.debug(
+        "video.menu.opened",
+        extra={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "suppress_nav": suppress_nav,
+            "fallback_mid": fallback_message_id,
+        },
+    )
+    return message_id
 
 _POLL_INTERVAL = 2.0
 _POLL_TIMEOUT = 240.0
