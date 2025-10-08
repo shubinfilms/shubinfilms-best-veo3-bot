@@ -31,12 +31,12 @@ def test_kb_home_menu_layout():
         "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
-        "hub:open:profile",
-        "hub:open:kb",
-        "hub:open:photo",
-        "hub:open:music",
-        "hub:open:video",
-        "hub:open:dialog",
+        "menu:profile",
+        "menu:kb",
+        "menu:photo",
+        "menu:music",
+        "menu:video",
+        "menu:dialog",
     ]
 
 

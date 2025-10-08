@@ -221,9 +221,9 @@ from keyboards import (
     menu_pay_unified,
 )
 
-PROFILE_CB_TRANSACTIONS = "PROFILE_TRANSACTIONS"
-PROFILE_CB_INVITE = "PROFILE_INVITE"
-PROFILE_CB_PROMO = "PROFILE_PROMO"
+PROFILE_CB_TRANSACTIONS = "profile:history"
+PROFILE_CB_INVITE = "profile:invite"
+PROFILE_CB_PROMO = "profile:promo"
 from texts import (
     SUNO_MODE_PROMPT,
     SUNO_START_READY_MESSAGE,
@@ -5967,7 +5967,7 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "video:menu": "video",
     AI_MENU_CB: "ai_modes",
     "ai:menu": "ai_modes",
-    CB_PROFILE_BACK: "balance",
+    CB_PROFILE_BACK: "root",
     CB_MAIN_BACK: "root",
     CB_AI_MODES: "ai_modes",
     CB_PROFILE_TOPUP: "profile_topup",
@@ -6948,7 +6948,7 @@ def balance_menu_kb(*, referral_url: Optional[str] = None) -> InlineKeyboardMark
     else:
         keyboard.append([InlineKeyboardButton("👥 Пригласить друга", callback_data=PROFILE_CB_INVITE)])
     keyboard.append([InlineKeyboardButton("🎁 Активировать промокод", callback_data=PROFILE_CB_PROMO)])
-    keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="menu:root")])
+    keyboard.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data=CB_PROFILE_BACK)])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -7147,6 +7147,128 @@ async def handle_menu_profile(callback: HubCallbackContext) -> None:
             query=callback.query,
         ),
         description="profile:legacy-open",
+    )
+
+
+@register_callback_action("menu", "root", module="hub")
+async def handle_menu_root(callback: HubCallbackContext) -> None:
+    ctx = callback.application_context
+    chat_id = callback.chat_id
+    if chat_id is None:
+        return
+
+    await reset_user_state(
+        ctx,
+        chat_id,
+        notify_chat_off=False,
+        suppress_notification=True,
+    )
+    await show_emoji_hub_for_chat(
+        chat_id,
+        ctx,
+        user_id=callback.user_id,
+        replace=True,
+    )
+
+
+@register_callback_action("profile", "topup", module="profile")
+async def handle_profile_topup(callback: HubCallbackContext) -> None:
+    chat_id = callback.chat_id
+    if chat_id is None:
+        return
+    await callback.application_context.bot.send_message(
+        chat_id,
+        "Пополнить баланс — в разработке",
+    )
+
+
+@register_callback_action("profile", "history", module="profile")
+async def handle_profile_history(callback: HubCallbackContext) -> None:
+    chat_id = callback.chat_id
+    if chat_id is None:
+        return
+    await callback.application_context.bot.send_message(
+        chat_id,
+        "История операций пока пуста.",
+    )
+
+
+@register_callback_action("profile", "invite", module="profile")
+async def handle_profile_invite(callback: HubCallbackContext) -> None:
+    ctx = callback.application_context
+    chat_id = callback.chat_id
+    user_id = callback.user_id or callback.chat_id
+
+    referral_url: Optional[str] = None
+    if user_id is not None:
+        try:
+            referral_url = await _build_referral_link(int(user_id), ctx)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.debug("profile.invite_link_failed | user=%s err=%s", user_id, exc)
+            referral_url = None
+
+    if not referral_url:
+        if chat_id is not None:
+            await ctx.bot.send_message(
+                chat_id,
+                "Не удалось получить ссылку, попробуйте позже.",
+            )
+        return
+
+    query = callback.query
+    if query is not None:
+        try:
+            await query.answer(url=referral_url)
+            return
+        except BadRequest:
+            pass
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.debug("profile.invite_answer_failed | user=%s err=%s", user_id, exc)
+
+    if chat_id is not None:
+        await ctx.bot.send_message(
+            chat_id,
+            f"🔗 Пригласительная ссылка:\n{referral_url}",
+            disable_web_page_preview=True,
+        )
+
+
+@register_callback_action("profile", "promo", module="profile")
+async def handle_profile_promo(callback: HubCallbackContext) -> None:
+    ctx = callback.application_context
+    chat_id = callback.chat_id
+
+    if not PROMO_ENABLED:
+        if chat_id is not None:
+            await ctx.bot.send_message(chat_id, "🎟️ Промокоды временно отключены.")
+        return
+
+    state_dict = state(ctx)
+    state_dict["mode"] = "promo"
+    callback.session["mode"] = "promo"
+
+    if chat_id is not None:
+        await ctx.bot.send_message(chat_id, "Введите промокод одним сообщением…")
+
+
+@register_callback_action("profile", "back", module="profile")
+async def handle_profile_back(callback: HubCallbackContext) -> None:
+    ctx = callback.application_context
+    chat_id = callback.chat_id
+    if chat_id is None:
+        return
+
+    await reset_user_state(
+        ctx,
+        chat_id,
+        notify_chat_off=False,
+        suppress_notification=True,
+    )
+    await show_emoji_hub_for_chat(
+        chat_id,
+        ctx,
+        user_id=callback.user_id,
+        replace=True,
     )
 
 
@@ -17948,7 +18070,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.upscale:", handle_mj_upscale_choice),
     (r"^(hub:open:(profile|kb|photo|music|video|dialog))$", handle_hub_open_callback),
     (
-        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
+        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|menu:|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
         hub_router,
     ),
     (r"^go:", main_suggest_router),
