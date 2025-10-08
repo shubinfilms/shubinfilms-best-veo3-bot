@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from collections.abc import MutableMapping
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from telegram import InlineKeyboardMarkup, Update
@@ -315,6 +316,12 @@ async def _dispatch_route(
         return False
 
     lock_acquired = False
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    if (
+        isinstance(chat_data_obj, MutableMapping)
+        and (namespace, action) in {("menu", "click"), ("kb", "open")}
+    ):
+        chat_data_obj["nav_event"] = True
     try:
         if apply_text_lock:
             if not user_lock(chat_id, "reply-nav", ttl=1):

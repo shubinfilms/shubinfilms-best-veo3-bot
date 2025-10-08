@@ -62,7 +62,6 @@ def test_open_from_quick_no_dialog_notice(monkeypatch):
         user_id,
         *,
         suppress_nav,
-        reused_msg,
         update,
         ctx,
         source,
@@ -72,13 +71,12 @@ def test_open_from_quick_no_dialog_notice(monkeypatch):
                 "chat_id": chat_id,
                 "user_id": user_id,
                 "suppress_nav": suppress_nav,
-                "reused_msg": reused_msg,
                 "source": source,
                 "nav": getattr(ctx, "nav_event", False),
             }
         )
         ctx.chat_data["profile_msg_id"] = 300
-        return 300
+        return profile_handlers.OpenedProfile(msg_id=300, reused=True)
 
     async def fake_disable(*_args, **_kwargs):
         return False
@@ -155,7 +153,6 @@ def test_single_render_no_duplicates(monkeypatch):
             update=update,
             ctx=ctx,
             suppress_nav=True,
-            reused_msg=True,
             source="inline",
         )
         second = await profile_handlers.open_profile_card(
@@ -164,10 +161,9 @@ def test_single_render_no_duplicates(monkeypatch):
             update=update,
             ctx=ctx,
             suppress_nav=True,
-            reused_msg=True,
             source="inline",
         )
-        assert first == second == ctx.chat_data.get("profile_msg_id")
+        assert first.msg_id == second.msg_id == ctx.chat_data.get("profile_msg_id")
 
     asyncio.run(scenario())
 

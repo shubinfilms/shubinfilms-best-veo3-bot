@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import MutableMapping
 from typing import Awaitable, Callable, Optional
 
 from telegram import InlineKeyboardButton, Update
@@ -79,6 +80,32 @@ def configure(
     _state_getter = state_getter
 
 
+def _chat_data(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, object] | None:
+    obj = getattr(ctx, "chat_data", None)
+    return obj if isinstance(obj, MutableMapping) else None
+
+
+def _get_msg_id(chat_data: MutableMapping[str, object] | None) -> Optional[int]:
+    if not isinstance(chat_data, MutableMapping):
+        return None
+    raw = chat_data.get("kb_msg_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _store_msg_id(
+    chat_data: MutableMapping[str, object] | None, message_id: Optional[int]
+) -> None:
+    if not isinstance(chat_data, MutableMapping):
+        return
+    if isinstance(message_id, int):
+        chat_data["kb_msg_id"] = int(message_id)
+    else:
+        chat_data.pop("kb_msg_id", None)
+
+
 def _root_rows() -> list[list[InlineKeyboardButton]]:
     return [
         [InlineKeyboardButton("🪄 Примеры генераций", callback_data=KB_EXAMPLES)],
@@ -144,6 +171,11 @@ async def _send_card(
         raise RuntimeError("knowledge_base.state_getter is not configured")
 
     state_dict = _state_getter(ctx)
+    chat_data = _chat_data(ctx)
+    effective_fallback = fallback_message_id
+    if effective_fallback is None:
+        effective_fallback = _get_msg_id(chat_data)
+
     payload = {
         "ctx": ctx,
         "chat_id": chat_id,
@@ -152,12 +184,16 @@ async def _send_card(
         "state_key": _CARD_STATE_KEY,
         "msg_ids_key": _CARD_MSG_KEY,
         "state_dict": state_dict,
-        "fallback_message_id": fallback_message_id,
+        "fallback_message_id": effective_fallback,
         "parse_mode": card.get("parse_mode"),
         "disable_web_page_preview": card.get("disable_web_page_preview", True),
         "log_label": log_label,
     }
     result = await _send_menu(**payload)
+    if isinstance(result, int):
+        _store_msg_id(chat_data, result)
+    elif isinstance(effective_fallback, int):
+        _store_msg_id(chat_data, effective_fallback)
     if active_card is not None:
         try:
             state_dict[_STATE_ACTIVE_CARD_KEY] = active_card
@@ -177,7 +213,12 @@ async def open_root(
         "[KB] open",
         extra={"chat_id": chat_id, "suppress_nav": suppress_nav},
     )
-    return await _send_card(
+    chat_data = _chat_data(ctx)
+    previous_mid = _get_msg_id(chat_data)
+    effective_fallback = fallback_message_id
+    if effective_fallback is None:
+        effective_fallback = previous_mid
+    message_id = await _send_card(
         ctx,
         chat_id,
         _root_card(),
@@ -185,6 +226,13 @@ async def open_root(
         active_card="kb:root",
         fallback_message_id=fallback_message_id,
     )
+    reused = bool(
+        isinstance(message_id, int)
+        and effective_fallback is not None
+        and message_id == effective_fallback
+    )
+    log.info("kb.opened reused=%s msg_id=%s", reused, message_id)
+    return message_id
 
 
 async def show_examples(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[int]:
