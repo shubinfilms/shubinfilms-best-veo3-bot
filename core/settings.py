@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     MAX_IN_LOG_BODY: int = Field(default=2048, ge=256, le=65536)
     REDIS_PREFIX: str = Field(default="suno:prod")
     BOT_USERNAME: Optional[str] = None
+    BOT_NAME: Optional[str] = None
     SUPPORT_USERNAME: str = Field(default="BestAi_Support")
     SUPPORT_USER_ID: int = Field(default=7223448532)
     REF_BONUS_HINT_ENABLED: bool = Field(default=False)
@@ -128,6 +129,8 @@ class Settings(BaseSettings):
     UPLOAD_FALLBACK_ENABLED: bool = Field(default=False)
 
     PUBLIC_BASE_URL: Optional[str] = Field(default=None)
+
+    TOPUP_URL: Optional[str] = Field(default=None)
 
     YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
