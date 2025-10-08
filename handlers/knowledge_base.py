@@ -135,6 +135,7 @@ async def _send_card(
     *,
     log_label: str,
     active_card: Optional[str] = None,
+    fallback_message_id: Optional[int] = None,
 ) -> Optional[int]:
     if _send_menu is None:
         raise RuntimeError("knowledge_base.send_menu is not configured")
@@ -151,6 +152,7 @@ async def _send_card(
         "state_key": _CARD_STATE_KEY,
         "msg_ids_key": _CARD_MSG_KEY,
         "state_dict": state_dict,
+        "fallback_message_id": fallback_message_id,
         "parse_mode": card.get("parse_mode"),
         "disable_web_page_preview": card.get("disable_web_page_preview", True),
         "log_label": log_label,
@@ -164,14 +166,24 @@ async def _send_card(
     return result
 
 
-async def open_root(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[int]:
-    log.info("[KB] open", extra={"chat_id": chat_id})
+async def open_root(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    suppress_nav: bool = False,
+    fallback_message_id: Optional[int] = None,
+) -> Optional[int]:
+    log.info(
+        "[KB] open",
+        extra={"chat_id": chat_id, "suppress_nav": suppress_nav},
+    )
     return await _send_card(
         ctx,
         chat_id,
         _root_card(),
         log_label="ui.kb.root",
         active_card="kb:root",
+        fallback_message_id=fallback_message_id,
     )
 
 
