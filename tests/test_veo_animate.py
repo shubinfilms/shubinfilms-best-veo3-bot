@@ -66,7 +66,7 @@ def test_veo_animate_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
         calls.append((image_url, prompt))
         return "job-1"
 
-    async def fake_wait(job_id: str) -> tuple[list[str], dict]:
+    async def fake_wait(job_id: str, *, context=None) -> tuple[list[str], dict]:
         assert job_id == "job-1"
         return ["https://cdn.example/video.mp4"], {"status": "done"}
 
@@ -100,7 +100,7 @@ def test_veo_animate_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_start(image_url: str, prompt: str | None) -> str:
         return "job-2"
 
-    async def fake_wait(job_id: str) -> tuple[list[str], dict]:
+    async def fake_wait(job_id: str, *, context=None) -> tuple[list[str], dict]:
         raise video_module.VeoAnimateTimeout("timeout")
 
     monkeypatch.setattr(video_module, "_start_animation", fake_start)
@@ -164,7 +164,7 @@ def test_veo_animate_list_of_urls(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_start(image_url: str, prompt: str | None) -> str:
         return "job-3"
 
-    async def fake_wait(job_id: str) -> tuple[list[str], dict]:
+    async def fake_wait(job_id: str, *, context=None) -> tuple[list[str], dict]:
         return ["https://cdn.example/a.mp4", "https://cdn.example/b.mp4"], {"status": "done"}
 
     monkeypatch.setattr(video_module, "_start_animation", fake_start)
@@ -193,7 +193,7 @@ def test_veo_animate_waits_for_photo(monkeypatch: pytest.MonkeyPatch) -> None:
         call_counter.append(image_url)
         return "job-4"
 
-    async def fake_wait(job_id: str) -> tuple[list[str], dict]:
+    async def fake_wait(job_id: str, *, context=None) -> tuple[list[str], dict]:
         return ["https://cdn.example/auto.mp4"], {"status": "done"}
 
     monkeypatch.setattr(video_module, "_start_animation", fake_start)
