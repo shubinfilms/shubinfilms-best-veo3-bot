@@ -11,6 +11,7 @@ from .prompt_master_handler import (
     prompt_master_process,
     prompt_master_reset,
 )
+from .video import handle_veo_animate_photo, veo_animate, veo_animate_command
 
 __all__ = [
     "clear_pm_prompts",
@@ -25,4 +26,7 @@ __all__ = [
     "prompt_master_open",
     "prompt_master_process",
     "prompt_master_reset",
+    "veo_animate",
+    "veo_animate_command",
+    "handle_veo_animate_photo",
 ]

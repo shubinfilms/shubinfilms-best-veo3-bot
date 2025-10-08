@@ -90,6 +90,8 @@ _ACTIVE_MODE_KEY_TMPL = f"{_PFX}:user:active_mode:{{}}"
 ACTIVE_MODE_KEY = _ACTIVE_MODE_KEY_TMPL
 _PM_STEP_KEY_TMPL = f"{_PFX}:pm:step:{{}}"
 _PM_BUF_KEY_TMPL = f"{_PFX}:pm:buf:{{}}"
+_VEO_ANIM_KEY_TMPL = f"{_PFX}:veo:anim:{{}}:{{}}"
+_VEO_ANIM_TTL = _TTL
 
 
 class MenuLocked(RuntimeError):
@@ -147,6 +149,18 @@ def _memory_set_with_ttl(key: str, value: str, ttl: int) -> None:
     expires_at = time.time() + max(ttl, 1)
     with _memory_lock:
         _memory_store[key] = (expires_at, value)
+
+
+def remember_veo_anim_job(user_id: int, job_id: str, *, ttl: int = _VEO_ANIM_TTL) -> None:
+    key = _VEO_ANIM_KEY_TMPL.format(int(user_id), str(job_id))
+    value = _now_iso()
+    if _r is not None:
+        try:
+            _r.setex(key, max(1, int(ttl)), value)
+            return
+        except redis.RedisError:
+            _logger.exception("redis.veo_anim.set_fail", extra={"key": key})
+    _memory_set_with_ttl(key, value, max(1, int(ttl)))
 
 
 def _memory_get(key: str) -> Optional[str]:

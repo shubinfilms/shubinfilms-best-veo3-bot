@@ -4,7 +4,7 @@ from typing import Sequence
 
 from telegram import InlineKeyboardButton
 
-from keyboards import kb_main
+from keyboards import CB, kb_main
 from texts import (
     TXT_AI_DIALOG_CHOOSE,
     TXT_AI_DIALOG_NORMAL,
@@ -69,7 +69,7 @@ def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int) -> dict:
         [
             InlineKeyboardButton(
                 f"Оживить изображение (Veo) — 💎 {veo_photo_cost}",
-                callback_data="mode:veo_photo",
+                callback_data=CB.VIDEO_VEO_ANIMATE,
             )
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
