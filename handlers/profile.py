@@ -259,6 +259,60 @@ async def _edit_existing_card(
     return None
 
 
+async def open_profile(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    source: str,
+    suppress_nav: bool = True,
+) -> None:
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source=source)
+    try:
+        now = time.monotonic()
+        if isinstance(chat_data, MutableMapping):
+            raw_open_at = chat_data.get("profile_open_at")
+            try:
+                last_open = float(raw_open_at)
+            except (TypeError, ValueError):
+                last_open = 0.0
+            if now - last_open < 0.5:
+                log.debug(
+                    "profile.open.debounced",
+                    extra={"source": source, "delta": now - last_open},
+                )
+                return
+            chat_data["profile_open_at"] = now
+            chat_data.pop("wait_kind", None)
+            chat_data["nav_event"] = True
+            chat_data["suppress_dialog_notice"] = True
+
+        user = update.effective_user
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None and message is not None:
+            chat = getattr(message, "chat", None)
+
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None and message is not None:
+            chat_id = getattr(message, "chat_id", None)
+
+        user_id = getattr(user, "id", None)
+
+        result = await open_profile_card(
+            chat_id,
+            user_id,
+            update=update,
+            ctx=ctx,
+            suppress_nav=suppress_nav,
+            source=source,
+        )
+
+        reused = bool(result.reused) if isinstance(result, OpenedProfile) else False
+        log.info("profile.open source=%s reused_msg=%s", source, reused)
+    finally:
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+
+
 async def open_profile_card(
     chat_id: Optional[int],
     user_id: Optional[int],
@@ -341,39 +395,17 @@ async def open_profile_card(
 
 
 async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
     query = update.callback_query
-    if chat is None and query is not None and query.message is not None:
-        chat = query.message.chat
-
-    chat_id = getattr(chat, "id", None)
-    user_id = getattr(user, "id", None)
-
-    chat_data, flag, previous_nav = _set_nav_event(ctx, source="inline")
-    try:
-        if query is not None:
-            if isinstance(chat_data, MutableMapping) and chat_data.get(_PROFILE_LOCK_KEY):
-                with suppress(BadRequest):
-                    await query.answer("Открываю профиль…")
-                return
+    chat_data = _chat_data(ctx)
+    if query is not None:
+        if isinstance(chat_data, MutableMapping) and chat_data.get(_PROFILE_LOCK_KEY):
             with suppress(BadRequest):
-                await query.answer()
-        result = await open_profile_card(
-            chat_id,
-            user_id,
-            update=update,
-            ctx=ctx,
-            suppress_nav=True,
-            source="menu",
-        )
-        log.info(
-            "profile.click action=menu msg_id=%s reused=%s",
-            result.msg_id,
-            result.reused,
-        )
-    finally:
-        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+                await query.answer("Открываю профиль…")
+            return
+        with suppress(BadRequest):
+            await query.answer()
+
+    await open_profile(update, ctx, source="menu", suppress_nav=True)
 
 
 def _topup_url() -> Optional[str]:
@@ -806,6 +838,7 @@ __all__ = [
     "handle_promo_timeout",
     "is_waiting_for_promo",
     "OpenedProfile",
+    "open_profile",
     "open_profile_card",
     "on_profile_history",
     "on_profile_invite",

@@ -80,7 +80,7 @@ def test_chat_mode_cleared_when_opening_video(monkeypatch, ctx):
     state_after = bot_module.state(ctx)
     assert state_after.get(bot_module.STATE_CHAT_MODE) is None
     assert video_calls, "Video menu should be opened"
-    assert any(entry.get("text") == "🛑 Режим диалога отключён." for entry in bot.sent)
+    assert not any(entry.get("text") == "🛑 Режим диалога отключён." for entry in bot.sent)
 
 
 def test_prompt_master_disabled_when_opening_profile(monkeypatch, ctx):
@@ -88,11 +88,23 @@ def test_prompt_master_disabled_when_opening_profile(monkeypatch, ctx):
 
     profile_calls = []
 
-    async def fake_show_balance(chat_id, context, *, force_new=False):
-        profile_calls.append((chat_id, force_new))
-        return None
+    async def fake_core_open(
+        update_param,
+        ctx_param,
+        *,
+        edit: bool,
+        suppress_nav: bool = True,
+        force_new: bool = False,
+        **_kwargs,
+    ):
+        profile_calls.append({
+            "suppress_nav": suppress_nav,
+            "edit": edit,
+            "force_new": force_new,
+        })
+        return 777
 
-    monkeypatch.setattr(bot_module, "show_balance_card", fake_show_balance)
+    monkeypatch.setattr(bot_module, "open_profile_card", fake_core_open)
 
     update, query = _make_update(chat_id=300, user_id=400)
 
@@ -112,4 +124,4 @@ def test_prompt_master_disabled_when_opening_profile(monkeypatch, ctx):
     assert state_after.get(bot_module.STATE_CHAT_MODE) is None
     assert profile_calls, "Profile card should be shown"
     assert not any("Обычный чат включён" in (entry.get("text") or "") for entry in bot.sent)
-    assert any(entry.get("text") == "🛑 Режим диалога отключён." for entry in bot.sent)
+    assert not any(entry.get("text") == "🛑 Режим диалога отключён." for entry in bot.sent)

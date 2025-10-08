@@ -36,6 +36,7 @@ def test_open_from_inline_no_dialog_notice(monkeypatch):
         callback_query=query,
         effective_chat=message.chat,
         effective_user=query.from_user,
+        effective_message=message,
     )
 
     asyncio.run(profile_handlers.on_profile_menu(update, ctx))
