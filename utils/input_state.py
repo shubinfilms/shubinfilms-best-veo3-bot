@@ -30,6 +30,7 @@ class WaitKind(str, Enum):
     SUNO_LYRICS = "suno_lyrics"
     MJ_PROMPT = "mj_prompt"
     SORA2_PROMPT = "sora2_prompt"
+    PROMO_CODE = "promo_code"
 
 
 def classify_wait_input(text: Optional[str]) -> Tuple[bool, Optional[str]]:
