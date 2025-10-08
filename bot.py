@@ -5295,11 +5295,7 @@ def _norm_btn_text(t: Optional[str]) -> str:
 BALANCE_CARD_STATE_KEY = "last_ui_msg_id_balance"
 LEDGER_PAGE_SIZE = 10
 
-_PROFILE_CHATDATA_KEY = "profile_card"
-_PROFILE_CHATDATA_MSG_KEY = "msg_id"
-_PROFILE_CHATDATA_HASH_KEY = "hash"
 _PROFILE_MSG_ID_KEY = "profile_msg_id"
-_PROFILE_MSG_HASH_KEY = "profile_msg_hash"
 
 _KB_MSG_ID_KEY = "kb_msg_id"
 _PHOTO_MSG_ID_KEY = "photo_msg_id"
@@ -7436,6 +7432,114 @@ def _profile_keyboard_signature(markup: InlineKeyboardMarkup) -> tuple[tuple[tup
     return tuple(signature_rows)
 
 
+def _profile_store_message_id(
+    chat_data: MutableMapping[str, Any] | None, message_id: Optional[int]
+) -> None:
+    if not isinstance(chat_data, MutableMapping):
+        return
+    if isinstance(message_id, int):
+        chat_data[_PROFILE_MSG_ID_KEY] = int(message_id)
+    else:
+        chat_data.pop(_PROFILE_MSG_ID_KEY, None)
+
+
+async def _profile_notify_error(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]
+) -> None:
+    if chat_id is None:
+        return
+    try:
+        await ctx.bot.send_message(
+            chat_id,
+            profile_handlers.PROFILE_UPDATE_ERROR_TEXT,
+        )
+    except Exception:  # pragma: no cover - defensive logging
+        log.debug(
+            "profile.card.notify_failed",
+            exc_info=True,
+            extra={"chat_id": chat_id},
+        )
+
+
+async def _try_edit_profile_message(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    message_id: Optional[int],
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> str:
+    if chat_id is None or message_id is None:
+        return "missing"
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        return "ok"
+    except BadRequest as exc:
+        lowered = str(exc).lower()
+        if "message is not modified" in lowered:
+            return "not_modified"
+        if "message to edit not found" in lowered or "message identifier is not specified" in lowered:
+            return "missing"
+        log.warning(
+            "profile.card.edit_failed | chat=%s mid=%s err=%s",
+            chat_id,
+            message_id,
+            exc,
+        )
+    except TelegramError as exc:
+        log.warning(
+            "profile.card.edit_failed | chat=%s mid=%s err=%s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        await _profile_notify_error(ctx, chat_id)
+        return "error"
+    except Exception:
+        log.exception("profile.card.edit_failed | chat=%s mid=%s", chat_id, message_id)
+        await _profile_notify_error(ctx, chat_id)
+        return "error"
+    return "error"
+
+
+async def _send_profile_message(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> Optional[int]:
+    if chat_id is None:
+        return None
+    try:
+        message = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        log.warning("profile.card.send_failed | chat=%s err=%s", chat_id, exc)
+        await _profile_notify_error(ctx, chat_id)
+        return None
+    except Exception:
+        log.exception("profile.card.send_failed | chat=%s", chat_id)
+        await _profile_notify_error(ctx, chat_id)
+        return None
+
+    message_id = getattr(message, "message_id", None)
+    try:
+        return int(message_id) if message_id is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 async def open_profile_card(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -7458,194 +7562,109 @@ async def open_profile_card(
     user_id = user.id if user else None
     resolved_user = user_id or get_user_id(ctx) or chat_id
 
-    chat_data_obj = getattr(ctx, "chat_data", None)
-    chat_data: Optional[MutableMapping[str, Any]] = chat_data_obj if isinstance(chat_data_obj, MutableMapping) else None
-    profile_state: Optional[MutableMapping[str, Any]] = None
-    if chat_data is not None:
-        stored = chat_data.get(_PROFILE_CHATDATA_KEY)
-        if isinstance(stored, MutableMapping):
-            profile_state = stored
-        else:
-            profile_state = {}
-            chat_data[_PROFILE_CHATDATA_KEY] = profile_state
-
+    chat_data = _chat_data_mapping(ctx)
     nav_started = _nav_start(chat_data) if suppress_nav else False
 
-    last_card_info = chat_data.get("last_card") if isinstance(chat_data, MutableMapping) else None
-    same_last_card = False
-    fallback_last_mid: Optional[int] = None
-    if isinstance(last_card_info, MutableMapping):
-        if last_card_info.get("kind") == "profile" and last_card_info.get("chat_id") == chat_id:
-            same_last_card = True
-            raw_mid = last_card_info.get("message_id")
-            try:
-                fallback_last_mid = int(raw_mid)
-            except (TypeError, ValueError, OverflowError):
-                fallback_last_mid = None
-
-    state_dict = state(ctx)
-
-    referral_url: Optional[str] = None
-    if resolved_user is not None:
-        try:
-            referral_url = await _build_referral_link(int(resolved_user), ctx)
-        except Exception as exc:
-            log.warning(
-                "referral_link_failed | user=%s err=%s",
-                resolved_user,
-                exc,
-            )
-            referral_url = None
-
-    if referral_url:
-        log.info(
-            "invite.url",
-            extra={"user_id": resolved_user, "chat_id": chat_id, "url": referral_url},
-        )
-
-    snapshot_target = int(resolved_user) if resolved_user is not None else int(chat_id)
-    snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
-    text = _profile_balance_text(snapshot)
-    reply_markup = balance_menu_kb(referral_url=referral_url)
-    keyboard_signature = _profile_keyboard_signature(reply_markup)
-    snapshot_value = snapshot.value if snapshot.value is not None else "__none__"
-    snapshot_warning = snapshot.warning or ""
-    content_hash = hash((snapshot_value, snapshot.display, snapshot_warning, keyboard_signature))
-
-    last_msg_id: Optional[int] = None
-    last_hash: Optional[int] = None
-    if profile_state is not None:
-        raw_mid = profile_state.get(_PROFILE_CHATDATA_MSG_KEY)
-        try:
-            last_msg_id = int(raw_mid)
-        except (TypeError, ValueError):
-            last_msg_id = None
-        raw_hash = profile_state.get(_PROFILE_CHATDATA_HASH_KEY)
-        if isinstance(raw_hash, int):
-            last_hash = raw_hash
-
-    if chat_data is not None:
-        raw_mid_new = chat_data.get(_PROFILE_MSG_ID_KEY)
-        if last_msg_id is None and raw_mid_new is not None:
-            try:
-                last_msg_id = int(raw_mid_new)
-            except (TypeError, ValueError):
-                last_msg_id = None
-        raw_hash_new = chat_data.get(_PROFILE_MSG_HASH_KEY)
-        if isinstance(raw_hash_new, int):
-            last_hash = raw_hash_new
-
-    if fallback_last_mid is not None and last_msg_id is None:
-        last_msg_id = fallback_last_mid
-
-    edit_mode = edit or (same_last_card and not force_new)
-
-    if not edit_mode:
-        last_msg_id = None
-    if force_new:
-        last_msg_id = None
-
-    reused_message = False
-
     try:
-        if edit_mode and last_msg_id and last_hash == content_hash:
-            reused_message = True
-            log.info(
-                "profile.open (chat_id=%s, user_id=%s, suppress_nav=%s, reused_msg=%s)",
-                chat_id,
-                resolved_user,
-                suppress_nav,
-                True,
-            )
-            return last_msg_id
+        state_dict = state(ctx)
+        profile_state_obj = state_dict.get("profile_card")
+        if isinstance(profile_state_obj, MutableMapping):
+            profile_state: MutableMapping[str, Any] = profile_state_obj
+        else:
+            profile_state = {}
+            state_dict["profile_card"] = profile_state
 
-        message_id: Optional[int] = None
+        stored_msg_id: Optional[int] = None
+        if not force_new:
+            stored_msg_id = _chat_data_get_int(chat_data, _PROFILE_MSG_ID_KEY)
+            if stored_msg_id is None:
+                raw_state_mid = profile_state.get("message_id")
+                try:
+                    stored_msg_id = int(raw_state_mid)
+                except (TypeError, ValueError):
+                    stored_msg_id = None
+            if stored_msg_id is None:
+                stored_msg_id = _get_profile_card_message_id(chat_id)
 
-        bot_obj = getattr(ctx, "bot", None)
-        send_message = getattr(bot_obj, "send_message", None) if bot_obj is not None else None
+        raw_hash = profile_state.get("hash")
+        try:
+            last_hash = int(raw_hash)
+        except (TypeError, ValueError):
+            last_hash = None
 
-        if edit_mode and last_msg_id:
+        referral_url: Optional[str] = None
+        if resolved_user is not None:
             try:
-                if callable(send_message):
-                    await safe_edit_message(
-                        ctx,
-                        chat_id,
-                        last_msg_id,
-                        text,
-                        reply_markup,
-                        parse_mode=ParseMode.MARKDOWN,
-                        disable_web_page_preview=True,
-                    )
-                    message_id = last_msg_id
-                    reused_message = True
-                    log.debug("ui.edit ok msg_id=%s", message_id)
-                else:
-                    edited_mid = await show_balance_card(
-                        chat_id,
-                        ctx,
-                        force_new=False,
-                        referral_url=referral_url,
-                    )
-                    message_id = edited_mid if isinstance(edited_mid, int) else last_msg_id
-                    log.debug("ui.edit ok msg_id=%s", message_id)
-            except BadRequest as exc:
-                if "message is not modified" in str(exc).lower():
-                    message_id = last_msg_id
-                    reused_message = True
-                    log.debug("ui.edit ok msg_id=%s", message_id)
-                else:
-                    log.debug(
-                        "ui.edit fail msg_id=%s err=%s",
-                        last_msg_id,
-                        exc,
-                    )
-                    message_id = None
+                referral_url = await _build_referral_link(int(resolved_user), ctx)
             except Exception as exc:
-                log.debug(
-                    "ui.edit fail msg_id=%s err=%s",
-                    last_msg_id,
+                log.warning(
+                    "referral_link_failed | user=%s err=%s",
+                    resolved_user,
                     exc,
                 )
-                message_id = None
+                referral_url = None
 
-        if message_id is None:
-            try:
-                fallback_mid = await show_balance_card(
-                    chat_id,
+        if referral_url:
+            log.info(
+                "invite.url",
+                extra={"user_id": resolved_user, "chat_id": chat_id, "url": referral_url},
+            )
+
+        snapshot_target = int(resolved_user) if resolved_user is not None else int(chat_id)
+        snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
+        text = _profile_balance_text(snapshot)
+        reply_markup = balance_menu_kb(referral_url=referral_url)
+        keyboard_signature = _profile_keyboard_signature(reply_markup)
+        snapshot_value = snapshot.value if snapshot.value is not None else "__none__"
+        snapshot_warning = snapshot.warning or ""
+        content_hash = hash((snapshot_value, snapshot.display, snapshot_warning, keyboard_signature))
+
+        allow_edit = edit and not force_new
+        if not allow_edit:
+            stored_msg_id = None
+
+        message_id: Optional[int] = None
+        reused_message = False
+
+        if allow_edit and stored_msg_id:
+            if last_hash == content_hash:
+                message_id = stored_msg_id
+                reused_message = True
+            else:
+                edit_status = await _try_edit_profile_message(
                     ctx,
-                    force_new=force_new,
-                    referral_url=referral_url,
-                )
-            except TypeError:
-                fallback_mid = await show_balance_card(
                     chat_id,
-                    ctx,
-                    force_new=force_new,
+                    stored_msg_id,
+                    text,
+                    reply_markup,
                 )
-            message_id = fallback_mid
-            if message_id is None and callable(send_message):
-                sent = await tg_safe_send(
-                    send_message,
-                    method_name="sendMessage",
-                    kind="message",
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True,
-                )
-                message_id = getattr(sent, "message_id", None)
-            if message_id is not None:
-                if edit_mode and last_msg_id and message_id == last_msg_id:
+                if edit_status in {"ok", "not_modified"}:
+                    message_id = stored_msg_id
                     reused_message = True
-                    log.debug("ui.edit ok msg_id=%s", message_id)
+                elif edit_status == "missing":
+                    _profile_store_message_id(chat_data, None)
+                    stored_msg_id = None
                 else:
-                    log.debug("ui.send new msg_id=%s", message_id)
+                    return stored_msg_id
 
         if message_id is None:
-            return None
+            new_mid = await _send_profile_message(ctx, chat_id, text, reply_markup)
+            if new_mid is None:
+                return stored_msg_id
+            message_id = new_mid
 
-        reused_message = reused_message or (edit_mode and last_msg_id and message_id == last_msg_id)
+        profile_state["message_id"] = message_id
+        profile_state["hash"] = content_hash
+
+        _profile_store_message_id(chat_data, message_id)
+        if isinstance(chat_data, MutableMapping):
+            chat_data["last_card"] = {
+                "kind": "profile",
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
+
+        _set_profile_card_message_id(chat_id, message_id)
 
         state_dict[BALANCE_CARD_STATE_KEY] = message_id
         msg_ids = state_dict.get("msg_ids")
@@ -7654,21 +7673,6 @@ async def open_profile_card(
             state_dict["msg_ids"] = msg_ids
         msg_ids["balance"] = message_id
         state_dict["last_panel"] = "balance"
-
-        if profile_state is not None:
-            profile_state[_PROFILE_CHATDATA_MSG_KEY] = message_id
-            profile_state[_PROFILE_CHATDATA_HASH_KEY] = content_hash
-
-        if chat_data is not None:
-            chat_data[_PROFILE_MSG_ID_KEY] = message_id
-            chat_data[_PROFILE_MSG_HASH_KEY] = content_hash
-            chat_data["last_card"] = {
-                "kind": "profile",
-                "chat_id": chat_id,
-                "message_id": message_id,
-            }
-
-        _set_profile_card_message_id(chat_id, message_id)
 
         log.info(
             "profile.open (chat_id=%s, user_id=%s, suppress_nav=%s, reused_msg=%s)",
@@ -17377,8 +17381,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         nav_started = _nav_start(nav_chat_data)
         is_profile_btn = btn == "профиль"
         nav_prev_attr = getattr(ctx, "nav_event", False)
+        prev_chat_nav_flag = nav_chat_data.get("nav_event") if isinstance(nav_chat_data, MutableMapping) else None
         if is_profile_btn:
             setattr(ctx, "nav_event", True)
+            if isinstance(nav_chat_data, MutableMapping):
+                nav_chat_data["nav_event"] = True
         try:
             await reset_user_state(ctx, chat_id, notify_chat_off=True)
 
@@ -17418,6 +17425,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         finally:
             if is_profile_btn:
                 setattr(ctx, "nav_event", nav_prev_attr)
+                if isinstance(nav_chat_data, MutableMapping):
+                    if prev_chat_nav_flag is None:
+                        nav_chat_data.pop("nav_event", None)
+                    else:
+                        nav_chat_data["nav_event"] = prev_chat_nav_flag
             _nav_finish(nav_chat_data, started=nav_started)
         # continue processing if button handled via raises above
         return

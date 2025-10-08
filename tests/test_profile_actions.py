@@ -70,13 +70,30 @@ def test_invite_link_logged(monkeypatch, caplog):
 
     monkeypatch.setattr(profile_handlers, "_bot_name", lambda: "ExampleBot")
 
+    captured: dict[str, dict] = {}
+
+    async def fake_edit(ctx_obj, chat_id, message_id, payload):
+        captured["payload"] = payload
+        return True
+
+    monkeypatch.setattr(profile_handlers, "_edit_card", fake_edit)
+
     update = _build_callback_update(chat_id=55, message_id=88, user_id=900)
 
     with caplog.at_level("INFO"):
         asyncio.run(profile_handlers.on_profile_invite(update, ctx))
 
-    assert bot.sent, "invite message not sent"
-    assert "https://t.me/ExampleBot?start=ref_900" in bot.sent[0]["text"]
+    payload = captured.get("payload")
+    assert payload is not None
+    assert "https://t.me/ExampleBot?start=ref_900" in payload["text"]
+    markup = payload.get("reply_markup")
+    buttons = getattr(markup, "inline_keyboard", []) if markup else []
+    assert any(
+        getattr(button, "url", None) == "https://t.me/ExampleBot?start=ref_900"
+        for row in buttons
+        for button in row
+    )
+    assert not bot.sent
     assert any("profile.invite_link" in record.getMessage() for record in caplog.records)
 
 
@@ -103,7 +120,7 @@ def test_topup_stub(monkeypatch):
 
     payload = captured.get("payload")
     assert payload is not None
-    assert "Пополнить баланс — в разработке" in payload["text"]
+    assert "Пополнение — в разработке." in payload["text"]
     assert not bot.sent
 
 
