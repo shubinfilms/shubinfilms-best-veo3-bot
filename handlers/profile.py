@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import time
 from collections.abc import MutableMapping, Sequence
 from contextlib import suppress
@@ -10,9 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from html import escape
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from ui.card import build_card
@@ -31,21 +31,11 @@ _PROMO_WAIT_KEY = "profile_wait_state"
 _PROMO_WAIT_UNTIL_KEY = "profile_wait_until"
 _PROMO_WAIT_USER_KEY = "profile_wait_user_id"
 PROMO_WAIT_TTL = 180
-PROFILE_UPDATE_ERROR_TEXT = "⚠️ Не получилось обновить профиль, попробуйте ещё раз"
 _PROFILE_LOCK_KEY = "profile_open_in_progress"
 PROFILE_MSG_ID = "profile_msg_id"
 PROFILE_OPEN_AT = "profile_open_at"
 NAV_UNTIL = "nav_active_until"
 
-
-def _env_flag(name: str) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    if value in {"", "0", "false", "no"}:
-        return False
-    return True
-
-
-PROFILE_FORCE_SEND = _env_flag("PROFILE_FORCE_SEND")
 
 _HISTORY_TYPE_LABELS = {
     "credit": "Пополнение",
@@ -53,6 +43,223 @@ _HISTORY_TYPE_LABELS = {
     "refund": "Возврат",
 }
 
+
+def _as_html(text: str) -> str:
+    if not text:
+        return ""
+    lines = [escape(line) for line in str(text).splitlines()]
+    return "<br/>".join(lines)
+
+
+def render_profile_root(ctx: ContextTypes.DEFAULT_TYPE, data: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    return render_profile_view(ctx, "root", data=data)
+
+
+def render_profile_view(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    view: str,
+    data: dict | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    normalized = (view or "root").strip().lower()
+    payload: dict = data or {}
+
+    if normalized == "root":
+        return _render_root_view(ctx, payload)
+    if normalized == "topup":
+        return _render_topup_view(payload)
+    if normalized == "history":
+        return _render_history_view(payload)
+    if normalized == "invite":
+        return _render_invite_view(payload)
+    if normalized == "promo":
+        return _render_promo_view()
+
+    return _render_unknown_view(normalized)
+
+
+def _render_root_view(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    payload: dict,
+) -> tuple[str, InlineKeyboardMarkup]:
+    snapshot = payload.get("snapshot")
+    referral_url = payload.get("referral_url")
+
+    chat_state = _chat_data(ctx)
+    state_payload: dict[str, Any] | None
+    if isinstance(chat_state, MutableMapping):
+        raw_state = chat_state.get("profile_render_state")
+        state_payload = raw_state if isinstance(raw_state, dict) else None
+    else:
+        state_payload = None
+
+    if snapshot is None:
+        from bot import _resolve_balance_snapshot, get_user_id
+
+        target = payload.get("snapshot_target")
+        if target is None and state_payload is not None:
+            target = state_payload.get("snapshot_target")
+        if target is None:
+            target = get_user_id(ctx)
+        chat_id = payload.get("chat_id")
+        if chat_id is None and state_payload is not None:
+            chat_id = state_payload.get("chat_id")
+        if target is None and chat_id is not None:
+            target = chat_id
+        if target is not None:
+            snapshot = _resolve_balance_snapshot(ctx, int(target), prefer_cached=True)
+
+    if snapshot is not None:
+        from bot import _profile_balance_text
+
+        text = _profile_balance_text(snapshot)
+    else:
+        text = "👤 Профиль\n💎 Баланс недоступен"
+
+    if referral_url is None:
+        if state_payload is not None:
+            referral_url = state_payload.get("referral_url")
+        if referral_url is None:
+            referral_url = payload.get("referral_url_cached")
+
+    from bot import balance_menu_kb
+
+    markup = balance_menu_kb(referral_url=referral_url)
+    return _as_html(text), markup
+
+
+def _render_topup_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
+    topup_url = payload.get("topup_url") or ""
+    rows: list[list[InlineKeyboardButton]] = []
+    body: Sequence[str] | None
+    subtitle: str
+
+    if topup_url:
+        rows.append([InlineKeyboardButton("Пополнить баланс", url=str(topup_url))])
+        subtitle = "Пополнение через сайт"
+        body = ("Откроется безопасная страница оплаты.",)
+    else:
+        subtitle = "Скоро"
+        rows.append([InlineKeyboardButton("Пополнить баланс", callback_data="noop")])
+        body = ("Пополнение будет доступно позже.",)
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")])
+    card = build_card("💎 Пополнение", subtitle, rows, body_lines=body)
+    return card["text"], card["reply_markup"]
+
+
+def _render_history_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
+    entries = payload.get("entries") or []
+    formatted: list[str] = []
+    for entry in entries[-5:]:
+        line = _format_history_entry(entry)
+        if line:
+            formatted.append(line)
+
+    if not formatted:
+        formatted = ["История операций пока пуста."]
+
+    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+    card = build_card("🧾 История операций", "Последние операции", rows, body_lines=formatted)
+    return card["text"], card["reply_markup"]
+
+
+def _render_invite_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
+    link = payload.get("invite_link")
+    rows: list[list[InlineKeyboardButton]] = []
+    if link:
+        rows.append([InlineKeyboardButton("Скопировать ссылку", url=str(link))])
+        body = (f"Ваша ссылка: {link}",)
+    else:
+        rows.append([InlineKeyboardButton("Скопировать ссылку", callback_data="noop")])
+        body = ("Ссылка станет доступна позже — мы работаем над запуском.",)
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")])
+    card = build_card(
+        "👥 Пригласить друга",
+        "Поделитесь ссылкой и получите бонус после первой оплаты друга.",
+        rows,
+        body_lines=body,
+    )
+    return card["text"], card["reply_markup"]
+
+
+def _render_promo_view() -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+    body = (
+        "Отправьте промокод в чат одним сообщением.",
+        "Мы автоматически проверим и начислим бонусы.",
+    )
+    card = build_card("🎁 Промокод", "Как активировать код", rows, body_lines=body)
+    return card["text"], card["reply_markup"]
+
+
+def _render_unknown_view(view: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+    body = ("Этот раздел пока недоступен. Попробуйте позже.",)
+    card = build_card(
+        "ℹ️ Профиль",
+        f"Раздел {view or '—'} временно недоступен",
+        rows,
+        body_lines=body,
+    )
+    return card["text"], card["reply_markup"]
+
+
+
+async def profile_update_or_send(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    markup: InlineKeyboardMarkup,
+    *,
+    parse_mode: ParseMode = ParseMode.HTML,
+) -> Message | None:
+    chat = update.effective_chat
+    message = update.effective_message
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+
+    if chat_id is None:
+        log.warning("profile.edit.fallback", extra={"reason": "missing_chat"})
+        return None
+
+    chat_data = _chat_data(ctx)
+    msg_id = _get_profile_msg_id(chat_data)
+
+    try:
+        if msg_id:
+            result = await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+            if isinstance(chat_data, MutableMapping):
+                chat_data[PROFILE_MSG_ID] = getattr(result, "message_id", msg_id)
+            log.info(
+                "profile.edit.ok",
+                extra={"chat_id": chat_id, "msg_id": msg_id},
+            )
+            return result
+        raise BadRequest("no previous profile message")
+    except BadRequest as exc:
+        log.warning(
+            "profile.edit.fallback",
+            extra={"chat_id": chat_id, "msg_id": msg_id, "error": str(exc)},
+        )
+        result = await ctx.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True,
+        )
+        if isinstance(chat_data, MutableMapping):
+            chat_data[PROFILE_MSG_ID] = getattr(result, "message_id", None)
+        return result
 
 def _chat_data(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any] | None:
     obj = getattr(ctx, "chat_data", None)
@@ -92,172 +299,201 @@ def _clear_nav_event(
     setattr(ctx, "nav_event", previous_nav)
 
 
-def _callback_target(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE
-) -> tuple[Optional[int], Optional[int]]:
-    chat = update.effective_chat
-    query = update.callback_query
-    message = getattr(update, "effective_message", None)
+async def handle_profile_view(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    view: str,
+) -> Message | None:
+    normalized = (view or "root").strip().lower()
+    if normalized == "back":
+        normalized = "root"
 
+    source = f"profile_{normalized}"
+    chat_data, flag, previous_nav = _set_nav_event(ctx, source=source)
+    try:
+        query = update.callback_query
+        if query is not None:
+            with suppress(BadRequest):
+                await query.answer()
+
+        log.info("profile.cb", extra={"view": normalized})
+
+        if normalized != "promo":
+            clear_promo_wait(ctx)
+
+        data: dict[str, Any]
+        if normalized == "root":
+            data = await _prepare_root_payload(update, ctx)
+        elif normalized == "topup":
+            topup_url = _topup_url() or ""
+            if not topup_url:
+                log.warning("profile.view.no_topup_url")
+            data = {"topup_url": topup_url}
+        elif normalized == "history":
+            user_id = _resolve_profile_user_id(update, ctx)
+            history = await _billing_history(user_id) if user_id is not None else []
+            if not history:
+                log.warning("profile.view.empty_history", extra={"user": user_id})
+            data = {"entries": history}
+        elif normalized == "invite":
+            user_id = _resolve_profile_user_id(update, ctx)
+            bot_name = _bot_name()
+            invite_link: Optional[str]
+            if bot_name and user_id:
+                invite_link = f"https://t.me/{bot_name}?start=ref_{user_id}"
+            else:
+                invite_link = None
+                if not bot_name:
+                    log.warning("profile.view.no_bot_name")
+            data = {"invite_link": invite_link}
+        elif normalized == "promo":
+            data = {}
+        else:
+            data = {"view": normalized}
+
+        text, markup = render_profile_view(ctx, normalized, data=data)
+        result = await profile_update_or_send(update, ctx, text, markup)
+        if result is None:
+            return None
+
+        chat_state = _chat_data(ctx)
+        if isinstance(chat_state, MutableMapping):
+            chat_state["profile_last_view"] = normalized
+
+        if normalized == "root":
+            _store_root_context(ctx, data, result, update)
+        elif normalized == "promo":
+            user_id = _resolve_profile_user_id(update, ctx)
+            chat = update.effective_chat
+            chat_id = getattr(chat, "id", None)
+            msg_id = getattr(result, "message_id", None)
+            if user_id is not None and chat_id is not None and msg_id is not None:
+                _activate_promo_wait(
+                    ctx,
+                    user_id=int(user_id),
+                    chat_id=int(chat_id),
+                    message_id=int(msg_id),
+                )
+
+        return result
+    finally:
+        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+
+
+async def on_profile_cbq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = getattr(query, "data", "") if query else ""
+    if not isinstance(data, str) or not data.startswith("profile:"):
+        return
+
+    _, _, raw_view = data.partition(":")
+    await handle_profile_view(update, ctx, raw_view or "root")
+
+
+async def _prepare_root_payload(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> dict[str, Any]:
+    chat = update.effective_chat
+    message = update.effective_message
     chat_id = getattr(chat, "id", None)
-    if chat_id is None and query and query.message:
-        chat_id = getattr(query.message, "chat_id", None)
     if chat_id is None and message is not None:
         chat_id = getattr(message, "chat_id", None)
 
-    stored_mid = _get_profile_msg_id(_chat_data(ctx))
-    if stored_mid is not None:
-        return chat_id, stored_mid
+    user = update.effective_user
+    user_id = getattr(user, "id", None)
 
-    if query and query.message:
-        return getattr(query.message, "chat_id", None), getattr(query.message, "message_id", None)
-    if message is not None:
-        return getattr(message, "chat_id", None), getattr(message, "message_id", None)
+    from bot import get_user_id
 
-    if chat_id is None:
-        return None, None
-    return chat_id, None
+    resolved_user = user_id or get_user_id(ctx) or chat_id
 
+    referral_url: Optional[str] = None
+    if resolved_user is not None:
+        from bot import _build_referral_link
 
-async def safe_send_or_edit_profile(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    payload: dict[str, Any],
-    *,
-    force_new: bool = False,
-    message_id: Optional[int] = None,
-) -> Optional[int]:
-    chat_data = _chat_data(ctx)
-    force_send = PROFILE_FORCE_SEND or force_new
-    previous_msg_id = _get_profile_msg_id(chat_data)
-    target_mid: Optional[int]
-    if force_send:
-        target_mid = None
-    elif isinstance(message_id, int):
-        target_mid = int(message_id)
-    else:
-        target_mid = previous_msg_id
-
-    text, markup, parse_mode, disable_preview = _payload_components(payload)
-
-    log.info(
-        "profile.render.start",
-        extra={
-            "chat_id": chat_id,
-            "msg_id": target_mid,
-            "force_new": force_send,
-        },
-    )
-
-    if chat_id is not None and target_mid is not None:
         try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=target_mid,
-                text=text,
-                reply_markup=markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_preview,
-            )
-        except BadRequest as exc:
+            referral_url = await _build_referral_link(int(resolved_user), ctx)
+        except Exception as exc:
             log.warning(
-                "profile.card.edit_failed",
-                extra={"chat_id": chat_id, "msg_id": target_mid, "error": str(exc)},
+                "profile.view.referral_failed",
+                extra={"user": resolved_user, "error": str(exc)},
             )
-            _store_profile_msg_id(chat_data, None)
-        except TelegramError as exc:
-            log.error(
-                "profile.card.edit_failed",
-                extra={"chat_id": chat_id, "msg_id": target_mid, "error": str(exc)},
-            )
-            _store_profile_msg_id(chat_data, None)
-            await _notify_profile_error(ctx, chat_id)
-        except Exception:
-            log.exception("profile.card.edit_failed | chat=%s", chat_id)
-            _store_profile_msg_id(chat_data, None)
-            await _notify_profile_error(ctx, chat_id)
-        else:
-            _store_profile_msg_id(chat_data, target_mid)
-            log.info(
-                "profile.card.edited",
-                extra={"chat_id": chat_id, "msg_id": target_mid},
-            )
-            return target_mid
+            referral_url = None
 
-    if chat_id is None:
-        log.info(
-            "profile.render.skip",
-            extra={"chat_id": chat_id, "reason": "missing_chat"},
-        )
-        return None
-
-    try:
-        message = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=markup,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_preview,
-        )
-    except TelegramError as exc:
-        log.error(
-            "profile.card.send_failed",
-            extra={"chat_id": chat_id, "error": str(exc)},
-        )
-        await _notify_profile_error(ctx, chat_id)
-        return None
-    except Exception:
-        log.exception("profile.card.send_failed | chat=%s", chat_id)
-        await _notify_profile_error(ctx, chat_id)
-        return None
-
-    message_id_value = getattr(message, "message_id", None)
-    try:
-        result_mid = int(message_id_value) if message_id_value is not None else None
-    except (TypeError, ValueError):
-        result_mid = None
-
-    if isinstance(result_mid, int):
-        _store_profile_msg_id(chat_data, result_mid)
-        log.info(
-            "profile.card.sent",
-            extra={"chat_id": chat_id, "msg_id": result_mid},
-        )
+    if resolved_user is not None:
+        snapshot_target: Optional[int] = int(resolved_user)
+    elif chat_id is not None:
+        snapshot_target = int(chat_id)
     else:
-        log.warning(
-            "profile.card.sent_missing_id",
-            extra={"chat_id": chat_id},
-        )
+        snapshot_target = None
 
-    return result_mid
+    snapshot = None
+    if snapshot_target is not None:
+        from bot import _resolve_balance_snapshot
+
+        snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
+
+    return {
+        "snapshot": snapshot,
+        "snapshot_target": snapshot_target,
+        "referral_url": referral_url,
+        "chat_id": chat_id,
+    }
 
 
-async def _edit_card(
+def _store_root_context(
     ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    message_id: Optional[int],
     payload: dict[str, Any],
-) -> bool:
-    chat_data = _chat_data(ctx)
-    stored_mid = _get_profile_msg_id(chat_data)
-    target_mid = message_id if isinstance(message_id, int) else stored_mid
+    message: Message,
+    update: Update,
+) -> None:
+    chat_state = _chat_data(ctx)
+    if not isinstance(chat_state, MutableMapping):
+        return
 
-    edit_result = await _edit_existing_card(ctx, chat_id, target_mid, payload)
-    if edit_result is True:
-        if isinstance(target_mid, int):
-            _store_profile_msg_id(chat_data, target_mid)
-        return True
+    chat_id = payload.get("chat_id")
+    if chat_id is None:
+        chat = update.effective_chat
+        if chat is not None:
+            chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            chat_id = getattr(message, "chat_id", None)
 
-    if edit_result is False:
-        _store_profile_msg_id(chat_data, None)
-        new_mid = await _send_profile_card(ctx, chat_id, payload)
-        if isinstance(new_mid, int):
-            _store_profile_msg_id(chat_data, new_mid)
-            return True
-        return False
+    chat_state["profile_render_state"] = {
+        "snapshot_target": payload.get("snapshot_target"),
+        "chat_id": chat_id,
+        "referral_url": payload.get("referral_url"),
+    }
 
-    return False
 
+def _resolve_profile_user_id(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> Optional[int]:
+    user = update.effective_user
+    if user is not None:
+        uid = getattr(user, "id", None)
+        if uid is not None:
+            return int(uid)
+
+    from bot import get_user_id
+
+    ctx_user = get_user_id(ctx)
+    if ctx_user is not None:
+        return int(ctx_user)
+
+    chat = update.effective_chat
+    if chat is not None:
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            return int(chat_id)
+
+    message = update.effective_message
+    if message is not None:
+        mid = getattr(message, "chat_id", None)
+        if mid is not None:
+            return int(mid)
+
+    return None
 
 async def profile_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_data = _chat_data(ctx)
@@ -310,107 +546,6 @@ def _store_profile_msg_id(
         chat_data[PROFILE_MSG_ID] = int(message_id)
     else:
         chat_data.pop(PROFILE_MSG_ID, None)
-
-
-def _payload_components(payload: dict[str, Any]) -> tuple[str, Any, ParseMode, bool]:
-    return (
-        str(payload.get("text", "")),
-        payload.get("reply_markup"),
-        payload.get("parse_mode", ParseMode.HTML),
-        bool(payload.get("disable_web_page_preview", True)),
-    )
-
-
-async def _notify_profile_error(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
-    if chat_id is None:
-        return
-    try:
-        await ctx.bot.send_message(chat_id=chat_id, text=PROFILE_UPDATE_ERROR_TEXT)
-    except Exception:  # pragma: no cover - defensive logging
-        log.debug("profile.card.notify_failed", exc_info=True, extra={"chat_id": chat_id})
-
-
-async def _send_profile_card(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    payload: dict[str, Any],
-) -> Optional[int]:
-    if chat_id is None:
-        return None
-    text, markup, parse_mode, disable_preview = _payload_components(payload)
-    try:
-        message = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=markup,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_preview,
-        )
-    except TelegramError as exc:
-        log.warning(
-            "profile.card.send_failed | chat=%s err=%s",
-            chat_id,
-            exc,
-        )
-        await _notify_profile_error(ctx, chat_id)
-        return None
-    except Exception:
-        log.exception("profile.card.send_failed | chat=%s", chat_id)
-        await _notify_profile_error(ctx, chat_id)
-        return None
-
-    message_id = getattr(message, "message_id", None)
-    try:
-        return int(message_id) if message_id is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-async def _edit_existing_card(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    message_id: Optional[int],
-    payload: dict[str, Any],
-) -> Optional[bool]:
-    if chat_id is None or message_id is None:
-        return False
-    text, markup, parse_mode, disable_preview = _payload_components(payload)
-    try:
-        await ctx.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=markup,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_preview,
-        )
-        return True
-    except BadRequest as exc:
-        lowered = str(exc).lower()
-        if "message is not modified" in lowered:
-            return True
-        if "message to edit not found" in lowered or "message identifier is not specified" in lowered:
-            return False
-        log.warning(
-            "profile.card.edit_failed | chat=%s mid=%s err=%s",
-            chat_id,
-            message_id,
-            exc,
-        )
-    except TelegramError as exc:
-        log.warning(
-            "profile.card.edit_failed | chat=%s mid=%s err=%s",
-            chat_id,
-            message_id,
-            exc,
-        )
-        await _notify_profile_error(ctx, chat_id)
-        return None
-    except Exception:
-        log.exception("profile.card.edit_failed | chat=%s mid=%s", chat_id, message_id)
-        await _notify_profile_error(ctx, chat_id)
-        return None
-    return None
 
 
 async def open_profile(
@@ -592,40 +727,8 @@ def _topup_url() -> Optional[str]:
 
 
 async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_topup")
-    try:
-        log.info("profile.click", extra={"action": "topup"})
-        query = update.callback_query
-        if query is not None:
-            with suppress(BadRequest):
-                await query.answer()
-
-        chat_id, message_id = _callback_target(update, ctx)
-
-        topup_url = _topup_url()
-        rows: list[list[InlineKeyboardButton]] = []
-        body_lines: Sequence[str] | None
-        if topup_url:
-            rows.append([InlineKeyboardButton("Перейти к оплате", url=topup_url)])
-            subtitle = "Пополнение через сайт"
-            body_lines = ("Откроется безопасная страница оплаты.",)
-        else:
-            log.warning("profile.topup.no_url")
-            subtitle = "Скоро"
-            body_lines = (
-                "Пополнение — в разработке.",
-                "Мы работаем над запуском пополнения в боте.",
-            )
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")])
-        payload = build_card("💎 Пополнение", subtitle, rows, body_lines=body_lines)
-
-        success = await _edit_card(ctx, chat_id, message_id, payload)
-        log.info(
-            "profile.action",
-            extra={"action": "topup", "result": "ok" if success else "skipped"},
-        )
-    finally:
-        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+    log.info("profile.click", extra={"action": "topup"})
+    await handle_profile_view(update, ctx, "topup")
 
 
 async def _billing_history(user_id: int) -> list[dict[str, Any]]:
@@ -708,41 +811,8 @@ def _format_history_entry(entry: dict[str, Any]) -> Optional[str]:
 
 
 async def on_profile_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_history")
-    try:
-        log.info("profile.click", extra={"action": "history"})
-        user = update.effective_user
-        uid = user.id if user else None
-        if uid is None:
-            return
-
-        query = update.callback_query
-        if query is not None:
-            with suppress(BadRequest):
-                await query.answer()
-
-        history = await _billing_history(uid)
-        entries = [_format_history_entry(item) for item in history[-5:]]
-        lines = [item for item in entries if item]
-
-        if lines:
-            log.info("profile.history.count=%s", len(lines), extra={"user": uid})
-            body: Sequence[str] | None = lines
-        else:
-            log.info("profile.history.empty", extra={"user": uid})
-            body = ("История операций пока пуста.",)
-
-        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")]]
-        payload = build_card("🧾 История операций", "Последние операции", rows, body_lines=body)
-
-        chat_id, message_id = _callback_target(update, ctx)
-        success = await _edit_card(ctx, chat_id, message_id, payload)
-        log.info(
-            "profile.action",
-            extra={"action": "history", "result": "ok" if success else "skipped"},
-        )
-    finally:
-        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+    log.info("profile.click", extra={"action": "history"})
+    await handle_profile_view(update, ctx, "history")
 
 
 def _bot_name() -> Optional[str]:
@@ -760,59 +830,8 @@ def _bot_name() -> Optional[str]:
 
 
 async def on_profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_invite")
-    try:
-        log.info("profile.click", extra={"action": "invite"})
-        query = update.callback_query
-        if query is not None:
-            with suppress(BadRequest):
-                await query.answer()
-
-        user = update.effective_user
-        chat_id, message_id = _callback_target(update, ctx)
-        if user is None or chat_id is None:
-            return
-
-        bot_name = _bot_name()
-        link: Optional[str]
-        if bot_name:
-            link = f"https://t.me/{bot_name}?start=ref_{user.id}"
-            log.info(
-                "profile.invite_link | user=%s username=%s",
-                user.id,
-                getattr(user, "username", None),
-            )
-        else:
-            link = None
-            log.info("profile.invite.skipped", extra={"user": user.id})
-
-        if link:
-            invite_button = InlineKeyboardButton("Скопировать ссылку", url=link)
-            body_lines: Sequence[str] | None = (f"Ваша ссылка: {link}",)
-        else:
-            log.warning("profile.invite.no_bot_name")
-            invite_button = InlineKeyboardButton("Скопировать ссылку", callback_data="noop")
-            body_lines = ("Ссылка станет доступна позже — мы работаем над запуском.",)
-
-        rows = [
-            [invite_button],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")],
-        ]
-        payload = build_card(
-            "👥 Пригласить друга",
-            "Поделитесь ссылкой и получите бонус после первой оплаты друга.",
-            rows,
-            body_lines=body_lines,
-        )
-
-        success = await _edit_card(ctx, chat_id, message_id, payload)
-        log.info("profile.invite.sent", extra={"user": user.id, "result": success})
-        log.info(
-            "profile.action",
-            extra={"action": "invite", "result": "ok" if success else "skipped"},
-        )
-    finally:
-        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+    log.info("profile.click", extra={"action": "invite"})
+    await handle_profile_view(update, ctx, "invite")
 
 
 def _activate_promo_wait(
@@ -886,77 +905,13 @@ def is_waiting_for_promo(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def on_profile_promo_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_promo")
-    try:
-        log.info("profile.click", extra={"action": "promo"})
-        query = update.callback_query
-        if query is not None:
-            with suppress(BadRequest):
-                await query.answer()
-
-        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:menu")]]
-        payload = build_card(
-            "🎁 Промокод",
-            "Введите код одним сообщением.",
-            rows,
-            body_lines=("Отправьте промокод в чат.",),
-        )
-
-        chat_id, message_id = _callback_target(update, ctx)
-        success = await _edit_card(ctx, chat_id, message_id, payload)
-        if success:
-            user = update.effective_user
-            user_id = getattr(user, "id", None)
-            if user_id is not None and chat_id is not None and message_id is not None:
-                _activate_promo_wait(
-                    ctx,
-                    user_id=int(user_id),
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                )
-                log.info("profile.promo.wait", extra={"user": user_id})
-        log.info(
-            "profile.action",
-            extra={"action": "promo", "result": "waiting" if success else "skipped"},
-        )
-    finally:
-        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+    log.info("profile.click", extra={"action": "promo"})
+    await handle_profile_view(update, ctx, "promo")
 
 
 async def on_profile_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_data, flag, previous_nav = _set_nav_event(ctx, source="profile_back")
-    try:
-        log.info("profile.click", extra={"action": "back"})
-        clear_promo_wait(ctx)
-        query = update.callback_query
-        if query is not None:
-            with suppress(BadRequest):
-                await query.answer()
-        chat_id, message_id = _callback_target(update, ctx)
-        if chat_id is None:
-            from bot import handle_menu  # lazy import
-
-            _store_profile_msg_id(chat_data, None)
-            await handle_menu(update, ctx, notify_chat_off=False)
-            return
-
-        from handlers.menu import build_main_menu_card  # lazy import
-
-        payload = build_main_menu_card()
-        success = await _edit_card(ctx, chat_id, message_id, payload)
-        if success:
-            log.info(
-                "profile.action",
-                extra={"action": "back", "result": "menu", "msg_id": message_id},
-            )
-            _store_profile_msg_id(chat_data, None)
-        else:
-            from bot import handle_menu  # lazy import
-
-            await handle_menu(update, ctx, notify_chat_off=False)
-            _store_profile_msg_id(chat_data, None)
-    finally:
-        _clear_nav_event(chat_data, flag, ctx, previous_nav)
+    log.info("profile.click", extra={"action": "back"})
+    await handle_profile_view(update, ctx, "back")
 
 
 async def _apply_promo(user_id: int, code: str) -> bool:
@@ -1025,8 +980,6 @@ __all__ = [
     "PROFILE_MSG_ID",
     "PROFILE_OPEN_AT",
     "NAV_UNTIL",
-    "PROFILE_FORCE_SEND",
-    "PROFILE_UPDATE_ERROR_TEXT",
     "PROMO_WAIT_KIND",
     "PROMO_WAIT_TTL",
     "clear_promo_wait",
@@ -1043,5 +996,9 @@ __all__ = [
     "on_profile_promo_start",
     "on_profile_topup",
     "profile_reset_command",
-    "safe_send_or_edit_profile",
+    "render_profile_root",
+    "render_profile_view",
+    "profile_update_or_send",
+    "handle_profile_view",
+    "on_profile_cbq",
 ]
