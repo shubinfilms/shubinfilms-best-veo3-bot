@@ -7466,103 +7466,6 @@ def _profile_store_message_id(
         chat_data.pop(_PROFILE_MSG_ID_KEY, None)
 
 
-async def _profile_notify_error(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]
-) -> None:
-    if chat_id is None:
-        return
-    try:
-        await ctx.bot.send_message(
-            chat_id,
-            profile_handlers.PROFILE_UPDATE_ERROR_TEXT,
-        )
-    except Exception:  # pragma: no cover - defensive logging
-        log.debug(
-            "profile.card.notify_failed",
-            exc_info=True,
-            extra={"chat_id": chat_id},
-        )
-
-
-async def _try_edit_profile_message(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    message_id: Optional[int],
-    text: str,
-    reply_markup: InlineKeyboardMarkup,
-) -> str:
-    if chat_id is None or message_id is None:
-        return "missing"
-    try:
-        await ctx.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-        return "ok"
-    except BadRequest as exc:
-        lowered = str(exc).lower()
-        if "message is not modified" in lowered:
-            return "not_modified"
-        if "message to edit not found" in lowered or "message identifier is not specified" in lowered:
-            return "missing"
-        log.warning(
-            "profile.card.edit_failed | chat=%s mid=%s err=%s",
-            chat_id,
-            message_id,
-            exc,
-        )
-    except TelegramError as exc:
-        log.warning(
-            "profile.card.edit_failed | chat=%s mid=%s err=%s",
-            chat_id,
-            message_id,
-            exc,
-        )
-        await _profile_notify_error(ctx, chat_id)
-        return "error"
-    except Exception:
-        log.exception("profile.card.edit_failed | chat=%s mid=%s", chat_id, message_id)
-        await _profile_notify_error(ctx, chat_id)
-        return "error"
-    return "error"
-
-
-async def _send_profile_message(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    text: str,
-    reply_markup: InlineKeyboardMarkup,
-) -> Optional[int]:
-    if chat_id is None:
-        return None
-    try:
-        message = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-    except TelegramError as exc:
-        log.warning("profile.card.send_failed | chat=%s err=%s", chat_id, exc)
-        await _profile_notify_error(ctx, chat_id)
-        return None
-    except Exception:
-        log.exception("profile.card.send_failed | chat=%s", chat_id)
-        await _profile_notify_error(ctx, chat_id)
-        return None
-
-    message_id = getattr(message, "message_id", None)
-    try:
-        return int(message_id) if message_id is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
 async def open_profile_card(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -7609,23 +7512,6 @@ async def open_profile_card(
             if stored_msg_id is None:
                 stored_msg_id = _get_profile_card_message_id(chat_id)
 
-        chat_hash: Optional[int] = None
-        if isinstance(chat_data, MutableMapping):
-            chat_hash_raw = chat_data.get("profile_rendered_hash")
-            try:
-                chat_hash = int(chat_hash_raw) if chat_hash_raw is not None else None
-            except (TypeError, ValueError):
-                chat_hash = None
-
-        raw_hash = profile_state.get("hash")
-        if chat_hash is not None:
-            last_hash = chat_hash
-        else:
-            try:
-                last_hash = int(raw_hash)
-            except (TypeError, ValueError):
-                last_hash = None
-
         referral_url: Optional[str] = None
         if resolved_user is not None:
             try:
@@ -7657,35 +7543,30 @@ async def open_profile_card(
         if not allow_edit:
             stored_msg_id = None
 
-        message_id: Optional[int] = None
-        reused_message = False
+        previous_mid = _chat_data_get_int(chat_data, _PROFILE_MSG_ID_KEY)
+        if allow_edit and stored_msg_id and stored_msg_id != previous_mid:
+            _profile_store_message_id(chat_data, stored_msg_id)
+            previous_mid = stored_msg_id
+        elif not allow_edit and isinstance(chat_data, MutableMapping):
+            chat_data.pop(_PROFILE_MSG_ID_KEY, None)
+            previous_mid = None
 
-        if allow_edit and stored_msg_id:
-            if last_hash == content_hash:
-                message_id = stored_msg_id
-                reused_message = True
-            else:
-                edit_status = await _try_edit_profile_message(
-                    ctx,
-                    chat_id,
-                    stored_msg_id,
-                    text,
-                    reply_markup,
-                )
-                if edit_status in {"ok", "not_modified"}:
-                    message_id = stored_msg_id
-                    reused_message = True
-                elif edit_status == "missing":
-                    _profile_store_message_id(chat_data, None)
-                    stored_msg_id = None
-                else:
-                    return stored_msg_id
+        payload = {
+            "text": text,
+            "reply_markup": reply_markup,
+            "parse_mode": ParseMode.MARKDOWN,
+            "disable_web_page_preview": True,
+        }
 
+        message_id = await profile_handlers.safe_send_or_edit_profile(
+            ctx,
+            chat_id,
+            payload,
+            force_new=not allow_edit,
+            message_id=stored_msg_id if allow_edit else None,
+        )
         if message_id is None:
-            new_mid = await _send_profile_message(ctx, chat_id, text, reply_markup)
-            if new_mid is None:
-                return stored_msg_id
-            message_id = new_mid
+            return None
 
         profile_state["message_id"] = message_id
         profile_state["hash"] = content_hash
@@ -7710,6 +7591,12 @@ async def open_profile_card(
             state_dict["msg_ids"] = msg_ids
         msg_ids["balance"] = message_id
         state_dict["last_panel"] = "balance"
+
+        reused_message = (
+            isinstance(message_id, int)
+            and previous_mid is not None
+            and message_id == previous_mid
+        )
 
         log.info(
             "profile.open (chat_id=%s, user_id=%s, suppress_nav=%s, reused_msg=%s)",
@@ -14713,39 +14600,51 @@ async def handle_menu(
     if chat_id is None:
         return
 
-    await reset_user_state(
-        ctx,
-        chat_id,
-        notify_chat_off=notify_chat_off,
-        suppress_notification=query is not None,
-    )
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    nav_flag = isinstance(chat_data_obj, MutableMapping)
+    previous_nav_attr = getattr(ctx, "nav_event", False)
+    if nav_flag:
+        chat_data_obj["nav_event"] = True
+    setattr(ctx, "nav_event", True)
 
-    guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
-
-    await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
-    _clear_pm_menu_state(chat_id, user_id=user_id)
-    state_dict = state(ctx)
-    if user_id:
-        await disable_chat_mode(
+    try:
+        await reset_user_state(
             ctx,
-            chat_id=chat_id,
-            user_id=user_id,
-            state_dict=state_dict,
-            notify=False,
+            chat_id,
+            notify_chat_off=notify_chat_off,
+            suppress_notification=query is not None,
         )
-        clear_wait(user_id)
 
-    if not guard_acquired:
-        log.debug("menu.guard_skip", extra={"chat_id": chat_id})
+        guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
 
-    await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
+        await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
+        _clear_pm_menu_state(chat_id, user_id=user_id)
+        state_dict = state(ctx)
+        if user_id:
+            await disable_chat_mode(
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                state_dict=state_dict,
+                notify=False,
+            )
+            clear_wait(user_id)
 
-    await ensure_main_reply_keyboard(
-        ctx,
-        chat_id,
-        state_dict=state_dict,
-        text=TXT_MENU_TITLE,
-    )
+        if not guard_acquired:
+            log.debug("menu.guard_skip", extra={"chat_id": chat_id})
+
+        await show_emoji_hub_for_chat(chat_id, ctx, user_id=user_id, replace=True)
+
+        await ensure_main_reply_keyboard(
+            ctx,
+            chat_id,
+            state_dict=state_dict,
+            text=TXT_MENU_TITLE,
+        )
+    finally:
+        if nav_flag and isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj.pop("nav_event", None)
+        setattr(ctx, "nav_event", previous_nav_attr)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
@@ -18800,6 +18699,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("transactions",), transactions_command),
     (("balance_recalc",), balance_recalc),
     (("sora2_health",), sora2_health_command),
+    (("profile_reset",), profile_handlers.profile_reset_command),
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [

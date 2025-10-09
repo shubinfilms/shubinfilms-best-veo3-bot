@@ -484,14 +484,32 @@ async def route_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     if not parsed:
         return False
     namespace, action = parsed
-    handled = await _dispatch_route(
-        namespace,
-        action,
-        update=update,
-        ctx=ctx,
-        source="text",
-        apply_text_lock=True,
-    )
+    chat_data_obj = getattr(ctx, "chat_data", None)
+    if isinstance(chat_data_obj, MutableMapping) and chat_data_obj.get("nav_event"):
+        return False
+
+    nav_flag = False
+    previous_nav_attr = getattr(ctx, "nav_event", False)
+    if isinstance(chat_data_obj, MutableMapping):
+        chat_data_obj["nav_event"] = True
+        nav_flag = True
+    if nav_flag:
+        setattr(ctx, "nav_event", True)
+
+    try:
+        handled = await _dispatch_route(
+            namespace,
+            action,
+            update=update,
+            ctx=ctx,
+            source="text",
+            apply_text_lock=True,
+        )
+    finally:
+        if nav_flag and isinstance(chat_data_obj, MutableMapping):
+            chat_data_obj.pop("nav_event", None)
+        if nav_flag:
+            setattr(ctx, "nav_event", previous_nav_attr)
     return handled
 
 
