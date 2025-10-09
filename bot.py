@@ -4186,6 +4186,13 @@ def should_show_dialog_disabled(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     chat_data_obj = getattr(ctx, "chat_data", None)
     if not isinstance(chat_data_obj, MutableMapping):
         return False
+    nav_deadline = chat_data_obj.get("nav_active_until")
+    if nav_deadline is not None:
+        try:
+            if float(nav_deadline) > time.monotonic():
+                return False
+        except (TypeError, ValueError):
+            chat_data_obj.pop("nav_active_until", None)
     if chat_data_obj.pop("suppress_dialog_notice", False):
         return False
     if chat_data_obj.get("just_exited_plain_chat"):
@@ -4202,9 +4209,16 @@ async def reset_user_state(
     suppress_notification: bool = False,
 ):
     chat_data_obj = getattr(ctx, "chat_data", None)
-    nav_suppressed = isinstance(chat_data_obj, MutableMapping) and (
-        chat_data_obj.get("nav_in_progress") is True
-    )
+    nav_suppressed = False
+    if isinstance(chat_data_obj, MutableMapping):
+        nav_suppressed = chat_data_obj.get("nav_in_progress") is True
+        if not nav_suppressed:
+            deadline = chat_data_obj.get("nav_active_until")
+            if deadline is not None:
+                try:
+                    nav_suppressed = float(deadline) > time.monotonic()
+                except (TypeError, ValueError):
+                    chat_data_obj.pop("nav_active_until", None)
     chat_nav_flag = False
     if isinstance(chat_data_obj, MutableMapping):
         chat_nav_flag = bool(chat_data_obj.pop("nav_event", False))
@@ -17369,6 +17383,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # continue processing if button handled via raises above
         return
     # end btn nav block
+
+    if isinstance(chat_data_obj, MutableMapping):
+        deadline = chat_data_obj.get("nav_active_until")
+        if deadline is not None:
+            try:
+                if float(deadline) > time.monotonic():
+                    log.info(
+                        "nav.suppress_dialog_notice",
+                        extra={"chat_id": msg.chat_id, "source": "timer"},
+                    )
+                    return
+            except (TypeError, ValueError):
+                chat_data_obj.pop("nav_active_until", None)
 
     waiting_for_input = _chat_state_waiting_input(s)
     if (

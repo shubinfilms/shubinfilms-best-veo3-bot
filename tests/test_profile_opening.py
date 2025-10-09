@@ -30,7 +30,11 @@ def test_quick_button_opens_profile_once(monkeypatch):
 
     calls: list[dict[str, object]] = []
 
-    async def fake_open_card(chat_id, user_id, *, update, ctx: SimpleNamespace, suppress_nav, source):
+    async def fake_open_card(update, ctx: SimpleNamespace, *, suppress_nav, source):
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+        user = getattr(update, "effective_user", None)
+        user_id = getattr(user, "id", None)
         calls.append({
             "chat_id": chat_id,
             "user_id": user_id,
