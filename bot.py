@@ -228,6 +228,10 @@ from keyboards import (
 PROFILE_CB_TRANSACTIONS = "profile:history"
 PROFILE_CB_INVITE = "profile:invite"
 PROFILE_CB_PROMO = "profile:promo"
+
+
+def _profile_simple_enabled() -> bool:
+    return bool(getattr(_app_settings, "FEATURE_PROFILE_SIMPLE", False))
 from texts import (
     SUNO_MODE_PROMPT,
     SUNO_START_READY_MESSAGE,
@@ -6174,6 +6178,26 @@ async def show_profile_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await ctx.bot.send_message(chat_id, **card)
 
 
+async def _open_profile_entry(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    source: str,
+    suppress_nav: bool = True,
+) -> None:
+    if _profile_simple_enabled():
+        from handlers import profile_simple
+
+        await profile_simple.profile_open(update, ctx)
+    else:
+        await profile_handlers.open_profile(
+            update,
+            ctx,
+            source=source,
+            suppress_nav=suppress_nav,
+        )
+
+
 async def show_kb_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message_id = await knowledge_base_open_root(ctx, chat_id)
     chat_data = _chat_data_mapping(ctx)
@@ -6279,7 +6303,7 @@ async def handle_quick_profile_button(
             state_dict=state_dict,
             notify=False,
         )
-        await profile_handlers.open_profile(
+        await _open_profile_entry(
             update,
             ctx,
             source="quick",
@@ -6625,7 +6649,7 @@ async def _dispatch_home_action(
                 nav_chat_data.pop("profile_msg_id", None)
                 nav_chat_data.pop("profile_rendered_hash", None)
 
-            await profile_handlers.open_profile(
+            await _open_profile_entry(
                 update,
                 ctx,
                 source=source,
@@ -6807,7 +6831,7 @@ async def _dispatch_home_action(
                 chat_data_obj.pop("profile_msg_id", None)
                 chat_data_obj.pop("profile_rendered_hash", None)
 
-        await profile_handlers.open_profile(
+        await _open_profile_entry(
             update,
             ctx,
             source=source,
@@ -17363,7 +17387,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     state_dict=s,
                     notify=False,
                 )
-                await profile_handlers.open_profile(
+                await _open_profile_entry(
                     update,
                     ctx,
                     source="quick",
@@ -18783,6 +18807,28 @@ REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE
 ]
 
 
+async def handle_profile_simple_callback(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not _profile_simple_enabled():
+        return
+
+    from handlers import profile_simple
+
+    query = update.callback_query
+    data = getattr(query, "data", "") if query else ""
+    action = (data or "").split(":", 1)[1] if ":" in (data or "") else "open"
+    mapping = {
+        "open": profile_simple.profile_open,
+        "topup": profile_simple.profile_topup,
+        "history": profile_simple.profile_history,
+        "invite": profile_simple.profile_invite,
+        "back": profile_simple.profile_back,
+    }
+    handler = mapping.get(action, profile_simple.profile_open)
+    await handler(update, ctx)
+
+
 QUICK_BUTTON_PATTERNS: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
     (r"^(?:👤\s*)?Профиль$", handle_quick_profile_button),
     (r"^(?:📚\s*)?База знаний$", handle_quick_kb_button),
@@ -18828,6 +18874,14 @@ def register_handlers(application: Any) -> None:
 
     for names, callback in ADDITIONAL_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))
+
+    if _profile_simple_enabled():
+        application.add_handler(
+            CallbackQueryHandler(
+                handle_profile_simple_callback,
+                pattern=r"^profile:(open|topup|history|invite|back)$",
+            )
+        )
 
     for pattern, callback in CALLBACK_HANDLER_SPECS:
         if pattern is None:

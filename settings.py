@@ -110,6 +110,7 @@ def _populate_from_settings() -> None:
     g["WELCOME_BONUS_ENABLED"] = bool(settings.WELCOME_BONUS_ENABLED)
     g["BOT_SINGLETON_DISABLED"] = bool(settings.BOT_SINGLETON_DISABLED)
     g["ENABLE_VERTICAL_NORMALIZE"] = bool(settings.ENABLE_VERTICAL_NORMALIZE)
+    g["FEATURE_PROFILE_SIMPLE"] = bool(settings.FEATURE_PROFILE_SIMPLE)
 
     g["PUBLIC_BASE_URL"] = settings.PUBLIC_BASE_URL
 

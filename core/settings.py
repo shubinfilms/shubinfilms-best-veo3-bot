@@ -165,6 +165,8 @@ class Settings(BaseSettings):
     BOT_SINGLETON_DISABLED: bool = Field(default=False)
     ENABLE_VERTICAL_NORMALIZE: bool = Field(default=True)
 
+    FEATURE_PROFILE_SIMPLE: bool = Field(default=False)
+
     DIALOG_ENABLED: Optional[bool] = Field(default=None)
 
     # Runtime/computed attributes populated in ``model_post_init``
