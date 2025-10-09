@@ -4211,6 +4211,7 @@ async def reset_user_state(
     *,
     notify_chat_off: bool = False,
     suppress_notification: bool = False,
+    show_dialog_notice: bool = True,
 ):
     chat_data_obj = getattr(ctx, "chat_data", None)
     nav_suppressed = False
@@ -4249,7 +4250,13 @@ async def reset_user_state(
 
     nav_event_flag = getattr(ctx, "nav_event", False) or chat_nav_flag
 
-    if notify_chat_off and not suppress_notification and was_chat and chat_id:
+    if (
+        notify_chat_off
+        and show_dialog_notice
+        and not suppress_notification
+        and was_chat
+        and chat_id
+    ):
         if nav_suppressed or nav_event_flag:
             log.info(
                 "nav.suppress_dialog_notice",
@@ -6294,7 +6301,12 @@ async def handle_quick_profile_button(
         if isinstance(chat_data_obj, MutableMapping):
             chat_data_obj["nav_event"] = True
             chat_data_obj["suppress_dialog_notice"] = True
-        await reset_user_state(ctx, chat_id, notify_chat_off=True)
+        await reset_user_state(
+            ctx,
+            chat_id,
+            notify_chat_off=True,
+            show_dialog_notice=False,
+        )
         state_dict = state(ctx)
         await disable_chat_mode(
             ctx,
@@ -6342,7 +6354,12 @@ async def handle_quick_kb_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     try:
         if isinstance(chat_data_obj, MutableMapping):
             chat_data_obj["nav_event"] = True
-        await reset_user_state(ctx, chat_id, notify_chat_off=True)
+        await reset_user_state(
+            ctx,
+            chat_id,
+            notify_chat_off=True,
+            show_dialog_notice=False,
+        )
         await open_kb_card(update, ctx, suppress_nav=True)
     finally:
         log.info("nav.finish", extra={"kind": "kb", "chat_id": chat_id})
@@ -6606,6 +6623,7 @@ async def _dispatch_home_action(
             chat_id,
             notify_chat_off=True,
             suppress_notification=False,
+            show_dialog_notice=False,
         )
         await disable_chat_mode(
             ctx,
@@ -6635,6 +6653,7 @@ async def _dispatch_home_action(
                     chat_id,
                     notify_chat_off=True,
                     suppress_notification=False,
+                    show_dialog_notice=False,
                 )
                 await disable_chat_mode(
                     ctx,
@@ -7732,6 +7751,7 @@ async def handle_menu_profile(callback: HubCallbackContext) -> None:
             callback.chat_id,
             notify_chat_off=True,
             suppress_notification=False,
+            show_dialog_notice=False,
         )
 
     legacy_state = state(ctx)
@@ -14636,7 +14656,8 @@ async def handle_menu(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
-    notify_chat_off: bool = True,
+    notify_chat_off: bool = False,
+    show_dialog_notice: bool | None = None,
 ) -> None:
     await ensure_user_record(update)
 
@@ -14665,6 +14686,7 @@ async def handle_menu(
             chat_id,
             notify_chat_off=notify_chat_off,
             suppress_notification=query is not None,
+            show_dialog_notice=notify_chat_off if show_dialog_notice is None else show_dialog_notice,
         )
 
         guard_acquired = acquire_main_menu_guard(chat_id, ttl=MAIN_MENU_GUARD_TTL)
@@ -14774,7 +14796,7 @@ async def cancel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     if user:
         clear_wait(user.id)
-    await handle_menu(update, ctx)
+    await handle_menu(update, ctx, notify_chat_off=True, show_dialog_notice=True)
 
 
 async def suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -17376,7 +17398,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 nav_chat_data["nav_event"] = True
                 nav_chat_data["suppress_dialog_notice"] = True
         try:
-            await reset_user_state(ctx, chat_id, notify_chat_off=True)
+            await reset_user_state(
+                ctx,
+                chat_id,
+                notify_chat_off=True,
+                show_dialog_notice=False,
+            )
 
             if is_profile_btn:
                 log.info("nav.event (source=quick)")
