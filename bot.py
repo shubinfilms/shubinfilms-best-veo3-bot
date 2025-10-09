@@ -7546,9 +7546,17 @@ async def open_profile_card(
 
         snapshot_target = int(resolved_user) if resolved_user is not None else int(chat_id)
         snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
-        text = _profile_balance_text(snapshot)
-        reply_markup = balance_menu_kb(referral_url=referral_url)
-        keyboard_signature = _profile_keyboard_signature(reply_markup)
+        view_text, view_markup = profile_handlers.render_profile_view(
+            ctx,
+            "root",
+            {
+                "snapshot": snapshot,
+                "snapshot_target": snapshot_target,
+                "referral_url": referral_url,
+                "chat_id": chat_id,
+            },
+        )
+        keyboard_signature = _profile_keyboard_signature(view_markup)
         snapshot_value = snapshot.value if snapshot.value is not None else "__none__"
         snapshot_warning = snapshot.warning or ""
         content_hash = hash((snapshot_value, snapshot.display, snapshot_warning, keyboard_signature))
@@ -7565,20 +7573,20 @@ async def open_profile_card(
             chat_data.pop(_PROFILE_MSG_ID_KEY, None)
             previous_mid = None
 
-        payload = {
-            "text": text,
-            "reply_markup": reply_markup,
-            "parse_mode": ParseMode.MARKDOWN,
-            "disable_web_page_preview": True,
-        }
-
-        message_id = await profile_handlers.safe_send_or_edit_profile(
+        result_message = await profile_handlers.profile_update_or_send(
+            update,
             ctx,
-            chat_id,
-            payload,
-            force_new=not allow_edit,
-            message_id=stored_msg_id if allow_edit else None,
+            view_text,
+            view_markup,
         )
+        if result_message is None:
+            return None
+
+        raw_message_id = getattr(result_message, "message_id", None)
+        try:
+            message_id = int(raw_message_id) if raw_message_id is not None else None
+        except (TypeError, ValueError):
+            message_id = None
         if message_id is None:
             return None
 
@@ -7587,6 +7595,12 @@ async def open_profile_card(
 
         if isinstance(chat_data, MutableMapping):
             chat_data["profile_rendered_hash"] = int(content_hash)
+            chat_data["profile_render_state"] = {
+                "snapshot_target": snapshot_target,
+                "chat_id": chat_id,
+                "referral_url": referral_url,
+            }
+            chat_data["profile_last_view"] = "root"
 
         _profile_store_message_id(chat_data, message_id)
         if isinstance(chat_data, MutableMapping):
