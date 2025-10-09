@@ -12,18 +12,32 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import handlers.profile as profile_handlers
+from helpers.telegram_html import sanitize_profile_html, strip_telegram_html
 
 
 class DummyBot:
-    def __init__(self, *, edit_exception: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        edit_exception: Exception | list[Exception | None] | None = None,
+    ):
         self.edit_calls: list[dict] = []
         self.send_calls: list[dict] = []
-        self._edit_exception = edit_exception
+        if isinstance(edit_exception, list):
+            self._edit_exceptions = list(edit_exception)
+            self._edit_exception = None
+        else:
+            self._edit_exceptions = []
+            self._edit_exception = edit_exception
         self._next_message_id = 1000
 
     async def edit_message_text(self, **kwargs):  # type: ignore[override]
         self.edit_calls.append(kwargs)
-        if self._edit_exception is not None:
+        if self._edit_exceptions:
+            exc = self._edit_exceptions.pop(0)
+            if exc is not None:
+                raise exc
+        elif self._edit_exception is not None:
             raise self._edit_exception
         return SimpleNamespace(message_id=self._next_message_id, chat_id=kwargs.get("chat_id"))
 
@@ -159,3 +173,92 @@ def test_profile_back_returns_root(monkeypatch):
         "chat_id": prepared["chat_id"],
         "referral_url": prepared["referral_url"],
     }
+
+
+def test_profile_html_sanitizer_br():
+    raw = "<b>Hello</b><br/>world<br> & friends"
+    sanitized, mode = sanitize_profile_html(raw)
+    assert "<br" not in sanitized
+    assert "Hello" in sanitized and "world" in sanitized
+    assert mode == profile_handlers.ParseMode.HTML
+    plain = strip_telegram_html(sanitized)
+    assert "Hello\nworld" in plain
+
+
+def test_profile_open_from_menu_and_quick(monkeypatch):
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_open_profile_card(update, ctx, *, source: str, suppress_nav: bool = True):
+        calls.append((source, suppress_nav))
+        return profile_handlers.OpenedProfile(msg_id=777, reused=False)
+
+    monkeypatch.setattr(profile_handlers, "open_profile_card", fake_open_profile_card)
+
+    async def scenario():
+        ctx = _make_ctx()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=55),
+            effective_message=SimpleNamespace(chat_id=55),
+            effective_user=SimpleNamespace(id=99),
+        )
+        await profile_handlers.open_profile(update, ctx, source="menu", suppress_nav=True)
+        ctx.chat_data[profile_handlers.PROFILE_OPEN_AT] = 0
+        await profile_handlers.open_profile(update, ctx, source="quick", suppress_nav=True)
+
+    asyncio.run(scenario())
+
+    assert calls == [("menu", True), ("quick", True)]
+
+
+def test_profile_invite_without_bot_name(monkeypatch):
+    ctx = _make_ctx()
+    ctx.bot.username = "InviteBot"
+    monkeypatch.setattr(profile_handlers, "_bot_name", lambda: None)
+
+    captured: dict[str, str] = {}
+
+    async def fake_update(update, inner_ctx, text, markup, *, parse_mode=profile_handlers.ParseMode.HTML):
+        captured["text"] = text
+        captured["parse_mode"] = parse_mode
+        return SimpleNamespace(message_id=321)
+
+    monkeypatch.setattr(profile_handlers, "profile_update_or_send", fake_update)
+
+    update = _make_callback_update("invite")
+    asyncio.run(profile_handlers.handle_profile_view(update, ctx, "invite"))
+
+    assert "https://t.me/InviteBot?start=ref_20" in captured["text"]
+    assert captured["parse_mode"] == profile_handlers.ParseMode.HTML
+
+
+def test_profile_topup_without_url():
+    ctx = _make_ctx()
+    text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
+    assert "Пополнение — в разработке" in text_topup
+    assert "<br" not in text_topup
+
+
+def test_profile_history_empty():
+    ctx = _make_ctx()
+    text_history, _ = profile_handlers.render_profile_view(ctx, "history", {"entries": []})
+    assert "История операций пока пуста" in text_history
+    assert "<br" not in text_history
+
+
+def test_profile_edit_fallbacks():
+    bot = DummyBot(edit_exception=[BadRequest("can't parse entities")])
+    ctx = _make_ctx(bot)
+    ctx.chat_data[profile_handlers.PROFILE_MSG_ID] = 42
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123),
+        effective_message=SimpleNamespace(chat_id=123),
+    )
+
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("ok", callback_data="noop")]])
+    result = asyncio.run(profile_handlers.profile_update_or_send(update, ctx, "hello", markup))
+
+    assert result is not None
+    assert len(bot.edit_calls) == 2
+    assert bot.edit_calls[0]["parse_mode"] == profile_handlers.ParseMode.HTML
+    assert bot.edit_calls[1]["parse_mode"] is None
+    assert not bot.send_calls
