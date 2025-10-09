@@ -7,6 +7,7 @@ from collections.abc import MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from html import escape
@@ -15,6 +16,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+from helpers.telegram_html import sanitize_profile_html, strip_telegram_html
 from ui.card import build_card
 from utils.input_state import (
     WaitInputState,
@@ -48,7 +50,7 @@ def _as_html(text: str) -> str:
     if not text:
         return ""
     lines = [escape(line) for line in str(text).splitlines()]
-    return "<br/>".join(lines)
+    return "\n".join(lines)
 
 
 def render_profile_root(ctx: ContextTypes.DEFAULT_TYPE, data: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
@@ -263,7 +265,7 @@ async def profile_update_or_send(
     text: str,
     markup: InlineKeyboardMarkup,
     *,
-    parse_mode: ParseMode = ParseMode.HTML,
+    parse_mode: ParseMode | str | None = ParseMode.HTML,
 ) -> Message | None:
     chat = update.effective_chat
     message = update.effective_message
@@ -278,39 +280,129 @@ async def profile_update_or_send(
     chat_data = _chat_data(ctx)
     msg_id = _get_profile_msg_id(chat_data)
 
-    try:
-        if msg_id:
-            result = await ctx.bot.edit_message_text(
+    safe_text, safe_mode = sanitize_profile_html(text)
+    plain_text = strip_telegram_html(safe_text)
+    current_text = safe_text
+    current_mode: ParseMode | str | None = safe_mode
+
+    if parse_mode is None:
+        current_mode = None
+
+    def _result_from_existing(message_id: Optional[int]) -> Message | SimpleNamespace:
+        if isinstance(message_id, int):
+            return SimpleNamespace(message_id=message_id)
+        return SimpleNamespace()
+
+    async def _send_message(text_to_send: str, mode: ParseMode | str | None) -> Message | None:
+        nonlocal current_text, current_mode
+        try:
+            result_msg = await ctx.bot.send_message(
                 chat_id=chat_id,
-                message_id=msg_id,
-                text=text,
+                text=text_to_send,
                 reply_markup=markup,
-                parse_mode=parse_mode,
+                parse_mode=mode,
                 disable_web_page_preview=True,
             )
-            if isinstance(chat_data, MutableMapping):
-                chat_data[PROFILE_MSG_ID] = getattr(result, "message_id", msg_id)
-            log.info(
-                "profile.edit.ok",
-                extra={"chat_id": chat_id, "msg_id": msg_id},
+        except BadRequest as exc:
+            error_text = str(exc)
+            lowered = error_text.lower()
+            log.warning(
+                "profile.edit.fallback",
+                extra={
+                    "chat_id": chat_id,
+                    "msg_id": msg_id,
+                    "stage": "send",
+                    "error": error_text,
+                },
             )
-            return result
-        raise BadRequest("no previous profile message")
-    except BadRequest as exc:
-        log.warning(
-            "profile.edit.fallback",
-            extra={"chat_id": chat_id, "msg_id": msg_id, "error": str(exc)},
-        )
-        result = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=markup,
-            parse_mode=parse_mode,
-            disable_web_page_preview=True,
-        )
-        if isinstance(chat_data, MutableMapping):
-            chat_data[PROFILE_MSG_ID] = getattr(result, "message_id", None)
-        return result
+            if "can't parse entities" in lowered and mode is not None:
+                current_text = plain_text
+                current_mode = None
+                return await _send_message(current_text, current_mode)
+            return None
+        else:
+            message_id = getattr(result_msg, "message_id", None)
+            if isinstance(chat_data, MutableMapping):
+                chat_data[PROFILE_MSG_ID] = message_id
+            log.info(
+                "profile.open.result",
+                extra={"chat_id": chat_id, "msg_id": message_id, "mode": "send"},
+            )
+            return result_msg
+
+    if msg_id:
+        while True:
+            try:
+                result = await ctx.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=current_text,
+                    reply_markup=markup,
+                    parse_mode=current_mode,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as exc:
+                error_text = str(exc)
+                lowered = error_text.lower()
+                if "message is not modified" in lowered:
+                    log.info(
+                        "profile.edit.skipped",
+                        extra={"chat_id": chat_id, "msg_id": msg_id},
+                    )
+                    log.info(
+                        "profile.open.result",
+                        extra={"chat_id": chat_id, "msg_id": msg_id, "mode": "noop"},
+                    )
+                    return _result_from_existing(msg_id)
+                if "can't parse entities" in lowered and current_mode is not None:
+                    log.warning(
+                        "profile.edit.fallback",
+                        extra={
+                            "chat_id": chat_id,
+                            "msg_id": msg_id,
+                            "stage": "edit",
+                            "error": error_text,
+                        },
+                    )
+                    current_text = plain_text
+                    current_mode = None
+                    continue
+                if "message to edit not found" in lowered:
+                    log.warning(
+                        "profile.edit.fallback",
+                        extra={
+                            "chat_id": chat_id,
+                            "msg_id": msg_id,
+                            "stage": "edit",
+                            "error": error_text,
+                        },
+                    )
+                    break
+                log.warning(
+                    "profile.edit.fallback",
+                    extra={
+                        "chat_id": chat_id,
+                        "msg_id": msg_id,
+                        "stage": "edit",
+                        "error": error_text,
+                    },
+                )
+                break
+            else:
+                message_id = getattr(result, "message_id", msg_id)
+                if isinstance(chat_data, MutableMapping):
+                    chat_data[PROFILE_MSG_ID] = message_id
+                log.info(
+                    "profile.edit.ok",
+                    extra={"chat_id": chat_id, "msg_id": msg_id},
+                )
+                log.info(
+                    "profile.open.result",
+                    extra={"chat_id": chat_id, "msg_id": message_id, "mode": "edit"},
+                )
+                return result
+
+    return await _send_message(current_text, current_mode)
 
 def _chat_data(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any] | None:
     obj = getattr(ctx, "chat_data", None)
@@ -399,6 +491,11 @@ async def handle_profile_view(
         elif normalized == "invite":
             user_id = _resolve_profile_user_id(update, ctx)
             bot_name = _bot_name()
+            if not bot_name:
+                bot_obj = getattr(ctx, "bot", None)
+                bot_username = getattr(bot_obj, "username", None)
+                if isinstance(bot_username, str) and bot_username:
+                    bot_name = bot_username
             invite_link: Optional[str]
             if bot_name and user_id:
                 invite_link = f"https://t.me/{bot_name}?start=ref_{user_id}"
