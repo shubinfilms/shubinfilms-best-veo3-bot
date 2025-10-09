@@ -17,6 +17,7 @@ from billing import get_history
 from core.balance_provider import get_balance_snapshot
 from redis_utils import rds
 import settings as app_settings
+from .stars import open_stars_menu
 
 log = logging.getLogger(__name__)
 
@@ -188,11 +189,30 @@ async def profile_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _answer_callback(update)
-    text = (
-        "💎 Пополнение — скоро.\n"
-        "Способы (подготовка): Telegram Stars • Карта • Crypto"
+    context = _extract_context(update)
+    chat_id = context.chat_id
+    message = getattr(update, "effective_message", None)
+    query = getattr(update, "callback_query", None)
+    if query is not None and getattr(query, "message", None) is not None:
+        message = query.message
+
+    message_id = getattr(message, "message_id", None)
+
+    result = await open_stars_menu(
+        ctx,
+        chat_id=chat_id,
+        message_id=message_id,
+        edit_message=True,
+        source="profile",
     )
-    await _send_profile_message(update, ctx, text=text, reply_markup=_back_keyboard())
+
+    if chat_id is not None:
+        resolved_id: Optional[int] = None
+        if result is not None:
+            resolved_id = getattr(result, "message_id", None)
+        if resolved_id is None:
+            resolved_id = message_id if isinstance(message_id, int) else None
+        _store_last_message_id(chat_id, resolved_id)
 
 
 def _format_history_entry(entry: Any) -> str:
