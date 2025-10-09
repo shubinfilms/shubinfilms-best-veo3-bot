@@ -128,57 +128,108 @@ def _render_root_view(
 
 
 def _render_topup_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
-    topup_url = payload.get("topup_url") or ""
-    rows: list[list[InlineKeyboardButton]] = []
-    body: Sequence[str] | None
-    subtitle: str
+    raw_urls = payload.get("payment_urls")
+    urls: dict[str, str] = {}
 
-    if topup_url:
-        rows.append([InlineKeyboardButton("Пополнить баланс", url=str(topup_url))])
-        subtitle = "Пополнение через сайт"
-        body = ("Откроется безопасная страница оплаты.",)
+    if isinstance(raw_urls, MutableMapping):
+        for key in ("stars", "card", "crypto"):
+            value = raw_urls.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+            else:
+                text = str(value).strip()
+            if text:
+                urls[key] = text
+
+    legacy_url = payload.get("topup_url")
+    if legacy_url and "card" not in urls:
+        if isinstance(legacy_url, str):
+            legacy_text = legacy_url.strip()
+        else:
+            legacy_text = str(legacy_url).strip()
+        if legacy_text:
+            urls["card"] = legacy_text
+
+    methods: Sequence[tuple[str, str]] = (
+        ("stars", "⭐ Telegram Stars"),
+        ("card", "💳 Оплата картой"),
+        ("crypto", "🪙 Crypto"),
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    available_labels: list[str] = []
+
+    for key, label in methods:
+        link = urls.get(key)
+        if link:
+            rows.append([InlineKeyboardButton(label, url=link)])
+            available_labels.append(label)
+
+    if available_labels:
+        subtitle = "Выберите удобный способ оплаты."
+        body_lines: Sequence[str] = ["Оплатить с помощью:"] + available_labels
     else:
-        subtitle = "Скоро"
-        rows.append([InlineKeyboardButton("Пополнить баланс", callback_data="noop")])
-        body = ("Пополнение будет доступно позже.",)
+        subtitle = "Скоро доступно"
+        body_lines = (
+            "Пополнение — в разработке. Мы работаем над запуском пополнения в боте.",
+        )
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")])
-    card = build_card("💎 Пополнение", subtitle, rows, body_lines=body)
+    card = build_card("💎 Пополнить баланс", subtitle, rows, body_lines=body_lines)
     return card["text"], card["reply_markup"]
 
 
 def _render_history_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
-    entries = payload.get("entries") or []
+    raw_entries = payload.get("entries") or []
+    entries = list(raw_entries)[:5]
+
     formatted: list[str] = []
-    for entry in entries[-5:]:
+    for idx, entry in enumerate(entries, start=1):
         line = _format_history_entry(entry)
         if line:
-            formatted.append(line)
+            formatted.append(f"{idx}. {line}")
 
-    if not formatted:
-        formatted = ["История операций пока пуста."]
+    if formatted:
+        body_lines: Sequence[str] = ["История операций:"] + formatted
+    else:
+        body_lines = ("История операций пока пуста.",)
 
     rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
-    card = build_card("🧾 История операций", "Последние операции", rows, body_lines=formatted)
+    card = build_card(
+        "🧾 История операций",
+        "Последние операции",
+        rows,
+        body_lines=body_lines,
+    )
     return card["text"], card["reply_markup"]
 
 
 def _render_invite_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
     link = payload.get("invite_link")
-    rows: list[list[InlineKeyboardButton]] = []
-    if link:
-        rows.append([InlineKeyboardButton("Скопировать ссылку", url=str(link))])
-        body = (f"Ваша ссылка: {link}",)
-    else:
-        rows.append([InlineKeyboardButton("Скопировать ссылку", callback_data="noop")])
-        body = ("Ссылка станет доступна позже — мы работаем над запуском.",)
 
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")])
+    if isinstance(link, str):
+        link_text = link.strip()
+    else:
+        link_text = str(link).strip() if link else ""
+
+    if link_text:
+        body_lines: Sequence[str] = ("Ваша ссылка:", link_text)
+    else:
+        body_lines = (
+            "Ссылка станет доступна позже — мы работаем над запуском.",
+        )
+
+    rows = [
+        [InlineKeyboardButton("Скопировать ссылку", callback_data="profile:invite_copy")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")],
+    ]
     card = build_card(
         "👥 Пригласить друга",
         "Поделитесь ссылкой и получите бонус после первой оплаты друга.",
         rows,
-        body_lines=body,
+        body_lines=body_lines,
     )
     return card["text"], card["reply_markup"]
 
@@ -251,8 +302,8 @@ async def profile_update_or_send(
             extra={"chat_id": chat_id, "msg_id": msg_id, "error": str(exc)},
         )
         result = await ctx.bot.send_message(
-            chat_id,
-            text,
+            chat_id=chat_id,
+            text=text,
             reply_markup=markup,
             parse_mode=parse_mode,
             disable_web_page_preview=True,
@@ -304,19 +355,25 @@ async def handle_profile_view(
     ctx: ContextTypes.DEFAULT_TYPE,
     view: str,
 ) -> Message | None:
-    normalized = (view or "root").strip().lower()
-    if normalized == "back":
-        normalized = "root"
+    raw_view = (view or "root").strip().lower()
+    subaction: Optional[str] = None
 
-    source = f"profile_{normalized}"
+    if raw_view == "back":
+        normalized = "root"
+    elif raw_view in {"invite_copy", "invite:copy"}:
+        normalized = "invite"
+        subaction = "copy"
+    else:
+        normalized = raw_view
+
+    source_suffix = f"_{subaction}" if subaction else ""
+    source = f"profile_{normalized}{source_suffix}"
     chat_data, flag, previous_nav = _set_nav_event(ctx, source=source)
     try:
         query = update.callback_query
-        if query is not None:
-            with suppress(BadRequest):
-                await query.answer()
+        answer_text: Optional[str] = None
 
-        log.info("profile.cb", extra={"view": normalized})
+        log.info("profile.cb", extra={"view": normalized, "action": subaction})
 
         if normalized != "promo":
             clear_promo_wait(ctx)
@@ -325,13 +382,17 @@ async def handle_profile_view(
         if normalized == "root":
             data = await _prepare_root_payload(update, ctx)
         elif normalized == "topup":
-            topup_url = _topup_url() or ""
-            if not topup_url:
-                log.warning("profile.view.no_topup_url")
-            data = {"topup_url": topup_url}
+            payment_urls = _payment_urls()
+            if not payment_urls:
+                legacy_url = _topup_url() or ""
+                if legacy_url:
+                    payment_urls = {"card": legacy_url}
+                else:
+                    log.warning("profile.view.no_topup_url")
+            data = {"payment_urls": payment_urls}
         elif normalized == "history":
             user_id = _resolve_profile_user_id(update, ctx)
-            history = await _billing_history(user_id) if user_id is not None else []
+            history = await get_user_transactions(user_id) if user_id is not None else []
             if not history:
                 log.warning("profile.view.empty_history", extra={"user": user_id})
             data = {"entries": history}
@@ -346,6 +407,13 @@ async def handle_profile_view(
                 if not bot_name:
                     log.warning("profile.view.no_bot_name")
             data = {"invite_link": invite_link}
+            if subaction == "copy":
+                if invite_link:
+                    answer_text = invite_link
+                else:
+                    answer_text = (
+                        "Ссылка станет доступна позже — мы работаем над запуском."
+                    )
         elif normalized == "promo":
             data = {}
         else:
@@ -355,6 +423,13 @@ async def handle_profile_view(
         result = await profile_update_or_send(update, ctx, text, markup)
         if result is None:
             return None
+
+        if query is not None:
+            with suppress(BadRequest):
+                if answer_text is None:
+                    await query.answer()
+                else:
+                    await query.answer(answer_text, show_alert=False)
 
         chat_state = _chat_data(ctx)
         if isinstance(chat_state, MutableMapping):
@@ -726,6 +801,31 @@ def _topup_url() -> Optional[str]:
     return getattr(app_settings, "TOPUP_URL", None)
 
 
+def _payment_urls() -> dict[str, str]:
+    try:
+        import settings as app_settings
+    except Exception:  # pragma: no cover - defensive
+        return {}
+
+    result: dict[str, str] = {}
+    mapping = (
+        ("stars", "STARS_PAYMENT_URL"),
+        ("card", "CARD_PAYMENT_URL"),
+        ("crypto", "CRYPTO_PAYMENT_URL"),
+    )
+
+    for key, attr in mapping:
+        value = getattr(app_settings, attr, "")
+        if isinstance(value, str):
+            text = value.strip()
+        else:
+            text = str(value).strip() if value else ""
+        if text:
+            result[key] = text
+
+    return result
+
+
 async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("profile.click", extra={"action": "topup"})
     await handle_profile_view(update, ctx, "topup")
@@ -755,34 +855,104 @@ async def _billing_history(user_id: int) -> list[dict[str, Any]]:
         return []
 
 
-def _format_timestamp(value: Any) -> str:
-    ts: Optional[datetime] = None
+def _coerce_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
     if isinstance(value, (int, float)):
         try:
-            ts = datetime.fromtimestamp(float(value))
+            return datetime.fromtimestamp(float(value))
         except Exception:
-            ts = None
-    elif isinstance(value, str):
+            return None
+    if isinstance(value, str):
         text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            pass
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
-                ts = datetime.strptime(text.split(".")[0], fmt)
-                break
+                return datetime.strptime(text.split(".")[0], fmt)
             except Exception:
                 continue
-        else:
-            try:
-                num = float(text)
-            except Exception:
-                num = None
-            if num is not None:
-                try:
-                    ts = datetime.fromtimestamp(num)
-                except Exception:
-                    ts = None
+        try:
+            return datetime.fromtimestamp(float(text))
+        except Exception:
+            return None
+    return None
+
+
+def _format_timestamp(value: Any) -> str:
+    ts = _coerce_timestamp(value)
     if ts is None:
         return "—"
     return ts.strftime("%d.%m.%Y")
+
+
+def _entry_datetime(entry: dict[str, Any]) -> Optional[datetime]:
+    if not isinstance(entry, MutableMapping):
+        return None
+    for key in ("created_at", "timestamp", "ts", "date"):
+        if key in entry:
+            dt = _coerce_timestamp(entry.get(key))
+            if dt is not None:
+                return dt
+    return None
+
+
+def _transaction_sort_key(entry: dict[str, Any]) -> float:
+    dt = _entry_datetime(entry)
+    if dt is not None:
+        try:
+            return float(dt.timestamp())
+        except Exception:
+            pass
+    for key in ("created_at", "timestamp", "ts"):
+        value = entry.get(key)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float("-inf")
+
+
+def _ledger_transactions(user_id: int, limit: int = 5) -> list[dict[str, Any]]:
+    try:
+        from redis_utils import get_ledger_entries
+    except Exception:
+        return []
+
+    try:
+        entries = get_ledger_entries(int(user_id), offset=0, limit=max(int(limit), 0))
+    except Exception:
+        log.exception("profile.history.ledger_failed | user=%s", user_id)
+        return []
+
+    safe_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            safe_entries.append(entry)
+    return safe_entries
+
+
+async def get_user_transactions(user_id: Any) -> list[dict[str, Any]]:
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return []
+
+    history = await _billing_history(uid)
+    entries = [entry for entry in history if isinstance(entry, dict)]
+
+    if not entries:
+        entries = _ledger_transactions(uid, limit=5)
+
+    if not entries:
+        return []
+
+    entries.sort(key=_transaction_sort_key, reverse=True)
+    return entries[:5]
 
 
 def _format_history_entry(entry: dict[str, Any]) -> Optional[str]:
@@ -790,15 +960,30 @@ def _format_history_entry(entry: dict[str, Any]) -> Optional[str]:
         raw_type = str(entry.get("type", "")).lower()
     except Exception:
         raw_type = ""
-    label = _HISTORY_TYPE_LABELS.get(raw_type, raw_type.capitalize() or "Операция")
+
+    reason = ""
+    for key in ("reason", "title", "name", "description"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            reason = " ".join(value.strip().split())
+            break
+    if not reason:
+        reason = _HISTORY_TYPE_LABELS.get(raw_type, raw_type.capitalize() or "Операция")
 
     amount_raw = entry.get("amount")
     try:
-        amount = int(amount_raw)
+        amount = abs(int(amount_raw))
     except Exception:
         amount = 0
-    sign = "−" if amount < 0 else "+"
-    amount_text = f"{sign}{abs(amount)}💎"
+
+    if raw_type == "debit" and amount > 0:
+        amount_text = f"−{amount}💎"
+    elif raw_type == "refund" and amount > 0:
+        amount_text = f"+{amount}💎"
+    elif amount > 0:
+        amount_text = f"+{amount}💎"
+    else:
+        amount_text = "0💎"
 
     ts_value = entry.get("created_at")
     if ts_value is None:
@@ -807,7 +992,7 @@ def _format_history_entry(entry: dict[str, Any]) -> Optional[str]:
         ts_value = entry.get("ts")
     date_text = _format_timestamp(ts_value)
 
-    return f"{date_text} • {label} • {amount_text}"
+    return f"{reason} ({amount_text}) — {date_text}"
 
 
 async def on_profile_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -69,8 +69,8 @@ def test_profile_callbacks_route_all_views(monkeypatch):
         return []
 
     monkeypatch.setattr(profile_handlers, "_prepare_root_payload", fake_prepare)
-    monkeypatch.setattr(profile_handlers, "_topup_url", lambda: "https://pay.example")
-    monkeypatch.setattr(profile_handlers, "_billing_history", fake_history)
+    monkeypatch.setattr(profile_handlers, "_payment_urls", lambda: {"card": "https://pay.example"})
+    monkeypatch.setattr(profile_handlers, "get_user_transactions", fake_history)
     monkeypatch.setattr(profile_handlers, "_bot_name", lambda: "TestBot")
 
     def fake_render(ctx, view, data=None):
@@ -115,8 +115,8 @@ def test_profile_edit_fallback_when_msg_missing():
 def test_profile_no_empty_screens():
     ctx = _make_ctx()
 
-    text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"topup_url": ""})
-    assert "Пополнение будет доступно позже" in text_topup
+    text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
+    assert "Пополнение — в разработке" in text_topup
 
     text_invite, _ = profile_handlers.render_profile_view(ctx, "invite", {"invite_link": None})
     assert "Ссылка станет доступна позже" in text_invite

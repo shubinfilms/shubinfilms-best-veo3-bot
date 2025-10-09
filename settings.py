@@ -75,12 +75,14 @@ def _populate_from_settings() -> None:
     g["UPLOAD_FALLBACK_ENABLED"] = bool(settings.UPLOAD_FALLBACK_ENABLED)
 
     g["TOPUP_URL"] = settings.TOPUP_URL or ""
+    g["STARS_PAYMENT_URL"] = settings.STARS_PAYMENT_URL or ""
+    g["CARD_PAYMENT_URL"] = settings.CARD_PAYMENT_URL or ""
 
     g["YOOKASSA_SHOP_ID"] = settings.YOOKASSA_SHOP_ID
     g["YOOKASSA_SECRET_KEY"] = settings.YOOKASSA_SECRET_KEY
     g["YOOKASSA_RETURN_URL"] = settings.YOOKASSA_RETURN_URL
     g["YOOKASSA_CURRENCY"] = settings.YOOKASSA_CURRENCY
-    g["CRYPTO_PAYMENT_URL"] = settings.CRYPTO_PAYMENT_URL
+    g["CRYPTO_PAYMENT_URL"] = settings.CRYPTO_PAYMENT_URL or ""
 
     g["SORA2_ENABLED"] = bool(settings.SORA2_ENABLED)
     g["SORA2_API_KEY"] = settings.SORA2_API_KEY_EFFECTIVE
