@@ -57,6 +57,13 @@ def test_stars_button_label():
     assert keyboard.inline_keyboard[1][0].text == TXT_PAY_CARD
 
 
+def test_stars_topup_keyboard_labels():
+    keyboard = bot.stars_topup_kb()
+    for index, stars in enumerate(bot.STARS_PACK_ORDER):
+        expected = f"⭐ {stars} → 💎 {bot.STARS_TO_DIAMONDS[stars]}"
+        assert keyboard.inline_keyboard[index][0].text == expected
+
+
 @pytest.fixture
 def yk_environment(monkeypatch):
     monkeypatch.setenv("YOOKASSA_SHOP_ID", "shop")
