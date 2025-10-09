@@ -14414,10 +14414,9 @@ def stars_topup_kb() -> InlineKeyboardMarkup:
         diamonds = STARS_TO_DIAMONDS.get(stars)
         if not diamonds:
             continue
-        bonus = max(diamonds - stars, 0)
-        cap = f"⭐ {stars} → 💎 {diamonds}" + (f" +{bonus}💎 бонус" if bonus else "")
+        label = f"⭐ {stars} → 💎 {diamonds}"
         rows.append(
-            [InlineKeyboardButton(cap, callback_data=f"buy:stars:{stars}:{diamonds}")]
+            [InlineKeyboardButton(label, callback_data=f"buy:stars:{stars}:{diamonds}")]
         )
     rows.append([InlineKeyboardButton("🛒 Где купить Stars", url=STARS_BUY_URL)])
     rows.append([InlineKeyboardButton(common_text("topup.menu.back"), callback_data="topup:open")])
@@ -14535,39 +14534,15 @@ async def handle_topup_callback(
 
         if normalized == "topup:stars":
             await query.answer()
-            text = "\n".join(
-                filter(
-                    None,
-                    [
-                        common_text("topup.stars.title"),
-                        common_text("topup.stars.info"),
-                    ],
-                )
+            text = (
+                "💎 Пополнение через Telegram Stars\n"
+                "Если звёзд не хватает — купите в официальном боте @PremiumBot."
             )
-            edit_callable = getattr(query, "edit_message_text", None)
-            try:
-                if callable(edit_callable):
-                    await _safe_edit_message_text(
-                        edit_callable,
-                        text,
-                        reply_markup=stars_topup_kb(),
-                    )
-                elif message is not None and getattr(ctx.bot, "edit_message_text", None):
-                    await _safe_edit_message_text(
-                        ctx.bot.edit_message_text,
-                        chat_id=chat_id,
-                        message_id=message.message_id,
-                        text=text,
-                        reply_markup=stars_topup_kb(),
-                    )
-                else:
-                    raise AttributeError("edit_message_text not available")
-            except Exception:
-                await ctx.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=stars_topup_kb(),
-                )
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=stars_topup_kb(),
+            )
             return True
 
         if normalized == "topup:yookassa":

@@ -44,4 +44,6 @@ def test_old_topup_callbacks_still_routed(monkeypatch):
 
     assert handled_stars is True
     assert handled_card is True
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["text"].startswith("💎 Пополнение через Telegram Stars")
