@@ -131,7 +131,9 @@ class Settings(BaseSettings):
     PUBLIC_BASE_URL: Optional[str] = Field(default=None)
 
     TOPUP_URL: str = Field(default="")
-
+    STARS_PAYMENT_URL: Optional[str] = Field(default=None)
+    CARD_PAYMENT_URL: Optional[str] = Field(default=None)
+    
     YOOKASSA_SHOP_ID: Optional[str] = Field(default=None)
     YOOKASSA_SECRET_KEY: Optional[str] = Field(default=None)
     YOOKASSA_RETURN_URL: Optional[str] = Field(default=None)
