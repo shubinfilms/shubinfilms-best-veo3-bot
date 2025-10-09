@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
@@ -12,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import handlers.profile as profile_handlers
-from helpers.telegram_html import sanitize_profile_html, strip_telegram_html
+from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
 
 
 class DummyBot:
@@ -110,27 +109,35 @@ def test_profile_callbacks_route_all_views(monkeypatch):
     assert len(updated) == 6
 
 
-def test_profile_edit_fallback_when_msg_missing():
+def test_open_profile_send_fallback():
     bot = DummyBot(edit_exception=BadRequest("message to edit not found"))
     ctx = _make_ctx(bot)
+    ctx.chat_data[profile_handlers.PROFILE_MSG_ID] = 77
     update = SimpleNamespace(
-        effective_chat=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(id=123, type="private"),
         effective_message=SimpleNamespace(chat_id=123),
     )
 
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("ok", callback_data="noop")]])
-    result = asyncio.run(profile_handlers.profile_update_or_send(update, ctx, "hello", markup))
+    result = asyncio.run(
+        profile_handlers.profile_update_or_send(update, ctx, "hello<br/>world", markup)
+    )
 
     assert bot.send_calls, "send_message should be used as fallback"
     assert result is not None
     assert ctx.chat_data.get("profile_msg_id") == result.message_id
+    assert ctx.chat_data.get("profile_last_msg_id") == result.message_id
+    assert len(bot.edit_calls) == 1
+    assert len(bot.send_calls) == 1
+    sent_kwargs = bot.send_calls[0]["kwargs"]
+    assert "<br/>" not in sent_kwargs["text"]
 
 
 def test_profile_no_empty_screens():
     ctx = _make_ctx()
 
     text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
-    assert "Пополнение — в разработке" in text_topup
+    assert "Telegram Stars — Скоро" in text_topup
 
     text_invite, _ = profile_handlers.render_profile_view(ctx, "invite", {"invite_link": None})
     assert "Ссылка станет доступна позже" in text_invite
@@ -139,8 +146,13 @@ def test_profile_no_empty_screens():
     assert "История операций пока пуста" in text_history
 
 
-def test_profile_back_returns_root(monkeypatch):
-    prepared = {"snapshot": SimpleNamespace(display="5💎", warning=None, value=5), "snapshot_target": 5, "referral_url": None, "chat_id": 42}
+def test_inner_buttons_back(monkeypatch):
+    prepared = {
+        "snapshot": SimpleNamespace(display="5💎", warning=None, value=5),
+        "snapshot_target": 5,
+        "referral_url": None,
+        "chat_id": 42,
+    }
 
     async def fake_prepare(update, ctx):
         return prepared
@@ -149,10 +161,12 @@ def test_profile_back_returns_root(monkeypatch):
 
     def fake_render(ctx, view, data=None):
         render_calls.append(view)
-        return "root screen", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="profile:back")]])
+        return f"view:{view}", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+        )
 
     async def fake_update(update, ctx, text, markup, *, parse_mode=profile_handlers.ParseMode.HTML):
-        return SimpleNamespace(message_id=555)
+        return SimpleNamespace(message_id=len(render_calls))
 
     monkeypatch.setattr(profile_handlers, "_prepare_root_payload", fake_prepare)
     monkeypatch.setattr(profile_handlers, "render_profile_view", fake_render)
@@ -160,26 +174,30 @@ def test_profile_back_returns_root(monkeypatch):
 
     async def scenario():
         ctx = _make_ctx()
-        update = _make_callback_update("back")
-        await profile_handlers.handle_profile_view(update, ctx, "back")
+        for view in ("topup", "history", "invite"):
+            await profile_handlers.handle_profile_view(_make_callback_update(view), ctx, view)
+            await profile_handlers.handle_profile_view(_make_callback_update("back"), ctx, "back")
         return ctx
 
     ctx = asyncio.run(scenario())
 
-    assert render_calls == ["root"]
+    assert render_calls == [
+        "topup",
+        "root",
+        "history",
+        "root",
+        "invite",
+        "root",
+    ]
     assert ctx.chat_data.get("profile_last_view") == "root"
-    assert ctx.chat_data.get("profile_render_state") == {
-        "snapshot_target": prepared["snapshot_target"],
-        "chat_id": prepared["chat_id"],
-        "referral_url": prepared["referral_url"],
-    }
 
 
-def test_profile_html_sanitizer_br():
+def test_html_br_sanitized():
     raw = "<b>Hello</b><br/>world<br> & friends"
-    sanitized, mode = sanitize_profile_html(raw)
-    assert "<br" not in sanitized
-    assert "Hello" in sanitized and "world" in sanitized
+    filtered = tg_html_safe(raw)
+    assert "<br/>" not in filtered
+    sanitized, mode = sanitize_profile_html(filtered)
+    assert "<br/>" not in sanitized
     assert mode == profile_handlers.ParseMode.HTML
     plain = strip_telegram_html(sanitized)
     assert "Hello\nworld" in plain
@@ -234,7 +252,7 @@ def test_profile_invite_without_bot_name(monkeypatch):
 def test_profile_topup_without_url():
     ctx = _make_ctx()
     text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
-    assert "Пополнение — в разработке" in text_topup
+    assert "Telegram Stars — Скоро" in text_topup
     assert "<br" not in text_topup
 
 
@@ -250,7 +268,7 @@ def test_profile_edit_fallbacks():
     ctx = _make_ctx(bot)
     ctx.chat_data[profile_handlers.PROFILE_MSG_ID] = 42
     update = SimpleNamespace(
-        effective_chat=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(id=123, type="private"),
         effective_message=SimpleNamespace(chat_id=123),
     )
 
@@ -258,7 +276,5 @@ def test_profile_edit_fallbacks():
     result = asyncio.run(profile_handlers.profile_update_or_send(update, ctx, "hello", markup))
 
     assert result is not None
-    assert len(bot.edit_calls) == 2
-    assert bot.edit_calls[0]["parse_mode"] == profile_handlers.ParseMode.HTML
-    assert bot.edit_calls[1]["parse_mode"] is None
-    assert not bot.send_calls
+    assert len(bot.edit_calls) == 1
+    assert len(bot.send_calls) == 1

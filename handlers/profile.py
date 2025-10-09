@@ -7,7 +7,6 @@ from collections.abc import MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
-from types import SimpleNamespace
 from typing import Any, Optional
 
 from html import escape
@@ -16,7 +15,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
-from helpers.telegram_html import sanitize_profile_html, strip_telegram_html
+from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
 from ui.card import build_card
 from utils.input_state import (
     WaitInputState,
@@ -166,31 +165,31 @@ def _render_topup_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
     )
 
     rows: list[list[InlineKeyboardButton]] = []
-    available_labels: list[str] = []
+    lines: list[str] = []
 
     for key, label in methods:
         link = urls.get(key)
         if link:
             rows.append([InlineKeyboardButton(label, url=link)])
-            available_labels.append(label)
+            lines.append(f"{label} — доступно")
+        else:
+            lines.append(f"{label} — Скоро")
 
-    if available_labels:
-        subtitle = "Выберите удобный способ оплаты."
-        body_lines: Sequence[str] = ["Оплатить с помощью:"] + available_labels
-    else:
-        subtitle = "Скоро доступно"
-        body_lines = (
-            "Пополнение — в разработке. Мы работаем над запуском пополнения в боте.",
-        )
+    subtitle = "Выберите способ пополнения" if urls else "Способы скоро станут доступны"
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")])
-    card = build_card("💎 Пополнить баланс", subtitle, rows, body_lines=body_lines)
+    card = build_card(
+        "💎 Пополнить баланс",
+        subtitle,
+        rows,
+        body_lines=tuple(lines) or ("Способы пополнения появятся позже.",),
+    )
     return card["text"], card["reply_markup"]
 
 
 def _render_history_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
     raw_entries = payload.get("entries") or []
-    entries = list(raw_entries)[:5]
+    entries = list(raw_entries)[:10]
 
     formatted: list[str] = []
     for idx, entry in enumerate(entries, start=1):
@@ -201,7 +200,7 @@ def _render_history_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
     if formatted:
         body_lines: Sequence[str] = ["История операций:"] + formatted
     else:
-        body_lines = ("История операций пока пуста.",)
+        body_lines = ("История операций пока пуста",)
 
     rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
     card = build_card(
@@ -223,15 +222,15 @@ def _render_invite_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
 
     if link_text:
         body_lines: Sequence[str] = ("Ваша ссылка:", link_text)
+        rows = [
+            [InlineKeyboardButton("Скопировать ссылку", callback_data="profile:invite_copy")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")],
+        ]
     else:
         body_lines = (
-            "Ссылка станет доступна позже — мы работаем над запуском.",
+            "Ссылка станет доступна позже — мы работаем над запуском",
         )
-
-    rows = [
-        [InlineKeyboardButton("Скопировать ссылку", callback_data="profile:invite_copy")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")],
-    ]
+        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
     card = build_card(
         "👥 Пригласить друга",
         "Поделитесь ссылкой и получите бонус после первой оплаты друга.",
@@ -278,136 +277,123 @@ async def profile_update_or_send(
     if chat_id is None and message is not None:
         chat_id = getattr(message, "chat_id", None)
 
+    chat_type = getattr(chat, "type", None)
+    if chat_type not in (None, "private"):
+        log.warning(
+            "profile.send.blocked",
+            extra={"chat_id": chat_id, "chat_type": chat_type},
+        )
+        return None
+
     if chat_id is None:
-        log.warning("profile.edit.fallback", extra={"reason": "missing_chat"})
+        log.warning("profile.send.missing_chat")
         return None
 
     chat_data = _chat_data(ctx)
     msg_id = _get_profile_msg_id(chat_data)
 
-    safe_text, safe_mode = sanitize_profile_html(text)
-    plain_text = strip_telegram_html(safe_text)
-    current_text = safe_text
-    current_mode: ParseMode | str | None = safe_mode
-
+    safe_source = tg_html_safe(text)
+    safe_text, safe_mode = sanitize_profile_html(safe_source)
     if parse_mode is None:
-        current_mode = None
+        safe_mode = None
 
-    def _result_from_existing(message_id: Optional[int]) -> Message | SimpleNamespace:
-        if isinstance(message_id, int):
-            return SimpleNamespace(message_id=message_id)
-        return SimpleNamespace()
+    if msg_id:
+        try:
+            result = await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=safe_text,
+                reply_markup=markup,
+                parse_mode=safe_mode,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            log.warning(
+                "profile.edit.failed",
+                extra={
+                    "chat_id": chat_id,
+                    "msg_id": msg_id,
+                    "error": str(exc),
+                },
+            )
+        else:
+            if isinstance(chat_data, MutableMapping):
+                message_id = getattr(result, "message_id", msg_id)
+                if isinstance(message_id, int):
+                    chat_data[PROFILE_MSG_ID] = message_id
+                    chat_data["profile_last_msg_id"] = message_id
+                else:
+                    chat_data.pop(PROFILE_MSG_ID, None)
+                    chat_data.pop("profile_last_msg_id", None)
+            return result
 
-    async def _send_message(text_to_send: str, mode: ParseMode | str | None) -> Message | None:
-        nonlocal current_text, current_mode
+    return await send_profile_card(
+        ctx,
+        chat_id=chat_id,
+        text=text,
+        reply_markup=markup,
+        parse_mode=parse_mode,
+    )
+
+
+async def send_profile_card(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int],
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    parse_mode: ParseMode | str | None = ParseMode.HTML,
+) -> Message | None:
+    if chat_id is None:
+        log.warning("profile.send.missing_chat")
+        return None
+
+    chat_data = _chat_data(ctx)
+    prepared = tg_html_safe(text)
+    safe_text, safe_mode = sanitize_profile_html(prepared)
+    plain_text = strip_telegram_html(safe_text)
+
+    attempts: list[tuple[str, ParseMode | str | None]] = []
+    if parse_mode is None:
+        if plain_text:
+            attempts.append((plain_text, None))
+        else:
+            attempts.append((safe_text, None))
+    else:
+        attempts.append((safe_text, safe_mode))
+        if plain_text and plain_text != safe_text:
+            attempts.append((plain_text, None))
+
+    for body, mode in attempts:
         try:
             result_msg = await ctx.bot.send_message(
                 chat_id=chat_id,
-                text=text_to_send,
-                reply_markup=markup,
+                text=body,
+                reply_markup=reply_markup,
                 parse_mode=mode,
                 disable_web_page_preview=True,
             )
         except BadRequest as exc:
-            error_text = str(exc)
-            lowered = error_text.lower()
             log.warning(
-                "profile.edit.fallback",
+                "profile.send.failed",
                 extra={
                     "chat_id": chat_id,
-                    "msg_id": msg_id,
-                    "stage": "send",
-                    "error": error_text,
+                    "error": str(exc),
+                    "mode": mode,
                 },
             )
-            if "can't parse entities" in lowered and mode is not None:
-                current_text = plain_text
-                current_mode = None
-                return await _send_message(current_text, current_mode)
-            return None
-        else:
-            message_id = getattr(result_msg, "message_id", None)
-            if isinstance(chat_data, MutableMapping):
+            continue
+        message_id = getattr(result_msg, "message_id", None)
+        if isinstance(chat_data, MutableMapping):
+            if isinstance(message_id, int):
                 chat_data[PROFILE_MSG_ID] = message_id
-            log.info(
-                "profile.open.result",
-                extra={"chat_id": chat_id, "msg_id": message_id, "mode": "send"},
-            )
-            return result_msg
-
-    if msg_id:
-        while True:
-            try:
-                result = await ctx.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=current_text,
-                    reply_markup=markup,
-                    parse_mode=current_mode,
-                    disable_web_page_preview=True,
-                )
-            except BadRequest as exc:
-                error_text = str(exc)
-                lowered = error_text.lower()
-                if "message is not modified" in lowered:
-                    log.info(
-                        "profile.edit.skipped",
-                        extra={"chat_id": chat_id, "msg_id": msg_id},
-                    )
-                    log.info(
-                        "profile.open.result",
-                        extra={"chat_id": chat_id, "msg_id": msg_id, "mode": "noop"},
-                    )
-                    return _result_from_existing(msg_id)
-                if "can't parse entities" in lowered and current_mode is not None:
-                    log.warning(
-                        "profile.edit.fallback",
-                        extra={
-                            "chat_id": chat_id,
-                            "msg_id": msg_id,
-                            "stage": "edit",
-                            "error": error_text,
-                        },
-                    )
-                    current_text = plain_text
-                    current_mode = None
-                    continue
-                if "message to edit not found" in lowered:
-                    log.warning(
-                        "profile.edit.fallback",
-                        extra={
-                            "chat_id": chat_id,
-                            "msg_id": msg_id,
-                            "stage": "edit",
-                            "error": error_text,
-                        },
-                    )
-                    break
-                log.warning(
-                    "profile.edit.fallback",
-                    extra={
-                        "chat_id": chat_id,
-                        "msg_id": msg_id,
-                        "stage": "edit",
-                        "error": error_text,
-                    },
-                )
-                break
+                chat_data["profile_last_msg_id"] = message_id
             else:
-                message_id = getattr(result, "message_id", msg_id)
-                if isinstance(chat_data, MutableMapping):
-                    chat_data[PROFILE_MSG_ID] = message_id
-                log.info(
-                    "profile.edit.ok",
-                    extra={"chat_id": chat_id, "msg_id": msg_id},
-                )
-                log.info(
-                    "profile.open.result",
-                    extra={"chat_id": chat_id, "msg_id": message_id, "mode": "edit"},
-                )
-                return result
+                chat_data.pop(PROFILE_MSG_ID, None)
+                chat_data.pop("profile_last_msg_id", None)
+        return result_msg
 
-    return await _send_message(current_text, current_mode)
+    return None
 
 def _chat_data(ctx: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any] | None:
     obj = getattr(ctx, "chat_data", None)

@@ -15,13 +15,26 @@ ALLOWED: frozenset[str] = frozenset({
     "pre",
     "a",
     "tg-spoiler",
+    "blockquote",
 })
 
 _ALLOWED_ATTRS: dict[str, frozenset[str]] = {
     "a": frozenset({"href"}),
 }
 
-_MAX_TEXT_LENGTH = 4000
+_MAX_TEXT_LENGTH = 3800
+
+
+def tg_html_safe(text: str) -> str:
+    """Return text adapted for Telegram HTML."""
+
+    if not text:
+        return ""
+
+    safe = text.replace("<br/>", "\n").replace("<BR/>", "\n")
+    if len(safe) > _MAX_TEXT_LENGTH:
+        safe = safe[: _MAX_TEXT_LENGTH - 1].rstrip() + "…"
+    return safe
 
 
 class _ProfileHTMLSanitizer(HTMLParser):
