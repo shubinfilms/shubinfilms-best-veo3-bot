@@ -59,14 +59,16 @@ def test_open_from_quick_no_dialog_notice(monkeypatch):
     calls: list[dict] = []
 
     async def fake_helper(
-        chat_id,
-        user_id,
-        *,
-        suppress_nav,
         update,
         ctx,
+        *,
+        suppress_nav,
         source,
     ):
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+        user = getattr(update, "effective_user", None)
+        user_id = getattr(user, "id", None)
         calls.append(
             {
                 "chat_id": chat_id,
@@ -149,18 +151,14 @@ def test_single_render_no_duplicates(monkeypatch):
 
     async def scenario():
         first = await profile_handlers.open_profile_card(
-            chat.id,
-            404,
-            update=update,
-            ctx=ctx,
+            update,
+            ctx,
             suppress_nav=True,
             source="inline",
         )
         second = await profile_handlers.open_profile_card(
-            chat.id,
-            404,
-            update=update,
-            ctx=ctx,
+            update,
+            ctx,
             suppress_nav=True,
             source="inline",
         )
