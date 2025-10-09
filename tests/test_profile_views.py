@@ -85,6 +85,12 @@ def test_profile_callbacks_route_all_views(monkeypatch):
     monkeypatch.setattr(profile_handlers, "_payment_urls", lambda: {"card": "https://pay.example"})
     monkeypatch.setattr(profile_handlers, "get_user_transactions", fake_history)
     monkeypatch.setattr(profile_handlers, "_bot_name", lambda: "TestBot")
+    open_calls: list[dict] = []
+
+    async def fake_open(ctx_param, **kwargs):
+        open_calls.append(kwargs)
+
+    monkeypatch.setattr(profile_handlers, "open_stars_menu", fake_open)
 
     def fake_render(ctx, view, data=None):
         rendered.append(view)
@@ -105,8 +111,9 @@ def test_profile_callbacks_route_all_views(monkeypatch):
 
     asyncio.run(scenario())
 
-    assert rendered == ["root", "topup", "history", "invite", "promo", "root"], rendered
-    assert len(updated) == 6
+    assert rendered == ["root", "history", "invite", "promo", "root"], rendered
+    assert len(updated) == 5
+    assert open_calls and open_calls[0]["source"] == "profile"
 
 
 def test_open_profile_send_fallback():
@@ -136,8 +143,10 @@ def test_open_profile_send_fallback():
 def test_profile_no_empty_screens():
     ctx = _make_ctx()
 
-    text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
-    assert "Telegram Stars — Скоро" in text_topup
+    text_topup, markup_topup = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
+    assert "скор" not in text_topup.lower()
+    assert "бонус" not in text_topup.lower()
+    assert len(markup_topup.inline_keyboard) == 8
 
     text_invite, _ = profile_handlers.render_profile_view(ctx, "invite", {"invite_link": None})
     assert "Ссылка станет доступна позже" in text_invite
@@ -168,6 +177,12 @@ def test_inner_buttons_back(monkeypatch):
     async def fake_update(update, ctx, text, markup, *, parse_mode=profile_handlers.ParseMode.HTML):
         return SimpleNamespace(message_id=len(render_calls))
 
+    open_calls: list[dict] = []
+
+    async def fake_open(ctx_param, **kwargs):
+        open_calls.append(kwargs)
+
+    monkeypatch.setattr(profile_handlers, "open_stars_menu", fake_open)
     monkeypatch.setattr(profile_handlers, "_prepare_root_payload", fake_prepare)
     monkeypatch.setattr(profile_handlers, "render_profile_view", fake_render)
     monkeypatch.setattr(profile_handlers, "profile_update_or_send", fake_update)
@@ -181,14 +196,8 @@ def test_inner_buttons_back(monkeypatch):
 
     ctx = asyncio.run(scenario())
 
-    assert render_calls == [
-        "topup",
-        "root",
-        "history",
-        "root",
-        "invite",
-        "root",
-    ]
+    assert render_calls == ["root", "history", "root", "invite", "root"], render_calls
+    assert open_calls and open_calls[0]["source"] == "profile"
     assert ctx.chat_data.get("profile_last_view") == "root"
 
 
@@ -251,8 +260,9 @@ def test_profile_invite_without_bot_name(monkeypatch):
 
 def test_profile_topup_without_url():
     ctx = _make_ctx()
-    text_topup, _ = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
-    assert "Telegram Stars — Скоро" in text_topup
+    text_topup, markup_topup = profile_handlers.render_profile_view(ctx, "topup", {"payment_urls": {}})
+    assert "скор" not in text_topup.lower()
+    assert len(markup_topup.inline_keyboard) == 8
     assert "<br" not in text_topup
 
 

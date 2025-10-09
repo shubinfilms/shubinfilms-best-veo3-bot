@@ -16,6 +16,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
+from .stars import build_stars_kb, open_stars_menu, render_stars_text
 from ui.card import build_card
 from utils.input_state import (
     WaitInputState,
@@ -134,57 +135,8 @@ def _render_root_view(
 
 
 def _render_topup_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
-    raw_urls = payload.get("payment_urls")
-    urls: dict[str, str] = {}
-
-    if isinstance(raw_urls, MutableMapping):
-        for key in ("stars", "card", "crypto"):
-            value = raw_urls.get(key)
-            if value is None:
-                continue
-            if isinstance(value, str):
-                text = value.strip()
-            else:
-                text = str(value).strip()
-            if text:
-                urls[key] = text
-
-    legacy_url = payload.get("topup_url")
-    if legacy_url and "card" not in urls:
-        if isinstance(legacy_url, str):
-            legacy_text = legacy_url.strip()
-        else:
-            legacy_text = str(legacy_url).strip()
-        if legacy_text:
-            urls["card"] = legacy_text
-
-    methods: Sequence[tuple[str, str]] = (
-        ("stars", "⭐ Telegram Stars"),
-        ("card", "💳 Оплата картой"),
-        ("crypto", "🪙 Crypto"),
-    )
-
-    rows: list[list[InlineKeyboardButton]] = []
-    lines: list[str] = []
-
-    for key, label in methods:
-        link = urls.get(key)
-        if link:
-            rows.append([InlineKeyboardButton(label, url=link)])
-            lines.append(f"{label} — доступно")
-        else:
-            lines.append(f"{label} — Скоро")
-
-    subtitle = "Выберите способ пополнения" if urls else "Способы скоро станут доступны"
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")])
-    card = build_card(
-        "💎 Пополнить баланс",
-        subtitle,
-        rows,
-        body_lines=tuple(lines) or ("Способы пополнения появятся позже.",),
-    )
-    return card["text"], card["reply_markup"]
+    _ = payload  # legacy compatibility
+    return render_stars_text(), build_stars_kb()
 
 
 def _render_history_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
@@ -465,14 +417,34 @@ async def handle_profile_view(
         if normalized == "root":
             data = await _prepare_root_payload(update, ctx)
         elif normalized == "topup":
-            payment_urls = _payment_urls()
-            if not payment_urls:
-                legacy_url = _topup_url() or ""
-                if legacy_url:
-                    payment_urls = {"card": legacy_url}
-                else:
-                    log.warning("profile.view.no_topup_url")
-            data = {"payment_urls": payment_urls}
+            message_obj = getattr(update, "effective_message", None)
+            if query is not None and getattr(query, "message", None) is not None:
+                message_obj = query.message
+
+            chat_obj = getattr(update, "effective_chat", None)
+            chat_id = getattr(chat_obj, "id", None)
+            if chat_id is None and message_obj is not None:
+                chat_id = getattr(message_obj, "chat_id", None)
+
+            message_id = getattr(message_obj, "message_id", None)
+
+            result = await open_stars_menu(
+                ctx,
+                chat_id=chat_id,
+                message_id=message_id,
+                edit_message=True,
+                source="profile",
+            )
+
+            if query is not None:
+                with suppress(BadRequest):
+                    await query.answer()
+
+            chat_state = _chat_data(ctx)
+            if isinstance(chat_state, MutableMapping):
+                chat_state["profile_last_view"] = "topup"
+
+            return result
         elif normalized == "history":
             user_id = _resolve_profile_user_id(update, ctx)
             history = await get_user_transactions(user_id) if user_id is not None else []
@@ -951,7 +923,25 @@ async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     log.info("profile.click", extra={"action": "topup"})
-    await handle_profile_view(update, ctx, "topup")
+    message = getattr(update, "effective_message", None)
+    query = getattr(update, "callback_query", None)
+    if query is not None and getattr(query, "message", None) is not None:
+        message = query.message
+
+    chat_obj = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+
+    message_id = getattr(message, "message_id", None)
+
+    await open_stars_menu(
+        ctx,
+        chat_id=chat_id,
+        message_id=message_id,
+        edit_message=True,
+        source="profile",
+    )
 
 
 async def _billing_history(user_id: int) -> list[dict[str, Any]]:

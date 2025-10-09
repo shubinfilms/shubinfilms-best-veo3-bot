@@ -111,6 +111,7 @@ from hub_router import (
     set_fallback as set_hub_fallback,
 )
 from handlers import profile as profile_handlers
+from handlers.stars import open_stars_menu
 
 from state import state as redis_state
 
@@ -14879,7 +14880,21 @@ async def dialog_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def buy_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)
-    await topup(update, ctx)
+
+    message = update.effective_message
+    chat = update.effective_chat
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "message_id", None) if message is not None else None
+
+    await open_stars_menu(
+        ctx,
+        chat_id=chat_id,
+        message_id=message_id,
+        edit_message=False,
+        source="command",
+    )
 
 
 async def lang_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
