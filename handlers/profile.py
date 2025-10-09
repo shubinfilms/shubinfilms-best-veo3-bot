@@ -26,7 +26,12 @@ from utils.input_state import (
     input_state,
     set_wait_state,
 )
+import settings as app_settings
 log = logging.getLogger(__name__)
+
+
+def _simple_profile_enabled() -> bool:
+    return bool(getattr(app_settings, "FEATURE_PROFILE_SIMPLE", False))
 
 PROMO_WAIT_KIND = WaitKind.PROMO_CODE.value
 _PROMO_WAIT_KEY = "profile_wait_state"
@@ -553,6 +558,23 @@ async def handle_profile_view(
 
 
 async def on_profile_cbq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        query = update.callback_query
+        data = getattr(query, "data", "") if query else ""
+        action = (data or "").split(":", 1)[1] if ":" in (data or "") else "open"
+        mapping = {
+            "open": profile_simple.profile_open,
+            "topup": profile_simple.profile_topup,
+            "history": profile_simple.profile_history,
+            "invite": profile_simple.profile_invite,
+            "back": profile_simple.profile_back,
+        }
+        handler = mapping.get(action, profile_simple.profile_open)
+        await handler(update, ctx)
+        return
+
     query = update.callback_query
     data = getattr(query, "data", "") if query else ""
     if not isinstance(data, str) or not data.startswith("profile:"):
@@ -727,6 +749,12 @@ async def open_profile(
     source: str,
     suppress_nav: bool = True,
 ) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        await profile_simple.profile_open(update, ctx)
+        return
+
     chat_data, flag, previous_nav = _set_nav_event(ctx, source=source)
     try:
         now = time.monotonic()
@@ -877,6 +905,12 @@ async def open_profile_card(
 
 
 async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        await profile_simple.profile_open(update, ctx)
+        return
+
     query = update.callback_query
     chat_data = _chat_data(ctx)
     if query is not None:
@@ -924,6 +958,12 @@ def _payment_urls() -> dict[str, str]:
 
 
 async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        await profile_simple.profile_topup(update, ctx)
+        return
+
     log.info("profile.click", extra={"action": "topup"})
     await handle_profile_view(update, ctx, "topup")
 
@@ -1093,6 +1133,12 @@ def _format_history_entry(entry: dict[str, Any]) -> Optional[str]:
 
 
 async def on_profile_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        await profile_simple.profile_history(update, ctx)
+        return
+
     log.info("profile.click", extra={"action": "history"})
     await handle_profile_view(update, ctx, "history")
 
@@ -1112,6 +1158,12 @@ def _bot_name() -> Optional[str]:
 
 
 async def on_profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        await profile_simple.profile_invite(update, ctx)
+        return
+
     log.info("profile.click", extra={"action": "invite"})
     await handle_profile_view(update, ctx, "invite")
 
@@ -1192,6 +1244,12 @@ async def on_profile_promo_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 async def on_profile_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if _simple_profile_enabled():
+        from . import profile_simple
+
+        await profile_simple.profile_back(update, ctx)
+        return
+
     log.info("profile.click", extra={"action": "back"})
     await handle_profile_view(update, ctx, "back")
 
