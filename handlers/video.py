@@ -56,6 +56,7 @@ async def open_menu(
     *,
     veo_fast_cost: int,
     veo_photo_cost: int,
+    sora2_cost: int,
     suppress_nav: bool = False,
     fallback_message_id: Optional[int] = None,
 ) -> Optional[int]:
@@ -63,7 +64,11 @@ async def open_menu(
         raise RuntimeError("video menu handler is not configured")
 
     state_dict = _state_getter(ctx)
-    card = build_video_card(veo_fast_cost=veo_fast_cost, veo_photo_cost=veo_photo_cost)
+    card = build_video_card(
+        veo_fast_cost=veo_fast_cost,
+        veo_photo_cost=veo_photo_cost,
+        sora2_cost=sora2_cost,
+    )
 
     message_id = await _send_menu(
         ctx,

@@ -148,7 +148,7 @@ def test_video_sora2_start_sets_wait_state(monkeypatch, bot_module):
     assert wait_state.kind == WaitKind.SORA2_PROMPT
     assert wait_state.meta.get("mode") == "sora2_simple"
     assert wait_state.meta.get("suppress_ack") is True
-    assert "Введите текст" in captured[0]["text"]
+    assert "Отправьте текстовое описание сцены" in captured[0]["text"]
 
     clear_wait_state(101)
 

@@ -6169,6 +6169,7 @@ async def _open_menu_section(
             chat_id,
             veo_fast_cost=TOKEN_COSTS.get("veo_fast", 0),
             veo_photo_cost=TOKEN_COSTS.get("veo_photo", 0),
+            sora2_cost=TOKEN_COSTS.get("sora2_ttv", 0),
             suppress_nav=suppress_nav,
             fallback_message_id=fallback_message_id,
         )
@@ -6493,7 +6494,11 @@ async def show_images_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def show_video_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    card = build_video_card(veo_fast_cost=TOKEN_COSTS["veo_fast"], veo_photo_cost=TOKEN_COSTS["veo_photo"])
+    card = build_video_card(
+        veo_fast_cost=TOKEN_COSTS["veo_fast"],
+        veo_photo_cost=TOKEN_COSTS["veo_photo"],
+        sora2_cost=TOKEN_COSTS["sora2_ttv"],
+    )
     await ctx.bot.send_message(chat_id, **card)
 
 
@@ -7191,12 +7196,10 @@ def video_menu_kb() -> InlineKeyboardMarkup:
 
 
 def sora2_intro_text() -> str:
-    example = "человек идёт по пляжу на закате, волны блестят, медленная камера"
     return (
         "🎬 *Sora2 — генерация видео по тексту*\n\n"
-        "Отправьте текстовое описание сцены, которую хотите создать.\n"
         f"Стоимость: 💎 {PRICE_SORA2_TEXT}\n\n"
-        f"_Пример:_ {example}"
+        "Нажмите «🚀 Начать генерацию», затем отправьте текстовое описание сцены."
     )
 
 
@@ -11301,9 +11304,8 @@ def sora2_card_text(s: Dict[str, Any]) -> str:
         intro_title = "🎬 <b>Sora2 — видео из изображений</b>"
     lines = [intro_title, f"💎 Стоимость генерации: <b>{PRICE_SORA2_TEXT}</b>"]
     if is_text_mode:
-        lines.append("Отправьте текстовое описание сцены, которую хотите создать.")
         lines.append(
-            "<i>Пример: человек идёт по пляжу на закате, волны блестят, медленная камера</i>"
+            "Нажмите «🚀 Начать генерацию», затем отправьте текстовое описание сцены."
         )
     else:
         lines.append("Прикрепите 1–4 ссылок на изображения и добавьте описание сцены.")
@@ -15371,7 +15373,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     message_id = await safe_edit_or_send_menu(
                         ctx,
                         chat_id=chat_id,
-                        text="✏️ Введите текст для Sora2 (описание сцены).",
+                        text="✏️ Отправьте текстовое описание сцены для Sora2.",
                         reply_markup=InlineKeyboardMarkup(
                             [[InlineKeyboardButton("⬅️ Отменить", callback_data="video:menu")]]
                         ),
@@ -15416,12 +15418,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
             if target_chat is not None:
                 await _clear_video_menu_state(target_chat, user_id=user_id, ctx=ctx)
-                await show_emoji_hub_for_chat(
-                    target_chat,
-                    ctx,
-                    user_id=user_id,
-                    replace=True,
-                )
+                await show_main_menu(target_chat, ctx)
             return
     finally:
         await _answer()

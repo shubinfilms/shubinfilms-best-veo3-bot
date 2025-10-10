@@ -58,7 +58,7 @@ def build_music_card() -> dict:
     return build_card(TXT_KB_MUSIC, "Выберите режим:", rows)
 
 
-def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int) -> dict:
+def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int, sora2_cost: int) -> dict:
     rows = [
         [
             InlineKeyboardButton(
@@ -70,6 +70,12 @@ def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int) -> dict:
             InlineKeyboardButton(
                 f"Оживить изображение (Veo) — 💎 {veo_photo_cost}",
                 callback_data=CB.VIDEO_VEO_ANIMATE,
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"🎬 Sora2 — текст → видео — 💎 {sora2_cost}",
+                callback_data="video:type:sora2",
             )
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
