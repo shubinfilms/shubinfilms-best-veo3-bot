@@ -141,7 +141,7 @@ class Settings(BaseSettings):
     CRYPTO_PAYMENT_URL: Optional[str] = Field(default=None)
 
     FEATURE_SORA2_ENABLED: bool = Field(default=True)
-    SORA2_ENABLED: bool = Field(default=False)
+    SORA2_ENABLED: bool = Field(default=True)
     SORA2_API_KEY: Optional[str] = Field(default=None)
     SORA2_GEN_PATH: str = Field(
         default="https://api.kie.ai/api/v1/jobs/createTask"
@@ -153,7 +153,7 @@ class Settings(BaseSettings):
     SORA2_TIMEOUT_READ: int = Field(default=30, ge=1, le=600)
     SORA2_TIMEOUT_WRITE: int = Field(default=30, ge=1, le=600)
     SORA2_TIMEOUT_POOL: int = Field(default=10, ge=1, le=180)
-    SORA2_PRICE: int = Field(default=50, ge=0, le=1000)
+    SORA2_PRICE: int = Field(default=30, ge=0, le=1000)
     SORA2_DEFAULT_AR: str = Field(default="landscape")
     SORA2_DEFAULT_QUALITY: str = Field(default="standard")
     SORA2_ALLOWED_AR: tuple[str, ...] = Field(default=("16:9", "9:16", "1:1"))
