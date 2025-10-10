@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     YOOKASSA_CURRENCY: str = Field(default="RUB")
     CRYPTO_PAYMENT_URL: Optional[str] = Field(default=None)
 
+    FEATURE_SORA2_ENABLED: bool = Field(default=True)
     SORA2_ENABLED: bool = Field(default=False)
     SORA2_API_KEY: Optional[str] = Field(default=None)
     SORA2_GEN_PATH: str = Field(
@@ -152,6 +153,12 @@ class Settings(BaseSettings):
     SORA2_TIMEOUT_READ: int = Field(default=30, ge=1, le=600)
     SORA2_TIMEOUT_WRITE: int = Field(default=30, ge=1, le=600)
     SORA2_TIMEOUT_POOL: int = Field(default=10, ge=1, le=180)
+    SORA2_PRICE: int = Field(default=50, ge=0, le=1000)
+    SORA2_ALLOWED_AR: tuple[str, ...] = Field(default=("16:9", "9:16", "1:1"))
+    SORA2_MAX_DURATION: int = Field(default=10, ge=1, le=60)
+    SORA2_QUEUE_KEY: str = Field(default="queue:sora2")
+    KIA_SORA2_TIMEOUT: int = Field(default=1800, ge=60, le=7200)
+    KIA_SORA2_RETRY: int = Field(default=2, ge=0, le=5)
 
     VEO_WAIT_STICKER_ID: int = Field(default=5375464961822695044)
     SORA2_WAIT_STICKER_ID: int = Field(default=5375464961822695044)

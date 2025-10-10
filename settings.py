@@ -84,6 +84,7 @@ def _populate_from_settings() -> None:
     g["YOOKASSA_CURRENCY"] = settings.YOOKASSA_CURRENCY
     g["CRYPTO_PAYMENT_URL"] = settings.CRYPTO_PAYMENT_URL or ""
 
+    g["FEATURE_SORA2_ENABLED"] = bool(settings.FEATURE_SORA2_ENABLED)
     g["SORA2_ENABLED"] = bool(settings.SORA2_ENABLED)
     g["SORA2_API_KEY"] = settings.SORA2_API_KEY_EFFECTIVE
     g["SORA2_GEN_PATH"] = settings.SORA2_GEN_PATH
@@ -93,6 +94,12 @@ def _populate_from_settings() -> None:
     g["SORA2_TIMEOUT_READ"] = int(settings.SORA2_TIMEOUT_READ)
     g["SORA2_TIMEOUT_WRITE"] = int(settings.SORA2_TIMEOUT_WRITE)
     g["SORA2_TIMEOUT_POOL"] = int(settings.SORA2_TIMEOUT_POOL)
+    g["SORA2_PRICE"] = int(settings.SORA2_PRICE)
+    g["SORA2_ALLOWED_AR"] = set(settings.SORA2_ALLOWED_AR)
+    g["SORA2_MAX_DURATION"] = int(settings.SORA2_MAX_DURATION)
+    g["SORA2_QUEUE_KEY"] = settings.SORA2_QUEUE_KEY
+    g["KIA_SORA2_TIMEOUT"] = int(settings.KIA_SORA2_TIMEOUT)
+    g["KIA_SORA2_RETRY"] = int(settings.KIA_SORA2_RETRY)
     g["SORA2"] = settings.sora2_payload_defaults()
 
     g["VEO_WAIT_STICKER_ID"] = int(settings.VEO_WAIT_STICKER_ID)
