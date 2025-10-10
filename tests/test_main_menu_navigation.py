@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tests.suno_test_utils import FakeBot, bot_module
+import handlers.knowledge_base as kb_module  # noqa: E402
 
 
 def test_menu_callbacks_route_ok(monkeypatch):
@@ -111,31 +112,38 @@ def test_menu_open_no_duplicates(monkeypatch):
 
     fallback_values: list[object] = []
 
-    async def fake_kb(context, chat_id, *, suppress_nav, fallback_message_id=None):
+    async def fake_open_root(context, chat_id, *, suppress_nav=False, fallback_message_id=None):
         fallback_values.append(fallback_message_id)
-        return 777
+        result = fallback_message_id if fallback_message_id is not None else 777
+        if isinstance(context.chat_data, dict):
+            context.chat_data[bot_module._KB_MSG_ID_KEY] = result
+        return result
 
-    monkeypatch.setattr(bot_module, "knowledge_base_open_root", fake_kb)
+    monkeypatch.setattr(kb_module, "open_root", fake_open_root)
 
     async def fake_answer():
         return None
 
     query = SimpleNamespace(
-        data="menu:kb",
-        message=SimpleNamespace(chat=SimpleNamespace(id=42), chat_id=42),
+        data="kb_open",
+        message=SimpleNamespace(chat=SimpleNamespace(id=42), chat_id=42, message_id=555),
         from_user=SimpleNamespace(id=321),
         answer=fake_answer,
     )
-    update = SimpleNamespace(callback_query=query, effective_chat=query.message.chat, effective_user=query.from_user)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=query.message.chat,
+        effective_user=query.from_user,
+    )
 
     async def scenario():
-        await bot_module.handle_main_menu_callback(update, ctx)
-        assert fallback_values == [None]
-        assert ctx.chat_data.get(bot_module._KB_MSG_ID_KEY) == 777
+        await kb_module.kb_open_handler(update, ctx)
+        assert fallback_values == [555]
+        assert ctx.chat_data.get(bot_module._KB_MSG_ID_KEY) == 555
 
-        await bot_module.handle_main_menu_callback(update, ctx)
-        assert fallback_values == [None, 777]
-        assert ctx.chat_data.get(bot_module._KB_MSG_ID_KEY) == 777
+        await kb_module.kb_open_handler(update, ctx)
+        assert fallback_values == [555, 555]
+        assert ctx.chat_data.get(bot_module._KB_MSG_ID_KEY) == 555
 
     asyncio.run(scenario())
 

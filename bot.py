@@ -272,6 +272,8 @@ from handlers.knowledge_base import (
     KB_ROOT,
     configure as configure_knowledge_base,
     handle_callback as knowledge_base_callback,
+    kb_open_entrypoint as knowledge_base_open_entrypoint,
+    kb_open_handler as knowledge_base_open_handler,
     open_root as knowledge_base_open_root,
     show_examples as knowledge_base_show_examples,
     show_lessons as knowledge_base_show_lessons,
@@ -6361,7 +6363,7 @@ async def handle_quick_kb_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             notify_chat_off=True,
             show_dialog_notice=False,
         )
-        await open_kb_card(update, ctx, suppress_nav=True)
+        await knowledge_base_open_entrypoint(update, ctx)
     finally:
         log.info("nav.finish", extra={"kind": "kb", "chat_id": chat_id})
         _nav_finish(nav_chat_data, started=nav_started)
@@ -6408,6 +6410,7 @@ TEXT_ALIASES.update(
 HOME_ROUTE_ACTIONS: Dict[str, str] = {
     "profile": "balance",
     "kb": "knowledge",
+    "kb_open": "knowledge",
     "photo": "image",
     "music": "music",
     "video": "video",
@@ -6441,6 +6444,7 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     PROFILE_MENU_CB: "balance",
     "profile:menu": "balance",
     KNOWLEDGE_MENU_CB: "knowledge",
+    "menu:kb": "knowledge",
     "kb:menu": "knowledge",
     IMAGE_MENU_CB: "image",
     "image:menu": "image",
@@ -15000,7 +15004,7 @@ async def profile_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def kb_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await route_home(update, ctx, "home:kb")
+    await route_home(update, ctx, "kb_open")
 
 
 async def handle_video_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -18796,6 +18800,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
+    (r"^kb_open$", knowledge_base_open_handler),
     (r"^dialog_default$", dialog_mode_callback),
     (r"^prompt_master$", prompt_master_mode_callback),
     (r"^dialog:choose_regular$", dialog_choose_regular_callback),
@@ -18859,7 +18864,6 @@ async def handle_profile_simple_callback(
 
 QUICK_BUTTON_PATTERNS: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
     (r"^(?:👤\s*)?Профиль$", handle_quick_profile_button),
-    (r"^(?:📚\s*)?База знаний$", handle_quick_kb_button),
 ]
 
 
@@ -18896,6 +18900,15 @@ def register_handlers(application: Any) -> None:
     )
     card_input_handler.block = False
     application.add_handler(card_input_handler, group=1)
+
+    kb_text_handler = MessageHandler(
+        filters.TEXT
+        & ~filters.COMMAND
+        & filters.Regex(r"(?i)^\s*(?:📚\s*)?база\s+знаний\s*$"),
+        handle_quick_kb_button,
+    )
+    kb_text_handler.block = False
+    application.add_handler(kb_text_handler, group=0)
 
     for names, callback in PRIORITY_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))
