@@ -7743,6 +7743,17 @@ async def show_balance_card(
     return mid
 
 
+@register_callback_action("menu", "kb", module="kb")
+async def handle_menu_kb(callback: HubCallbackContext) -> None:
+    await _perform_menu_open(
+        "kb",
+        update=callback.update,
+        ctx=callback.application_context,
+        query=callback.query,
+        log_click=False,
+    )
+
+
 @register_callback_action("menu", "profile", module="profile")
 async def handle_menu_profile(callback: HubCallbackContext) -> None:
     ctx = callback.application_context
