@@ -267,7 +267,11 @@ from handlers.menu import (
 from handlers.music import configure as configure_music_menu, open_menu as music_open_menu
 from handlers.photo import configure as configure_photo_menu, open_menu as photo_open_menu
 from handlers.dialog import configure as configure_dialog_menu, open_menu as dialog_open_menu
-from handlers.video import configure_menu as configure_video_menu, open_menu as video_open_menu
+from handlers.video import (
+    configure_menu as configure_video_menu,
+    open_menu as video_open_menu,
+    open_sora2_card as video_open_sora2_card,
+)
 from handlers.knowledge_base import (
     KB_PREFIX,
     KB_ROOT,
@@ -4426,27 +4430,6 @@ async def _wait_acknowledge(message: Message) -> None:
         )
 
 
-async def _sora2_charge_or_fail(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    try:
-        await billing.charge(user_id, SORA2_PRICE, reason="sora2")
-        log.info("sora2.charge.ok", extra={"user": user_id, "price": SORA2_PRICE})
-        return True
-    except billing.NotEnoughFunds:
-        await ctx.bot.send_message(
-            user_id,
-            "Недостаточно токенов 💎. Пополните баланс и попробуйте снова.",
-        )
-        log.warning("sora2.charge.fail_balance", extra={"user": user_id})
-        return False
-    except Exception:
-        log.exception("sora2.charge.error", extra={"user": user_id})
-        await ctx.bot.send_message(
-            user_id,
-            "⚠️ Не удалось списать токены. Попробуйте позже.",
-        )
-        return False
-
-
 async def _handle_sora2_simple_prompt(
     ctx: ContextTypes.DEFAULT_TYPE,
     message: Message,
@@ -4455,6 +4438,12 @@ async def _handle_sora2_simple_prompt(
     user_id: Optional[int],
 ) -> bool:
     if user_id is None:
+        return True
+
+    meta = wait_state.meta if isinstance(wait_state.meta, Mapping) else {}
+    legacy_wait_state = "ready" not in meta
+    if meta.get("ready") is False:
+        await message.reply_text("Нажмите «🚀 Начать генерацию» перед отправкой описания.")
         return True
 
     prompt = (message.text or "").strip()
@@ -4466,29 +4455,94 @@ async def _handle_sora2_simple_prompt(
     if chat_id is None:
         chat_id = user_id
 
-    if not await _sora2_charge_or_fail(ctx, user_id):
-        clear_wait_state(user_id, reason="sora2_simple_charge_fail")
+    state_dict = state(ctx)
+    state_dict["sora2_prompt"] = prompt
+
+    skip_balance_check = bool(meta.get("skip_balance_check")) or legacy_wait_state
+    if not skip_balance_check and not await ensure_tokens(
+        ctx, chat_id, user_id, SORA2_PRICE, reply_to=message.message_id
+    ):
+        clear_wait_state(user_id, reason="sora2_simple_done")
         return True
 
-    await message.reply_text("🎬 Задача Sora2 запущена. Подождите, идёт генерация…")
+    charged = False
+    precharged = False
+    if legacy_wait_state:
+        try:
+            await billing.charge(user_id, SORA2_PRICE, reason="sora2")
+            charged = True
+            precharged = True
+            log.info("sora2.charge.ok", extra={"user": user_id, "price": SORA2_PRICE})
+        except billing.NotEnoughFunds:
+            await ctx.bot.send_message(
+                chat_id,
+                "Недостаточно токенов 💎. Пополните баланс и попробуйте снова.",
+            )
+            log.warning("sora2.charge.fail_balance", extra={"user": user_id})
+            clear_wait_state(user_id, reason="sora2_simple_done")
+            return True
+        except Exception:
+            log.exception("sora2.charge.error", extra={"user": user_id})
+            await ctx.bot.send_message(
+                chat_id,
+                "⚠️ Не удалось списать токены. Попробуйте позже.",
+            )
+            clear_wait_state(user_id, reason="sora2_simple_done")
+            return True
+
+    await message.reply_text("🎬 Задача Sora2 запущена…")
 
     task_id: Optional[str] = None
-    charged = True
     try:
         task_id = await kie_create_sora2_task(ctx, prompt=prompt)
+        log.info("sora2.create.ok", extra={"user": user_id, "task_id": task_id})
+        if not precharged:
+            await billing.charge(user_id, SORA2_PRICE, reason="sora2")
+            charged = True
         result = await kie_poll_sora2(ctx, task_id)
-        result_json = result.get("resultJson") if isinstance(result, Mapping) else None
-        urls: Sequence[str] = []
-        if isinstance(result_json, Mapping):
-            raw_urls = result_json.get("resultUrls")
-            if isinstance(raw_urls, Sequence) and not isinstance(raw_urls, (str, bytes, bytearray)):
-                urls = [str(url) for url in raw_urls if isinstance(url, str) and url.strip()]
-        if not urls:
-            raise RuntimeError("KIE: empty resultUrls")
-        video_url = urls[0]
+        video_url: Optional[str] = None
+        urls: List[str] = []
+        if isinstance(result, Mapping):
+            raw_video = result.get("video_url")
+            if isinstance(raw_video, str) and raw_video.strip():
+                urls.append(raw_video.strip())
+            raw_collection = result.get("result_urls")
+            if isinstance(raw_collection, Sequence) and not isinstance(raw_collection, (str, bytes, bytearray)):
+                for candidate in raw_collection:
+                    if isinstance(candidate, str) and candidate.strip():
+                        normalized = candidate.strip()
+                        if normalized not in urls:
+                            urls.append(normalized)
+            result_json = result.get("result_payload")
+            if result_json is None:
+                result_json = result.get("resultJson")
+            if isinstance(result_json, Mapping):
+                raw_urls = result_json.get("resultUrls")
+                if isinstance(raw_urls, Sequence) and not isinstance(raw_urls, (str, bytes, bytearray)):
+                    for candidate in raw_urls:
+                        if isinstance(candidate, str) and candidate.strip():
+                            normalized = candidate.strip()
+                            if normalized not in urls:
+                                urls.append(normalized)
+        if urls:
+            video_url = urls[0]
+        if not video_url:
+            raise RuntimeError("Sora2: empty result url")
         await ctx.bot.send_video(chat_id=chat_id, video=video_url, caption="✨ Ваше видео готово!")
-        log.info("sora2.success", extra={"user": user_id, "task_id": task_id})
-    except Exception:
+        log.info(
+            "sora2.success",
+            extra={"user": user_id, "task_id": task_id, "url": video_url},
+        )
+    except billing.NotEnoughFunds:
+        log.warning(
+            "sora2.fail",
+            extra={"user": user_id, "task_id": task_id, "reason": "charge_insufficient"},
+        )
+        await ctx.bot.send_message(
+            chat_id,
+            "Недостаточно токенов 💎. Пополните баланс и попробуйте снова.",
+        )
+    except Exception as exc:
         try:
             if charged:
                 await billing.refund(user_id, SORA2_PRICE, reason="sora2-fail")
@@ -4498,7 +4552,10 @@ async def _handle_sora2_simple_prompt(
             chat_id,
             "⚠️ Не удалось получить результат Sora2. 💎 Токены возвращены.",
         )
-        log.exception("sora2.fail", extra={"user": user_id, "task_id": task_id})
+        log.error(
+            "sora2.fail",
+            extra={"user": user_id, "task_id": task_id, "reason": str(exc)},
+        )
     finally:
         clear_wait_state(user_id, reason="sora2_simple_done")
 
@@ -7509,7 +7566,7 @@ async def _start_video_mode(
             chat_id=chat_id,
             card_msg_id=card_id,
             kind=WaitKind.SORA2_PROMPT,
-            meta={"mode": mode},
+            meta={"mode": mode, "ready": False, "suppress_ack": True},
         )
         if message is not None:
             hint = _VIDEO_MODE_HINTS.get(mode)
@@ -11293,39 +11350,12 @@ def _extract_http_urls(text: str) -> List[str]:
 
 
 def sora2_card_text(s: Dict[str, Any]) -> str:
-    mode = s.get("mode") or "sora2_ttv"
-    display = _SORA2_MODE_TITLES.get(mode, "Text-to-Video")
-    prompt_raw = (s.get("sora2_prompt") or "").strip()
-    prompt_html = html.escape(prompt_raw) if prompt_raw else ""
-    image_urls = [str(url) for url in s.get("sora2_image_urls", []) if isinstance(url, str) and url.strip()]
-    is_text_mode = mode == "sora2_ttv"
-    intro_title = "🎬 <b>Sora2 — генерация видео по тексту</b>"
-    if not is_text_mode:
-        intro_title = "🎬 <b>Sora2 — видео из изображений</b>"
-    lines = [intro_title, f"💎 Стоимость генерации: <b>{PRICE_SORA2_TEXT}</b>"]
-    if is_text_mode:
-        lines.append(
-            "Нажмите «🚀 Начать генерацию», затем отправьте текстовое описание сцены."
-        )
-    else:
-        lines.append("Прикрепите 1–4 ссылок на изображения и добавьте описание сцены.")
-    lines.extend([
-        "",
-        f"• Режим: <b>{display}</b>",
-    ])
-    if image_urls:
-        lines.append(f"• Фото: <b>{len(image_urls)}/{SORA2_MAX_IMAGES}</b>")
-    lines.extend([
-        "",
-        "🖊️ <b>Промпт:</b>",
-        f"<code>{prompt_html}</code>" if prompt_html else "<code> </code>",
-    ])
-    if image_urls:
-        lines.append("")
-        lines.append("🔗 <b>Ссылки:</b>")
-        for url in image_urls:
-            lines.append(f"• <code>{html.escape(url)}</code>")
-    return "\n".join(lines)
+    del s  # legacy signature kept for compatibility
+    return (
+        "🎬 <b>Sora2 — генерация видео по тексту</b>\n"
+        f"Стоимость: 💎 {PRICE_SORA2_TEXT}\n\n"
+        "Нажмите «🚀 Начать генерацию», затем отправьте текстовое описание сцены."
+    )
 
 
 def sora2_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -15309,40 +15339,15 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                         chat_id,
                         ttl=VIDEO_MENU_LOCK_TTL,
                     ):
-                        log.info(
-                            "video.type.sora2.open",
-                            extra={"chat_id": chat_id, "user_id": user_id},
-                        )
                         fallback_id = getattr(message, "message_id", None)
-                        try:
-                            message_id = await safe_edit_or_send_menu(
-                                ctx,
-                                chat_id=chat_id,
-                                text=sora2_intro_text(),
-                                reply_markup=sora2_intro_keyboard(),
-                                state_key=VIDEO_MENU_STATE_KEY,
-                                msg_ids_key=VIDEO_MENU_MSG_IDS_KEY,
-                                state_dict=state_dict,
-                                fallback_message_id=fallback_id,
-                                parse_mode=ParseMode.MARKDOWN,
-                                disable_web_page_preview=True,
-                                log_label="ui.video_menu.sora2",
-                            )
-                        except Exception as exc:
-                            log.debug(
-                                "ui.video_menu.sora2_intro_failed",
-                                extra={
-                                    "chat_id": chat_id,
-                                    "error": str(exc),
-                                },
-                            )
-                            await _clear_video_menu_state(
-                                chat_id,
-                                user_id=user_id,
-                                ctx=ctx,
-                            )
-                            await sora2_entry(chat_id, ctx)
-                            return
+                        message_id = await video_open_sora2_card(
+                            ctx,
+                            chat_id=chat_id,
+                            sora2_cost=PRICE_SORA2_TEXT,
+                            user_id=user_id,
+                            fallback_message_id=fallback_id,
+                            send_menu=safe_edit_or_send_menu,
+                        )
                         if isinstance(message_id, int):
                             save_menu_message(
                                 _VIDEO_MENU_MESSAGE_NAME,
@@ -15373,9 +15378,9 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     message_id = await safe_edit_or_send_menu(
                         ctx,
                         chat_id=chat_id,
-                        text="✏️ Отправьте текстовое описание сцены для Sora2.",
+                        text="✏️ Отправьте текстовое описание сцены.",
                         reply_markup=InlineKeyboardMarkup(
-                            [[InlineKeyboardButton("⬅️ Отменить", callback_data="video:menu")]]
+                            [[InlineKeyboardButton("⬅️ Назад", callback_data="video:menu")]]
                         ),
                         state_key=VIDEO_MENU_STATE_KEY,
                         msg_ids_key=VIDEO_MENU_MSG_IDS_KEY,
@@ -15395,7 +15400,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                         chat_id=chat_id,
                         card_msg_id=card_id,
                         kind=WaitKind.SORA2_PROMPT,
-                        meta={"mode": "sora2_simple", "suppress_ack": True},
+                        meta={"mode": "sora2_simple", "suppress_ack": True, "ready": True},
                     )
             except MenuLocked:
                 answer_payload["text"] = "Обрабатываю…"
@@ -17634,6 +17639,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     user_id = user.id if user else None
+
+    if user_id is not None and get_wait(user_id) is not None:
+        log.debug(
+            "wait.skip_text",
+            extra={"chat_id": chat_id, "user_id": user_id},
+        )
+        return
     state_mode = s.get("mode")
     user_mode = _mode_get(chat_id) or MODE_CHAT
 

@@ -74,7 +74,7 @@ def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int, sora2_cost: int
         ],
         [
             InlineKeyboardButton(
-                f"🎬 Sora2 — текст → видео — 💎 {sora2_cost}",
+                f"🎬 Sora2 — генерация по тексту — 💎 {sora2_cost}",
                 callback_data="video:type:sora2",
             )
         ],
