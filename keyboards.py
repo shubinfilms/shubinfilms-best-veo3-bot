@@ -26,7 +26,7 @@ EMOJI = {
 }
 
 NAV_PROFILE = "menu:profile"
-NAV_KB = "menu:kb"
+NAV_KB = "kb_open"
 NAV_PHOTO = "menu:photo"
 NAV_MUSIC = "menu:music"
 NAV_VIDEO = "menu:video"

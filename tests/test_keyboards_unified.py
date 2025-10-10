@@ -32,7 +32,7 @@ def test_kb_home_menu_layout():
     ]
     assert callbacks == [
         "menu:profile",
-        "menu:kb",
+        "kb_open",
         "menu:photo",
         "menu:music",
         "menu:video",

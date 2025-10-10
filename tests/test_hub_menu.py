@@ -27,7 +27,7 @@ def test_build_hub_keyboard_layout():
     ]
     assert callbacks == [
         "menu:profile",
-        "menu:kb",
+        "kb_open",
         "menu:photo",
         "menu:music",
         "menu:video",

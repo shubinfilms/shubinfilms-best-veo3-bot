@@ -320,6 +320,59 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
 
 
+async def kb_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for inline callbacks opening the knowledge base."""
+
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    await _kb_render_or_send(update, context, origin="callback")
+
+
+async def kb_open_entrypoint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for text or command based knowledge base openings."""
+
+    await _kb_render_or_send(update, context, origin="text")
+
+
+async def _kb_render_or_send(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    origin: str,
+) -> None:
+    chat = getattr(update, "effective_chat", None)
+    message = getattr(update, "effective_message", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None and message is not None:
+        chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        return
+
+    chat_data = _chat_data(context)
+    fallback_message_id: Optional[int] = None
+    if origin == "callback":
+        query = update.callback_query
+        if query and query.message:
+            fallback_message_id = getattr(query.message, "message_id", None)
+
+    message_id = await open_root(
+        context,
+        chat_id,
+        suppress_nav=True,
+        fallback_message_id=fallback_message_id,
+    )
+
+    if isinstance(chat_data, MutableMapping) and isinstance(message_id, int):
+        chat_data["last_card"] = {
+            "kind": "kb",
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+
+
 __all__ = [
     "KB_EXAMPLES",
     "KB_FAQ",
@@ -328,6 +381,8 @@ __all__ = [
     "KB_ROOT",
     "KB_TEMPLATE_PREFIX",
     "KB_TEMPLATES",
+    "kb_open_entrypoint",
+    "kb_open_handler",
     "configure",
     "handle_callback",
     "open_root",
