@@ -38,6 +38,7 @@ def test_menu_callbacks_route_ok(monkeypatch):
         *,
         veo_fast_cost,
         veo_photo_cost,
+        sora2_cost,
         suppress_nav,
         fallback_message_id=None,
     ):
@@ -50,6 +51,7 @@ def test_menu_callbacks_route_ok(monkeypatch):
                     "fallback": fallback_message_id,
                     "fast": veo_fast_cost,
                     "photo": veo_photo_cost,
+                    "sora2": sora2_cost,
                 },
             )
         )
