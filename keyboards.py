@@ -261,10 +261,7 @@ def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], ...], ...]:
             (TXT_KB_PHOTO, HOME_CB_PHOTO),
             (TXT_KB_MUSIC, HOME_CB_MUSIC),
         ),
-        (
-            ("🎬 Sora2", "sora2_open"),
-            (TXT_KB_VIDEO, HOME_CB_VIDEO),
-        ),
+        ((TXT_KB_VIDEO, HOME_CB_VIDEO),),
         ((TXT_KB_AI_DIALOG, HOME_CB_DIALOG),),
     )
 

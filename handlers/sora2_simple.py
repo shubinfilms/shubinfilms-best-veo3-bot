@@ -23,6 +23,7 @@ from settings import (
     KIE_BASE_URL,
     SORA2_ALLOWED_AR,
     SORA2_MAX_DURATION,
+    SORA2_DEFAULT_AR,
     SORA2_PRICE,
     SORA2_QUEUE_KEY,
 )
@@ -39,9 +40,13 @@ _MODEL_CHOICES: Tuple[Tuple[str, str], ...] = (
 )
 
 
+def _default_aspect() -> str:
+    return "9:16" if (SORA2_DEFAULT_AR or "").strip().lower() == "portrait" else "16:9"
+
+
 @dataclass
 class _UiState:
-    aspect: str = "16:9"
+    aspect: str = _default_aspect()
     duration: int = 6
     model: str = "sora2_fast"
     message_id: Optional[int] = None
@@ -100,9 +105,9 @@ def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> _UiState:
 
 
 def _normalize_aspect(value: Any) -> str:
-    candidate = str(value or "16:9").strip()
+    candidate = str(value or _default_aspect()).strip()
     if candidate not in SORA2_ALLOWED_AR:
-        return "16:9"
+        return _default_aspect()
     return candidate
 
 

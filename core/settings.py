@@ -154,6 +154,8 @@ class Settings(BaseSettings):
     SORA2_TIMEOUT_WRITE: int = Field(default=30, ge=1, le=600)
     SORA2_TIMEOUT_POOL: int = Field(default=10, ge=1, le=180)
     SORA2_PRICE: int = Field(default=50, ge=0, le=1000)
+    SORA2_DEFAULT_AR: str = Field(default="landscape")
+    SORA2_DEFAULT_QUALITY: str = Field(default="standard")
     SORA2_ALLOWED_AR: tuple[str, ...] = Field(default=("16:9", "9:16", "1:1"))
     SORA2_MAX_DURATION: int = Field(default=10, ge=1, le=60)
     SORA2_QUEUE_KEY: str = Field(default="queue:sora2")
@@ -294,6 +296,20 @@ class Settings(BaseSettings):
             return int(str(value).strip())
         except (TypeError, ValueError):
             raise ValueError("Sticker identifiers must be integers")
+
+    @field_validator("SORA2_DEFAULT_AR", mode="before")
+    def _normalize_sora2_default_ar(cls, value: Any) -> str:
+        text = str(value or "landscape").strip().lower()
+        if text not in {"landscape", "portrait"}:
+            return "landscape"
+        return text
+
+    @field_validator("SORA2_DEFAULT_QUALITY", mode="before")
+    def _normalize_sora2_default_quality(cls, value: Any) -> str:
+        text = str(value or "standard").strip().lower()
+        if text not in {"standard", "hd"}:
+            return "standard"
+        return text
 
     @field_validator("DIALOG_ENABLED", mode="before")
     def _parse_optional_bool(cls, value: Any) -> Optional[bool]:

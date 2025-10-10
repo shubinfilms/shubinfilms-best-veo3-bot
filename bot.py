@@ -383,6 +383,8 @@ from settings import (
     SUNO_READY,
     SORA2,
     SORA2_ENABLED,
+    SORA2_DEFAULT_AR,
+    SORA2_DEFAULT_QUALITY,
     SORA2_WAIT_STICKER_ID as SETTINGS_SORA2_WAIT_STICKER_ID,
     BOT_USERNAME as SETTINGS_BOT_USERNAME,
     ENABLE_VERTICAL_NORMALIZE as SETTINGS_ENABLE_VERTICAL_NORMALIZE,
@@ -4063,6 +4065,10 @@ _WAIT_CLEAR_VALUES = {"-", "—"}
 _wait_log = logging.getLogger("wait-input")
 
 
+def _default_video_aspect() -> str:
+    return "9:16" if (SORA2_DEFAULT_AR or "").strip().lower() == "portrait" else "16:9"
+
+
 _SUNO_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _SUNO_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -4088,7 +4094,7 @@ def _reset_suno_start_flags(state_dict: Dict[str, Any]) -> None:
 
 
 DEFAULT_STATE = {
-    "mode": None, "aspect": "16:9", "model": None,
+    "mode": None, "aspect": _default_video_aspect(), "model": None,
     "last_prompt": None, "last_image_url": None,
     "generating": False, "generation_id": None, "last_task_id": None,
     "last_ui_msg_id_menu": None,
@@ -5319,7 +5325,6 @@ WELCOME = (
 
 
 MENU_BTN_VIDEO = "🎬 Генерация видео"
-MENU_BTN_SORA2 = "🎬 Sora2"
 MENU_BTN_IMAGE = "🎨 Генерация изображений"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
 MENU_BTN_PM = "🧠 Prompt-Master"
@@ -5331,7 +5336,7 @@ MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 REPLY_BUTTONS = [
     [KeyboardButton(TXT_KB_PROFILE), KeyboardButton(TXT_KB_KNOWLEDGE)],
     [KeyboardButton(TXT_KB_PHOTO), KeyboardButton(TXT_KB_MUSIC)],
-    [KeyboardButton("🎬 Sora2"), KeyboardButton(TXT_KB_VIDEO)],
+    [KeyboardButton(TXT_KB_VIDEO)],
     [KeyboardButton(TXT_KB_AI_DIALOG)],
 ]
 
@@ -5384,9 +5389,13 @@ VIDEO_MENU_MSG_IDS_KEY = "video_menu"
 VIDEO_MENU_LOCK_TTL = 5
 VIDEO_CALLBACK_ALIASES = {
     "video_menu": CB.VIDEO_MENU,
+    "video:menu": CB.VIDEO_MENU,
     "engine:veo": CB.VIDEO_PICK_VEO,
     "engine:sora2": CB.VIDEO_PICK_SORA2,
     "engine:sora2_disabled": CB.VIDEO_PICK_SORA2_DISABLED,
+    "video:type:veo": CB.VIDEO_PICK_VEO,
+    "video:type:sora2": CB.VIDEO_PICK_SORA2,
+    "video:type:sora2_soon": CB.VIDEO_PICK_SORA2_DISABLED,
     "mode:veo_text_fast": CB.VIDEO_MODE_VEO_FAST,
     "mode:veo_photo": CB.VIDEO_MODE_VEO_PHOTO,
     "mode:sora2_ttv": CB.VIDEO_MODE_SORA_TEXT,
@@ -6813,10 +6822,6 @@ async def _dispatch_home_action(
                 pass
         return
 
-    if action == "sora2":
-        await sora2_open_text(update, ctx)
-        return
-
     if action == "tpl_banana":
         if chat_id is None:
             return
@@ -7074,15 +7079,15 @@ def _sora2_is_enabled() -> bool:
 
 def video_menu_kb() -> InlineKeyboardMarkup:
     sora2_ready = _sora2_is_enabled()
-    sora2_label = "🧠 Sora2"
-    sora2_callback = CB_VIDEO_ENGINE_SORA2
+    sora2_label = "🎬 Sora2"
+    sora2_callback = "video:type:sora2"
     if not sora2_ready:
-        sora2_label = "🧠 Sora2 (скоро)"
-        sora2_callback = CB_VIDEO_ENGINE_SORA2_DISABLED
+        sora2_label = "🎬 Sora2 (скоро)"
+        sora2_callback = "video:type:sora2_soon"
     keyboard = [
-        [InlineKeyboardButton("🎥 VEO", callback_data=CB_VIDEO_ENGINE_VEO)],
+        [InlineKeyboardButton("🎥 VEO", callback_data="video:type:veo")],
         [InlineKeyboardButton(sora2_label, callback_data=sora2_callback)],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=CB_VIDEO_BACK)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="video:back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -11271,6 +11276,9 @@ def _sora2_normalize_aspect(raw: Any) -> str:
 def _sora2_aspect_for_api(aspect_ratio: Optional[str]) -> Optional[str]:
     aspect = (aspect_ratio or "").strip()
     if not aspect:
+        default = (SORA2_DEFAULT_AR or "").strip().lower()
+        if default in {"portrait", "landscape"}:
+            return default
         return None
     if aspect in {"9:16", "4:5"}:
         return "portrait"
@@ -11374,7 +11382,7 @@ def _build_sora2_payload(
     if aspect_value:
         input_payload["aspect_ratio"] = aspect_value
 
-    quality_value = (quality or "standard").strip().lower()
+    quality_value = (quality or SORA2_DEFAULT_QUALITY or "standard").strip().lower()
     if quality_value not in {"standard", "hd"}:
         quality_value = "standard"
     input_payload["quality"] = quality_value
@@ -18816,7 +18824,6 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("balance_recalc",), balance_recalc),
     (("sora2_health",), sora2_health_command),
     (("profile_reset",), profile_handlers.profile_reset_command),
-    (("sora2",), sora2_open_text),
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
@@ -18831,7 +18838,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (rf"^{KB_PREFIX}", knowledge_base_callback),
-    (r"^(?:cb:|video_menu$|engine:|mode:(?:veo|sora2)_|video:back$)", video_menu_callback),
+    (r"^(?:cb:|video_menu$|video:menu$|video:type:|engine:|mode:(?:veo|sora2)_|video:back$)", video_menu_callback),
     (r"^sora2_open$", sora2_open_cb),
     (r"^sora2:set:(?:ar|dur|model)=", sora2_set_param_cb),
     (r"^sora2:run:", sora2_run_cb),
@@ -18855,7 +18862,6 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
 
 REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
     (MENU_BTN_VIDEO, handle_video_entry),
-    (MENU_BTN_SORA2, sora2_open_text),
     (MENU_BTN_IMAGE, handle_image_entry),
     (MENU_BTN_SUNO, handle_music_entry),
     (MENU_BTN_PM, prompt_master_command),
