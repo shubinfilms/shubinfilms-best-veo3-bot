@@ -215,6 +215,7 @@ LEGACY_ALIASES: Dict[str, str] = {
     "nav:music": "hub:open:music",
     "nav:video": "hub:open:video",
     "nav:dialog": "hub:open:dialog",
+    "kb_open": "menu:kb",
     "menu:root": "menu:root",
     "banana:add_photo": "banana:add_more",
     "banana:clear": "banana:reset_all",

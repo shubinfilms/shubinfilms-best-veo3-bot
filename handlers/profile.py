@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 
 def _simple_profile_enabled() -> bool:
-    return bool(getattr(app_settings, "FEATURE_PROFILE_SIMPLE", False))
+    return False
 
 PROMO_WAIT_KIND = WaitKind.PROMO_CODE.value
 _PROMO_WAIT_KEY = "profile_wait_state"

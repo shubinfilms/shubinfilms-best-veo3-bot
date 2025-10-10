@@ -6,7 +6,7 @@ import inspect
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, MutableMapping, Optional
 
 import redis
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -83,16 +83,25 @@ async def _delete_previous_profile_message(ctx: ContextTypes.DEFAULT_TYPE, chat_
     last_message_id = _load_last_message_id(chat_id)
     if not last_message_id:
         return
+    bot_obj = getattr(ctx, "bot", None)
+    chat_data = getattr(ctx, "chat_data", None)
+    if not hasattr(bot_obj, "delete_message"):
+        _store_last_message_id(chat_id, None)
+        if isinstance(chat_data, MutableMapping):
+            chat_data.pop("profile_msg_id", None)
+        return
     try:
-        await ctx.bot.delete_message(chat_id=chat_id, message_id=last_message_id)
+        await bot_obj.delete_message(chat_id=chat_id, message_id=last_message_id)
     except (BadRequest, TelegramError):
         pass
     finally:
         _store_last_message_id(chat_id, None)
+        if isinstance(chat_data, MutableMapping):
+            chat_data.pop("profile_msg_id", None)
 
 
 async def _answer_callback(update: Update) -> None:
-    query = update.callback_query
+    query = getattr(update, "callback_query", None)
     if query is None:
         return
     with suppress(BadRequest):
@@ -141,7 +150,11 @@ async def _send_profile_message(
         log.debug("profile_simple.missing_chat_id")
         return
     await _delete_previous_profile_message(ctx, context.chat_id)
-    message = await ctx.bot.send_message(
+    bot_obj = getattr(ctx, "bot", None)
+    if not hasattr(bot_obj, "send_message"):
+        log.debug("profile_simple.missing_bot")
+        return
+    message = await bot_obj.send_message(
         chat_id=context.chat_id,
         text=text,
         reply_markup=reply_markup,
@@ -149,7 +162,11 @@ async def _send_profile_message(
         disable_web_page_preview=True,
     )
     if hasattr(message, "message_id") and context.chat_id is not None:
-        _store_last_message_id(context.chat_id, getattr(message, "message_id"))
+        msg_id = getattr(message, "message_id")
+        _store_last_message_id(context.chat_id, msg_id)
+        chat_data = getattr(ctx, "chat_data", None)
+        if isinstance(chat_data, MutableMapping):
+            chat_data["profile_msg_id"] = msg_id
 
 
 async def profile_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,21 +215,24 @@ async def profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     message_id = getattr(message, "message_id", None)
 
-    result = await open_stars_menu(
-        ctx,
-        chat_id=chat_id,
-        message_id=message_id,
-        edit_message=True,
-        source="profile",
-    )
+    try:
+        await open_stars_menu(
+            ctx,
+            chat_id=chat_id,
+            message_id=message_id,
+            edit_message=True,
+            source="profile",
+        )
+    except Exception:
+        log.exception("profile_simple.topup_stars_failed", extra={"chat_id": chat_id})
 
-    if chat_id is not None:
-        resolved_id: Optional[int] = None
-        if result is not None:
-            resolved_id = getattr(result, "message_id", None)
-        if resolved_id is None:
-            resolved_id = message_id if isinstance(message_id, int) else None
-        _store_last_message_id(chat_id, resolved_id)
+    text = "\n".join(
+        [
+            "💎 Пополнение — скоро.",
+            "Мы работаем над запуском оплаты прямо в боте.",
+        ]
+    )
+    await _send_profile_message(update, ctx, text=text, reply_markup=_back_keyboard())
 
 
 def _format_history_entry(entry: Any) -> str:

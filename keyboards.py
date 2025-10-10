@@ -238,6 +238,10 @@ def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:
         for label, callback in row:
             buttons.append(InlineKeyboardButton(text=label, callback_data=callback))
         rows.append(buttons)
+    if len(rows) == 4:
+        merged = rows[:2]
+        merged.append(rows[2] + rows[3])
+        rows = merged
     return rows
 
 
@@ -261,8 +265,12 @@ def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], ...], ...]:
             (TXT_KB_PHOTO, HOME_CB_PHOTO),
             (TXT_KB_MUSIC, HOME_CB_MUSIC),
         ),
-        ((TXT_KB_VIDEO, HOME_CB_VIDEO),),
-        ((TXT_KB_AI_DIALOG, HOME_CB_DIALOG),),
+        (
+            (TXT_KB_VIDEO, HOME_CB_VIDEO),
+        ),
+        (
+            (TXT_KB_AI_DIALOG, HOME_CB_DIALOG),
+        ),
     )
 
 
