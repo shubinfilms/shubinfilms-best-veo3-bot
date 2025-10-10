@@ -242,7 +242,7 @@ def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:
 
 
 @lru_cache(maxsize=1)
-def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], Tuple[str, str]], ...]:
+def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], ...], ...]:
     from texts import (
         TXT_KB_AI_DIALOG,
         TXT_KB_KNOWLEDGE,
@@ -262,9 +262,10 @@ def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], Tuple[str, str]], ..
             (TXT_KB_MUSIC, HOME_CB_MUSIC),
         ),
         (
+            ("🎬 Sora2", "sora2_open"),
             (TXT_KB_VIDEO, HOME_CB_VIDEO),
-            (TXT_KB_AI_DIALOG, HOME_CB_DIALOG),
         ),
+        ((TXT_KB_AI_DIALOG, HOME_CB_DIALOG),),
     )
 
 

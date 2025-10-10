@@ -30,6 +30,7 @@ class WaitKind(str, Enum):
     SUNO_LYRICS = "suno_lyrics"
     MJ_PROMPT = "mj_prompt"
     SORA2_PROMPT = "sora2_prompt"
+    SORA2 = "sora2"
     PROMO_CODE = "promo_code"
 
 

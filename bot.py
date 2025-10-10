@@ -279,6 +279,13 @@ from handlers.knowledge_base import (
     show_lessons as knowledge_base_show_lessons,
     show_templates as knowledge_base_show_templates,
 )
+from handlers.sora2_simple import (
+    sora2_cancel_cb,
+    sora2_open_cb,
+    sora2_open_text,
+    sora2_run_cb,
+    sora2_set_param_cb,
+)
 
 from balance import ensure_tokens, insufficient_balance_keyboard
 from core.balance_provider import (
@@ -4038,6 +4045,7 @@ _WAIT_LIMITS = {
     WaitKind.VEO_PROMPT: 3000,
     WaitKind.MJ_PROMPT: 2000,
     WaitKind.BANANA_PROMPT: 2000,
+    WaitKind.SORA2: 1200,
     WaitKind.SORA2_PROMPT: 5000,
 }
 
@@ -5311,6 +5319,7 @@ WELCOME = (
 
 
 MENU_BTN_VIDEO = "🎬 Генерация видео"
+MENU_BTN_SORA2 = "🎬 Sora2"
 MENU_BTN_IMAGE = "🎨 Генерация изображений"
 MENU_BTN_SUNO = "🎵 Генерация музыки"
 MENU_BTN_PM = "🧠 Prompt-Master"
@@ -5322,7 +5331,8 @@ MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
 REPLY_BUTTONS = [
     [KeyboardButton(TXT_KB_PROFILE), KeyboardButton(TXT_KB_KNOWLEDGE)],
     [KeyboardButton(TXT_KB_PHOTO), KeyboardButton(TXT_KB_MUSIC)],
-    [KeyboardButton(TXT_KB_VIDEO), KeyboardButton(TXT_KB_AI_DIALOG)],
+    [KeyboardButton("🎬 Sora2"), KeyboardButton(TXT_KB_VIDEO)],
+    [KeyboardButton(TXT_KB_AI_DIALOG)],
 ]
 
 
@@ -6400,6 +6410,8 @@ TEXT_ALIASES.update(
         "📹 Режим видео": VIDEO_MENU_CB,
         "🧠 Диалог с ИИ": AI_MENU_CB,
         "🎬 Генерация видео": VIDEO_MENU_CB,
+        "🎬 Sora2": "sora2_open",
+        "Sora2": "sora2_open",
         "🎨 Генерация изображений": IMAGE_MENU_CB,
         "🎵 Генерация музыки": MUSIC_MENU_CB,
         "🧠 Prompt-Master": "prompt_master",
@@ -6414,6 +6426,8 @@ HOME_ROUTE_ACTIONS: Dict[str, str] = {
     "photo": "image",
     "music": "music",
     "video": "video",
+    "sora2_open": "sora2",
+    "sora2": "sora2",
     "dialog": "ai_modes",
     "chat": "ai_modes",
     "balance_command": "balance",
@@ -6424,6 +6438,7 @@ _NAVIGATION_RESET_ACTIONS = {
     "knowledge",
     "music",
     "video",
+    "sora2",
     "chat",
     "prompt",
     "dialog_default",
@@ -6796,6 +6811,10 @@ async def _dispatch_home_action(
                 )
             except ValueError:
                 pass
+        return
+
+    if action == "sora2":
+        await sora2_open_text(update, ctx)
         return
 
     if action == "tpl_banana":
@@ -18797,6 +18816,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("balance_recalc",), balance_recalc),
     (("sora2_health",), sora2_health_command),
     (("profile_reset",), profile_handlers.profile_reset_command),
+    (("sora2",), sora2_open_text),
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
@@ -18812,6 +18832,10 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (rf"^{KB_PREFIX}", knowledge_base_callback),
     (r"^(?:cb:|video_menu$|engine:|mode:(?:veo|sora2)_|video:back$)", video_menu_callback),
+    (r"^sora2_open$", sora2_open_cb),
+    (r"^sora2:set:(?:ar|dur|model)=", sora2_set_param_cb),
+    (r"^sora2:run:", sora2_run_cb),
+    (r"^sora2:cancel$", sora2_cancel_cb),
     (r"^mj\.gallery\.again:", handle_mj_gallery_repeat),
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
@@ -18831,6 +18855,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
 
 REPLY_BUTTON_ROUTES: List[tuple[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]]] = [
     (MENU_BTN_VIDEO, handle_video_entry),
+    (MENU_BTN_SORA2, sora2_open_text),
     (MENU_BTN_IMAGE, handle_image_entry),
     (MENU_BTN_SUNO, handle_music_entry),
     (MENU_BTN_PM, prompt_master_command),
@@ -18943,6 +18968,13 @@ def register_handlers(application: Any) -> None:
         )
         quick_button_handler.block = False
         application.add_handler(quick_button_handler, group=0)
+
+    sora2_text_handler = MessageHandler(
+        filters.TEXT & filters.Regex(r"(?i)^\s*/?sora2\s*$"),
+        sora2_open_text,
+    )
+    sora2_text_handler.block = False
+    application.add_handler(sora2_text_handler, group=0)
 
     for text, handler in REPLY_BUTTON_ROUTES:
         pattern = rf"^{re.escape(text)}$"
