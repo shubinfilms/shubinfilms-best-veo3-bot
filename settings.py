@@ -95,6 +95,8 @@ def _populate_from_settings() -> None:
     g["SORA2_TIMEOUT_WRITE"] = int(settings.SORA2_TIMEOUT_WRITE)
     g["SORA2_TIMEOUT_POOL"] = int(settings.SORA2_TIMEOUT_POOL)
     g["SORA2_PRICE"] = int(settings.SORA2_PRICE)
+    g["SORA2_DEFAULT_AR"] = settings.SORA2_DEFAULT_AR
+    g["SORA2_DEFAULT_QUALITY"] = settings.SORA2_DEFAULT_QUALITY
     g["SORA2_ALLOWED_AR"] = set(settings.SORA2_ALLOWED_AR)
     g["SORA2_MAX_DURATION"] = int(settings.SORA2_MAX_DURATION)
     g["SORA2_QUEUE_KEY"] = settings.SORA2_QUEUE_KEY

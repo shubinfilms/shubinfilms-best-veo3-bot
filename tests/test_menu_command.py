@@ -38,7 +38,7 @@ def test_main_menu_keyboard_layout():
     assert labels == [
         ["👤 Профиль", "📚 База знаний"],
         ["📸 Режим фото", "🎧 Режим музыки"],
-        ["🎬 Sora2", "📹 Режим видео"],
+        ["📹 Режим видео"],
         ["🧠 Диалог с ИИ"],
     ]
 
@@ -48,16 +48,13 @@ def test_video_menu_keyboard_options():
     rows = markup.inline_keyboard
 
     assert rows[0][0].text == "🎥 VEO"
-    assert rows[0][0].callback_data == bot_module.CB_VIDEO_ENGINE_VEO
+    assert rows[0][0].callback_data == "video:type:veo"
 
     assert "Sora2" in rows[1][0].text
-    assert rows[1][0].callback_data in (
-        bot_module.CB_VIDEO_ENGINE_SORA2,
-        bot_module.CB_VIDEO_ENGINE_SORA2_DISABLED,
-    )
+    assert rows[1][0].callback_data in {"video:type:sora2", "video:type:sora2_soon"}
 
     assert rows[2][0].text == "⬅️ Назад"
-    assert rows[2][0].callback_data == bot_module.CB_VIDEO_BACK
+    assert rows[2][0].callback_data == "video:back"
 
 
 def test_menu_command_always_sends_welcome_block(monkeypatch):
