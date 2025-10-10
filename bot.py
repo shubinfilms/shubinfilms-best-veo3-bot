@@ -385,6 +385,7 @@ from settings import (
     SORA2_ENABLED,
     SORA2_DEFAULT_AR,
     SORA2_DEFAULT_QUALITY,
+    SORA2_PRICE,
     SORA2_WAIT_STICKER_ID as SETTINGS_SORA2_WAIT_STICKER_ID,
     BOT_USERNAME as SETTINGS_BOT_USERNAME,
     ENABLE_VERTICAL_NORMALIZE as SETTINGS_ENABLE_VERTICAL_NORMALIZE,
@@ -2548,8 +2549,8 @@ PRICE_BANANA = 5
 PRICE_VEO_FAST = 50
 PRICE_VEO_QUALITY = 150
 PRICE_VEO_ANIMATE = 50
-PRICE_SORA2_TEXT = 180
-PRICE_SORA2_IMAGE = 200
+PRICE_SORA2_TEXT = SORA2_PRICE
+PRICE_SORA2_IMAGE = SORA2_PRICE
 PRICE_SUNO = SUNO_PRICE
 
 TOKEN_COSTS = {
@@ -5400,6 +5401,7 @@ VIDEO_CALLBACK_ALIASES = {
     "mode:veo_photo": CB.VIDEO_MODE_VEO_PHOTO,
     "mode:sora2_ttv": CB.VIDEO_MODE_SORA_TEXT,
     "mode:sora2_itv": CB.VIDEO_MODE_SORA_IMAGE,
+    "sora2:start": CB.VIDEO_MODE_SORA_TEXT,
     "video:back": CB.VIDEO_MENU_BACK,
     "video:veo_animate": CB.VIDEO_VEO_ANIMATE,
 }
@@ -5759,7 +5761,7 @@ async def _clear_video_menu_state(
 _VIDEO_MODE_HINTS: Dict[str, str] = {
     "veo_text_fast": "✍️ Пришлите текст идеи и/или фото-референс — карточка обновится автоматически.",
     "veo_photo": "📸 Пришлите фото (подпись-промпт — по желанию). Карточка обновится автоматически.",
-    "sora2_ttv": "✍️ Пришлите текст (до 5000 символов). Нажмите «🚀 Запустить Sora 2», когда будете готовы.",
+    "sora2_ttv": "✍️ Пришлите текст (до 5000 символов). Нажмите «🚀 Начать генерацию», когда будете готовы.",
     "sora2_itv": "📸 Пришлите 1–4 ссылок на изображения и текст (до 5000 символов). Для очистки ссылок отправьте слово clear.",
 }
 
@@ -7090,6 +7092,27 @@ def video_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="video:back")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def sora2_intro_text() -> str:
+    example = (
+        "человек идёт по пляжу на закате, волны блестят, медленная камера"
+    )
+    return (
+        "🎬 <b>Sora2 — генерация видео по тексту</b>\n\n"
+        "Отправьте текстовое описание сцены, которую хотите создать.\n"
+        f"Стоимость генерации: 💎 {PRICE_SORA2_TEXT}\n\n"
+        f"<i>Пример:</i> <b>{example}</b>"
+    )
+
+
+def sora2_intro_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать генерацию", callback_data="sora2:start")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="video:menu")],
+        ]
+    )
 
 
 def veo_modes_kb() -> InlineKeyboardMarkup:
@@ -11178,10 +11201,22 @@ def sora2_card_text(s: Dict[str, Any]) -> str:
     prompt_raw = (s.get("sora2_prompt") or "").strip()
     prompt_html = html.escape(prompt_raw) if prompt_raw else ""
     image_urls = [str(url) for url in s.get("sora2_image_urls", []) if isinstance(url, str) and url.strip()]
-    lines = [
-        "🟦 <b>Карточка Sora 2</b>",
+    is_text_mode = mode == "sora2_ttv"
+    intro_title = "🎬 <b>Sora2 — генерация видео по тексту</b>"
+    if not is_text_mode:
+        intro_title = "🎬 <b>Sora2 — видео из изображений</b>"
+    lines = [intro_title, f"💎 Стоимость генерации: <b>{PRICE_SORA2_TEXT}</b>"]
+    if is_text_mode:
+        lines.append("Отправьте текстовое описание сцены, которую хотите создать.")
+        lines.append(
+            "<i>Пример: человек идёт по пляжу на закате, волны блестят, медленная камера</i>"
+        )
+    else:
+        lines.append("Прикрепите 1–4 ссылок на изображения и добавьте описание сцены.")
+    lines.extend([
+        "",
         f"• Режим: <b>{display}</b>",
-    ]
+    ])
     if image_urls:
         lines.append(f"• Фото: <b>{len(image_urls)}/{SORA2_MAX_IMAGES}</b>")
     lines.extend([
@@ -11201,7 +11236,7 @@ def sora2_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
     mode = s.get("mode") or "sora2_ttv"
     start_token = "s2_go_i2v" if mode == "sora2_itv" else "s2_go_t2v"
     rows = [
-        [InlineKeyboardButton("🚀 Запустить Sora 2", callback_data=start_token)],
+        [InlineKeyboardButton("🚀 Начать генерацию", callback_data=start_token)],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -15172,8 +15207,51 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                         pass
                 return
             if chat_id is not None:
-                await _clear_video_menu_state(chat_id, user_id=user_id, ctx=ctx)
-                await sora2_entry(chat_id, ctx)
+                try:
+                    async with with_menu_lock(
+                        _VIDEO_MENU_LOCK_NAME,
+                        chat_id,
+                        ttl=VIDEO_MENU_LOCK_TTL,
+                    ):
+                        fallback_id = getattr(message, "message_id", None)
+                        try:
+                            message_id = await safe_edit_or_send_menu(
+                                ctx,
+                                chat_id=chat_id,
+                                text=sora2_intro_text(),
+                                reply_markup=sora2_intro_keyboard(),
+                                state_key=VIDEO_MENU_STATE_KEY,
+                                msg_ids_key=VIDEO_MENU_MSG_IDS_KEY,
+                                state_dict=state_dict,
+                                fallback_message_id=fallback_id,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True,
+                                log_label="ui.video_menu.sora2",
+                            )
+                        except Exception as exc:
+                            log.debug(
+                                "ui.video_menu.sora2_intro_failed",
+                                extra={
+                                    "chat_id": chat_id,
+                                    "error": str(exc),
+                                },
+                            )
+                            await _clear_video_menu_state(
+                                chat_id,
+                                user_id=user_id,
+                                ctx=ctx,
+                            )
+                            await sora2_entry(chat_id, ctx)
+                            return
+                        if isinstance(message_id, int):
+                            save_menu_message(
+                                _VIDEO_MENU_MESSAGE_NAME,
+                                chat_id,
+                                message_id,
+                                _VIDEO_MENU_MESSAGE_TTL,
+                            )
+                except MenuLocked:
+                    answer_payload["text"] = "Обрабатываю…"
             return
 
         if data in VIDEO_MODE_CALLBACK_MAP:
@@ -18838,7 +18916,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),
     (rf"^{KB_PREFIX}", knowledge_base_callback),
-    (r"^(?:cb:|video_menu$|video:menu$|video:type:|engine:|mode:(?:veo|sora2)_|video:back$)", video_menu_callback),
+    (r"^(?:cb:|video_menu$|video:menu$|video:type:|engine:|mode:(?:veo|sora2)_|video:back$|sora2:start$)", video_menu_callback),
     (r"^sora2_open$", sora2_open_cb),
     (r"^sora2:set:(?:ar|dur|model)=", sora2_set_param_cb),
     (r"^sora2:run:", sora2_run_cb),
