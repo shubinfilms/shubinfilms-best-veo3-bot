@@ -66,6 +66,8 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
+from helpers.debounce import debounce
+
 from handlers import (
     configure_faq,
     faq_callback,
@@ -7421,6 +7423,25 @@ async def _send_video_menu_message(
     return getattr(result, "message_id", None)
 
 
+def _reset_video_waits(
+    *, user_id: Optional[int], chat_id: Optional[int], reason: str
+) -> None:
+    targets: set[int] = set()
+    if chat_id is not None:
+        targets.add(int(chat_id))
+    if user_id is not None:
+        targets.add(int(user_id))
+    for target in targets:
+        input_state.clear(target, reason=reason)
+    if user_id is None:
+        return
+    clear_wait(user_id, reason=reason)
+    try:
+        clear_wait_state(user_id, reason=reason)
+    except TypeError:
+        clear_wait_state(user_id)
+
+
 async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     message = getattr(update, "effective_message", None)
     chat = getattr(update, "effective_chat", None) or (
@@ -7433,6 +7454,7 @@ async def start_video_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Op
         return None
 
     user_id = user.id if user else None
+    _reset_video_waits(user_id=user_id, chat_id=chat_id, reason="video_menu_open")
     s = state(ctx)
     s["mode"] = None
     s.pop("model", None)
@@ -7546,6 +7568,7 @@ async def _start_video_mode(
 ) -> bool:
     if chat_id is None:
         return False
+    _reset_video_waits(user_id=user_id, chat_id=chat_id, reason="video_mode_select")
     if mode in {SORA2_MODE_TEXT_TO_VIDEO, SORA2_MODE_IMAGE_TO_VIDEO}:
         s = state(ctx)
         s["mode"] = mode
@@ -15238,11 +15261,15 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     user = getattr(query, "from_user", None) or update.effective_user
     user_id = user.id if user else None
 
-    answer_payload: Dict[str, Any] = {"text": "", "show_alert": False}
+    _reset_video_waits(user_id=user_id, chat_id=chat_id, reason="video_callback")
 
-    async def _answer() -> None:
-        text = str(answer_payload.get("text", ""))
-        show_alert = bool(answer_payload.get("show_alert", False))
+    answer_payload: Dict[str, Any] = {"text": "", "show_alert": False}
+    ack_sent = False
+
+    async def _send_answer(
+        text: str = "", *, show_alert: bool = False, fallback: bool = False
+    ) -> None:
+        nonlocal ack_sent
         answer_method = getattr(query, "answer", None)
         try:
             if callable(answer_method):
@@ -15250,6 +15277,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     await answer_method(text=text, show_alert=show_alert)
                 else:
                     await answer_method()
+                ack_sent = True
                 return
             bot_obj = getattr(ctx, "bot", None)
             if bot_obj is not None:
@@ -15258,28 +15286,47 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     text=text,
                     show_alert=show_alert,
                 )
+                ack_sent = True
+                return
         except Exception as exc:
             log.debug(
                 "ui.video_menu.answer_fail",
                 extra={"chat_id": chat_id, "error": str(exc)},
             )
+        if fallback and text and message is not None:
+            with suppress(Exception):
+                await message.reply_text(text)
 
+    async def _ensure_ack() -> None:
+        if not ack_sent:
+            await _send_answer()
+
+    log.info(
+        "video.click",
+        extra={"chat_id": chat_id, "user_id": user_id, "action": data},
+    )
     log.info(
         "ui.video_menu.click",
         extra={"chat_id": chat_id, "user_id": user_id, "data": data},
     )
 
     try:
+        if user_id is not None and not debounce(user_id, data):
+            await _ensure_ack()
+            return
         if data == CB.VIDEO_MENU:
             if chat_id is None:
                 return
             try:
+                await _ensure_ack()
                 await start_video_menu(update, ctx)
             except MenuLocked:
-                answer_payload["text"] = "Обрабатываю…"
+                if not ack_sent:
+                    answer_payload["text"] = "Обрабатываю…"
             return
 
         if data in {CB.VIDEO_VEO_ANIMATE, "video:veo_animate"}:
+            await _ensure_ack()
             await veo_animate(update, ctx)
             return
 
@@ -15287,6 +15334,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             if chat_id is None:
                 return
             try:
+                await _ensure_ack()
                 async with with_menu_lock(
                     _VIDEO_MENU_LOCK_NAME,
                     chat_id,
@@ -15314,7 +15362,8 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                             _VIDEO_MENU_MESSAGE_TTL,
                         )
             except MenuLocked:
-                answer_payload["text"] = "Обрабатываю…"
+                if not ack_sent:
+                    answer_payload["text"] = "Обрабатываю…"
             return
 
         if data == CB.VIDEO_PICK_SORA2_DISABLED:
@@ -15328,12 +15377,14 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 answer_payload["show_alert"] = True
                 if chat_id is not None:
                     try:
+                        await _ensure_ack()
                         await start_video_menu(update, ctx)
                     except MenuLocked:
                         pass
                 return
             if chat_id is not None:
                 try:
+                    await _ensure_ack()
                     async with with_menu_lock(
                         _VIDEO_MENU_LOCK_NAME,
                         chat_id,
@@ -15356,7 +15407,8 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                                 _VIDEO_MENU_MESSAGE_TTL,
                             )
                 except MenuLocked:
-                    answer_payload["text"] = "Обрабатываю…"
+                    if not ack_sent:
+                        answer_payload["text"] = "Обрабатываю…"
             return
 
         if data == "sora2:start":
@@ -15369,6 +15421,7 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 answer_payload["show_alert"] = True
                 return
             try:
+                await _ensure_ack()
                 async with with_menu_lock(
                     _VIDEO_MENU_LOCK_NAME,
                     chat_id,
@@ -15403,11 +15456,13 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                         meta={"mode": "sora2_simple", "suppress_ack": True, "ready": True},
                     )
             except MenuLocked:
-                answer_payload["text"] = "Обрабатываю…"
+                if not ack_sent:
+                    answer_payload["text"] = "Обрабатываю…"
             return
 
         if data in VIDEO_MODE_CALLBACK_MAP:
             selected_mode = VIDEO_MODE_CALLBACK_MAP[data]
+            await _ensure_ack()
             handled = await _start_video_mode(
                 selected_mode,
                 chat_id=chat_id,
@@ -15422,11 +15477,17 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         if data == CB.VIDEO_MENU_BACK:
             target_chat = chat_id if chat_id is not None else (user_id if user_id else None)
             if target_chat is not None:
+                await _ensure_ack()
                 await _clear_video_menu_state(target_chat, user_id=user_id, ctx=ctx)
                 await show_main_menu(target_chat, ctx)
             return
     finally:
-        await _answer()
+        text = str(answer_payload.get("text", ""))
+        show_alert = bool(answer_payload.get("show_alert", False))
+        if text or show_alert:
+            await _send_answer(text=text, show_alert=show_alert, fallback=True)
+        else:
+            await _ensure_ack()
 
 async def handle_image_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await image_command(update, ctx)
