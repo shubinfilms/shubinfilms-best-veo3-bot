@@ -1,6 +1,7 @@
 """HTTP client for interacting with the KIE Sora2 API."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -529,6 +530,111 @@ def upload_image_urls(image_urls: Iterable[str]) -> List[str]:
     return results
 
 
+def _kie_async_base() -> str:
+    base = getattr(settings, "KIE_BASE_URL", "") or "https://api.kie.ai/api/v1"
+    return str(base).rstrip("/")
+
+
+def _kie_create_endpoint() -> str:
+    return f"{_kie_async_base()}/jobs/createTask"
+
+
+def _kie_status_endpoint() -> str:
+    return f"{_kie_async_base()}/jobs/recordInfo"
+
+
+def _kie_headers() -> Dict[str, str]:
+    token = (settings.KIE_API_KEY or "").strip()
+    if not token:
+        raise RuntimeError("KIE API key is not configured")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _elapsed_ms(response: httpx.Response) -> Optional[int]:
+    try:
+        elapsed = response.elapsed
+    except Exception:
+        return None
+    if not elapsed:
+        return None
+    return int(elapsed.total_seconds() * 1000)
+
+
+async def kie_create_sora2_task(
+    ctx: Any,
+    *,
+    prompt: str,
+    aspect_ratio: Optional[str] = None,
+    quality: Optional[str] = None,
+    callback_url: Optional[str] = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "model": "sora-2-text-to-video",
+        "input": {"prompt": prompt},
+    }
+    if aspect_ratio:
+        payload["input"]["aspect_ratio"] = aspect_ratio
+    if quality:
+        payload["input"]["quality"] = quality
+    if callback_url:
+        payload["callBackUrl"] = callback_url
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            _kie_create_endpoint(),
+            json=payload,
+            headers=_kie_headers(),
+        )
+    logger.info(
+        "kie.http.create",
+        extra={
+            "status": response.status_code,
+            "elapsed_ms": _elapsed_ms(response),
+        },
+    )
+    response.raise_for_status()
+    data = response.json()
+    task_id = data.get("taskId") or data.get("task_id")
+    if not task_id:
+        raise RuntimeError("KIE: taskId is empty")
+    return str(task_id)
+
+
+async def kie_poll_sora2(
+    ctx: Any,
+    task_id: str,
+    *,
+    timeout_s: int = 600,
+    step_s: int = 5,
+) -> Mapping[str, Any]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(int(timeout_s), 1)
+    endpoint = _kie_status_endpoint()
+    headers = _kie_headers()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            response = await client.get(endpoint, params={"taskId": task_id}, headers=headers)
+            state_payload: Mapping[str, Any] = response.json()
+            state = str(state_payload.get("state") or "").lower()
+            logger.debug(
+                "kie.http.poll",
+                extra={"task_id": task_id, "state": state, "status": response.status_code},
+            )
+            response.raise_for_status()
+            if state in {"success"}:
+                result_json = state_payload.get("resultJson")
+                if not (isinstance(result_json, Mapping) and result_json.get("resultUrls")):
+                    raise RuntimeError("KIE: empty resultUrls")
+                return state_payload
+            if state in {"fail", "failed", "error"}:
+                raise RuntimeError(f"KIE: state={state}")
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(max(step_s, 1))
+    raise TimeoutError("KIE: polling timeout")
+
+
 __all__ = [
     "CreateTaskResponse",
     "QueryTaskResponse",
@@ -539,4 +645,6 @@ __all__ = [
     "create_task",
     "query_task",
     "upload_image_urls",
+    "kie_create_sora2_task",
+    "kie_poll_sora2",
 ]
