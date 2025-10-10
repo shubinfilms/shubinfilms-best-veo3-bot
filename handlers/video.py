@@ -11,7 +11,8 @@ from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, 
 from urllib.parse import urlparse
 
 import httpx
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from handlers.menu import build_video_card
@@ -29,11 +30,13 @@ from settings import (
 )
 
 from redis_utils import remember_veo_anim_job
+from utils.input_state import set_wait, WaitKind
 
 logger = logging.getLogger("veo.anim")
 
 _CARD_STATE_KEY = "video_menu_card"
 _MSG_IDS_KEY = "video"
+_SORA2_WAIT_META = {"mode": "sora2_simple", "ready": False, "suppress_ack": True}
 
 _send_menu: Optional[Callable[..., Awaitable[Optional[int]]]] = None
 _state_getter: Optional[Callable[[ContextTypes.DEFAULT_TYPE], MutableMapping[str, Any]]] = None
@@ -91,6 +94,77 @@ async def open_menu(
             "message_id": message_id,
             "suppress_nav": suppress_nav,
             "fallback_mid": fallback_message_id,
+        },
+    )
+    return message_id
+
+
+async def open_sora2_card(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    sora2_cost: int,
+    user_id: Optional[int],
+    suppress_nav: bool = False,
+    fallback_message_id: Optional[int] = None,
+    send_menu: Optional[Callable[..., Awaitable[Optional[int]]]] = None,
+) -> Optional[int]:
+    send_fn = send_menu or _send_menu
+    if send_fn is None or _state_getter is None:
+        raise RuntimeError("video menu handler is not configured")
+
+    state_dict = _state_getter(ctx)
+    text = (
+        "🎬 *Sora2 — генерация видео по тексту*\n"
+        f"Стоимость: 💎 {sora2_cost}\n\n"
+        "Нажмите «🚀 Начать генерацию», затем отправьте текстовое описание сцены."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать генерацию", callback_data="sora2:start")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="video:menu")],
+        ]
+    )
+
+    message_id = await send_fn(
+        ctx,
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        state_key=_CARD_STATE_KEY,
+        msg_ids_key=_MSG_IDS_KEY,
+        state_dict=state_dict,
+        fallback_message_id=fallback_message_id,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+        log_label="ui.video.menu.sora2",
+    )
+
+    if isinstance(user_id, int):
+        card_id: Optional[int]
+        if isinstance(message_id, int):
+            card_id = message_id
+        elif isinstance(fallback_message_id, int):
+            card_id = fallback_message_id
+        else:
+            card_id_raw = state_dict.get(_CARD_STATE_KEY)
+            card_id = card_id_raw if isinstance(card_id_raw, int) else None
+        if card_id is not None:
+            set_wait(
+                user_id,
+                WaitKind.SORA2_PROMPT.value,
+                card_id,
+                chat_id=chat_id,
+                meta=_SORA2_WAIT_META,
+            )
+
+    logger.debug(
+        "video.menu.sora2.open",
+        extra={
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "message_id": message_id,
+            "suppress_nav": suppress_nav,
         },
     )
     return message_id
@@ -698,6 +772,8 @@ __all__ = [
     "VeoAnimateBadRequest",
     "VeoAnimateError",
     "VeoAnimateTimeout",
+    "open_menu",
+    "open_sora2_card",
     "handle_veo_animate_photo",
     "trigger_veo_animation_retry",
     "veo_animate",

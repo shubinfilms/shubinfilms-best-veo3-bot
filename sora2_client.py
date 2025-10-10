@@ -531,8 +531,11 @@ def upload_image_urls(image_urls: Iterable[str]) -> List[str]:
 
 
 def _kie_async_base() -> str:
-    base = getattr(settings, "KIE_BASE_URL", "") or "https://api.kie.ai/api/v1"
-    return str(base).rstrip("/")
+    base = getattr(settings, "KIE_BASE_URL", "") or "https://api.kie.ai"
+    normalized = str(base).rstrip("/")
+    if not normalized.lower().endswith("/api/v1"):
+        normalized = f"{normalized}/api/v1"
+    return normalized
 
 
 def _kie_create_endpoint() -> str:
@@ -543,11 +546,14 @@ def _kie_status_endpoint() -> str:
     return f"{_kie_async_base()}/jobs/recordInfo"
 
 
-def _kie_headers() -> Dict[str, str]:
+def _kie_headers(*, json_payload: bool = False) -> Dict[str, str]:
     token = (settings.KIE_API_KEY or "").strip()
     if not token:
         raise RuntimeError("KIE API key is not configured")
-    return {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}"}
+    if json_payload:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 def _elapsed_ms(response: httpx.Response) -> Optional[int]:
@@ -568,23 +574,22 @@ async def kie_create_sora2_task(
     quality: Optional[str] = None,
     callback_url: Optional[str] = None,
 ) -> str:
+    input_payload: Dict[str, Any] = {"prompt": prompt}
+    aspect = (aspect_ratio or "").strip() or "16:9"
+    quality_value = (quality or "").strip() or "standard"
+    input_payload["aspect_ratio"] = aspect
+    input_payload["quality"] = quality_value
     payload: Dict[str, Any] = {
         "model": "sora-2-text-to-video",
-        "input": {"prompt": prompt},
+        "input": input_payload,
     }
-    if aspect_ratio:
-        payload["input"]["aspect_ratio"] = aspect_ratio
-    if quality:
-        payload["input"]["quality"] = quality
     if callback_url:
         payload["callBackUrl"] = callback_url
 
+    endpoint = _kie_create_endpoint()
+    headers = _kie_headers(json_payload=True)
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            _kie_create_endpoint(),
-            json=payload,
-            headers=_kie_headers(),
-        )
+        response = await client.post(endpoint, json=payload, headers=headers)
     logger.info(
         "kie.http.create",
         extra={
@@ -593,11 +598,24 @@ async def kie_create_sora2_task(
         },
     )
     response.raise_for_status()
-    data = response.json()
-    task_id = data.get("taskId") or data.get("task_id")
+    try:
+        data = response.json()
+    except Exception as exc:  # pragma: no cover - unexpected payload
+        raise RuntimeError("KIE: invalid JSON response") from exc
+    task_id: Optional[str] = None
+    if isinstance(data, Mapping):
+        data_block = data.get("data")
+        if isinstance(data_block, Mapping):
+            raw_task = data_block.get("taskId") or data_block.get("task_id")
+            if raw_task:
+                task_id = str(raw_task)
+        if not task_id:
+            raw_task = data.get("taskId") or data.get("task_id")
+            if raw_task:
+                task_id = str(raw_task)
     if not task_id:
         raise RuntimeError("KIE: taskId is empty")
-    return str(task_id)
+    return task_id
 
 
 async def kie_poll_sora2(
@@ -615,20 +633,54 @@ async def kie_poll_sora2(
     async with httpx.AsyncClient(timeout=30.0) as client:
         while True:
             response = await client.get(endpoint, params={"taskId": task_id}, headers=headers)
-            state_payload: Mapping[str, Any] = response.json()
-            state = str(state_payload.get("state") or "").lower()
-            logger.debug(
+            logger.info(
                 "kie.http.poll",
-                extra={"task_id": task_id, "state": state, "status": response.status_code},
+                extra={
+                    "task_id": task_id,
+                    "status": response.status_code,
+                    "elapsed_ms": _elapsed_ms(response),
+                },
             )
             response.raise_for_status()
-            if state in {"success"}:
-                result_json = state_payload.get("resultJson")
-                if not (isinstance(result_json, Mapping) and result_json.get("resultUrls")):
+            try:
+                payload = response.json()
+            except Exception as exc:  # pragma: no cover - unexpected payload
+                raise RuntimeError("KIE: status JSON invalid") from exc
+            data_block = payload.get("data") if isinstance(payload, Mapping) else None
+            data: Mapping[str, Any]
+            if isinstance(data_block, Mapping):
+                data = data_block
+            elif isinstance(payload, Mapping):
+                data = payload
+            else:
+                data = {}
+            state_raw = data.get("state") or data.get("status")
+            state_value = str(state_raw or "").strip().lower() or "unknown"
+            logger.info(
+                "sora2.poll.state",
+                extra={"task_id": task_id, "state": state_value},
+            )
+            if state_value in {"success"}:
+                direct_urls = _collect_urls(data.get("resultUrls"))
+                result_payload = _parse_result_json(data.get("resultJson"))
+                if result_payload:
+                    for candidate in _collect_urls(result_payload):
+                        if candidate not in direct_urls:
+                            direct_urls.append(candidate)
+                if not direct_urls:
                     raise RuntimeError("KIE: empty resultUrls")
-                return state_payload
-            if state in {"fail", "failed", "error"}:
-                raise RuntimeError(f"KIE: state={state}")
+                return {
+                    "state": state_value,
+                    "video_url": direct_urls[0],
+                    "result_urls": direct_urls,
+                    "result_payload": result_payload,
+                    "raw": payload,
+                }
+            if state_value in {"fail", "failed", "error"}:
+                reason = _extract_error_message(data if isinstance(data, Mapping) else {}, payload if isinstance(payload, Mapping) else {})
+                if not reason:
+                    reason = f"Sora2 task failed with state {state_value}"
+                raise RuntimeError(reason)
             if loop.time() >= deadline:
                 break
             await asyncio.sleep(max(step_s, 1))
