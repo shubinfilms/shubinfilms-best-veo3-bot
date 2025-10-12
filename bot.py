@@ -4448,8 +4448,8 @@ async def _handle_sora2_simple_prompt(
         await message.reply_text("Нажмите «🚀 Начать генерацию» перед отправкой описания.")
         return True
 
-    prompt = (message.text or "").strip()
-    if not prompt:
+    prompt_text = (message.text or "").strip()
+    if not prompt_text:
         await message.reply_text("⚠️ Введите текст (описание сцены).")
         return True
 
@@ -4458,7 +4458,7 @@ async def _handle_sora2_simple_prompt(
         chat_id = user_id
 
     state_dict = state(ctx)
-    state_dict["sora2_prompt"] = prompt
+    state_dict["sora2_prompt"] = prompt_text
 
     skip_balance_check = bool(meta.get("skip_balance_check")) or legacy_wait_state
     if not skip_balance_check and not await ensure_tokens(
@@ -4496,7 +4496,21 @@ async def _handle_sora2_simple_prompt(
 
     task_id: Optional[str] = None
     try:
-        task_id = await kie_create_sora2_task(ctx, prompt=prompt)
+        task_id = await kie_create_sora2_task(ctx, prompt=prompt_text)
+        if not task_id:
+            if charged:
+                try:
+                    await billing.refund(user_id, SORA2_PRICE, reason="sora2-fail")
+                except Exception:
+                    log.exception("sora2.refund.error", extra={"user": user_id})
+            await ctx.bot.send_message(
+                chat_id,
+                "⚠️ Sora2 временно недоступна. Попробуйте позже.",
+            )
+            log.error(
+                "sora2.fail_404", extra={"user": user_id, "stage": "create"}
+            )
+            return True
         log.info("sora2.create.ok", extra={"user": user_id, "task_id": task_id})
         if not precharged:
             await billing.charge(user_id, SORA2_PRICE, reason="sora2")
@@ -4544,7 +4558,7 @@ async def _handle_sora2_simple_prompt(
             chat_id,
             "Недостаточно токенов 💎. Пополните баланс и попробуйте снова.",
         )
-    except Exception as exc:
+    except Exception:
         try:
             if charged:
                 await billing.refund(user_id, SORA2_PRICE, reason="sora2-fail")
@@ -4556,7 +4570,8 @@ async def _handle_sora2_simple_prompt(
         )
         log.error(
             "sora2.fail",
-            extra={"user": user_id, "task_id": task_id, "reason": str(exc)},
+            exc_info=True,
+            extra={"user": user_id, "task_id": task_id},
         )
     finally:
         clear_wait_state(user_id, reason="sora2_simple_done")
@@ -6273,6 +6288,10 @@ async def music_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def video_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is not None:
+        with suppress(BadRequest):
+            await query.answer(cache_time=0)
     await _perform_menu_open(
         "video",
         update=update,
@@ -15318,6 +15337,10 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             if chat_id is None:
                 return
             try:
+                if query is not None:
+                    with suppress(BadRequest):
+                        await query.answer(cache_time=0)
+                        ack_sent = True
                 await _ensure_ack()
                 await start_video_menu(update, ctx)
             except MenuLocked:
@@ -15384,6 +15407,10 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 return
             if chat_id is not None:
                 try:
+                    if query is not None:
+                        with suppress(BadRequest):
+                            await query.answer(cache_time=0)
+                            ack_sent = True
                     await _ensure_ack()
                     async with with_menu_lock(
                         _VIDEO_MENU_LOCK_NAME,
@@ -15421,6 +15448,10 @@ async def video_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 answer_payload["show_alert"] = True
                 return
             try:
+                if query is not None:
+                    with suppress(BadRequest):
+                        await query.answer(cache_time=0)
+                        ack_sent = True
                 await _ensure_ack()
                 async with with_menu_lock(
                     _VIDEO_MENU_LOCK_NAME,
