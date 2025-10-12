@@ -573,7 +573,7 @@ async def kie_create_sora2_task(
     aspect_ratio: Optional[str] = None,
     quality: Optional[str] = None,
     callback_url: Optional[str] = None,
-) -> str:
+) -> Optional[str]:
     input_payload: Dict[str, Any] = {"prompt": prompt}
     aspect = (aspect_ratio or "").strip() or "16:9"
     quality_value = (quality or "").strip() or "standard"
@@ -590,6 +590,12 @@ async def kie_create_sora2_task(
     headers = _kie_headers(json_payload=True)
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(endpoint, json=payload, headers=headers)
+    if response.status_code == 404:
+        logger.error(
+            "sora2.fail_404",
+            extra={"url": endpoint, "payload": _sanitize_payload_for_log(payload)},
+        )
+        return None
     logger.info(
         "kie.http.create",
         extra={
