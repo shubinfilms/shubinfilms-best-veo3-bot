@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import random
 import threading
 import time
 from collections import OrderedDict
@@ -19,19 +21,22 @@ try:  # psycopg is optional for some environments
 except Exception:  # pragma: no cover - optional dependency missing
     PsycopgOperationalError = None  # type: ignore
 
-log = logging.getLogger(__name__)
+
+log = logging.getLogger("db.postgres")
 
 _DSN: str = ""
 _ENGINE: Optional[Engine] = None
 ENGINE: Optional[Engine] = None
 _LOCK = threading.Lock()
-_LOGGED_SUCCESS = False
-_MAX_RETRIES = 6
-_BACKOFF_BASE = 0.5
+_SQLA_PREFIX_DETECTED = False
+_LAST_NORMALIZE_PREFIX = False
+
 _RETRYABLE_MESSAGES = (
     "SSL connection has been closed unexpectedly",
     "server closed the connection unexpectedly",
     "connection already closed",
+    "timeout expired",
+    "timed out",
 )
 
 _USERS_DDL = """
@@ -97,67 +102,100 @@ CREATE INDEX IF NOT EXISTS idx_transactions_user_created_at
 """
 
 
-def normalize_dsn(url: str) -> str:
-    """Ensure the DSN always uses the psycopg driver and Neon defaults."""
+def _render_postgres_url(url: URL) -> str:
+    rendered = url.render_as_string(hide_password=False)
+    if rendered.startswith("postgresql://"):
+        return "postgres://" + rendered[len("postgresql://") :]
+    return rendered
 
-    raw = (url or "").strip()
-    if not raw:
-        raise ValueError("PostgreSQL DSN must be a non-empty string")
+
+def mask_dsn(dsn: str) -> str:
+    """Return a DSN safe for logging with the password redacted."""
+
+    if not dsn:
+        return ""
+    try:
+        parsed = make_url(dsn)
+    except Exception:  # pragma: no cover - defensive
+        return "***"
+    if parsed.password is None:
+        return _render_postgres_url(parsed)
+    masked = parsed.set(password="***")
+    return _render_postgres_url(masked)
+
+
+def normalize_dsn(raw: str) -> str:
+    """Normalise any PostgreSQL DSN into the canonical ``postgres://`` form."""
+
+    global _LAST_NORMALIZE_PREFIX
+
+    candidate = (raw or "").strip()
+    if not candidate:
+        raise ValueError(
+            "❌ DSN invalid: строка подключения пуста. "
+            "Используйте стандартный URL вида: "
+            "postgres://user:pass@host:port/db?sslmode=require"
+        )
 
     try:
-        parsed: URL = make_url(raw)
+        parsed: URL = make_url(candidate)
     except Exception as exc:  # pragma: no cover - invalid DSN formatting
-        raise ValueError(f"Invalid PostgreSQL DSN: {url!r}") from exc
+        raise ValueError(
+            "❌ DSN invalid: не удалось разобрать URL. "
+            "Используйте стандартный URL вида: "
+            "postgres://user:pass@host:port/db?sslmode=require"
+        ) from exc
 
     driver = (parsed.drivername or "").lower()
-    if driver in {"postgresql", "postgresql+psycopg2", "postgres", "postgres+psycopg2"}:
-        parsed = parsed.set(drivername="postgresql+psycopg")
-
-    query = {key: value for key, value in parsed.query.items()}
-    lowered = {key.lower(): key for key in query}
-    if "sslmode" not in lowered:
-        query["sslmode"] = "require"
-        parsed = parsed.set(query=query)
+    _LAST_NORMALIZE_PREFIX = False
+    if driver.startswith("postgresql+"):
+        _LAST_NORMALIZE_PREFIX = True
+        driver = "postgresql"
+    elif driver in {"postgresql", "postgres"}:
+        driver = "postgresql"
     else:
-        actual_key = lowered["sslmode"]
-        if not (query.get(actual_key) or "").strip():
-            query[actual_key] = "require"
-            parsed = parsed.set(query=query)
+        raise ValueError(
+            "❌ DSN invalid: обнаружена неподдерживаемая схема. "
+            "Используйте URL вида: "
+            "postgres://user:pass@host:port/db?sslmode=require"
+        )
 
-    return parsed.render_as_string(hide_password=False)
+    if not parsed.host:
+        raise ValueError(
+            "❌ DSN invalid: отсутствует хост. "
+            "Пример: postgres://user:pass@host:5432/db?sslmode=require"
+        )
+    if not parsed.database:
+        raise ValueError(
+            "❌ DSN invalid: отсутствует имя базы данных. "
+            "Пример: postgres://user:pass@host:5432/db?sslmode=require"
+        )
 
+    query_items: "OrderedDict[str, str]" = OrderedDict(parsed.query.items())
+    lowered = {key.lower(): key for key in query_items}
+    if "sslmode" not in lowered:
+        query_items["sslmode"] = "require"
+    else:
+        actual = lowered["sslmode"]
+        if not (query_items.get(actual) or "").strip():
+            query_items[actual] = "require"
 
-def configure(dsn: str) -> None:
-    """Configure the module with the database connection string."""
-
-    global _DSN, _ENGINE
-    dsn = normalize_dsn(dsn)
-    global ENGINE
-    if _DSN and _DSN != dsn:
-        with _LOCK:
-            if _ENGINE is not None:
-                try:
-                    _ENGINE.dispose()
-                except Exception:  # pragma: no cover - best effort cleanup
-                    pass
-                _ENGINE = None
-                ENGINE = None
-    _DSN = dsn
-    ENGINE = _ENGINE
+    normalized = parsed.set(drivername="postgresql", query=query_items)
+    return _render_postgres_url(normalized)
 
 
 def _iter_exception_chain(exc: BaseException) -> Iterable[BaseException]:
     current: Optional[BaseException] = exc
-    visited: set[int] = set()
-    while current is not None and id(current) not in visited:
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
         yield current
-        visited.add(id(current))
+        seen.add(id(current))
         current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
 
 
 def _is_retryable_error(exc: BaseException) -> bool:
     for candidate in _iter_exception_chain(exc):
-        if isinstance(candidate, (OperationalError, ConnectionResetError)):
+        if isinstance(candidate, (OperationalError, ConnectionResetError, TimeoutError)):
             return True
         if PsycopgOperationalError is not None and isinstance(candidate, PsycopgOperationalError):
             return True
@@ -172,57 +210,96 @@ def _test_connection(engine: Engine) -> None:
         conn.execute(text("SELECT 1"))
 
 
-def _connect_with_retry() -> Engine:
-    global _LOGGED_SUCCESS, ENGINE
+def connect_with_retry(dsn: str, attempts: int = 6, backoff: float = 1.5) -> Engine:
+    """Create a SQLAlchemy engine with retry logic and health check."""
+
+    if attempts <= 0:
+        raise ValueError("attempts must be a positive integer")
+    if backoff <= 1.0:
+        backoff = 1.5
+
+    psycopg_url = make_url(dsn).set(drivername="postgresql+psycopg")
+    engine_url = psycopg_url.render_as_string(hide_password=False)
+
     last_error: Optional[BaseException] = None
-    for attempt in range(1, _MAX_RETRIES + 1):
+    for attempt in range(1, attempts + 1):
+        log.info("postgres.connect_attempt | attempt=%s/%s", attempt, attempts)
         engine: Optional[Engine] = None
         try:
-            log.info("postgres.connect_attempt | attempt=%s/%s", attempt, _MAX_RETRIES)
             engine = create_engine(
-                _DSN,
+                engine_url,
                 future=True,
                 pool_pre_ping=True,
                 pool_size=5,
                 max_overflow=5,
-                pool_recycle=1800,
-                connect_args={"sslmode": "require"},
+                pool_timeout=15,
             )
             _test_connection(engine)
-            if not _LOGGED_SUCCESS:
-                log.info(
-                    "postgres.connected | driver=%s", engine.url.drivername
-                )
-                _LOGGED_SUCCESS = True
-            ENGINE = engine
+            log.info("postgres.connected | driver=postgresql+psycopg")
             return engine
         except Exception as exc:
             last_error = exc
             if engine is not None:
-                try:
+                with contextlib.suppress(Exception):  # pragma: no cover - best effort
                     engine.dispose()
-                except Exception:  # pragma: no cover - best effort cleanup
-                    pass
+
             retryable = _is_retryable_error(exc)
-            if not retryable or attempt >= _MAX_RETRIES:
-                log.error(
-                    "postgres.initialization_failed | attempt=%s/%s err=%s",
-                    attempt,
-                    _MAX_RETRIES,
-                    exc,
-                    exc_info=True,
-                )
+            if not retryable or attempt == attempts:
+                event = "postgres.connect_fail"
+                log.error("%s | attempt=%s/%s err=%s", event, attempt, attempts, exc, exc_info=True)
+                if retryable:
+                    error_class = exc.__class__.__name__
+                    message = (
+                        f"⚠️ PostgreSQL: не удалось подключиться за {attempts} попыток "
+                        f"({error_class}). Проверьте, что Neon compute «включён», и что "
+                        "firewall/SSL не блокируют соединение."
+                    )
+                    raise RuntimeError(message) from exc
                 raise
-            sleep_for = min(_BACKOFF_BASE * (2 ** (attempt - 1)), 4.0)
+
+            sleep_base = backoff ** (attempt - 1)
+            jitter = random.uniform(0.9, 1.1)
+            sleep_for = sleep_base * jitter
             log.warning(
-                "postgres.connection_retry | attempt=%s/%s err=%s wait=%.1fs",
+                "postgres.connect_retry | attempt=%s/%s err=%s wait=%.2fs",
                 attempt,
-                _MAX_RETRIES,
+                attempts,
                 exc,
                 sleep_for,
             )
             time.sleep(sleep_for)
-    raise RuntimeError("Unable to initialize PostgreSQL engine") from last_error
+
+    raise RuntimeError(
+        f"⚠️ PostgreSQL: не удалось подключиться за {attempts} попыток (timeout)."
+    ) from last_error
+
+
+def configure_engine(dsn: str) -> Engine:
+    """Normalise the DSN, establish a connection and store the engine."""
+
+    normalized = normalize_dsn(dsn)
+    log.info("postgres.configure_engine | dsn=%s", mask_dsn(normalized))
+
+    engine = connect_with_retry(normalized)
+
+    global _DSN, _ENGINE, ENGINE, _SQLA_PREFIX_DETECTED
+    with _LOCK:
+        if _ENGINE is not None and _ENGINE is not engine:
+            with contextlib.suppress(Exception):  # pragma: no cover - best effort
+                _ENGINE.dispose()
+        _DSN = normalized
+        _ENGINE = engine
+        ENGINE = engine
+        _SQLA_PREFIX_DETECTED = bool(_LAST_NORMALIZE_PREFIX)
+
+    log.info("postgres.initialized")
+    return engine
+
+
+def configure(dsn: str) -> None:
+    """Backward compatible wrapper for legacy callers."""
+
+    configure_engine(dsn)
 
 
 def _ensure_engine() -> Engine:
@@ -230,10 +307,10 @@ def _ensure_engine() -> Engine:
     if _ENGINE is not None:
         return _ENGINE
     if not _DSN:
-        raise RuntimeError("DATABASE_URL is not configured for Postgres helpers")
+        raise RuntimeError("PostgreSQL DSN not configured")
     with _LOCK:
         if _ENGINE is None:
-            _ENGINE = _connect_with_retry()
+            _ENGINE = connect_with_retry(_DSN)
             ENGINE = _ENGINE
     return _ENGINE
 
@@ -257,45 +334,156 @@ def get_engine() -> Engine:
     return _ensure_engine()
 
 
-def get_database_overview() -> Dict[str, Any]:
-    """Return aggregated information about the PostgreSQL database."""
+def _short_version(raw: Any) -> str:
+    text_value = str(raw or "").strip()
+    if not text_value:
+        return "unknown"
+    primary = text_value.splitlines()[0]
+    primary = primary.split(" on ")[0].split(",")[0].strip()
+    return primary or "unknown"
+
+
+def _current_sslmode() -> str:
+    if not _DSN:
+        return ""
+    try:
+        parsed = make_url(_DSN)
+    except Exception:  # pragma: no cover - defensive
+        return ""
+    value = parsed.query.get("sslmode")
+    return str(value) if value is not None else ""
+
+
+def db_overview() -> Dict[str, Any]:
+    """Collect statistics about the database and connection pool."""
 
     engine = _ensure_engine()
-    tables = ("users", "balances", "referrals", "transactions", "audit_log")
-    counts: "OrderedDict[str, int]" = OrderedDict()
-    sizes: "OrderedDict[str, int]" = OrderedDict()
-    with engine.connect() as conn:
-        version = conn.execute(text("SHOW server_version")).scalar()
-        for table in tables:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
-            counts[table] = int(result.scalar() or 0)
-        size_query = (
-            text(
+    tables = ("users", "balances", "referrals", "transactions")
+    overview: Dict[str, Any] = {}
+
+    try:
+        with engine.connect() as conn:
+            version_row = conn.execute(text("SELECT version()"))
+            version = _short_version(version_row.scalar())
+            current_db = conn.execute(text("SELECT current_database()"))
+            db_name = str(current_db.scalar() or "")
+            current_schema = conn.execute(text("SELECT current_schema()"))
+            schema_name = str(current_schema.scalar() or "")
+
+            table_metrics: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+            for table in tables:
+                try:
+                    result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
+                    count_value = int(result.scalar() or 0)
+                except SQLAlchemyError:
+                    count_value = 0
+                table_metrics[table] = {"rows": count_value, "size_bytes": 0}
+
+            size_stmt = text(
                 """
                 SELECT c.relname AS name,
                        pg_total_relation_size(c.oid) AS size
                   FROM pg_class AS c
                   JOIN pg_namespace AS n ON n.oid = c.relnamespace
-                 WHERE n.nspname = 'public' AND c.relname = ANY(:tables)
+                 WHERE n.nspname = current_schema() AND c.relname = ANY(:tables)
                 """
-            )
-            .bindparams(bindparam("tables", expanding=True))
-        )
-        for row in conn.execute(size_query, {"tables": list(tables)}).mappings():
-            sizes[row["name"]] = int(row["size"] or 0)
-        for table in tables:
-            sizes.setdefault(table, 0)
-    return {
-        "server_version": str(version or "unknown"),
-        "table_counts": counts,
-        "table_sizes": sizes,
-    }
+            ).bindparams(bindparam("tables", expanding=True))
+            size_rows = conn.execute(size_stmt, {"tables": list(tables)}).mappings()
+            for row in size_rows:
+                name = str(row.get("name"))
+                size_val = int(row.get("size") or 0)
+                if name in table_metrics:
+                    table_metrics[name]["size_bytes"] = size_val
+
+    except Exception as exc:
+        log.error("postgres.check.fail | err=%s", exc, exc_info=True)
+        raise
+
+    pool = getattr(engine, "pool", None)
+    in_use = 0
+    available = 0
+    if pool is not None:
+        checkout = getattr(pool, "checkedout", None)
+        if callable(checkout):
+            with contextlib.suppress(Exception):
+                value = checkout()
+                if isinstance(value, int):
+                    in_use = max(value, 0)
+        checkin = getattr(pool, "checkedin", None)
+        if callable(checkin):
+            with contextlib.suppress(Exception):
+                value = checkin()
+                if isinstance(value, int):
+                    available = max(value, 0)
+        if available == 0:
+            size_fn = getattr(pool, "size", None)
+            if callable(size_fn):
+                with contextlib.suppress(Exception):
+                    size_val = size_fn()
+                    if isinstance(size_val, int):
+                        available = max(size_val - in_use, 0)
+
+    tables_payload = OrderedDict()
+    for table, metrics in table_metrics.items():
+        size_bytes = int(metrics.get("size_bytes", 0))
+        tables_payload[table] = {
+            "rows": int(metrics.get("rows", 0)),
+            "size_bytes": size_bytes,
+            "size_mb": round(size_bytes / (1024 * 1024), 2) if size_bytes else 0.0,
+        }
+
+    overview.update(
+        {
+            "server_version": version,
+            "database": db_name,
+            "schema": schema_name,
+            "tables": tables_payload,
+            "pool": {
+                "in_use": in_use,
+                "available": available,
+            },
+            "sslmode": _current_sslmode() or "",
+            "sqlalchemy_prefix": _SQLA_PREFIX_DETECTED,
+            "dsn": mask_dsn(_DSN),
+        }
+    )
+
+    log.info(
+        "postgres.check.ok | db=%s schema=%s in_use=%s available=%s",
+        db_name,
+        schema_name,
+        in_use,
+        available,
+    )
+    return overview
+
+
+def get_database_overview() -> Dict[str, Any]:
+    """Backward compatible wrapper returning the database overview."""
+
+    return db_overview()
 
 
 def check_health() -> OrderedDict[str, int]:
     """Return row counts for key tables to assess DB health."""
 
-    return get_database_overview()["table_counts"]
+    snapshot = db_overview()
+    counts: "OrderedDict[str, int]" = OrderedDict()
+    for table, metrics in snapshot.get("tables", {}).items():
+        counts[table] = int(metrics.get("rows", 0))
+    return counts
+
+
+def sqlalchemy_prefix_detected() -> bool:
+    """Return whether the last configured DSN had a SQLAlchemy driver prefix."""
+
+    return _SQLA_PREFIX_DETECTED
+
+
+def current_dsn() -> str:
+    """Return the currently configured normalised DSN."""
+
+    return _DSN
 
 
 def export_balances_snapshot() -> Dict[str, Any]:
