@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 import requests
 
+from db.postgres import normalize_dsn
 from ledger import LedgerStorage
 from texts import common_text
 
@@ -36,6 +37,8 @@ def _ledger() -> LedgerStorage:
     if _ledger_instance is None:
         backend = (os.getenv("LEDGER_BACKEND") or "postgres").lower()
         dsn = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
+        if dsn:
+            dsn = normalize_dsn(dsn)
         _ledger_instance = LedgerStorage(dsn, backend=backend)
     return _ledger_instance
 
