@@ -76,6 +76,17 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return value.strip() or default
 
 
+def safe_decode(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:
+            return str(value)
+    return str(value).strip() or None
+
+
 def _decode(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -434,7 +445,23 @@ async def migrate_from_redis(
         log.info("redis-migration.start | prefix=%s", redis_prefix)
 
         user_records: Dict[int, Dict[str, Any]] = {}
+        user_sources: Dict[int, set[str]] = {}
         balance_rows: Dict[int, int] = {}
+
+        def _ensure_user_record(user_id: int, *, source: Optional[str] = None) -> Dict[str, Any]:
+            record = user_records.setdefault(
+                user_id,
+                {
+                    "id": user_id,
+                    "username": None,
+                    "referrer_id": None,
+                    "joined_at": None,
+                    "referral_earned_total": None,
+                },
+            )
+            if source:
+                user_sources.setdefault(user_id, set()).add(source)
+            return record
 
         # Load user profiles
         async for key in _scan_keys(conn, f"{redis_prefix}:user:*"):
@@ -449,20 +476,30 @@ async def migrate_from_redis(
                 log.warning("redis-migration.hgetall_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
                 continue
-            record = user_records.setdefault(
-                user_id,
-                {
-                    "id": user_id,
-                    "username": None,
-                    "referrer_id": None,
-                    "joined_at": None,
-                    "referral_earned_total": None,
-                },
-            )
-            username = _decode(profile.get(b"username")) if isinstance(profile, dict) else None
-            username = _sanitize_text(username)
-            if username:
-                record["username"] = username
+            record = _ensure_user_record(user_id, source=key)
+            if isinstance(profile, dict):
+                username_raw = safe_decode(profile.get(b"username"))
+                username = _sanitize_text(username_raw)
+                if username:
+                    record["username"] = username
+
+                referrer_raw = safe_decode(profile.get(b"referrer_id"))
+                referrer_id = _normalize_referrer(referrer_raw)
+                if referrer_id:
+                    record["referrer_id"] = referrer_id
+
+                joined_raw = safe_decode(profile.get(b"joined_at"))
+                joined_at = _parse_datetime(joined_raw)
+                if joined_at:
+                    record["joined_at"] = joined_at
+
+                referral_total_raw = safe_decode(profile.get(b"referral_earned_total"))
+                referral_total = _parse_int(referral_total_raw)
+                if referral_total is not None and referral_total >= 0:
+                    current_total = record.get("referral_earned_total")
+                    current_total_int = int(current_total) if isinstance(current_total, int) else _parse_int(current_total)
+                    if current_total_int is None or referral_total > current_total_int:
+                        record["referral_earned_total"] = referral_total
 
         # Load balances with both legacy and documented prefixes
         balance_patterns = [
@@ -491,16 +528,7 @@ async def migrate_from_redis(
                     skipped.append(f"invalid balance value: {key}")
                     continue
                 balance_rows[user_id] = tokens
-                user_records.setdefault(
-                    user_id,
-                    {
-                        "id": user_id,
-                        "username": None,
-                        "referrer_id": None,
-                        "joined_at": None,
-                        "referral_earned_total": None,
-                    },
-                )
+                _ensure_user_record(user_id, source=key)
 
         inviter_map, joined_at_map, earned_totals, referral_pairs = await _gather_ref_keys(
             conn,
@@ -509,28 +537,10 @@ async def migrate_from_redis(
         )
 
         for user_id, inviter_id in inviter_map.items():
-            record = user_records.setdefault(
-                user_id,
-                {
-                    "id": user_id,
-                    "username": None,
-                    "referrer_id": None,
-                    "joined_at": None,
-                    "referral_earned_total": None,
-                },
-            )
+            record = _ensure_user_record(user_id)
             record["referrer_id"] = inviter_id
             # Ensure inviter user exists too
-            user_records.setdefault(
-                inviter_id,
-                {
-                    "id": inviter_id,
-                    "username": None,
-                    "referrer_id": None,
-                    "joined_at": None,
-                    "referral_earned_total": None,
-                },
-            )
+            _ensure_user_record(inviter_id)
 
         for user_id, joined in joined_at_map.items():
             record = user_records.get(user_id)
@@ -538,20 +548,28 @@ async def migrate_from_redis(
                 record["joined_at"] = joined
 
         for referrer_id, total in earned_totals.items():
-            record = user_records.setdefault(
-                referrer_id,
-                {
-                    "id": referrer_id,
-                    "username": None,
-                    "referrer_id": None,
-                    "joined_at": None,
-                    "referral_earned_total": None,
-                },
-            )
+            record = _ensure_user_record(referrer_id)
             record["referral_earned_total"] = max(total, int(record.get("referral_earned_total") or 0))
 
         # Prepare batches
-        user_batches: List[Dict[str, Any]] = list(user_records.values())
+        total_user_candidates = len(user_records)
+        user_batches: List[Dict[str, Any]] = []
+        for user_id, record in user_records.items():
+            username_candidate = _sanitize_text(record.get("username"))
+            normalized_referrer = _normalize_referrer(record.get("referrer_id"))
+            if username_candidate is None and normalized_referrer is None:
+                source_keys = sorted(user_sources.get(user_id, []))
+                key_info = ", ".join(source_keys) if source_keys else f"user:{user_id}"
+                log.warning("redis-migration.users.skip | reason=missing_identity key=%s", key_info)
+                skipped.append(f"malformed user record: {key_info}")
+                continue
+            row = dict(record)
+            row["username"] = username_candidate
+            row["referrer_id"] = normalized_referrer
+            source_keys = sorted(user_sources.get(user_id, []))
+            if source_keys:
+                row["_source"] = ", ".join(source_keys)
+            user_batches.append(row)
         balance_batch = [
             {"user_id": user_id, "tokens": tokens}
             for user_id, tokens in balance_rows.items()
@@ -592,6 +610,8 @@ async def migrate_from_redis(
                     stats.balances_imported += processed
                 elif stage == "referrals":
                     stats.referrals_imported += processed
+                if stage == "users" and total and total % 500 == 0:
+                    log.info("Progress: migrated %s users so far...", total)
                 log.info(
                     "redis-migration.batch | stage=%s chunk=%s processed=%s cumulative=%s",
                     stage,
@@ -609,6 +629,11 @@ async def migrate_from_redis(
 
         stats.skipped_entries = len(skipped)
         stats.errors = skipped
+        log.info(
+            "Migration complete: %s/%s users imported successfully.",
+            stats.users_imported,
+            total_user_candidates,
+        )
 
         if progress_callback:
             await progress_callback(stats.snapshot(), "summary")
