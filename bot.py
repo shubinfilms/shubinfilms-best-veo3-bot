@@ -16362,11 +16362,12 @@ async def migrate_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         try:
             stats = await run_redis_migration(progress_callback=_progress_callback)
         except Exception as exc:
-            log.exception("admin.migrate_redis.failed | actor=%s err=%s", actor.id, exc)
+            log.error("admin.migrate_redis.failed | actor=%s err=%s", actor.id, exc, exc_info=True)
             try:
                 await status.edit_text(f"❌ Миграция завершилась ошибкой: {exc}")
             except Exception:
-                await message.reply_text("❌ Миграция завершилась ошибкой. Подробности в логах.")
+                pass
+            await message.reply_text(f"❌ Ошибка миграции: {exc}")
             return
         last_progress = None
         lines = stats.as_lines()
