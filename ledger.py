@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -113,7 +114,18 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         ddl_users = """
         CREATE TABLE IF NOT EXISTS users (
             id BIGINT PRIMARY KEY,
-            balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+            username TEXT,
+            referrer_id BIGINT,
+            joined_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now(),
+            referral_earned_total BIGINT NOT NULL DEFAULT 0
+        )
+        """
+
+        ddl_balances = """
+        CREATE TABLE IF NOT EXISTS balances (
+            user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            tokens BIGINT NOT NULL DEFAULT 0 CHECK (tokens >= 0),
             signup_bonus_granted BOOLEAN NOT NULL DEFAULT FALSE,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
@@ -137,6 +149,29 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             ON ledger(user_id, created_at DESC)
         """
 
+        ddl_referrals = """
+        CREATE TABLE IF NOT EXISTS referrals (
+            id BIGSERIAL PRIMARY KEY,
+            referrer_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+            referred_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            earned_tokens BIGINT NOT NULL DEFAULT 0,
+            UNIQUE (referrer_id, referred_id)
+        )
+        """
+
+        ddl_audit = """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT,
+            actor_id BIGINT,
+            action TEXT,
+            amount BIGINT,
+            meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+            ts TIMESTAMPTZ DEFAULT now()
+        )
+        """
+
         ddl_promo = """
         CREATE TABLE IF NOT EXISTS promo_usages (
             user_id BIGINT NOT NULL,
@@ -150,14 +185,37 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(ddl_users)
+                cur.execute(ddl_balances)
                 cur.execute(ddl_ledger)
                 cur.execute(ddl_ledger_idx)
+                cur.execute(ddl_referrals)
+                cur.execute(ddl_audit)
                 cur.execute(ddl_promo)
             conn.commit()
 
     @staticmethod
-    def _ensure_user(cur: psycopg.Cursor[Any], uid: int) -> None:
-        cur.execute("INSERT INTO users (id) VALUES (%s) ON CONFLICT DO NOTHING", (uid,))
+    def _ensure_user(
+        cur: psycopg.Cursor[Any],
+        uid: int,
+        *,
+        username: Optional[str] = None,
+        referrer_id: Optional[int] = None,
+    ) -> None:
+        cur.execute(
+            """
+            INSERT INTO users (id, username, referrer_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (id) DO UPDATE
+               SET username = COALESCE(%s, users.username),
+                   referrer_id = COALESCE(users.referrer_id, %s),
+                   updated_at = now()
+            """,
+            (uid, username, referrer_id, username, referrer_id),
+        )
+        cur.execute(
+            "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (uid,),
+        )
 
     # ------------------------------------------------------------------
     #   Public API
@@ -187,9 +245,20 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 self._ensure_user(cur, uid)
-                cur.execute("SELECT balance FROM users WHERE id=%s", (uid,))
+                cur.execute("SELECT tokens FROM balances WHERE user_id=%s", (uid,))
                 row = cur.fetchone()
                 return int(row[0]) if row else 0
+
+    def ensure_user(
+        self,
+        uid: int,
+        *,
+        username: Optional[str] = None,
+        referrer_id: Optional[int] = None,
+    ) -> None:
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                self._ensure_user(cur, uid, username=username, referrer_id=referrer_id)
 
     def credit(
         self,
@@ -209,7 +278,10 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 self._ensure_user(cur, uid)
-                cur.execute("SELECT balance FROM users WHERE id=%s FOR UPDATE", (uid,))
+                cur.execute(
+                    "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
+                    (uid,),
+                )
                 row = cur.fetchone()
                 old_balance = int(row[0]) if row else 0
 
@@ -219,11 +291,11 @@ class _PostgresLedgerStorage(_LedgerHelpers):
 
                 cur.execute(
                     """
-                    UPDATE users
-                       SET balance = balance + %s,
+                    UPDATE balances
+                       SET tokens = tokens + %s,
                            updated_at = now()
-                     WHERE id = %s
-                     RETURNING balance
+                     WHERE user_id = %s
+                     RETURNING tokens
                     """,
                     (amount, uid),
                 )
@@ -259,7 +331,10 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 self._ensure_user(cur, uid)
-                cur.execute("SELECT balance FROM users WHERE id=%s FOR UPDATE", (uid,))
+                cur.execute(
+                    "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
+                    (uid,),
+                )
                 row = cur.fetchone()
                 old_balance = int(row[0]) if row else 0
 
@@ -272,11 +347,11 @@ class _PostgresLedgerStorage(_LedgerHelpers):
 
                 cur.execute(
                     """
-                    UPDATE users
-                       SET balance = balance - %s,
+                    UPDATE balances
+                       SET tokens = tokens - %s,
                            updated_at = now()
-                     WHERE id = %s
-                     RETURNING balance
+                     WHERE user_id = %s
+                     RETURNING tokens
                     """,
                     (amount, uid),
                 )
@@ -305,7 +380,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             with conn.cursor() as cur:
                 self._ensure_user(cur, uid)
                 cur.execute(
-                    "SELECT balance, signup_bonus_granted FROM users WHERE id=%s FOR UPDATE",
+                    "SELECT tokens, signup_bonus_granted FROM balances WHERE user_id=%s FOR UPDATE",
                     (uid,),
                 )
                 row = cur.fetchone()
@@ -327,26 +402,26 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                 )
                 if cur.fetchone():
                     cur.execute(
-                        "UPDATE users SET signup_bonus_granted = TRUE WHERE id=%s",
+                        "UPDATE balances SET signup_bonus_granted = TRUE WHERE user_id=%s",
                         (uid,),
                     )
                     return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
 
                 if amount <= 0:
                     cur.execute(
-                        "UPDATE users SET signup_bonus_granted = TRUE WHERE id=%s",
+                        "UPDATE balances SET signup_bonus_granted = TRUE WHERE user_id=%s",
                         (uid,),
                     )
                     return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
 
                 cur.execute(
                     """
-                    UPDATE users
-                       SET balance = balance + %s,
+                    UPDATE balances
+                       SET tokens = tokens + %s,
                            signup_bonus_granted = TRUE,
                            updated_at = now()
-                     WHERE id = %s
-                     RETURNING balance
+                     WHERE user_id = %s
+                     RETURNING tokens
                     """,
                     (amount, uid),
                 )
@@ -381,7 +456,10 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 self._ensure_user(cur, uid)
-                cur.execute("SELECT balance FROM users WHERE id=%s FOR UPDATE", (uid,))
+                cur.execute(
+                    "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
+                    (uid,),
+                )
                 row = cur.fetchone()
                 old_balance = int(row[0]) if row else 0
 
@@ -415,11 +493,11 @@ class _PostgresLedgerStorage(_LedgerHelpers):
 
                 cur.execute(
                     """
-                    UPDATE users
-                       SET balance = balance + %s,
+                    UPDATE balances
+                       SET tokens = tokens + %s,
                            updated_at = now()
-                     WHERE id = %s
-                     RETURNING balance
+                     WHERE user_id = %s
+                     RETURNING tokens
                     """,
                     (amount, uid),
                 )
@@ -470,7 +548,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 self._ensure_user(cur, uid)
-                cur.execute("SELECT balance FROM users WHERE id=%s", (uid,))
+                cur.execute("SELECT tokens FROM balances WHERE user_id=%s", (uid,))
                 row = cur.fetchone()
                 previous = int(row[0]) if row else 0
 
@@ -488,7 +566,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                 updated = calculated != previous
                 if updated:
                     cur.execute(
-                        "UPDATE users SET balance = %s, updated_at = now() WHERE id = %s",
+                        "UPDATE balances SET tokens = %s, updated_at = now() WHERE user_id = %s",
                         (calculated, uid),
                     )
         if updated:
@@ -536,6 +614,16 @@ class _MemoryLedgerStorage(_LedgerHelpers):
         with self._lock:
             user = self._ensure_user(uid)
             return int(user["balance"])
+
+    def ensure_user(
+        self,
+        uid: int,
+        *,
+        username: Optional[str] = None,
+        referrer_id: Optional[int] = None,
+    ) -> None:
+        with self._lock:
+            self._ensure_user(uid)
 
     def credit(
         self,
@@ -761,6 +849,9 @@ class LedgerStorage:
         self.backend = backend
 
         if backend == "memory":
+            forbid_memory = os.getenv("FORBID_MEMORY_DB", "").lower() in {"1", "true", "yes", "on"}
+            if forbid_memory:
+                raise RuntimeError("Memory ledger backend is disabled by configuration")
             self._impl = _MemoryLedgerStorage()
         else:
             if not dsn:
