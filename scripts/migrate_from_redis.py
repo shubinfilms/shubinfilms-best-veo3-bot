@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, cast
 
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -850,11 +850,21 @@ async def migrate_from_redis(
     return stats
 
 
-async def cleanup_redis(conn: "redis.Redis", redis_prefix: str = "veo3:prod") -> int:
+async def cleanup_redis(
+    conn: "redis.Redis",
+    redis_prefix: str = "veo3:prod",
+    *,
+    exclude_keys: Iterable[str] | None = None,
+) -> int:
     """Remove legacy Redis keys that match the given prefix."""
 
     pattern = f"{redis_prefix}:*"
-    log.info("redis.cleanup.started | pattern=%s", pattern)
+    excluded = {key for key in (exclude_keys or [])}
+    log.info(
+        "redis.cleanup.started | pattern=%s exclude=%s",
+        pattern,
+        len(excluded) if excluded else 0,
+    )
 
     cursor: bytes | int | str = b"0"
     total_deleted = 0
@@ -862,14 +872,24 @@ async def cleanup_redis(conn: "redis.Redis", redis_prefix: str = "veo3:prod") ->
     while True:
         cursor, keys = await conn.scan(cursor=cursor, match=pattern, count=1000)
         if keys:
-            await conn.delete(*keys)
-            total_deleted += len(keys)
-            if total_deleted and total_deleted % 5000 == 0:
-                log.info("redis.cleanup.progress | deleted=%s", total_deleted)
+            filtered = [key for key in keys if key not in excluded]
+            skipped = len(keys) - len(filtered)
+            if filtered:
+                await conn.delete(*filtered)
+                total_deleted += len(filtered)
+                if total_deleted and total_deleted % 5000 == 0:
+                    log.info("redis.cleanup.progress | deleted=%s", total_deleted)
+            if skipped and skipped % 100 == 0:
+                log.info("redis.cleanup.skipped | skipped=%s", skipped)
         if cursor in (0, "0", b"0"):
             break
 
-    log.info("redis.cleanup.completed | pattern=%s deleted=%s", pattern, total_deleted)
+    log.info(
+        "redis.cleanup.completed | pattern=%s deleted=%s excluded=%s",
+        pattern,
+        total_deleted,
+        len(excluded) if excluded else 0,
+    )
     return total_deleted
 
 

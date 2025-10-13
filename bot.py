@@ -111,6 +111,7 @@ from kie_banana import (
 )
 
 import redis
+from redis.exceptions import WatchError
 import redis.asyncio as aioredis
 import billing
 
@@ -1254,6 +1255,9 @@ async def _safe_edit_message_text(
 # Redis
 REDIS_URL = SETTINGS_REDIS_URL
 REDIS_LOCK_ENABLED = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
+REDIS_LOCK_TTL_SEC = max(1, _env_int("REDIS_LOCK_TTL_SEC", 45))
+REDIS_LOCK_HEARTBEAT_SEC = max(1, _env_int("REDIS_LOCK_HEARTBEAT_SEC", 20))
+REDIS_LOCK_TAKEOVER_AFTER_SEC = max(1, _env_int("REDIS_LOCK_TAKEOVER_AFTER_SEC", 90))
 if REDIS_URL and not REDIS_URL.startswith("memory://"):
     redis_pool = redis.ConnectionPool.from_url(
         REDIS_URL,
@@ -16094,6 +16098,8 @@ async def admin_cleanup_redis_command(update: Update, ctx: ContextTypes.DEFAULT_
         await message.reply_text("⚠️ Redis недоступен или не сконфигурирован.")
         return
 
+    args = getattr(ctx, "args", []) or []
+    force = any(str(arg).lower() == "force" for arg in args)
     status_message = await message.reply_text("🧹 Начинаю очистку Redis...")
 
     pool: Optional[aioredis.ConnectionPool] = None
@@ -16108,13 +16114,105 @@ async def admin_cleanup_redis_command(update: Update, ctx: ContextTypes.DEFAULT_
             max_connections=10,
         )
         client = aioredis.Redis(connection_pool=pool)
-        deleted = await cleanup_redis(client, redis_prefix=REDIS_PREFIX)
+        lock_key = _rk("lock", "runner")
+        runner_lock_report: list[str] = []
+        runner_lock_deleted = False
+        lock_value: Dict[str, Any] = {}
+        lock_ttl_ms: Optional[int] = None
+        try:
+            raw_lock = await client.get(lock_key)
+            lock_value = json.loads(raw_lock) if raw_lock else {}
+        except Exception as exc:
+            runner_lock_report.append(f"• Ошибка чтения ключа: {exc}")
+            lock_value = {}
+        try:
+            lock_ttl_ms = await client.pttl(lock_key)
+        except Exception:
+            lock_ttl_ms = None
+
+        now = datetime.now(timezone.utc)
+        heartbeat_at = _parse_iso8601(lock_value.get("heartbeat_at"))
+        acquired_at = _parse_iso8601(lock_value.get("acquired_at"))
+        age_sec: Optional[float] = None
+        if heartbeat_at:
+            age_sec = max(0.0, (now - heartbeat_at).total_seconds())
+        elif acquired_at:
+            age_sec = max(0.0, (now - acquired_at).total_seconds())
+
+        stale_threshold = float(REDIS_LOCK_TAKEOVER_AFTER_SEC)
+        is_stale = age_sec is None or age_sec > stale_threshold
+        stale_for = (age_sec - stale_threshold) if age_sec is not None else None
+
+        ttl_text: str
+        if lock_ttl_ms is None or lock_ttl_ms < 0:
+            if lock_ttl_ms == -2 or not lock_value:
+                ttl_text = "нет"
+            else:
+                ttl_text = "∞"
+        else:
+            ttl_text = f"{lock_ttl_ms / 1000:.1f}с"
+
+        if lock_value:
+            runner_lock_report.append(
+                f"• host={lock_value.get('host')} pid={lock_value.get('pid')}"
+            )
+            runner_lock_report.append(
+                f"• acquired_at={lock_value.get('acquired_at')}"
+            )
+            runner_lock_report.append(
+                f"• heartbeat_at={lock_value.get('heartbeat_at')}"
+            )
+            if age_sec is not None:
+                runner_lock_report.append(f"• последняя активность {age_sec:.1f}с назад")
+            else:
+                runner_lock_report.append("• время последнего heartbeat неизвестно")
+            if stale_for is not None and stale_for > 0:
+                runner_lock_report.append(f"• протух на {stale_for:.1f}с")
+            elif not is_stale:
+                runner_lock_report.append("• свежий (не протух)")
+            runner_lock_report.append(f"• TTL={ttl_text}")
+            runner_lock_report.append(
+                "• JSON:\n```\n"
+                + json.dumps(lock_value, ensure_ascii=False, indent=2)
+                + "\n```"
+            )
+        else:
+            runner_lock_report.append("• Ключ отсутствует")
+
+        if force:
+            if is_stale and lock_value:
+                try:
+                    runner_lock_deleted = bool(await client.delete(lock_key))
+                except Exception as exc:
+                    runner_lock_report.append(f"• ⚠️ Не удалось удалить ключ: {exc}")
+                else:
+                    if runner_lock_deleted:
+                        runner_lock_report.append("• 🔨 Сломали протухший лок (force)")
+                    else:
+                        runner_lock_report.append("• ⚠️ Ключ не удалён (force)")
+            else:
+                runner_lock_report.append("• Force проигнорирован: лок не протух")
+
+        exclude_keys = None if runner_lock_deleted else {lock_key}
+        deleted = await cleanup_redis(
+            client,
+            redis_prefix=REDIS_PREFIX,
+            exclude_keys=exclude_keys,
+        )
         log.info(
-            "admin.cleanup_redis.completed | actor=%s deleted=%s", actor.id, deleted
+            "admin.cleanup_redis.completed | actor=%s deleted=%s lock_deleted=%s force=%s",
+            actor.id,
+            deleted,
+            runner_lock_deleted,
+            force,
         )
-        await status_message.edit_text(
-            f"✅ Очистка завершена.\nУдалено {deleted} ключей."
-        )
+
+        report_lines = ["🔒 Runner lock состояние:"] + runner_lock_report
+        report_lines.append("")
+        report_lines.append(f"🧹 Очистка завершена.\nУдалено {deleted} ключей.")
+        if force:
+            report_lines.append("Force: включён")
+        await status_message.edit_text("\n".join(report_lines))
     except Exception as exc:
         log.error("admin.cleanup_redis.failed | actor=%s err=%s", actor.id, exc, exc_info=True)
         await status_message.edit_text(f"❌ Ошибка очистки Redis: {exc}")
@@ -19635,24 +19733,37 @@ class RedisLockBusy(RuntimeError):
 runner_lock_state: Dict[str, Any] = {
     "enabled": bool(REDIS_URL) and REDIS_LOCK_ENABLED and redis_asyncio is not None,
     "owned": False,
+    "acquired_at": None,
     "heartbeat_at": None,
-    "started_at": None,
     "host": None,
     "pid": None,
+    "ttl_sec": REDIS_LOCK_TTL_SEC,
+    "heartbeat_interval_sec": REDIS_LOCK_HEARTBEAT_SEC,
+    "takeover_after_sec": REDIS_LOCK_TAKEOVER_AFTER_SEC,
 }
 
 
 class RedisRunnerLock:
-    LOCK_TTL_SECONDS = 60
-    HEARTBEAT_INTERVAL = 25
-    STALE_THRESHOLD_SECONDS = 90
-
     def __init__(self, redis_url: str, key: str, enabled: bool, version: str):
         self.redis_url = redis_url
         self.key = key
         self.version = version
         self.enabled = enabled and bool(redis_url) and redis_asyncio is not None
-        runner_lock_state["enabled"] = self.enabled
+
+        ttl_candidate = max(REDIS_LOCK_TTL_SEC, REDIS_LOCK_HEARTBEAT_SEC + 5)
+        self.ttl_sec = max(1, ttl_candidate)
+        self.heartbeat_interval = min(REDIS_LOCK_HEARTBEAT_SEC, max(1, self.ttl_sec - 5))
+        self.takeover_after_sec = REDIS_LOCK_TAKEOVER_AFTER_SEC
+        self._redis_ttl_ms = max(1000, int((self.ttl_sec + 15) * 1000))
+
+        runner_lock_state.update(
+            {
+                "enabled": self.enabled,
+                "ttl_sec": self.ttl_sec,
+                "heartbeat_interval_sec": self.heartbeat_interval,
+                "takeover_after_sec": self.takeover_after_sec,
+            }
+        )
 
         self._redis: Optional["redis_asyncio.Redis"] = None
         self._value: Dict[str, Any] = {}
@@ -19665,7 +19776,11 @@ class RedisRunnerLock:
 
     async def __aenter__(self) -> "RedisRunnerLock":
         if not self.enabled:
-            log.info("Redis runner lock disabled (enabled=%s, redis_asyncio=%s)", REDIS_LOCK_ENABLED, bool(redis_asyncio))
+            log.info(
+                "Redis runner lock disabled (enabled=%s, redis_asyncio=%s)",
+                REDIS_LOCK_ENABLED,
+                bool(redis_asyncio),
+            )
             return self
 
         assert redis_asyncio is not None  # for type checkers
@@ -19693,81 +19808,98 @@ class RedisRunnerLock:
             raise TypeError("callback must be callable")
         self._stop_callbacks.append(callback)
 
-    async def _acquire(self) -> None:
+    async def _acquire(self, *, reacquire: bool = False) -> None:
         if not self._redis:
             return
 
         backoff = 1.0
+        host = socket.gethostname()
+        pid = os.getpid()
         while True:
-            now_iso = _utcnow_iso()
-            host = socket.gethostname()
-            pid = os.getpid()
+            now = datetime.now(timezone.utc)
+            now_iso = now.isoformat()
+            acquired_at = self._value.get("acquired_at") if reacquire and self._value else now_iso
             self._value = {
                 "host": host,
                 "pid": pid,
-                "started_at": now_iso,
+                "acquired_at": acquired_at,
                 "heartbeat_at": now_iso,
                 "version": self.version,
+                "ttl_sec": self.ttl_sec,
             }
             payload = json.dumps(self._value, ensure_ascii=False)
 
             try:
-                acquired = await self._redis.set(self.key, payload, nx=True, px=self.LOCK_TTL_SECONDS * 1000)
+                acquired = await self._redis.set(self.key, payload, nx=True, px=self._redis_ttl_ms)
             except Exception as exc:
-                log.exception("Redis lock SET failed: %s", exc)
+                log.exception("runner_lock.acquire.set_failed | err=%s", exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
                 continue
 
             if acquired:
-                self._on_acquired(takeover=False)
+                reason = "reacquired" if reacquire else "fresh"
+                self._on_acquired(takeover=False, reason=reason, start_heartbeat=not self._heartbeat_task)
                 return
 
-            existing_raw = await self._redis.get(self.key)
-            existing = self._decode_existing(existing_raw)
-            if self._is_stale(existing):
-                event("LOCK_STALE_TAKEOVER", key=self.key, previous_host=existing.get("host"),
-                      previous_pid=existing.get("pid"), previous_heartbeat_at=existing.get("heartbeat_at"))
-                try:
-                    await self._redis.getdel(self.key)
-                except Exception as exc:
-                    log.warning("Redis lock GETDEL failed: %s", exc)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 5.0)
-                    continue
-
-                takeover = await self._redis.set(self.key, payload, nx=True, px=self.LOCK_TTL_SECONDS * 1000)
+            existing = await self._load_existing()
+            if self._is_stale(existing, now):
+                event(
+                    "LOCK_STALE_TAKEOVER",
+                    key=self.key,
+                    previous_host=existing.get("host"),
+                    previous_pid=existing.get("pid"),
+                    previous_heartbeat_at=existing.get("heartbeat_at"),
+                )
+                takeover = await self._attempt_takeover(payload, now)
                 if takeover:
-                    self._on_acquired(takeover=True)
+                    self._on_acquired(takeover=True, reason="took_over", start_heartbeat=not self._heartbeat_task)
                     return
-
+                log.info(
+                    "Redis runner lock takeover aborted | host=%s pid=%s", existing.get("host"), existing.get("pid")
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
                 continue
 
-            runner_lock_state.update({
-                "owned": False,
-                "heartbeat_at": existing.get("heartbeat_at"),
-                "started_at": existing.get("started_at"),
-                "host": existing.get("host"),
-                "pid": existing.get("pid"),
-            })
-            event("LOCK_BUSY", key=self.key, owner_host=existing.get("host"), owner_pid=existing.get("pid"),
-                  owner_heartbeat_at=existing.get("heartbeat_at"))
+            self._update_state_from_existing(existing)
+            event(
+                "LOCK_BUSY",
+                key=self.key,
+                owner_host=existing.get("host"),
+                owner_pid=existing.get("pid"),
+                owner_heartbeat_at=existing.get("heartbeat_at"),
+            )
             raise RedisLockBusy("redis runner lock busy")
 
-    def _on_acquired(self, takeover: bool) -> None:
+    def _on_acquired(self, *, takeover: bool, reason: str, start_heartbeat: bool) -> None:
         self._acquired = True
-        runner_lock_state.update({
-            "owned": True,
-            "heartbeat_at": self._value.get("heartbeat_at"),
-            "started_at": self._value.get("started_at"),
-            "host": self._value.get("host"),
-            "pid": self._value.get("pid"),
-        })
-        event("LOCK_ACQUIRED", key=self.key, host=self._value.get("host"), pid=self._value.get("pid"), takeover=takeover)
-        log.info("Redis runner lock acquired (takeover=%s)", takeover)
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        runner_lock_state.update(
+            {
+                "owned": True,
+                "acquired_at": self._value.get("acquired_at"),
+                "heartbeat_at": self._value.get("heartbeat_at"),
+                "host": self._value.get("host"),
+                "pid": self._value.get("pid"),
+            }
+        )
+        event(
+            "LOCK_ACQUIRED",
+            key=self.key,
+            host=self._value.get("host"),
+            pid=self._value.get("pid"),
+            takeover=takeover,
+            reason=reason,
+        )
+        log.info(
+            "Redis runner lock acquired | takeover=%s reason=%s host=%s pid=%s",
+            takeover,
+            reason,
+            self._value.get("host"),
+            self._value.get("pid"),
+        )
+        if start_heartbeat and not self._heartbeat_task:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def release(self) -> None:
         if self._released:
@@ -19782,84 +19914,158 @@ class RedisRunnerLock:
                 await self._heartbeat_task
 
         if not self.enabled or not self._redis:
-            runner_lock_state.update({
-                "owned": False,
-                "heartbeat_at": None,
-                "started_at": None,
-                "host": None,
-                "pid": None,
-            })
+            self._reset_state()
             return
 
+        current: Dict[str, Any] = {}
         try:
-            await self._redis.delete(self.key)
-            event("LOCK_RELEASED", key=self.key, host=self._value.get("host"), pid=self._value.get("pid"))
-            log.info("Redis runner lock released")
+            raw = await self._redis.get(self.key)
+            current = self._decode_existing(raw)
         except Exception as exc:
-            log.warning("Redis lock delete failed: %s", exc)
-        finally:
-            runner_lock_state.update({
-                "owned": False,
-                "heartbeat_at": None,
-                "started_at": None,
-                "host": None,
-                "pid": None,
-            })
-            await self._close_redis()
+            log.warning("runner_lock.release.read_failed | err=%s", exc)
+
+        owns_lock = self._is_owned_by_self(current)
+        if owns_lock:
+            try:
+                await self._redis.delete(self.key)
+                event(
+                    "LOCK_RELEASED",
+                    key=self.key,
+                    host=self._value.get("host"),
+                    pid=self._value.get("pid"),
+                )
+                log.info("Redis runner lock released")
+            except Exception as exc:
+                log.warning("Redis lock delete failed: %s", exc)
+        else:
+            log.info("Redis runner lock release skipped (owner changed)")
+
+        self._reset_state()
+        await self._close_redis()
 
     async def _heartbeat_loop(self) -> None:
         if not self._redis:
             return
         try:
             while not self._released:
-                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+                await asyncio.sleep(self.heartbeat_interval)
                 if self._released:
                     break
-                await self._heartbeat_once()
+                ok = await self._heartbeat_once()
+                if ok:
+                    continue
+                log.warning("runner_lock.heartbeat_lost | attempting reacquire")
+                try:
+                    await self._acquire(reacquire=True)
+                except RedisLockBusy:
+                    log.error("runner_lock.reacquire_conflict | shutdown requested")
+                    await self.release()
+                    self._notify_stop_callbacks(None)
+                    break
+                except Exception as exc:
+                    log.exception("runner_lock.reacquire_failed | err=%s", exc)
+                    await self.release()
+                    self._notify_stop_callbacks(None)
+                    break
         except asyncio.CancelledError:
             pass
 
-    async def _heartbeat_once(self) -> None:
+    async def _heartbeat_once(self) -> bool:
         if not self._redis or not self._acquired:
-            return
+            return False
         hb_iso = _utcnow_iso()
         self._value["heartbeat_at"] = hb_iso
         payload = json.dumps(self._value, ensure_ascii=False)
         try:
-            updated = await self._redis.set(self.key, payload, xx=True, px=self.LOCK_TTL_SECONDS * 1000)
+            updated = await self._redis.set(self.key, payload, xx=True, px=self._redis_ttl_ms)
         except Exception as exc:
             log.warning("Redis heartbeat failed: %s", exc)
-            return
+            return False
 
         if updated:
             runner_lock_state["heartbeat_at"] = hb_iso
-            event("LOCK_HEARTBEAT", key=self.key, heartbeat_at=hb_iso)
-        else:
-            log.warning("Redis heartbeat lost lock (key missing)")
+            event("LOCK_HEARTBEAT", key=self.key, heartbeat_at=hb_iso, ttl_sec=self.ttl_sec)
+            return True
 
-    def _decode_existing(self, raw: Optional[str]) -> Dict[str, Any]:
-        if not raw:
+        log.warning("Redis heartbeat lost lock (key missing)")
+        return False
+
+    async def _load_existing(self) -> Dict[str, Any]:
+        if not self._redis:
             return {}
         try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {}
+            raw = await self._redis.get(self.key)
+        except Exception as exc:
+            log.warning("runner_lock.existing_read_failed | err=%s", exc)
+            return {}
+        return self._decode_existing(raw)
 
-    def _is_stale(self, existing: Dict[str, Any]) -> bool:
+    async def _attempt_takeover(self, payload: str, now: datetime) -> bool:
+        if not self._redis:
+            return False
+        try:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(self.key)
+                        raw = await pipe.get(self.key)
+                        current = self._decode_existing(raw)
+                        if not self._is_stale(current, now):
+                            await pipe.unwatch()
+                            return False
+                        pipe.multi()
+                        pipe.delete(self.key)
+                        pipe.set(self.key, payload, nx=True, px=self._redis_ttl_ms)
+                        result = await pipe.execute()
+                        return bool(result and result[-1])
+                    except WatchError:
+                        continue
+        except Exception as exc:
+            log.warning("runner_lock.takeover_failed | err=%s", exc)
+        return False
+
+    def _is_stale(self, existing: Dict[str, Any], now: datetime) -> bool:
         if not existing:
             return True
-        hb = _parse_iso8601(existing.get("heartbeat_at")) or _parse_iso8601(existing.get("started_at"))
+        heartbeat = existing.get("heartbeat_at") or existing.get("acquired_at")
+        hb = _parse_iso8601(heartbeat)
         if not hb:
             return True
-        return (datetime.now(timezone.utc) - hb).total_seconds() > self.STALE_THRESHOLD_SECONDS
+        return (now - hb).total_seconds() > self.takeover_after_sec
+
+    def _update_state_from_existing(self, existing: Dict[str, Any]) -> None:
+        runner_lock_state.update(
+            {
+                "owned": False,
+                "acquired_at": existing.get("acquired_at"),
+                "heartbeat_at": existing.get("heartbeat_at"),
+                "host": existing.get("host"),
+                "pid": existing.get("pid"),
+            }
+        )
+
+    def _reset_state(self) -> None:
+        runner_lock_state.update(
+            {
+                "owned": False,
+                "acquired_at": None,
+                "heartbeat_at": None,
+                "host": None,
+                "pid": None,
+            }
+        )
+        self._acquired = False
+        self._value = {}
+
+    def _notify_stop_callbacks(self, sig: Optional[signal.Signals]) -> None:
+        for cb in list(self._stop_callbacks):
+            try:
+                cb(sig)
+            except Exception as exc:
+                log.warning("Runner lock stop callback failed: %s", exc)
 
     def _install_signal_handlers(self) -> None:
-        if not self.enabled:
-            return
-        if not self._loop:
+        if not self.enabled or not self._loop:
             return
         for sig_name in ("SIGTERM", "SIGINT"):
             if not hasattr(signal, sig_name):
@@ -19867,11 +20073,7 @@ class RedisRunnerLock:
             sig = getattr(signal, sig_name)
             try:
                 def _handler(s: signal.Signals = sig) -> None:
-                    for cb in list(self._stop_callbacks):
-                        try:
-                            cb(s)
-                        except Exception as exc:
-                            log.warning("Runner lock stop callback failed: %s", exc)
+                    self._notify_stop_callbacks(s)
                     asyncio.create_task(self._on_signal(s))
 
                 self._loop.add_signal_handler(sig, _handler)
@@ -19890,8 +20092,30 @@ class RedisRunnerLock:
         self._signal_handlers.clear()
 
     async def _on_signal(self, sig: signal.Signals) -> None:
-        log.info("Signal received: %s. Releasing Redis lock.", sig.name if hasattr(sig, "name") else str(sig))
+        log.info(
+            "Signal received: %s. Releasing Redis lock.",
+            sig.name if hasattr(sig, "name") else str(sig),
+        )
         await self.release()
+
+    def _is_owned_by_self(self, existing: Mapping[str, Any]) -> bool:
+        if not existing or not self._value:
+            return False
+        return (
+            existing.get("host") == self._value.get("host")
+            and existing.get("pid") == self._value.get("pid")
+        )
+
+    def _decode_existing(self, raw: Optional[str]) -> Dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
 
     async def _close_redis(self) -> None:
         if not self._redis:
