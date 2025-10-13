@@ -19,6 +19,8 @@ else:  # pragma: no cover - fallback alias to avoid runtime dependency
 
 import redis
 
+from db import postgres as db_postgres
+
 from settings import REDIS_PREFIX, REDIS_URL
 
 _logger = logging.getLogger("redis-utils")
@@ -910,6 +912,15 @@ def get_inviter(user_id: int) -> Optional[int]:
 def set_inviter(user_id: int, inviter_id: int) -> bool:
     if int(user_id) == int(inviter_id):
         return False
+    try:
+        db_postgres.set_referrer(int(user_id), int(inviter_id))
+    except Exception as exc:
+        _logger.warning(
+            "postgres.set_referrer_failed | user=%s inviter=%s err=%s",
+            user_id,
+            inviter_id,
+            exc,
+        )
     if _r:
         key = _ref_inviter_key(user_id)
         try:
@@ -945,10 +956,23 @@ def add_ref_user(inviter_id: int, user_id: int) -> bool:
         return len(users) != before
 
 
-def incr_ref_earned(inviter_id: int, amount: int) -> int:
+def incr_ref_earned(inviter_id: int, amount: int, *, referred_id: Optional[int] = None) -> int:
     amount = int(amount)
     if amount < 0:
         raise ValueError("amount must be non-negative")
+    try:
+        return db_postgres.increment_referral_earnings(
+            int(inviter_id),
+            amount,
+            referred_id=referred_id,
+        )
+    except Exception as exc:
+        _logger.warning(
+            "postgres.incr_referral_failed | inviter=%s referred=%s err=%s",
+            inviter_id,
+            referred_id,
+            exc,
+        )
     if _r:
         try:
             return int(_r.incrby(_ref_earned_key(inviter_id), amount))
@@ -962,6 +986,10 @@ def incr_ref_earned(inviter_id: int, amount: int) -> int:
 
 
 def get_ref_stats(inviter_id: int) -> Tuple[int, int]:
+    try:
+        return db_postgres.get_referral_stats(int(inviter_id))
+    except Exception as exc:
+        _logger.warning("postgres.get_ref_stats_failed | inviter=%s err=%s", inviter_id, exc)
     if _r:
         try:
             count = int(_r.scard(_ref_users_key(inviter_id)))
@@ -978,6 +1006,44 @@ def get_ref_stats(inviter_id: int) -> Tuple[int, int]:
         count = len(users) if users is not None else 0
         earned = _ref_earned_memory.get(int(inviter_id), 0)
         return count, int(earned)
+
+
+def restore_referrals_to_db() -> int:
+    records: list[tuple[int, int]] = []
+    if _r:
+        pattern = _REF_INVITER_KEY_TMPL.format("*")
+        try:
+            for key in _r.scan_iter(match=pattern):
+                try:
+                    user_part = str(key).rsplit(":", 1)[-1]
+                    user_id = int(user_part)
+                except (ValueError, TypeError):
+                    continue
+                try:
+                    inviter_raw = _r.get(key)
+                except Exception:
+                    continue
+                if inviter_raw is None:
+                    continue
+                try:
+                    inviter_id = int(inviter_raw)
+                except (TypeError, ValueError):
+                    continue
+                records.append((user_id, inviter_id))
+        except Exception as exc:
+            _logger.warning("redis.scan_referrals_failed | err=%s", exc)
+    else:
+        with _ref_lock:
+            records.extend((uid, inviter) for uid, inviter in _ref_inviter_memory.items())
+    if not records:
+        return 0
+    try:
+        restored = db_postgres.restore_referrals(records)
+        _logger.info("postgres.restore_referrals | restored=%s", restored)
+        return restored
+    except Exception as exc:
+        _logger.warning("postgres.restore_referrals_failed | err=%s", exc)
+        return 0
 
 
 async def add_user(redis_conn: Optional["redis.Redis"], user: "TelegramUser") -> bool:
@@ -1184,6 +1250,10 @@ def get_ledger_count(user_id: int) -> int:
 
 
 def ensure_user(user_id: int) -> None:
+    try:
+        db_postgres.ensure_user(int(user_id))
+    except Exception as exc:
+        _logger.warning("postgres.ensure_user_failed | user=%s err=%s", user_id, exc)
     if not _r:
         return
     p = _r.pipeline()

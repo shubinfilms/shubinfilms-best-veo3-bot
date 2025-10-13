@@ -336,6 +336,7 @@ from redis_utils import (
     add_ref_user,
     incr_ref_earned,
     get_ref_stats,
+    restore_referrals_to_db,
     set_last_mj_grid,
     get_last_mj_grid,
     clear_last_mj_grid,
@@ -376,6 +377,7 @@ from ledger import (
     BalanceRecalcResult,
     InsufficientBalance,
 )
+from db import postgres as db_postgres
 from settings import (
     BANANA_SEND_AS_DOCUMENT,
     CRYPTO_PAYMENT_URL,
@@ -1474,6 +1476,12 @@ LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
 DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
 if LEDGER_BACKEND != "memory" and not DATABASE_URL:
     raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
+if DATABASE_URL:
+    db_postgres.configure(DATABASE_URL)
+    try:
+        db_postgres.ensure_tables()
+    except Exception as exc:
+        log.warning("postgres.ensure_tables_failed | err=%s", exc)
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
@@ -2614,7 +2622,7 @@ def activate_fixed_promo(user_id: int, raw_code: str) -> Tuple[str, Optional[int
         return "invalid", None
 
     try:
-        ensure_user(user_id)
+        ledger_storage.ensure_user(user_id)
     except Exception as exc:
         log.exception("ensure_user failed before promo activation for %s: %s", user_id, exc)
         return "error", None
@@ -2663,9 +2671,16 @@ async def ensure_user_record(update: Optional[Update]) -> None:
     if update is None or update.effective_user is None:
         return
     try:
+        ledger_storage.ensure_user(
+            update.effective_user.id,
+            username=getattr(update.effective_user, "username", None),
+        )
+    except Exception as exc:
+        log.warning("ensure_user_db failed for %s: %s", update.effective_user.id, exc)
+    try:
         ensure_user(update.effective_user.id)
     except Exception as exc:
-        log.warning("ensure_user failed for %s: %s", update.effective_user.id, exc)
+        log.warning("ensure_user_redis failed for %s: %s", update.effective_user.id, exc)
     if redis_client is None:
         return
     try:
@@ -2861,6 +2876,9 @@ def _acquire_click_lock(user_id: Optional[int], action: str) -> bool:
 # Ledger storage (Postgres / memory)
 ledger_storage = LedgerStorage(DATABASE_URL, backend=LEDGER_BACKEND)
 register_balance_storage(ledger_storage)
+if LEDGER_BACKEND != "memory":
+    if not ledger_storage.ping():
+        raise RuntimeError("Failed to connect to PostgreSQL ledger backend")
 
 
 def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -10294,7 +10312,7 @@ async def _launch_suno_generation(
             return
 
     try:
-        ensure_user(user_id)
+        ledger_storage.ensure_user(user_id)
     except Exception as exc:
         log.exception("Suno ensure_user failed | user=%s err=%s", user_id, exc)
         await _suno_notify(
@@ -11995,7 +12013,7 @@ async def _start_sora2_generation(
 
     price, service_name = _sora2_price_and_service(mode)
     try:
-        ensure_user(user_id)
+        ledger_storage.ensure_user(user_id)
     except Exception as exc:
         log.exception("sora2.ensure_user_failed | user_id=%s err=%s", user_id, exc)
         await message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
@@ -15786,6 +15804,244 @@ async def suno_debug_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+def _admin_command_payload(message: Message, ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    args = getattr(ctx, "args", None)
+    if args:
+        return " ".join(str(arg) for arg in args)
+    text = message.text or message.caption or ""
+    return text.partition(" ")[2].strip()
+
+
+async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    payload = _admin_command_payload(message, ctx)
+    if not payload:
+        await message.reply_text("⚠️ Использование: /add_tokens <user_id> <amount> [примечание]")
+        return
+    parts = payload.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.reply_text("⚠️ Укажите пользователя и сумму.")
+        return
+    try:
+        target_id = int(parts[0])
+        delta = int(parts[1])
+    except ValueError:
+        await message.reply_text("⚠️ user_id и amount должны быть числами.")
+        return
+    note = parts[2].strip() if len(parts) > 2 else ""
+    if delta == 0:
+        await message.reply_text("⚠️ Сумма должна отличаться от нуля.")
+        return
+    op_id = f"admin:add:{uuid.uuid4().hex}"
+    meta = {"admin_id": actor.id, "note": note}
+    try:
+        ledger_storage.ensure_user(target_id)
+        if delta > 0:
+            result = ledger_storage.credit(target_id, delta, "admin_adjust", op_id, meta)
+        else:
+            try:
+                result = ledger_storage.debit(target_id, -delta, "admin_adjust", op_id, meta)
+            except InsufficientBalance as exc:
+                await message.reply_text(
+                    f"❌ Недостаточно токенов: доступно {exc.balance}, требуется {-delta}."
+                )
+                return
+    except Exception as exc:
+        log.exception("admin_add_tokens_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+        await message.reply_text("⚠️ Не удалось изменить баланс.")
+        return
+    try:
+        db_postgres.log_audit(target_id, "admin_add_tokens", delta, actor_id=actor.id, meta={"note": note})
+    except Exception as exc:
+        log.warning("audit_log_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+    await message.reply_text(
+        f"✅ Баланс пользователя {target_id}: {result.balance} (изменение {delta:+})."
+    )
+
+
+async def admin_set_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    payload = _admin_command_payload(message, ctx)
+    if not payload:
+        await message.reply_text("⚠️ Использование: /set_tokens <user_id> <amount> [примечание]")
+        return
+    parts = payload.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.reply_text("⚠️ Укажите пользователя и желаемый баланс.")
+        return
+    try:
+        target_id = int(parts[0])
+        desired = int(parts[1])
+    except ValueError:
+        await message.reply_text("⚠️ user_id и amount должны быть числами.")
+        return
+    if desired < 0:
+        await message.reply_text("⚠️ Баланс не может быть отрицательным.")
+        return
+    note = parts[2].strip() if len(parts) > 2 else ""
+    try:
+        ledger_storage.ensure_user(target_id)
+        current = ledger_storage.get_balance(target_id)
+    except Exception as exc:
+        log.exception("admin_set_tokens_fetch_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+        await message.reply_text("⚠️ Не удалось получить текущий баланс.")
+        return
+    delta = desired - current
+    if delta == 0:
+        await message.reply_text(f"ℹ️ Баланс пользователя {target_id} уже равен {desired}.")
+        return
+    op_id = f"admin:set:{uuid.uuid4().hex}"
+    meta = {"admin_id": actor.id, "note": note, "previous": current}
+    try:
+        if delta > 0:
+            result = ledger_storage.credit(target_id, delta, "admin_set", op_id, meta)
+        else:
+            try:
+                result = ledger_storage.debit(target_id, -delta, "admin_set", op_id, meta)
+            except InsufficientBalance as exc:
+                await message.reply_text(
+                    f"❌ Недостаточно токенов: доступно {exc.balance}, требуется {-delta}."
+                )
+                return
+    except Exception as exc:
+        log.exception("admin_set_tokens_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+        await message.reply_text("⚠️ Не удалось установить баланс.")
+        return
+    try:
+        db_postgres.log_audit(
+            target_id,
+            "admin_set_tokens",
+            desired,
+            actor_id=actor.id,
+            meta={"delta": delta, "note": note, "previous": current},
+        )
+    except Exception as exc:
+        log.warning("audit_log_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+    await message.reply_text(
+        f"✅ Баланс пользователя {target_id} обновлён: {result.balance} (изменение {delta:+})."
+    )
+
+
+async def admin_get_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    payload = _admin_command_payload(message, ctx)
+    if not payload:
+        await message.reply_text("⚠️ Использование: /get_balance <user_id>")
+        return
+    try:
+        target_id = int(payload.split()[0])
+    except ValueError:
+        await message.reply_text("⚠️ Укажите корректный user_id.")
+        return
+    try:
+        ledger_storage.ensure_user(target_id)
+        balance = ledger_storage.get_balance(target_id)
+    except Exception as exc:
+        log.exception("admin_get_balance_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+        await message.reply_text("⚠️ Не удалось получить баланс пользователя.")
+        return
+    try:
+        ref_count, ref_total = db_postgres.get_referral_stats(target_id)
+    except Exception as exc:
+        log.warning("admin_get_balance_ref_stats_failed | target=%s err=%s", target_id, exc)
+        ref_count, ref_total = 0, 0
+    await message.reply_text(
+        (
+            f"👤 Пользователь: {target_id}\n"
+            f"💎 Баланс: {balance}\n"
+            f"👥 Рефералов: {ref_count}\n"
+            f"💰 Доход с рефералов: {ref_total}"
+        )
+    )
+
+
+async def admin_list_referrals_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    payload = _admin_command_payload(message, ctx)
+    if not payload:
+        await message.reply_text("⚠️ Использование: /list_referrals <user_id>")
+        return
+    try:
+        target_id = int(payload.split()[0])
+    except ValueError:
+        await message.reply_text("⚠️ Укажите корректный user_id.")
+        return
+    try:
+        rows = db_postgres.list_referrals(target_id)
+    except Exception as exc:
+        log.exception("admin_list_referrals_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+        await message.reply_text("⚠️ Не удалось получить список рефералов.")
+        return
+    if not rows:
+        await message.reply_text(f"ℹ️ У пользователя {target_id} нет рефералов.")
+        return
+    lines: list[str] = []
+    for row in rows[:100]:
+        referred_id = row.get("user_id")
+        username = row.get("username") or "—"
+        earned = int(row.get("earned_tokens") or 0)
+        created = row.get("created_at")
+        if hasattr(created, "strftime"):
+            created_text = created.strftime("%Y-%m-%d")
+        else:
+            created_text = str(created) if created else "—"
+        lines.append(
+            f"• {username} (id {referred_id}) — {earned}💎, с {created_text}"
+        )
+    await message.reply_text(
+        "👥 Рефералы пользователя {0}:\n{1}".format(target_id, "\n".join(lines))
+    )
+
+
+async def admin_restore_referrals_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    try:
+        restored = restore_referrals_to_db()
+    except Exception as exc:
+        log.exception("admin_restore_referrals_failed | actor=%s err=%s", actor.id, exc)
+        await message.reply_text("⚠️ Не удалось восстановить связи.")
+        return
+    if restored == 0:
+        await message.reply_text("ℹ️ Новых связей не найдено.")
+    else:
+        await message.reply_text(f"✅ Восстановлено реферальных связей: {restored}.")
+
+
 async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -16790,7 +17046,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     mj_locale = "en"
             s["mj_locale"] = mj_locale
             try:
-                ensure_user(uid)
+                ledger_storage.ensure_user(uid)
             except Exception as exc:
                 log.exception("MJ ensure_user failed for %s: %s", uid, exc)
                 await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
@@ -16972,7 +17228,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
                 return
             try:
-                ensure_user(uid)
+                ledger_storage.ensure_user(uid)
             except Exception as exc:
                 log.exception("Banana ensure_user failed for %s: %s", uid, exc)
                 await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
@@ -17584,7 +17840,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if s.get("model") == "veo3":
                 s["model"] = "veo3_fast"
         try:
-            ensure_user(uid)
+            ledger_storage.ensure_user(uid)
         except Exception as exc:
             log.exception("VEO ensure_user failed for %s: %s", uid, exc)
             await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
@@ -18562,7 +18818,7 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
 
     user_id = user.id
     try:
-        ensure_user(user_id)
+        ledger_storage.ensure_user(user_id)
     except Exception as exc:
         log.warning("ensure_user failed during payment for %s: %s", user_id, exc)
 
@@ -18724,7 +18980,7 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
                 )
             if bonus_awarded:
                 try:
-                    total_ref_earned = incr_ref_earned(inviter_id, bonus)
+                    total_ref_earned = incr_ref_earned(inviter_id, bonus, referred_id=user_id)
                 except Exception as exc:
                     log.warning(
                         "referral_earned_increment_failed | inviter=%s err=%s",
@@ -19141,6 +19397,11 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("whoami",), whoami_command),
     (("suno_debug",), suno_debug_command),
     (("broadcast",), broadcast_command),
+    (("add_tokens",), admin_add_tokens_command),
+    (("set_tokens",), admin_set_tokens_command),
+    (("get_balance",), admin_get_balance_command),
+    (("list_referrals",), admin_list_referrals_command),
+    (("restore_referrals",), admin_restore_referrals_command),
     (("my_balance",), my_balance_command),
     (("add_balance",), add_balance_command),
     (("sub_balance",), sub_balance_command),
