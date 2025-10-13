@@ -1481,11 +1481,13 @@ DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
 if LEDGER_BACKEND != "memory" and not DATABASE_URL:
     raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
 if DATABASE_URL:
-    db_postgres.configure(DATABASE_URL)
     try:
+        db_postgres.configure(DATABASE_URL)
         db_postgres.ensure_tables()
+        log.info("postgres.initialized")
     except Exception as exc:
-        log.warning("postgres.ensure_tables_failed | err=%s", exc)
+        log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+        raise
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
@@ -15816,6 +15818,65 @@ def _admin_command_payload(message: Message, ctx: ContextTypes.DEFAULT_TYPE) -> 
     return text.partition(" ")[2].strip()
 
 
+async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    try:
+        stats = await asyncio.to_thread(db_postgres.check_health)
+    except Exception as exc:
+        log.exception("admin.check_db.failed | actor=%s err=%s", actor.id, exc)
+        await message.reply_text(f"❌ Ошибка подключения к PostgreSQL: {exc}")
+        return
+    lines = ["✅ PostgreSQL OK"]
+    lines.append(f"Users: {stats.get('users', 0)}")
+    lines.append(f"Balances: {stats.get('balances', 0)}")
+    lines.append(f"Referrals: {stats.get('referrals', 0)}")
+    lines.append(f"Transactions: {stats.get('transactions', 0)}")
+    lines.append(f"Audit log: {stats.get('audit_log', 0)}")
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_backup_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    status = await message.reply_text("⏳ Собираю резервную копию балансов…")
+    try:
+        snapshot = await asyncio.to_thread(db_postgres.export_balances_snapshot)
+    except Exception as exc:
+        log.exception("admin.backup_db.failed | actor=%s err=%s", actor.id, exc)
+        try:
+            await status.edit_text("❌ Не удалось создать резервную копию. Подробности в логах.")
+        except Exception:
+            await message.reply_text("❌ Не удалось создать резервную копию. Подробности в логах.")
+        return
+    payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
+    buffer = io.BytesIO(payload.encode("utf-8"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    buffer.name = f"balances_backup_{timestamp}.json"
+    caption = f"✅ Выгружено записей: {snapshot.get('count', 0)}"
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    try:
+        await message.reply_document(InputFile(buffer), caption=caption)
+    except Exception as exc:
+        log.exception("admin.backup_db.upload_failed | actor=%s err=%s", actor.id, exc)
+        await message.reply_text("⚠️ Не удалось отправить файл резервной копии.")
+
+
 async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -15846,6 +15907,15 @@ async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
     op_id = f"admin:add:{uuid.uuid4().hex}"
     meta = {"admin_id": actor.id, "note": note}
     try:
+        await asyncio.to_thread(db_postgres.ensure_user, target_id)
+    except Exception as exc:
+        log.warning(
+            "admin_add_tokens.ensure_user_failed | actor=%s target=%s err=%s",
+            actor.id,
+            target_id,
+            exc,
+        )
+    try:
         ledger_storage.ensure_user(target_id)
         if delta > 0:
             result = ledger_storage.credit(target_id, delta, "admin_adjust", op_id, meta)
@@ -15861,13 +15931,37 @@ async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
         log.exception("admin_add_tokens_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
         await message.reply_text("⚠️ Не удалось изменить баланс.")
         return
+    audit_meta = {"note": note, "op_id": op_id}
     try:
-        db_postgres.log_audit(target_id, "admin_add_tokens", delta, actor_id=actor.id, meta={"note": note})
+        await asyncio.to_thread(
+            db_postgres.log_audit,
+            target_id,
+            "admin_add_tokens",
+            delta,
+            actor_id=actor.id,
+            meta=audit_meta,
+        )
     except Exception as exc:
         log.warning("audit_log_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
-    await message.reply_text(
-        f"✅ Баланс пользователя {target_id}: {result.balance} (изменение {delta:+})."
+    try:
+        await asyncio.to_thread(
+            db_postgres.log_transaction,
+            target_id,
+            "credit" if delta > 0 else "debit",
+            abs(delta),
+            balance_after=result.balance,
+            reason="admin_adjust",
+            actor_id=actor.id,
+            meta=audit_meta,
+        )
+    except Exception as exc:
+        log.warning("transaction_log_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+    header = (
+        f"✅ Added {delta}💎 to user {target_id}."
+        if delta > 0
+        else f"✅ Deducted {abs(delta)}💎 from user {target_id}."
     )
+    await message.reply_text(f"{header}\nНовый баланс: {result.balance}💎.")
 
 
 async def admin_set_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -16075,6 +16169,18 @@ async def migrate_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             preview = stats.errors[:5]
             if preview:
                 lines.append("⚠️ Примеры пропусков:\n" + "\n".join(f"• {entry}" for entry in preview))
+        try:
+            health = await asyncio.to_thread(db_postgres.check_health)
+        except Exception as exc:
+            log.warning("admin.migrate_redis.health_failed | actor=%s err=%s", actor.id, exc)
+        else:
+            lines.append(
+                "📊 PostgreSQL totals: users {users}, balances {balances}, referrals {referrals}".format(
+                    users=health.get("users", 0),
+                    balances=health.get("balances", 0),
+                    referrals=health.get("referrals", 0),
+                )
+            )
         summary = "\n".join(lines)
         try:
             await status.edit_text(summary)
@@ -19445,6 +19551,8 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("whoami",), whoami_command),
     (("suno_debug",), suno_debug_command),
     (("broadcast",), broadcast_command),
+    (("check_db",), admin_check_db_command),
+    (("backup_db",), admin_backup_db_command),
     (("add_tokens",), admin_add_tokens_command),
     (("set_tokens",), admin_set_tokens_command),
     (("get_balance",), admin_get_balance_command),
