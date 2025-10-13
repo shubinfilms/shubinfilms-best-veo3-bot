@@ -23,7 +23,7 @@ log_environment(logging.getLogger("bot"))
 # Configure Telegram log forwarding as early as possible.
 import logger_to_telegram  # noqa: F401,E402
 
-import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata
+import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata, traceback
 import threading
 import atexit
 from pathlib import Path
@@ -1254,6 +1254,7 @@ if REDIS_URL and not REDIS_URL.startswith("memory://"):
     redis_pool = redis.ConnectionPool.from_url(
         REDIS_URL,
         decode_responses=True,
+        encoding="utf-8",
         socket_connect_timeout=5,
         socket_timeout=10,
         max_connections=10,
@@ -16047,7 +16048,8 @@ async def admin_cleanup_redis_command(update: Update, ctx: ContextTypes.DEFAULT_
     try:
         pool = aioredis.ConnectionPool.from_url(
             REDIS_URL,
-            decode_responses=False,
+            decode_responses=True,
+            encoding="utf-8",
             socket_connect_timeout=5,
             socket_timeout=10,
             max_connections=10,
@@ -16462,31 +16464,54 @@ async def migrate_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             stats = await run_redis_migration(progress_callback=_progress_callback)
         except Exception as exc:
             log.error("admin.migrate_redis.failed | actor=%s err=%s", actor.id, exc, exc_info=True)
+            traceback_text = traceback.format_exc()
             try:
                 await status.edit_text(f"❌ Миграция завершилась ошибкой: {exc}")
             except Exception:
                 pass
-            await message.reply_text(f"❌ Ошибка миграции: {exc}")
+            error_report = f"❌ Ошибка миграции: {exc}\n\n{traceback_text}"
+            await message.reply_text(error_report)
             return
         last_progress = None
-        lines = stats.as_lines()
+        summary_lines = [
+            "✅ Redis migration completed",
+            f"Migrated users: {stats.users_imported}",
+            f"Skipped invalid entries: {stats.skipped_entries}",
+        ]
+        remaining_keys = stats.remaining_redis_keys
+        if remaining_keys is None:
+            summary_lines.append("Remaining Redis keys: unknown")
+        else:
+            summary_lines.append(f"Remaining Redis keys: {remaining_keys}")
+        summary_lines.append("")
+        summary_lines.append(f"Balances imported: {stats.balances_imported}")
+        summary_lines.append(f"Referrals imported: {stats.referrals_imported}")
+        summary_lines.append(
+            f"Redis profiles processed: {stats.redis_profiles_processed}"
+        )
+        summary_lines.append(
+            f"Redis profiles skipped: {stats.redis_profiles_skipped}"
+        )
         if stats.errors:
             preview = stats.errors[:5]
             if preview:
-                lines.append("⚠️ Примеры пропусков:\n" + "\n".join(f"• {entry}" for entry in preview))
+                summary_lines.append("")
+                summary_lines.append("⚠️ Примеры пропусков:")
+                summary_lines.extend(f"• {entry}" for entry in preview)
         try:
             health = await asyncio.to_thread(db_postgres.check_health)
         except Exception as exc:
             log.warning("admin.migrate_redis.health_failed | actor=%s err=%s", actor.id, exc)
         else:
-            lines.append(
+            summary_lines.append("")
+            summary_lines.append(
                 "📊 PostgreSQL totals: users {users}, balances {balances}, referrals {referrals}".format(
                     users=health.get("users", 0),
                     balances=health.get("balances", 0),
                     referrals=health.get("referrals", 0),
                 )
             )
-        summary = "\n".join(lines)
+        summary = "\n".join(summary_lines)
         try:
             await status.edit_text(summary)
         except Exception:

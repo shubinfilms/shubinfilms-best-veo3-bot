@@ -282,7 +282,7 @@ def root() -> dict[str, bool]:
 def healthz() -> JSONResponse:
     if not REDIS_URL.startswith("memory://"):
         try:
-            redis.from_url(REDIS_URL)
+            redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
         except Exception as exc:  # pragma: no cover - configuration issues
             log.error("health.redis.invalid", extra={"error": str(exc)})
             raise HTTPException(status_code=503, detail="invalid redis configuration") from exc

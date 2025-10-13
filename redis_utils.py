@@ -30,7 +30,15 @@ _use_memory_only = bool(_redis_url and _redis_url.startswith("memory://"))
 if _use_memory_only:
     _r = None
 else:
-    _r = redis.from_url(_redis_url) if _redis_url else None
+    _r = (
+        redis.from_url(
+            _redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+        if _redis_url
+        else None
+    )
 rds = _r
 _PFX = REDIS_PREFIX
 _TTL = 24 * 60 * 60

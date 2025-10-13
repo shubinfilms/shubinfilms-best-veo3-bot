@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, cast
 
 import redis.asyncio as redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
@@ -45,6 +46,9 @@ class MigrationStats:
     referrals_imported: int = 0
     skipped_entries: int = 0
     errors: List[str] = field(default_factory=list)
+    redis_profiles_processed: int = 0
+    redis_profiles_skipped: int = 0
+    remaining_redis_keys: Optional[int] = None
 
     def as_lines(self) -> List[str]:
         lines = [
@@ -56,6 +60,16 @@ class MigrationStats:
             lines.append(f"⚠️ Skipped: {self.skipped_entries} invalid entries")
         else:
             lines.append("⚠️ Skipped: 0 invalid entries")
+        lines.append(
+            f"📦 Redis profiles processed: {self.redis_profiles_processed}"
+        )
+        lines.append(
+            f"🚫 Redis profiles skipped: {self.redis_profiles_skipped}"
+        )
+        if self.remaining_redis_keys is not None:
+            lines.append(
+                f"🗂️ Remaining Redis keys: {self.remaining_redis_keys}"
+            )
         return lines
 
     def snapshot(self) -> "MigrationStats":
@@ -65,6 +79,9 @@ class MigrationStats:
             referrals_imported=self.referrals_imported,
             skipped_entries=self.skipped_entries,
             errors=list(self.errors),
+            redis_profiles_processed=self.redis_profiles_processed,
+            redis_profiles_skipped=self.redis_profiles_skipped,
+            remaining_redis_keys=self.remaining_redis_keys,
         )
 
 
@@ -214,15 +231,44 @@ async def _execute_with_retry(engine: Engine, stmt: Any, rows: Sequence[Dict[str
 
 
 async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
-    cursor: int = 0
+    cursor: int | str = 0
     while True:
-        cursor, keys = await conn.scan(cursor=cursor, match=pattern, count=500)
+        try:
+            cursor, keys = await conn.scan(cursor=cursor, match=pattern, count=500)
+        except Exception as exc:
+            log.warning(
+                "redis-migration.scan_failed | pattern=%s cursor=%s err=%s",
+                pattern,
+                cursor,
+                exc,
+            )
+            break
         for key in keys:
             decoded = _decode(key)
             if decoded:
                 yield decoded
-        if cursor == 0:
+        if cursor in (0, "0", b"0"):
             break
+
+
+async def _count_keys(conn: redis.Redis, pattern: str) -> Optional[int]:
+    cursor: int | str = 0
+    total = 0
+    while True:
+        try:
+            cursor, keys = await conn.scan(cursor=cursor, match=pattern, count=1000)
+        except Exception as exc:
+            log.warning(
+                "redis-migration.count_failed | pattern=%s cursor=%s err=%s",
+                pattern,
+                cursor,
+                exc,
+            )
+            return None
+        total += len(keys)
+        if cursor in (0, "0", b"0"):
+            break
+    return total
 
 
 async def _execute_users(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
@@ -444,7 +490,44 @@ async def migrate_from_redis(
         raise RuntimeError("Failed to prepare PostgreSQL tables") from exc
 
     engine = cast(Engine, ENGINE) if ENGINE is not None else db_postgres.get_engine()
-    conn = redis.from_url(redis_url, encoding=None, decode_responses=False)
+
+    conn: Optional[redis.Redis] = None
+    retry_count = 3
+    for attempt in range(1, retry_count + 1):
+        candidate = redis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+        try:
+            await candidate.ping()
+        except RedisConnectionError as exc:
+            log.warning(
+                "redis-migration.connect.retry | attempt=%s err=%s",
+                attempt,
+                exc,
+            )
+            await candidate.close()
+            if attempt >= retry_count:
+                raise
+            await asyncio.sleep(2)
+            continue
+        except Exception as exc:
+            log.warning(
+                "redis-migration.connect.error | attempt=%s err=%s",
+                attempt,
+                exc,
+            )
+            await candidate.close()
+            if attempt >= retry_count:
+                raise
+            await asyncio.sleep(2)
+            continue
+        conn = candidate
+        break
+
+    if conn is None:
+        raise RuntimeError("Failed to establish Redis connection")
 
     try:
         log.info("redis-migration.start | prefix=%s", redis_prefix)
@@ -452,6 +535,8 @@ async def migrate_from_redis(
         user_records: Dict[int, Dict[str, Any]] = {}
         user_sources: Dict[int, set[str]] = {}
         balance_rows: Dict[int, int] = {}
+        stats.redis_profiles_processed = 0
+        stats.redis_profiles_skipped = 0
 
         def _ensure_user_record(user_id: int, *, source: Optional[str] = None) -> Dict[str, Any]:
             record = user_records.setdefault(
@@ -474,37 +559,51 @@ async def migrate_from_redis(
             user_id = _parse_int(user_part)
             if not user_id or user_id <= 0:
                 skipped.append(f"invalid user key: {key}")
+                stats.redis_profiles_skipped += 1
                 continue
             try:
                 profile = await conn.hgetall(key)
             except Exception as exc:  # pragma: no cover - network failure path
                 log.warning("redis-migration.hgetall_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
+                stats.redis_profiles_skipped += 1
                 continue
             record = _ensure_user_record(user_id, source=key)
             if isinstance(profile, dict):
-                username_raw = safe_decode(profile.get(b"username"))
+                username_raw = safe_decode(
+                    profile.get("username") or profile.get(b"username")
+                )
                 username = _sanitize_text(username_raw)
                 if username:
                     record["username"] = username
 
-                referrer_raw = safe_decode(profile.get(b"referrer_id"))
+                referrer_raw = safe_decode(
+                    profile.get("referrer_id") or profile.get(b"referrer_id")
+                )
                 referrer_id = _normalize_referrer(referrer_raw)
                 if referrer_id:
                     record["referrer_id"] = referrer_id
 
-                joined_raw = safe_decode(profile.get(b"joined_at"))
+                joined_raw = safe_decode(
+                    profile.get("joined_at") or profile.get(b"joined_at")
+                )
                 joined_at = _parse_datetime(joined_raw)
                 if joined_at:
                     record["joined_at"] = joined_at
 
-                referral_total_raw = safe_decode(profile.get(b"referral_earned_total"))
+                referral_total_raw = safe_decode(
+                    profile.get("referral_earned_total")
+                    or profile.get(b"referral_earned_total")
+                )
                 referral_total = _parse_int(referral_total_raw)
                 if referral_total is not None and referral_total >= 0:
                     current_total = record.get("referral_earned_total")
                     current_total_int = int(current_total) if isinstance(current_total, int) else _parse_int(current_total)
                     if current_total_int is None or referral_total > current_total_int:
                         record["referral_earned_total"] = referral_total
+            else:
+                skipped.append(f"invalid user payload: {key}")
+                stats.redis_profiles_skipped += 1
 
         # Load balances with both legacy and documented prefixes
         balance_patterns = [
@@ -567,6 +666,7 @@ async def migrate_from_redis(
                 key_info = ", ".join(source_keys) if source_keys else f"user:{user_id}"
                 log.warning("redis-migration.users.skip | reason=missing_identity key=%s", key_info)
                 skipped.append(f"malformed user record: {key_info}")
+                stats.redis_profiles_skipped += 1
                 continue
             row = dict(record)
             row["username"] = username_candidate
@@ -575,6 +675,7 @@ async def migrate_from_redis(
             if source_keys:
                 row["_source"] = ", ".join(source_keys)
             user_batches.append(row)
+            stats.redis_profiles_processed += 1
         balance_batch = [
             {"user_id": user_id, "tokens": tokens}
             for user_id, tokens in balance_rows.items()
@@ -681,8 +782,16 @@ async def migrate_from_redis(
             referral_batch, _execute_referrals, "referrals", skipped_log=skipped
         )
 
+        remaining_pattern = f"{redis_prefix}:*"
+        stats.remaining_redis_keys = await _count_keys(conn, remaining_pattern)
+        if stats.remaining_redis_keys is None:
+            log.warning(
+                "redis-migration.remaining_keys_failed | pattern=%s",
+                remaining_pattern,
+            )
+
         stats.skipped_entries = len(skipped)
-        stats.errors = skipped
+        stats.errors = list(skipped)
         log.info(
             "Migration complete: %s/%s users imported successfully.",
             stats.users_imported,
