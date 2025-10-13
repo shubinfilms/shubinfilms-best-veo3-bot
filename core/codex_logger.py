@@ -6,10 +6,12 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import ssl
 import threading
 import time
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
 
@@ -32,6 +34,9 @@ class AsyncCodexHandler(logging.Handler):
         self.batch_size = max(1, int(os.getenv("CODEX_LOG_BATCH_SIZE", "20")))
         self.flush_sec = max(0.5, float(os.getenv("CODEX_LOG_FLUSH_SEC", "2")))
         self.max_queue = max(1, int(os.getenv("CODEX_LOG_MAX_QUEUE", "1000")))
+        self.timeout_sec = max(0.1, float(os.getenv("CODEX_LOG_TIMEOUT_SEC", "5")))
+        self.max_retry = max(1, int(os.getenv("CODEX_LOG_MAX_RETRY", "3")))
+        self.silent_mode = os.getenv("CODEX_LOG_SILENT_MODE", "false").lower() == "true"
 
         self.queue: Optional[asyncio.Queue[Dict[str, Any]]] = None
         self.session: Optional[aiohttp.ClientSession] = None
@@ -41,12 +46,21 @@ class AsyncCodexHandler(logging.Handler):
         self._queue_ready = threading.Event()
         self._closing = False
         self._failure_streak = 0
-        self._last_fallback_ts = 0.0
+        self._backoff_until = 0.0
+        self.last_warning_ts = 0.0
+        self._offline_notified = False
+        self._disable_logged = False
         self._telegram_chat_id = os.getenv("TG_LOG_CHAT_ID")
         self._telegram_token = os.getenv("TELEGRAM_TOKEN")
 
+        if not self.enabled:
+            self._notify_offline_mode()
+            return
+
         if self.enabled and self.endpoint and self.api_key:
             self._start_worker()
+        else:
+            self._notify_offline_mode()
 
     # ------------------------------------------------------------------
     # Worker lifecycle
@@ -68,6 +82,64 @@ class AsyncCodexHandler(logging.Handler):
         except Exception as exc:  # pragma: no cover - defensive logging
             logging.getLogger("codex").warning("worker loop crashed: %s", exc)
 
+    def _notify_offline_mode(self) -> None:
+        if self._offline_notified:
+            return
+        logging.getLogger("codex").info("Codex logging temporarily disabled (offline mode).")
+        self._offline_notified = True
+
+    def _log_warning(self, message: str, *args: Any) -> None:
+        if self.silent_mode:
+            return
+        logging.getLogger("codex").warning(message, *args)
+
+    def _schedule_on_loop(self, factory: Callable[[], Awaitable[Any]]) -> None:
+        if not self._loop:
+            return
+
+        def _runner() -> None:
+            try:
+                asyncio.create_task(factory())
+            except RuntimeError:
+                pass
+
+        try:
+            self._loop.call_soon_threadsafe(_runner)
+        except RuntimeError:
+            pass
+
+    async def _wait_for_backoff(self) -> None:
+        if self._backoff_until <= 0:
+            return
+        delay = self._backoff_until - time.monotonic()
+        if delay > 0:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    def _disable_logging(self) -> None:
+        if not self.enabled:
+            self._notify_offline_mode()
+            return
+
+        if not self._disable_logged and not self.silent_mode:
+            logging.getLogger("codex").warning(
+                "⚠️ Codex logger disabled after repeated connection failures."
+            )
+            self._disable_logged = True
+
+        self.enabled = False
+        self._notify_offline_mode()
+        self._backoff_until = 0.0
+        self._failure_streak = self.max_retry
+
+        if self.queue is not None:
+            self._schedule_on_loop(self._shutdown_async)
+
+
     async def _worker_main(self) -> None:
         self._loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=self.max_queue)
@@ -86,7 +158,7 @@ class AsyncCodexHandler(logging.Handler):
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
             self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
 
@@ -221,25 +293,39 @@ class AsyncCodexHandler(logging.Handler):
     async def _flush_pending(self, pending: List[Dict[str, Any]]) -> None:
         if not pending or self.queue is None:
             return
+
         batch = list(pending)
+        pending.clear()
+
+        await self._wait_for_backoff()
+
+        if not self.enabled:
+            for _ in batch:
+                self.queue.task_done()
+            return
+
         success = await self._send_batch(batch)
-        if not success:
+        if not success and self.enabled:
             for item in batch:
                 try:
                     self.queue.put_nowait(item)
                 except asyncio.QueueFull:
                     break
+
         for _ in batch:
             self.queue.task_done()
-        pending.clear()
 
     async def _send_batch(self, batch: List[Dict[str, Any]]) -> bool:
         if not batch or not self.endpoint or not self.api_key:
             return True
+
         try:
             session = await self._ensure_session()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # pragma: no cover - defensive
-            logging.getLogger("codex").warning("session init failed: %s", exc)
+            self._log_warning("session init failed: %s", exc)
+            await self._handle_flush_failure(batch, str(exc))
             return False
 
         headers = {
@@ -251,26 +337,47 @@ class AsyncCodexHandler(logging.Handler):
         try:
             async with session.post(self.endpoint, data=payload, headers=headers) as resp:
                 if resp.status >= 400:
-                    raise RuntimeError(f"Codex returned {resp.status}")
+                    body = await resp.text()
+                    raise RuntimeError(f"Codex returned {resp.status}: {body[:200]}")
+        except asyncio.CancelledError:
+            raise
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            socket.gaierror,
+            ssl.SSLError,
+            OSError,
+        ) as exc:
+            self._log_warning("flush error: %s", exc)
+            await self._handle_flush_failure(batch, str(exc))
+            return False
         except Exception as exc:
-            logging.getLogger("codex").warning("flush error: %s", exc)
+            self._log_warning("unexpected flush error: %s", exc)
             await self._handle_flush_failure(batch, str(exc))
             return False
 
         self._failure_streak = 0
+        self._backoff_until = 0.0
         return True
 
     async def _handle_flush_failure(self, batch: List[Dict[str, Any]], reason: str) -> None:
         self._failure_streak += 1
+
+        delay = min(8.0, 2 ** max(0, self._failure_streak - 1))
+        self._backoff_until = max(self._backoff_until, time.monotonic() + delay)
+
+        if self._failure_streak >= self.max_retry:
+            self._disable_logging()
+
         if (
-            self._failure_streak <= 3
+            self.silent_mode
             or not self._telegram_chat_id
             or not self._telegram_token
         ):
             return
 
         now = time.time()
-        if now - self._last_fallback_ts < 60:
+        if now - self.last_warning_ts < 60:
             return
 
         try:
@@ -302,7 +409,7 @@ class AsyncCodexHandler(logging.Handler):
         try:
             async with session.post(url, json=payload) as resp:
                 if resp.status < 400:
-                    self._last_fallback_ts = now
+                    self.last_warning_ts = now
         except Exception:  # pragma: no cover - best effort fallback
             return
 

@@ -27,6 +27,21 @@ from core.codex_logger import attach_codex_handler
 
 attach_codex_handler()
 
+_codex_enabled = os.getenv("CODEX_LOG_ENABLED", "false").lower() == "true"
+_codex_endpoint = "set" if os.getenv("CODEX_LOG_ENDPOINT") else "missing"
+_codex_timeout = os.getenv("CODEX_LOG_TIMEOUT_SEC", "5")
+_codex_max_retry = os.getenv("CODEX_LOG_MAX_RETRY", "3")
+_codex_silent = os.getenv("CODEX_LOG_SILENT_MODE", "false").lower()
+
+logging.getLogger("bot").info(
+    "Codex logging: %s (endpoint=%s, timeout=%ss, max_retry=%s, silent_mode=%s)",
+    "enabled" if _codex_enabled else "disabled",
+    _codex_endpoint,
+    _codex_timeout,
+    _codex_max_retry,
+    _codex_silent,
+)
+
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata, traceback
 import threading
 import atexit
