@@ -659,6 +659,29 @@ async def migrate_from_redis(
     return stats
 
 
+async def cleanup_redis(conn: "redis.Redis", redis_prefix: str = "veo3:prod") -> int:
+    """Remove legacy Redis keys that match the given prefix."""
+
+    pattern = f"{redis_prefix}:*"
+    log.info("redis.cleanup.started | pattern=%s", pattern)
+
+    cursor: bytes | int | str = b"0"
+    total_deleted = 0
+
+    while True:
+        cursor, keys = await conn.scan(cursor=cursor, match=pattern, count=1000)
+        if keys:
+            await conn.delete(*keys)
+            total_deleted += len(keys)
+            if total_deleted and total_deleted % 5000 == 0:
+                log.info("redis.cleanup.progress | deleted=%s", total_deleted)
+        if cursor in (0, "0", b"0"):
+            break
+
+    log.info("redis.cleanup.completed | pattern=%s deleted=%s", pattern, total_deleted)
+    return total_deleted
+
+
 def _configure_logging() -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
