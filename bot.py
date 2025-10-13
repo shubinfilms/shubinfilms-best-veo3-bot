@@ -19616,7 +19616,13 @@ class RedisRunnerLock:
             return self
 
         assert redis_asyncio is not None  # for type checkers
-        self._redis = redis_asyncio.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+        self._redis = redis_asyncio.from_url(
+            self.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            health_check_interval=30,
+            socket_keepalive=True,
+        )
         try:
             await self._acquire()
         except Exception:
