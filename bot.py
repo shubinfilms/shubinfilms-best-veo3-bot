@@ -378,6 +378,7 @@ from ledger import (
     InsufficientBalance,
 )
 from db import postgres as db_postgres
+from scripts.migrate_from_redis import migrate_from_redis as run_redis_migration
 from settings import (
     BANANA_SEND_AS_DOCUMENT,
     CRYPTO_PAYMENT_URL,
@@ -1470,6 +1471,9 @@ ADMIN_IDS = _parse_admin_ids(_env("ADMIN_IDS"))
 
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+REDIS_MIGRATION_LOCK = asyncio.Lock()
 
 
 LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
@@ -16042,6 +16046,50 @@ async def admin_restore_referrals_command(update: Update, ctx: ContextTypes.DEFA
         await message.reply_text(f"✅ Восстановлено реферальных связей: {restored}.")
 
 
+async def migrate_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    if REDIS_MIGRATION_LOCK.locked():
+        await message.reply_text("⚠️ Миграция уже выполняется другим администратором.")
+        return
+    log.info("admin.migrate_redis.start | actor=%s", actor.id)
+    async with REDIS_MIGRATION_LOCK:
+        status = await message.reply_text("⏳ Запускаю миграцию из Redis в PostgreSQL…")
+        try:
+            stats = await run_redis_migration()
+        except Exception as exc:
+            log.exception("admin.migrate_redis.failed | actor=%s err=%s", actor.id, exc)
+            try:
+                await status.edit_text("❌ Миграция завершилась ошибкой. Подробности в логах.")
+            except Exception:
+                await message.reply_text("❌ Миграция завершилась ошибкой. Подробности в логах.")
+            return
+        lines = stats.as_lines()
+        if stats.errors:
+            preview = stats.errors[:5]
+            if preview:
+                lines.append("⚠️ Примеры пропусков:\n" + "\n".join(f"• {entry}" for entry in preview))
+        summary = "\n".join(lines)
+        try:
+            await status.edit_text(summary)
+        except Exception:
+            await message.reply_text(summary)
+        log.info(
+            "admin.migrate_redis.completed | actor=%s users=%s balances=%s referrals=%s skipped=%s",
+            actor.id,
+            stats.users_imported,
+            stats.balances_imported,
+            stats.referrals_imported,
+            stats.skipped_entries,
+        )
+
+
 async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -19402,6 +19450,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("get_balance",), admin_get_balance_command),
     (("list_referrals",), admin_list_referrals_command),
     (("restore_referrals",), admin_restore_referrals_command),
+    (("migrate_redis",), migrate_redis_command),
     (("my_balance",), my_balance_command),
     (("add_balance",), add_balance_command),
     (("sub_balance",), sub_balance_command),
