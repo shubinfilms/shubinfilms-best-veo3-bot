@@ -48,12 +48,14 @@ class MigrationStats:
 
     def as_lines(self) -> List[str]:
         lines = [
-            f"✅ Migrated {self.users_imported} users",
-            f"✅ Migrated {self.balances_imported} balances",
-            f"✅ Migrated {self.referrals_imported} referrals",
+            f"✅ Migrated: {self.users_imported} users",
+            f"💰 Balances imported: {self.balances_imported}",
+            f"🤝 Referrals imported: {self.referrals_imported}",
         ]
         if self.skipped_entries:
-            lines.append(f"⚠️ Skipped {self.skipped_entries} malformed entries")
+            lines.append(f"⚠️ Skipped: {self.skipped_entries} invalid entries")
+        else:
+            lines.append("⚠️ Skipped: 0 invalid entries")
         return lines
 
     def snapshot(self) -> "MigrationStats":
@@ -76,26 +78,29 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return value.strip() or default
 
 
-def safe_decode(value: Any) -> Optional[str]:
+def safe_decode(value: Any) -> str:
+    """Return a safe string representation of *value*.
+
+    Redis sometimes stores malformed byte sequences or even non-string
+    payloads. This helper normalises any value into a UTF-8 string while
+    ignoring undecodable bytes. ``None`` is converted into an empty string so
+    callers can treat the result uniformly.
+    """
+
     if value is None:
-        return None
+        return ""
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="ignore")
         except Exception:
             return str(value)
-    return str(value).strip() or None
+    return str(value)
 
 
 def _decode(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value.decode("utf-8", "ignore")
-    return str(value)
+    text = safe_decode(value)
+    text = text.strip()
+    return text or None
 
 
 def _sanitize_text(value: Any) -> Optional[str]:
@@ -597,12 +602,57 @@ async def migrate_from_redis(
             items: List[Dict[str, Any]],
             executor,
             stage: str,
+            *,
+            skipped_log: List[str],
         ) -> int:
             total = 0
             chunk_size = max(1, batch_size)
             for idx in range(0, len(items), chunk_size):
                 chunk = items[idx : idx + chunk_size]
-                processed = await executor(engine, chunk)
+                try:
+                    processed = await executor(engine, chunk)
+                except Exception as exc:
+                    if stage == "users":
+                        log.error(
+                            "redis-migration.batch_failed | stage=%s chunk=%s err=%s",
+                            stage,
+                            idx // chunk_size + 1,
+                            exc,
+                            exc_info=True,
+                        )
+                        recovered = 0
+                        for row in chunk:
+                            try:
+                                single_processed = await executor(engine, [row])
+                            except Exception as row_exc:  # pragma: no cover - defensive skip path
+                                user_id = row.get("id")
+                                error_text = str(row_exc)
+                                warning_entry = (
+                                    f"⚠️ user {user_id} skipped due to database error: {error_text}"
+                                )
+                                skipped_log.append(warning_entry)
+                                log.warning(
+                                    "⚠️ redis-migration.user.skip | user_id=%s err=%s row=%s",
+                                    user_id,
+                                    row_exc,
+                                    row,
+                                    exc_info=True,
+                                )
+                                continue
+                            recovered += single_processed
+                            total += single_processed
+                            stats.users_imported += single_processed
+                            if progress_callback:
+                                await progress_callback(stats.snapshot(), stage)
+                        log.info(
+                            "redis-migration.batch.recovered | stage=%s chunk=%s recovered=%s cumulative=%s",
+                            stage,
+                            idx // chunk_size + 1,
+                            recovered,
+                            total,
+                        )
+                        continue
+                    raise
                 total += processed
                 if stage == "users":
                     stats.users_imported += processed
@@ -623,9 +673,13 @@ async def migrate_from_redis(
                     await progress_callback(stats.snapshot(), stage)
             return total
 
-        await _chunked_execute(user_batches, _execute_users, "users")
-        await _chunked_execute(balance_batch, _execute_balances, "balances")
-        await _chunked_execute(referral_batch, _execute_referrals, "referrals")
+        await _chunked_execute(user_batches, _execute_users, "users", skipped_log=skipped)
+        await _chunked_execute(
+            balance_batch, _execute_balances, "balances", skipped_log=skipped
+        )
+        await _chunked_execute(
+            referral_batch, _execute_referrals, "referrals", skipped_log=skipped
+        )
 
         stats.skipped_entries = len(skipped)
         stats.errors = skipped
@@ -645,11 +699,19 @@ async def migrate_from_redis(
             stats.referrals_imported,
             stats.skipped_entries,
         )
-        for line in stats.as_lines():
-            log.info("redis-migration.summary | %s", line)
+        summary_lines = stats.as_lines()
+        for line in summary_lines:
+            level = (
+                logging.WARNING
+                if line.startswith("⚠️") and stats.skipped_entries
+                else logging.INFO
+            )
+            log.log(level, "redis-migration.summary | %s", line)
         if stats.skipped_entries:
+            summary_block = "\n".join(summary_lines)
+            log.warning("redis-migration.summary.report\n%s", summary_block)
             for entry in skipped:
-                log.warning("redis-migration.skipped | %s", entry)
+                log.warning("⚠️ redis-migration.skipped | %s", entry)
     finally:
         try:
             await conn.close()

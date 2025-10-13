@@ -20,6 +20,9 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 init_logging("bot")
 log_environment(logging.getLogger("bot"))
 
+# Configure Telegram log forwarding as early as possible.
+import logger_to_telegram  # noqa: F401,E402
+
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata
 import threading
 import atexit
@@ -15967,11 +15970,11 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             mismatch_count = int(ledger_summary.get("mismatch_count", 0))
 
     if ledger_error:
-        lines.append(f"📊 Ledger synced: error ({ledger_error})")
+        lines.append(f"⚠️ Ledger synced: error ({ledger_error})")
     elif mismatch_count:
-        lines.append(f"📊 Ledger synced: ⚠️ {mismatch_count} mismatches")
+        lines.append(f"⚠️ Ledger synced: {mismatch_count} mismatches")
     else:
-        lines.append("📊 Ledger synced: OK ✅")
+        lines.append("✅ Ledger synced")
 
     redis_keys_line = None
     if REDIS_URL and not REDIS_URL.startswith("memory://") and redis_pool is not None:
@@ -15989,13 +15992,15 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
         try:
             remaining_keys = await asyncio.to_thread(_count_redis_keys)
-            status_emoji = "✅" if remaining_keys == 0 else "⚠️"
-            redis_keys_line = f"🧹 Redis keys remaining: {remaining_keys} {status_emoji}"
+            if remaining_keys == 0:
+                redis_keys_line = "⚙️ Redis keys remaining: 0"
+            else:
+                redis_keys_line = f"⚠️ Redis keys remaining: {remaining_keys}"
         except Exception as exc:
             log.warning("admin.check_db.redis_scan_failed | actor=%s err=%s", actor.id, exc)
-            redis_keys_line = f"🧹 Redis keys remaining: error ({exc}) ❌"
+            redis_keys_line = f"⚠️ Redis keys remaining: error ({exc})"
     else:
-        redis_keys_line = "🧹 Redis keys remaining: n/a"
+        redis_keys_line = "⚙️ Redis keys remaining: n/a"
 
     if redis_keys_line:
         lines.append(redis_keys_line)
