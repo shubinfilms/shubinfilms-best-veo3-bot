@@ -7,17 +7,31 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import redis.asyncio as redis
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from db import postgres as db_postgres
 
 log = logging.getLogger("redis-migration")
 
 DEFAULT_BATCH_SIZE = 200
+MAX_DB_ATTEMPTS = 3
+T = TypeVar("T")
+
+try:  # psycopg might not be present in all environments
+    from psycopg.errors import OperationalError as PsycopgOperationalError
+except Exception:  # pragma: no cover - optional dependency missing
+    PsycopgOperationalError = None  # type: ignore
+
+_RETRYABLE_MESSAGES = (
+    "SSL connection has been closed unexpectedly",
+    "server closed the connection unexpectedly",
+    "connection already closed",
+)
 
 
 @dataclass(slots=True)
@@ -91,6 +105,63 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
         return None
 
 
+def _iter_exception_chain(exc: BaseException) -> List[BaseException]:
+    chain: List[BaseException] = []
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return chain
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    for candidate in _iter_exception_chain(exc):
+        if isinstance(candidate, (OperationalError, ConnectionError, ConnectionResetError)):
+            return True
+        if PsycopgOperationalError is not None and isinstance(candidate, PsycopgOperationalError):
+            return True
+        message = str(candidate)
+        if any(token in message for token in _RETRYABLE_MESSAGES):
+            return True
+    return False
+
+
+async def _run_with_retry(job_name: str, func: Callable[[], T]) -> T:
+    delay = 1.0
+    for attempt in range(1, MAX_DB_ATTEMPTS + 1):
+        try:
+            return await asyncio.to_thread(func)
+        except Exception as exc:
+            if attempt >= MAX_DB_ATTEMPTS or not _is_retryable_error(exc):
+                log.error("db.%s.failed | attempt=%s err=%s", job_name, attempt, exc)
+                raise
+            wait = min(delay, 8.0)
+            log.warning(
+                "db.%s.retry | attempt=%s err=%s wait=%.1fs",
+                job_name,
+                attempt,
+                exc,
+                wait,
+            )
+            await asyncio.sleep(wait)
+            delay *= 2
+    raise RuntimeError(f"db.{job_name} exhausted retries")
+
+
+async def _execute_with_retry(engine: Engine, stmt: Any, rows: Sequence[Dict[str, Any]], label: str) -> int:
+    if not rows:
+        return 0
+
+    def _run() -> int:
+        with engine.begin() as conn:
+            conn.execute(stmt, rows)
+        return len(rows)
+
+    return await _run_with_retry(f"{label}_batch", _run)
+
+
 async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
     cursor: int = 0
     while True:
@@ -103,8 +174,10 @@ async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
             break
 
 
-def _get_engine(dsn: str) -> Engine:
-    return create_engine(dsn, future=True, pool_pre_ping=True)
+def _get_engine(_: str) -> Engine:
+    """Return the shared SQLAlchemy engine configured via ``db_postgres``."""
+
+    return db_postgres.get_engine()
 
 
 async def _execute_users(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
@@ -131,13 +204,7 @@ async def _execute_users(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
                updated_at = NOW()
         """
     )
-
-    def _run() -> int:
-        with engine.begin() as conn:
-            conn.execute(stmt, rows)
-        return len(rows)
-
-    return await asyncio.to_thread(_run)
+    return await _execute_with_retry(engine, stmt, rows, "users")
 
 
 async def _execute_balances(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
@@ -153,13 +220,7 @@ async def _execute_balances(engine: Engine, rows: Sequence[Dict[str, Any]]) -> i
                updated_at = NOW()
         """
     )
-
-    def _run() -> int:
-        with engine.begin() as conn:
-            conn.execute(stmt, rows)
-        return len(rows)
-
-    return await asyncio.to_thread(_run)
+    return await _execute_with_retry(engine, stmt, rows, "balances")
 
 
 async def _execute_referrals(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
@@ -173,13 +234,7 @@ async def _execute_referrals(engine: Engine, rows: Sequence[Dict[str, Any]]) -> 
         ON CONFLICT (referrer_id, referred_id) DO NOTHING
         """
     )
-
-    def _run() -> int:
-        with engine.begin() as conn:
-            conn.execute(stmt, rows)
-        return len(rows)
-
-    return await asyncio.to_thread(_run)
+    return await _execute_with_retry(engine, stmt, rows, "referrals")
 
 
 async def _gather_ref_keys(
@@ -301,7 +356,8 @@ async def migrate_from_redis(
     try:
         await asyncio.to_thread(db_postgres.ensure_tables)
     except Exception as exc:
-        log.warning("postgres.ensure_tables_failed | err=%s", exc)
+        log.error("postgres.ensure_tables_failed | err=%s", exc)
+        raise
 
     engine = _get_engine(database_url)
     conn = redis.from_url(redis_url, encoding=None, decode_responses=False)
@@ -481,7 +537,6 @@ async def migrate_from_redis(
             await conn.close()
         except Exception:  # pragma: no cover
             pass
-        engine.dispose()
 
     return stats
 

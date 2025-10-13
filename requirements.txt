@@ -19,11 +19,10 @@ mutagen>=1.47.0
 Pillow>=10.0
 
 # Database toolkit for admin features
-SQLAlchemy>=2.0,<3.0
+SQLAlchemy>=2.0.30,<3.0
 
 # PostgreSQL + пул соединений
-psycopg[binary]>=3.2,<3.3
-psycopg-pool>=3.2,<3.3
+psycopg[binary,pool]>=3.1,<4.0
 
 # Вспомогательные пакеты для сборки
 wheel>=0.43
