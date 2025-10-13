@@ -209,11 +209,11 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             INSERT INTO users (id, username, referrer_id)
             VALUES (%s, %s, %s)
             ON CONFLICT (id) DO UPDATE
-               SET username = COALESCE(%s, users.username),
-                   referrer_id = COALESCE(users.referrer_id, %s),
+               SET username = COALESCE(EXCLUDED.username, users.username),
+                   referrer_id = COALESCE(EXCLUDED.referrer_id, users.referrer_id),
                    updated_at = now()
             """,
-            (uid, username, referrer_id, username, referrer_id),
+            (uid, username, referrer_id),
         )
         cur.execute(
             "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT DO NOTHING",

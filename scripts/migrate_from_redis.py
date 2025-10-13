@@ -87,6 +87,22 @@ def _decode(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _sanitize_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
+def _normalize_referrer(value: Any) -> Optional[int]:
+    if value in (None, "", "None"):
+        return None
+    candidate = _parse_int(value)
+    if candidate is None or candidate <= 0:
+        return None
+    return candidate
+
+
 def _parse_int(value: Any) -> Optional[int]:
     raw = _decode(value)
     if raw is None or raw == "":
@@ -197,13 +213,49 @@ async def _execute_users(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
     if not rows:
         return 0
 
+    prepared: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            user_id = int(row.get("id"))
+        except (TypeError, ValueError):
+            log.warning("redis-migration.users.skip | reason=invalid_id row=%s", row)
+            continue
+
+        joined_at = row.get("joined_at")
+        if joined_at is not None and not isinstance(joined_at, datetime):
+            joined_at = _parse_datetime(joined_at)
+        if isinstance(joined_at, datetime):
+            joined_at = joined_at.astimezone(timezone.utc)
+        else:
+            joined_at = None
+
+        referral_total = row.get("referral_earned_total")
+        if isinstance(referral_total, int):
+            referral_total_int = max(referral_total, 0)
+        else:
+            parsed_total = _parse_int(referral_total)
+            referral_total_int = max(parsed_total, 0) if parsed_total is not None else None
+
+        prepared.append(
+            {
+                "id": user_id,
+                "username": _sanitize_text(row.get("username")),
+                "referrer_id": _normalize_referrer(row.get("referrer_id")),
+                "joined_at": joined_at,
+                "referral_earned_total": referral_total_int,
+            }
+        )
+
+    if not prepared:
+        return 0
+
     stmt = text(
         """
         INSERT INTO users (id, username, referrer_id, joined_at, referral_earned_total)
         VALUES (:id, :username, :referrer_id, COALESCE(:joined_at, NOW()), COALESCE(:referral_earned_total, 0))
         ON CONFLICT (id) DO UPDATE
            SET username = COALESCE(EXCLUDED.username, users.username),
-               referrer_id = COALESCE(users.referrer_id, EXCLUDED.referrer_id),
+               referrer_id = COALESCE(EXCLUDED.referrer_id, users.referrer_id),
                joined_at = CASE
                                WHEN users.joined_at IS NULL AND EXCLUDED.joined_at IS NOT NULL
                                    THEN EXCLUDED.joined_at
@@ -217,7 +269,7 @@ async def _execute_users(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
                updated_at = NOW()
         """
     )
-    return await _execute_with_retry(engine, stmt, rows, "users")
+    return await _execute_with_retry(engine, stmt, prepared, "users")
 
 
 async def _execute_balances(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
@@ -408,6 +460,7 @@ async def migrate_from_redis(
                 },
             )
             username = _decode(profile.get(b"username")) if isinstance(profile, dict) else None
+            username = _sanitize_text(username)
             if username:
                 record["username"] = username
 
@@ -539,6 +592,13 @@ async def migrate_from_redis(
                     stats.balances_imported += processed
                 elif stage == "referrals":
                     stats.referrals_imported += processed
+                log.info(
+                    "redis-migration.batch | stage=%s chunk=%s processed=%s cumulative=%s",
+                    stage,
+                    idx // chunk_size + 1,
+                    processed,
+                    total,
+                )
                 if progress_callback:
                     await progress_callback(stats.snapshot(), stage)
             return total
