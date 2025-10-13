@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, cast
 
-import redis.asyncio as redis
+import redis.asyncio as aioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -230,7 +230,7 @@ async def _execute_with_retry(engine: Engine, stmt: Any, rows: Sequence[Dict[str
     return await _run_with_retry(f"{label}_batch", _run)
 
 
-async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
+async def _scan_keys(conn: aioredis.Redis, pattern: str) -> AsyncIterator[str]:
     cursor: int | str = 0
     while True:
         try:
@@ -251,7 +251,7 @@ async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
             break
 
 
-async def _count_keys(conn: redis.Redis, pattern: str) -> Optional[int]:
+async def _count_keys(conn: aioredis.Redis, pattern: str) -> Optional[int]:
     cursor: int | str = 0
     total = 0
     while True:
@@ -365,7 +365,7 @@ async def _execute_referrals(engine: Engine, rows: Sequence[Dict[str, Any]]) -> 
 
 
 async def _gather_ref_keys(
-    conn: redis.Redis,
+    conn: aioredis.Redis,
     prefix: str,
     *,
     skipped: List[str],
@@ -491,13 +491,15 @@ async def migrate_from_redis(
 
     engine = cast(Engine, ENGINE) if ENGINE is not None else db_postgres.get_engine()
 
-    conn: Optional[redis.Redis] = None
+    conn: Optional[aioredis.Redis] = None
     retry_count = 3
     for attempt in range(1, retry_count + 1):
-        candidate = redis.from_url(
+        candidate = aioredis.from_url(
             redis_url,
             encoding="utf-8",
             decode_responses=True,
+            health_check_interval=30,
+            socket_keepalive=True,
         )
         try:
             await candidate.ping()
@@ -568,8 +570,16 @@ async def migrate_from_redis(
                 skipped.append(f"error reading {key}")
                 stats.redis_profiles_skipped += 1
                 continue
-            record = _ensure_user_record(user_id, source=key)
-            if isinstance(profile, dict):
+            if not profile:
+                skipped.append(f"empty user payload: {key}")
+                stats.redis_profiles_skipped += 1
+                continue
+            if not isinstance(profile, dict):
+                skipped.append(f"invalid user payload: {key}")
+                stats.redis_profiles_skipped += 1
+                continue
+            try:
+                record = _ensure_user_record(user_id, source=key)
                 username_raw = safe_decode(
                     profile.get("username") or profile.get(b"username")
                 )
@@ -598,12 +608,22 @@ async def migrate_from_redis(
                 referral_total = _parse_int(referral_total_raw)
                 if referral_total is not None and referral_total >= 0:
                     current_total = record.get("referral_earned_total")
-                    current_total_int = int(current_total) if isinstance(current_total, int) else _parse_int(current_total)
+                    current_total_int = (
+                        int(current_total)
+                        if isinstance(current_total, int)
+                        else _parse_int(current_total)
+                    )
                     if current_total_int is None or referral_total > current_total_int:
                         record["referral_earned_total"] = referral_total
-            else:
-                skipped.append(f"invalid user payload: {key}")
+            except Exception as exc:
+                log.warning(
+                    "redis-migration.user.decode_failed | key=%s err=%s",
+                    key,
+                    exc,
+                )
+                skipped.append(f"malformed user payload: {key}")
                 stats.redis_profiles_skipped += 1
+                continue
 
         # Load balances with both legacy and documented prefixes
         balance_patterns = [
@@ -830,7 +850,7 @@ async def migrate_from_redis(
     return stats
 
 
-async def cleanup_redis(conn: "redis.Redis", redis_prefix: str = "veo3:prod") -> int:
+async def cleanup_redis(conn: "aioredis.Redis", redis_prefix: str = "veo3:prod") -> int:
     """Remove legacy Redis keys that match the given prefix."""
 
     pattern = f"{redis_prefix}:*"

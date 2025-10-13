@@ -105,6 +105,8 @@ class StateManager:
                 _REDIS_URL,
                 decode_responses=True,
                 encoding="utf-8",
+                health_check_interval=30,
+                socket_keepalive=True,
             )
         else:  # pragma: no cover - exercised implicitly in tests
             self._redis = None
