@@ -86,20 +86,54 @@ _TRANSACTIONS_DDL = """
 CREATE TABLE IF NOT EXISTS transactions (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    direction TEXT NOT NULL CHECK (direction IN ('credit', 'debit', 'adjustment')),
-    amount BIGINT NOT NULL CHECK (amount >= 0),
-    balance_after BIGINT CHECK (balance_after >= 0),
+    type TEXT NOT NULL,
+    amount BIGINT NOT NULL,
     reason TEXT,
-    actor_id BIGINT,
-    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
 _TRANSACTIONS_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_transactions_user_created_at
-    ON transactions(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_user_id
+    ON transactions(user_id);
 """
+
+_TRANSACTIONS_MIGRATIONS = [
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'transactions' AND column_name = 'direction'
+        ) AND NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'transactions' AND column_name = 'type'
+        ) THEN
+            ALTER TABLE transactions RENAME COLUMN direction TO type;
+        END IF;
+    END;
+    $$;
+    """,
+    "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT",
+    "UPDATE transactions SET type = COALESCE(type, 'credit') WHERE type IS NULL",
+    "ALTER TABLE transactions ALTER COLUMN type SET NOT NULL",
+    "ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_direction_check",
+    "ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_amount_check",
+    "ALTER TABLE transactions ALTER COLUMN amount TYPE BIGINT",
+    "ALTER TABLE transactions ALTER COLUMN amount SET NOT NULL",
+    "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reason TEXT",
+    "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE transactions ALTER COLUMN created_at SET DEFAULT NOW()",
+    "ALTER TABLE transactions ALTER COLUMN created_at SET NOT NULL",
+    """
+    UPDATE transactions
+       SET amount = CASE
+            WHEN type = 'debit' AND amount > 0 THEN -amount
+            ELSE amount
+        END
+     WHERE type = 'debit' AND amount > 0
+    """,
+]
 
 
 def _render_postgres_url(url: URL) -> str:
@@ -335,6 +369,8 @@ def ensure_tables() -> None:
         conn.execute(text(_AUDIT_DDL))
         conn.execute(text(_TRANSACTIONS_DDL))
         conn.execute(text(_TRANSACTIONS_INDEX_DDL))
+        for statement in _TRANSACTIONS_MIGRATIONS:
+            conn.execute(text(statement))
 
 
 def get_engine() -> Engine:
@@ -442,6 +478,12 @@ def db_overview() -> Dict[str, Any]:
             "size_mb": round(size_bytes / (1024 * 1024), 2) if size_bytes else 0.0,
         }
 
+    try:
+        ledger_summary = check_balance_consistency()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("postgres.ledger.check_failed | err=%s", exc, exc_info=True)
+        ledger_summary = {"error": str(exc)}
+
     overview.update(
         {
             "server_version": version,
@@ -455,6 +497,7 @@ def db_overview() -> Dict[str, Any]:
             "sslmode": _current_sslmode() or "",
             "sqlalchemy_prefix": _SQLA_PREFIX_DETECTED,
             "dsn": mask_dsn(_DSN),
+            "ledger": ledger_summary,
         }
     )
 
@@ -522,42 +565,135 @@ def export_balances_snapshot() -> Dict[str, Any]:
     return {"generated_at": generated_at, "count": len(records), "balances": records}
 
 
-def log_transaction(
+def _apply_transaction(
     user_id: int,
-    direction: str,
-    amount: int,
+    tx_type: str,
+    signed_amount: int,
     *,
-    balance_after: Optional[int] = None,
     reason: Optional[str] = None,
     actor_id: Optional[int] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Persist a balance change event in the ``transactions`` table."""
+    audit_action: Optional[str] = None,
+    audit_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    """Apply a balance change and persist the transaction atomically."""
 
-    direction_norm = (direction or "").strip().lower()
-    if direction_norm not in {"credit", "debit", "adjustment"}:
-        raise ValueError("direction must be credit, debit or adjustment")
-    amount_value = abs(int(amount))
-    payload = json.dumps(meta or {}, ensure_ascii=False)
+    user_id = int(user_id)
+    tx_type_norm = (tx_type or "").strip().lower()
+    if not tx_type_norm:
+        raise ValueError("transaction type must be provided")
+    signed_amount = int(signed_amount)
+    if signed_amount == 0:
+        raise ValueError("amount must be a non-zero integer")
+
+    reason_value = (reason or tx_type_norm).strip() or tx_type_norm
     engine = _ensure_engine()
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                INSERT INTO transactions (user_id, direction, amount, balance_after, reason, actor_id, meta)
-                VALUES (:user_id, :direction, :amount, :balance_after, :reason, :actor_id, :meta::jsonb)
+                INSERT INTO users (id)
+                VALUES (:uid)
+                ON CONFLICT (id) DO NOTHING
+                """
+            ),
+            {"uid": user_id},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO balances (user_id, tokens)
+                VALUES (:uid, 0)
+                ON CONFLICT (user_id) DO NOTHING
+                """
+            ),
+            {"uid": user_id},
+        )
+        current_raw = conn.execute(
+            text("SELECT tokens FROM balances WHERE user_id = :uid FOR UPDATE"),
+            {"uid": user_id},
+        ).scalar()
+        current_balance = int(current_raw or 0)
+        new_balance = current_balance + signed_amount
+        if new_balance < 0:
+            raise ValueError(
+                f"insufficient balance: have {current_balance}, need {abs(signed_amount)}"
+            )
+        conn.execute(
+            text(
+                """
+                UPDATE balances
+                   SET tokens = :new_balance,
+                       updated_at = NOW()
+                 WHERE user_id = :uid
+                """
+            ),
+            {"new_balance": new_balance, "uid": user_id},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO transactions (user_id, type, amount, reason)
+                VALUES (:user_id, :type, :amount, :reason)
                 """
             ),
             {
-                "user_id": int(user_id),
-                "direction": direction_norm,
-                "amount": amount_value,
-                "balance_after": int(balance_after) if balance_after is not None else None,
-                "reason": reason,
-                "actor_id": int(actor_id) if actor_id is not None else None,
-                "meta": payload,
+                "user_id": user_id,
+                "type": tx_type_norm,
+                "amount": signed_amount,
+                "reason": reason_value,
             },
         )
+        if audit_action:
+            payload = json.dumps(audit_meta or {}, ensure_ascii=False)
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO audit_log (user_id, actor_id, action, amount, meta)
+                    VALUES (:user_id, :actor_id, :action, :amount, :meta::jsonb)
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "actor_id": int(actor_id) if actor_id is not None else None,
+                    "action": audit_action,
+                    "amount": signed_amount,
+                    "meta": payload,
+                },
+            )
+
+    return {"old_balance": current_balance, "new_balance": new_balance}
+
+
+def log_transaction(
+    user_id: int,
+    tx_type: str,
+    amount: int,
+    *,
+    reason: Optional[str] = None,
+) -> Dict[str, int]:
+    """Persist a transaction and update the balance atomically."""
+
+    tx_type_norm = (tx_type or "").strip().lower()
+    if not tx_type_norm:
+        raise ValueError("transaction type must be provided")
+
+    amount_value = int(amount)
+    if amount_value == 0:
+        raise ValueError("amount must be a non-zero integer")
+
+    if tx_type_norm == "debit":
+        signed_amount = -abs(amount_value)
+    elif tx_type_norm == "credit":
+        signed_amount = abs(amount_value)
+    else:
+        signed_amount = amount_value
+
+    return _apply_transaction(
+        user_id,
+        tx_type_norm,
+        signed_amount,
+        reason=reason,
+    )
 
 
 def apply_balance_delta(
@@ -575,90 +711,21 @@ def apply_balance_delta(
     if delta == 0:
         raise ValueError("delta must be a non-zero integer")
 
-    engine = _ensure_engine()
-    direction = "credit" if delta > 0 else "debit"
-    amount = abs(delta)
+    tx_type = "credit" if delta > 0 else "debit"
     metadata: Dict[str, Any] = {"delta": delta}
     if note:
         metadata["note"] = note
 
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO users (id)
-                VALUES (:uid)
-                ON CONFLICT (id) DO NOTHING
-                """
-            ),
-            {"uid": user_id},
-        )
-        conn.execute(
-            text(
-                """
-                INSERT INTO balances (user_id)
-                VALUES (:uid)
-                ON CONFLICT (user_id) DO NOTHING
-                """
-            ),
-            {"uid": user_id},
-        )
-        current_raw = conn.execute(
-            text("SELECT tokens FROM balances WHERE user_id = :uid FOR UPDATE"),
-            {"uid": user_id},
-        ).scalar()
-        current_balance = int(current_raw or 0)
-        new_balance = current_balance + delta
-        if new_balance < 0:
-            raise ValueError(
-                f"insufficient balance: have {current_balance}, need {abs(delta)}"
-            )
-        conn.execute(
-            text(
-                """
-                UPDATE balances
-                   SET tokens = :new_balance,
-                       updated_at = NOW()
-                 WHERE user_id = :uid
-                """
-            ),
-            {"new_balance": new_balance, "uid": user_id},
-        )
-        payload = json.dumps(metadata, ensure_ascii=False)
-        conn.execute(
-            text(
-                """
-                INSERT INTO audit_log (user_id, actor_id, action, amount, meta)
-                VALUES (:user_id, :actor_id, :action, :amount, :meta::jsonb)
-                """
-            ),
-            {
-                "user_id": user_id,
-                "actor_id": int(actor_id) if actor_id is not None else None,
-                "action": reason,
-                "amount": delta,
-                "meta": payload,
-            },
-        )
-        conn.execute(
-            text(
-                """
-                INSERT INTO transactions (user_id, direction, amount, balance_after, reason, actor_id, meta)
-                VALUES (:user_id, :direction, :amount, :balance_after, :reason, :actor_id, :meta::jsonb)
-                """
-            ),
-            {
-                "user_id": user_id,
-                "direction": direction,
-                "amount": amount,
-                "balance_after": new_balance,
-                "reason": reason,
-                "actor_id": int(actor_id) if actor_id is not None else None,
-                "meta": payload,
-            },
-        )
-
-    return {"old_balance": current_balance, "new_balance": new_balance}
+    result = _apply_transaction(
+        user_id,
+        tx_type,
+        delta,
+        reason=reason,
+        actor_id=actor_id,
+        audit_action=reason,
+        audit_meta=metadata,
+    )
+    return result
 
 
 def ensure_user(user_id: int, *, username: Optional[str] = None, referrer_id: Optional[int] = None) -> None:
@@ -739,6 +806,68 @@ def set_referrer(user_id: int, referrer_id: int) -> bool:
             {"referrer": referrer_id, "referred": user_id},
         )
     return True
+
+
+def check_balance_consistency() -> Dict[str, Any]:
+    """Compare sums between balances and transactions and list mismatches."""
+
+    engine = _ensure_engine()
+    with engine.connect() as conn:
+        total_balances_raw = conn.execute(
+            text("SELECT COALESCE(SUM(tokens), 0) FROM balances")
+        ).scalar()
+        total_transactions_raw = conn.execute(
+            text("SELECT COALESCE(SUM(amount), 0) FROM transactions")
+        ).scalar()
+        mismatch_rows = conn.execute(
+            text(
+                """
+                WITH aggregated AS (
+                    SELECT b.user_id AS user_id,
+                           b.tokens AS balance,
+                           COALESCE(SUM(t.amount), 0) AS total_tx
+                      FROM balances AS b
+                 LEFT JOIN transactions AS t ON t.user_id = b.user_id
+                  GROUP BY b.user_id, b.tokens
+                    UNION ALL
+                    SELECT t.user_id AS user_id,
+                           0 AS balance,
+                           COALESCE(SUM(t.amount), 0) AS total_tx
+                      FROM transactions AS t
+                 LEFT JOIN balances AS b ON b.user_id = t.user_id
+                     WHERE b.user_id IS NULL
+                  GROUP BY t.user_id
+                )
+                SELECT user_id, balance, total_tx
+                  FROM aggregated
+                 WHERE balance != total_tx
+                 ORDER BY user_id
+                """
+            )
+        ).mappings().all()
+
+    total_balances = int(total_balances_raw or 0)
+    total_transactions = int(total_transactions_raw or 0)
+    mismatches: List[Dict[str, int]] = []
+    for row in mismatch_rows:
+        user_id_val = row.get("user_id")
+        balance_val = row.get("balance")
+        tx_val = row.get("total_tx")
+        mismatches.append(
+            {
+                "user_id": int(user_id_val) if user_id_val is not None else 0,
+                "balance": int(balance_val or 0),
+                "total_tx": int(tx_val or 0),
+            }
+        )
+
+    return {
+        "total_balances": total_balances,
+        "total_transactions": total_transactions,
+        "difference": total_balances - total_transactions,
+        "mismatches": mismatches,
+        "mismatch_count": len(mismatches),
+    }
 
 
 def increment_referral_earnings(

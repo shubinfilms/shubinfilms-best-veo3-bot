@@ -152,6 +152,59 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             ON ledger(user_id, created_at DESC)
         """
 
+        ddl_transactions = """
+        CREATE TABLE IF NOT EXISTS transactions (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            type TEXT NOT NULL,
+            amount BIGINT NOT NULL,
+            reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+
+        ddl_transactions_idx = """
+        CREATE INDEX IF NOT EXISTS idx_transactions_user_id
+            ON transactions(user_id)
+        """
+
+        ddl_transactions_migrations = [
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                     WHERE table_name = 'transactions' AND column_name = 'direction'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                     WHERE table_name = 'transactions' AND column_name = 'type'
+                ) THEN
+                    ALTER TABLE transactions RENAME COLUMN direction TO type;
+                END IF;
+            END;
+            $$;
+            """,
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT",
+            "UPDATE transactions SET type = COALESCE(type, 'credit') WHERE type IS NULL",
+            "ALTER TABLE transactions ALTER COLUMN type SET NOT NULL",
+            "ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_direction_check",
+            "ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_amount_check",
+            "ALTER TABLE transactions ALTER COLUMN amount TYPE BIGINT",
+            "ALTER TABLE transactions ALTER COLUMN amount SET NOT NULL",
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reason TEXT",
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()",
+            "ALTER TABLE transactions ALTER COLUMN created_at SET DEFAULT now()",
+            "ALTER TABLE transactions ALTER COLUMN created_at SET NOT NULL",
+            """
+            UPDATE transactions
+               SET amount = CASE
+                    WHEN type = 'debit' AND amount > 0 THEN -amount
+                    ELSE amount
+                END
+             WHERE type = 'debit' AND amount > 0
+            """,
+        ]
+
         ddl_referrals = """
         CREATE TABLE IF NOT EXISTS referrals (
             id BIGSERIAL PRIMARY KEY,
@@ -191,6 +244,10 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                 cur.execute(ddl_balances)
                 cur.execute(ddl_ledger)
                 cur.execute(ddl_ledger_idx)
+                cur.execute(ddl_transactions)
+                cur.execute(ddl_transactions_idx)
+                for statement in ddl_transactions_migrations:
+                    cur.execute(statement)
                 cur.execute(ddl_referrals)
                 cur.execute(ddl_audit)
                 cur.execute(ddl_promo)
@@ -218,6 +275,33 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         cur.execute(
             "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
             (uid,),
+        )
+
+    @staticmethod
+    def _record_transaction(
+        cur: psycopg.Cursor[Any],
+        uid: int,
+        tx_type: str,
+        amount: int,
+        reason: str,
+    ) -> None:
+        amount_val = int(amount)
+        if amount_val == 0:
+            return
+        tx_type_norm = (tx_type or "").strip().lower() or "adjustment"
+        reason_text = reason or tx_type_norm
+        if tx_type_norm == "debit":
+            signed_amount = -abs(amount_val)
+        elif tx_type_norm == "credit":
+            signed_amount = abs(amount_val)
+        else:
+            signed_amount = amount_val
+        cur.execute(
+            """
+            INSERT INTO transactions (user_id, type, amount, reason)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (uid, tx_type_norm, signed_amount, reason_text),
         )
 
     # ------------------------------------------------------------------
@@ -312,6 +396,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                     """,
                     (uid, amount, reason, op_id, meta_json),
                 )
+                self._record_transaction(cur, uid, "credit", amount, reason)
 
         self._log_operation("credit", uid, op_id, amount, reason, old_balance, new_balance, meta)
         return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
@@ -368,6 +453,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                     """,
                     (uid, amount, reason, op_id, meta_json),
                 )
+                self._record_transaction(cur, uid, "debit", amount, reason)
 
         self._log_operation("debit", uid, op_id, amount, reason, old_balance, new_balance, meta)
         return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
@@ -438,6 +524,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                     """,
                     (uid, amount, "signup_bonus", op_id, meta_json),
                 )
+                self._record_transaction(cur, uid, "credit", amount, "signup_bonus")
 
         self._log_operation(
             "credit", uid, op_id, amount, "signup_bonus", old_balance, new_balance, meta
@@ -514,6 +601,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
                     """,
                     (uid, amount, "promo", op_id, meta_json),
                 )
+                self._record_transaction(cur, uid, "credit", amount, "promo")
 
         self._log_operation("credit", uid, op_id, amount, "promo", old_balance, new_balance, meta)
         return LedgerOpResult(True, new_balance, op_id, "promo", old_balance)
