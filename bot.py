@@ -104,6 +104,7 @@ from kie_banana import (
 )
 
 import redis
+import redis.asyncio as aioredis
 import billing
 
 from hub_router import (
@@ -117,6 +118,7 @@ from handlers import profile as profile_handlers
 from handlers.stars import open_stars_menu
 
 from state import state as redis_state
+from scripts.migrate_from_redis import cleanup_redis
 
 from ui_helpers import (
     upsert_card,
@@ -1243,11 +1245,19 @@ async def _safe_edit_message_text(
         return exc
 
 # Redis
-REDIS_URL           = SETTINGS_REDIS_URL
-REDIS_LOCK_ENABLED  = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
+REDIS_URL = SETTINGS_REDIS_URL
+REDIS_LOCK_ENABLED = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 if REDIS_URL and not REDIS_URL.startswith("memory://"):
-    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    redis_pool = redis.ConnectionPool.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        max_connections=10,
+    )
+    redis_client = redis.Redis(connection_pool=redis_pool)
 else:
+    redis_pool = None
     redis_client = None
 
 
@@ -1391,7 +1401,9 @@ def acquire_singleton_lock(ttl_sec: int = 3600) -> None:
         return
 
     try:
-        client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        if redis_pool is None:
+            raise RuntimeError("redis pool is not configured")
+        client = redis.Redis(connection_pool=redis_pool)
     except Exception as exc:
         singleton_log.warning("Leader election disabled: redis unavailable (%s)", exc)
         return
@@ -15946,14 +15958,47 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     lines.append(f"📊 Transactions: {formatted_rows} rows")
 
     ledger_summary = overview.get("ledger", {})
-    if isinstance(ledger_summary, dict) and ledger_summary.get("error"):
-        lines.append(f"🧾 Ledger check error: {ledger_summary['error']}")
-    else:
-        mismatch_count = int(ledger_summary.get("mismatch_count", 0)) if isinstance(ledger_summary, dict) else 0
-        if mismatch_count:
-            lines.append(f"🧾 Ledger mismatch: {mismatch_count} users")
+    ledger_error: Optional[str] = None
+    mismatch_count = 0
+    if isinstance(ledger_summary, dict):
+        if ledger_summary.get("error"):
+            ledger_error = str(ledger_summary.get("error"))
         else:
-            lines.append("🧾 Ledger: synchronized ✅")
+            mismatch_count = int(ledger_summary.get("mismatch_count", 0))
+
+    if ledger_error:
+        lines.append(f"📊 Ledger synced: error ({ledger_error})")
+    elif mismatch_count:
+        lines.append(f"📊 Ledger synced: ⚠️ {mismatch_count} mismatches")
+    else:
+        lines.append("📊 Ledger synced: OK ✅")
+
+    redis_keys_line = None
+    if REDIS_URL and not REDIS_URL.startswith("memory://") and redis_pool is not None:
+        def _count_redis_keys() -> int:
+            client = redis.Redis(connection_pool=redis_pool)
+            pattern = f"{REDIS_PREFIX}:*"
+            total = 0
+            cursor = 0
+            while True:
+                cursor, keys = client.scan(cursor=cursor, match=pattern, count=1000)
+                total += len(keys)
+                if cursor == 0:
+                    break
+            return total
+
+        try:
+            remaining_keys = await asyncio.to_thread(_count_redis_keys)
+            status_emoji = "✅" if remaining_keys == 0 else "⚠️"
+            redis_keys_line = f"🧹 Redis keys remaining: {remaining_keys} {status_emoji}"
+        except Exception as exc:
+            log.warning("admin.check_db.redis_scan_failed | actor=%s err=%s", actor.id, exc)
+            redis_keys_line = f"🧹 Redis keys remaining: error ({exc}) ❌"
+    else:
+        redis_keys_line = "🧹 Redis keys remaining: n/a"
+
+    if redis_keys_line:
+        lines.append(redis_keys_line)
 
     lines.append(
         "Pool: in_use={in_use} available={available}".format(
@@ -15975,6 +16020,55 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         )
 
     await message.reply_text("\n".join(lines))
+
+
+async def admin_cleanup_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ Доступ запрещён.")
+        return
+    if not REDIS_URL or REDIS_URL.startswith("memory://"):
+        await message.reply_text("⚠️ Redis недоступен или не сконфигурирован.")
+        return
+
+    status_message = await message.reply_text("🧹 Начинаю очистку Redis...")
+
+    pool: Optional[aioredis.ConnectionPool] = None
+    client: Optional[aioredis.Redis] = None
+    try:
+        pool = aioredis.ConnectionPool.from_url(
+            REDIS_URL,
+            decode_responses=False,
+            socket_connect_timeout=5,
+            socket_timeout=10,
+            max_connections=10,
+        )
+        client = aioredis.Redis(connection_pool=pool)
+        deleted = await cleanup_redis(client, redis_prefix=REDIS_PREFIX)
+        log.info(
+            "admin.cleanup_redis.completed | actor=%s deleted=%s", actor.id, deleted
+        )
+        await status_message.edit_text(
+            f"✅ Очистка завершена.\nУдалено {deleted} ключей."
+        )
+    except Exception as exc:
+        log.error("admin.cleanup_redis.failed | actor=%s err=%s", actor.id, exc, exc_info=True)
+        await status_message.edit_text(f"❌ Ошибка очистки Redis: {exc}")
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        if pool is not None:
+            try:
+                await pool.disconnect()
+            except Exception:
+                pass
 
 
 async def admin_backup_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -19758,6 +19852,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("suno_debug",), suno_debug_command),
     (("broadcast",), broadcast_command),
     (("check_db",), admin_check_db_command),
+    (("cleanup_redis",), admin_cleanup_redis_command),
     (("check_balances",), admin_check_balances_command),
     (("backup_db",), admin_backup_db_command),
     (("add_tokens",), admin_add_tokens_command),
