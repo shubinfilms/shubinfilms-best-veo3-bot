@@ -23,6 +23,10 @@ log_environment(logging.getLogger("bot"))
 # Configure Telegram log forwarding as early as possible.
 import logger_to_telegram  # noqa: F401,E402
 
+from core.codex_logger import attach_codex_handler
+
+attach_codex_handler()
+
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata, traceback
 import threading
 import atexit
@@ -16028,6 +16032,55 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("\n".join(lines))
 
 
+async def admin_diag_codex_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    log = logging.getLogger("veo3-bot")
+    log.info("DIAG_CODEX: test info")
+    try:
+        raise ValueError("DIAG_CODEX: simulated error")
+    except Exception:
+        log.exception("DIAG_CODEX: test exception")
+
+    await message.reply_text("✅ Codex diagnostic triggered. Check dashboard.")
+
+
+async def admin_diag_env_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    keys = [
+        "CODEX_LOG_ENABLED",
+        "CODEX_LOG_ENDPOINT",
+        "CODEX_LOG_API_KEY",
+        "APP_NAME",
+        "APP_ENV",
+    ]
+    envs = []
+    for key in keys:
+        raw = os.getenv(key, "(missing)")
+        if raw and raw not in {"(missing)", ""}:
+            masked = f"{raw[:6]}***"
+        else:
+            masked = "(missing)"
+        envs.append(f"{key}={masked}")
+
+    await message.reply_text("🔧 Codex ENV:\n" + "\n".join(envs))
+
+
 async def admin_cleanup_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -19891,6 +19944,8 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("cleanup_redis",), admin_cleanup_redis_command),
     (("check_balances",), admin_check_balances_command),
     (("backup_db",), admin_backup_db_command),
+    (("diag_codex",), admin_diag_codex_command),
+    (("diag_env",), admin_diag_env_command),
     (("add_tokens",), admin_add_tokens_command),
     (("spend_tokens",), admin_spend_tokens_command),
     (("set_tokens",), admin_set_tokens_command),
