@@ -12,7 +12,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -321,6 +321,15 @@ def ensure_tables() -> None:
     engine = _ensure_engine()
     with engine.begin() as conn:
         conn.execute(text(_USERS_DDL))
+        conn.execute(
+            text(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS username TEXT,
+                  ADD COLUMN IF NOT EXISTS referrer_id BIGINT
+                """
+            )
+        )
         conn.execute(text(_BALANCES_DDL))
         conn.execute(text(_REFERRALS_DDL))
         conn.execute(text(_AUDIT_DDL))
@@ -358,7 +367,7 @@ def db_overview() -> Dict[str, Any]:
     """Collect statistics about the database and connection pool."""
 
     engine = _ensure_engine()
-    tables = ("users", "balances", "referrals", "transactions")
+    tables = ["users", "balances", "referrals", "transactions"]
     overview: Dict[str, Any] = {}
 
     try:
@@ -387,11 +396,12 @@ def db_overview() -> Dict[str, Any]:
                   JOIN pg_namespace AS n ON n.oid = c.relnamespace
                  WHERE n.nspname = current_schema() AND c.relname = ANY(:tables)
                 """
-            ).bindparams(bindparam("tables", expanding=True))
-            size_rows = conn.execute(size_stmt, {"tables": list(tables)}).mappings()
-            for row in size_rows:
-                name = str(row.get("name"))
-                size_val = int(row.get("size") or 0)
+            )
+            size_rows = conn.execute(size_stmt, {"tables": tables}).mappings().all()
+            size_map = {
+                str(row.get("name")): int(row.get("size") or 0) for row in size_rows
+            }
+            for name, size_val in size_map.items():
                 if name in table_metrics:
                     table_metrics[name]["size_bytes"] = size_val
 
@@ -667,8 +677,8 @@ def ensure_user(user_id: int, *, username: Optional[str] = None, referrer_id: Op
                 INSERT INTO users (id, username, referrer_id)
                 VALUES (:id, :username, :referrer_id)
                 ON CONFLICT (id) DO UPDATE
-                   SET username = COALESCE(:username, users.username),
-                       referrer_id = COALESCE(users.referrer_id, :referrer_id),
+                   SET username = COALESCE(EXCLUDED.username, users.username),
+                       referrer_id = COALESCE(EXCLUDED.referrer_id, users.referrer_id),
                        updated_at = NOW()
                 """
             ),
