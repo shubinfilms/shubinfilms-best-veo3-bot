@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, cast
 
 import redis.asyncio as redis
 from sqlalchemy import text
@@ -15,11 +15,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
 from db import postgres as db_postgres
+from db.postgres import ENGINE
 
 log = logging.getLogger("redis-migration")
 
 DEFAULT_BATCH_SIZE = 200
-MAX_DB_ATTEMPTS = 3
+MAX_DB_ATTEMPTS = 6
+_BACKOFF_BASE = 0.5
 T = TypeVar("T")
 
 try:  # psycopg might not be present in all environments
@@ -53,6 +55,18 @@ class MigrationStats:
         if self.skipped_entries:
             lines.append(f"⚠️ Skipped {self.skipped_entries} malformed entries")
         return lines
+
+    def snapshot(self) -> "MigrationStats":
+        return MigrationStats(
+            users_imported=self.users_imported,
+            balances_imported=self.balances_imported,
+            referrals_imported=self.referrals_imported,
+            skipped_entries=self.skipped_entries,
+            errors=list(self.errors),
+        )
+
+
+ProgressCallback = Callable[[MigrationStats, str], Awaitable[None]]
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -129,25 +143,30 @@ def _is_retryable_error(exc: BaseException) -> bool:
 
 
 async def _run_with_retry(job_name: str, func: Callable[[], T]) -> T:
-    delay = 1.0
+    delay = _BACKOFF_BASE
     for attempt in range(1, MAX_DB_ATTEMPTS + 1):
         try:
             return await asyncio.to_thread(func)
         except Exception as exc:
             if attempt >= MAX_DB_ATTEMPTS or not _is_retryable_error(exc):
-                log.error("db.%s.failed | attempt=%s err=%s", job_name, attempt, exc)
+                log.error(
+                    "redis-migration.%s.failed | attempt=%s err=%s",
+                    job_name,
+                    attempt,
+                    exc,
+                )
                 raise
-            wait = min(delay, 8.0)
+            wait = min(delay, 4.0)
             log.warning(
-                "db.%s.retry | attempt=%s err=%s wait=%.1fs",
+                "redis-migration.%s.retry | attempt=%s err=%s wait=%.1fs",
                 job_name,
                 attempt,
                 exc,
                 wait,
             )
             await asyncio.sleep(wait)
-            delay *= 2
-    raise RuntimeError(f"db.{job_name} exhausted retries")
+            delay = min(delay * 2, 4.0)
+    raise RuntimeError(f"redis-migration.{job_name} exhausted retries")
 
 
 async def _execute_with_retry(engine: Engine, stmt: Any, rows: Sequence[Dict[str, Any]], label: str) -> int:
@@ -172,12 +191,6 @@ async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
                 yield decoded
         if cursor == 0:
             break
-
-
-def _get_engine(_: str) -> Engine:
-    """Return the shared SQLAlchemy engine configured via ``db_postgres``."""
-
-    return db_postgres.get_engine()
 
 
 async def _execute_users(engine: Engine, rows: Sequence[Dict[str, Any]]) -> int:
@@ -260,7 +273,7 @@ async def _gather_ref_keys(
             try:
                 inviter_raw = await conn.get(key)
             except Exception as exc:  # pragma: no cover - network failure path
-                log.warning("redis.get_inviter_failed | key=%s err=%s", key, exc)
+                log.warning("redis-migration.get_inviter_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
                 continue
             inviter_id = _parse_int(inviter_raw)
@@ -277,7 +290,7 @@ async def _gather_ref_keys(
             try:
                 members = await conn.smembers(key)
             except Exception as exc:  # pragma: no cover
-                log.warning("redis.smembers_failed | key=%s err=%s", key, exc)
+                log.warning("redis-migration.smembers_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
                 continue
             for member in members:
@@ -295,7 +308,7 @@ async def _gather_ref_keys(
             try:
                 value_raw = await conn.get(key)
             except Exception as exc:  # pragma: no cover
-                log.warning("redis.get_earned_failed | key=%s err=%s", key, exc)
+                log.warning("redis-migration.get_earned_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
                 continue
             total = _parse_int(value_raw)
@@ -312,7 +325,7 @@ async def _gather_ref_keys(
             try:
                 joined_raw = await conn.get(key)
             except Exception as exc:  # pragma: no cover
-                log.warning("redis.get_joined_failed | key=%s err=%s", key, exc)
+                log.warning("redis-migration.get_joined_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
                 continue
             dt = _parse_datetime(joined_raw)
@@ -337,6 +350,7 @@ async def migrate_from_redis(
     database_url: Optional[str] = None,
     redis_prefix: Optional[str] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> MigrationStats:
     """Perform a one-time migration from Redis into PostgreSQL."""
 
@@ -350,20 +364,22 @@ async def migrate_from_redis(
         raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) is required for migration")
 
     stats = MigrationStats()
+    if progress_callback:
+        await progress_callback(stats.snapshot(), "start")
     skipped: List[str] = []
 
     db_postgres.configure(database_url)
     try:
         await asyncio.to_thread(db_postgres.ensure_tables)
     except Exception as exc:
-        log.error("postgres.ensure_tables_failed | err=%s", exc)
-        raise
+        log.error("redis-migration.ensure_tables_failed | err=%s", exc, exc_info=True)
+        raise RuntimeError("Failed to prepare PostgreSQL tables") from exc
 
-    engine = _get_engine(database_url)
+    engine = cast(Engine, ENGINE) if ENGINE is not None else db_postgres.get_engine()
     conn = redis.from_url(redis_url, encoding=None, decode_responses=False)
 
     try:
-        log.info("redis.migration.start | prefix=%s", redis_prefix)
+        log.info("redis-migration.start | prefix=%s", redis_prefix)
 
         user_records: Dict[int, Dict[str, Any]] = {}
         balance_rows: Dict[int, int] = {}
@@ -378,7 +394,7 @@ async def migrate_from_redis(
             try:
                 profile = await conn.hgetall(key)
             except Exception as exc:  # pragma: no cover - network failure path
-                log.warning("redis.hgetall_failed | key=%s err=%s", key, exc)
+                log.warning("redis-migration.hgetall_failed | key=%s err=%s", key, exc)
                 skipped.append(f"error reading {key}")
                 continue
             record = user_records.setdefault(
@@ -414,7 +430,7 @@ async def migrate_from_redis(
                 try:
                     value = await conn.get(key)
                 except Exception as exc:  # pragma: no cover
-                    log.warning("redis.get_balance_failed | key=%s err=%s", key, exc)
+                    log.warning("redis-migration.get_balance_failed | key=%s err=%s", key, exc)
                     skipped.append(f"error reading {key}")
                     continue
                 tokens = _parse_int(value)
@@ -506,32 +522,49 @@ async def migrate_from_redis(
             )
 
         # Execute migrations in batches
-        async def _chunked_execute(items: List[Dict[str, Any]], executor) -> int:
+        async def _chunked_execute(
+            items: List[Dict[str, Any]],
+            executor,
+            stage: str,
+        ) -> int:
             total = 0
-            for idx in range(0, len(items), max(1, batch_size)):
-                chunk = items[idx : idx + max(1, batch_size)]
-                total += await executor(engine, chunk)
+            chunk_size = max(1, batch_size)
+            for idx in range(0, len(items), chunk_size):
+                chunk = items[idx : idx + chunk_size]
+                processed = await executor(engine, chunk)
+                total += processed
+                if stage == "users":
+                    stats.users_imported += processed
+                elif stage == "balances":
+                    stats.balances_imported += processed
+                elif stage == "referrals":
+                    stats.referrals_imported += processed
+                if progress_callback:
+                    await progress_callback(stats.snapshot(), stage)
             return total
 
-        stats.users_imported = await _chunked_execute(user_batches, _execute_users)
-        stats.balances_imported = await _chunked_execute(balance_batch, _execute_balances)
-        stats.referrals_imported = await _chunked_execute(referral_batch, _execute_referrals)
+        await _chunked_execute(user_batches, _execute_users, "users")
+        await _chunked_execute(balance_batch, _execute_balances, "balances")
+        await _chunked_execute(referral_batch, _execute_referrals, "referrals")
 
         stats.skipped_entries = len(skipped)
         stats.errors = skipped
 
+        if progress_callback:
+            await progress_callback(stats.snapshot(), "summary")
+
         log.info(
-            "redis.migration.finished | users=%s balances=%s referrals=%s skipped=%s",
+            "redis-migration.finished | users=%s balances=%s referrals=%s skipped=%s",
             stats.users_imported,
             stats.balances_imported,
             stats.referrals_imported,
             stats.skipped_entries,
         )
         for line in stats.as_lines():
-            log.info(line)
+            log.info("redis-migration.summary | %s", line)
         if stats.skipped_entries:
             for entry in skipped:
-                log.warning("redis.migration.skipped | %s", entry)
+                log.warning("redis-migration.skipped | %s", entry)
     finally:
         try:
             await conn.close()
@@ -551,7 +584,7 @@ def main() -> None:
     try:
         stats = asyncio.run(migrate_from_redis())
     except Exception as exc:  # pragma: no cover - CLI failure path
-        log.exception("redis.migration.failed | err=%s", exc)
+        log.exception("redis-migration.failed | err=%s", exc)
         raise
     for line in stats.as_lines():
         print(line)

@@ -378,7 +378,7 @@ from ledger import (
     InsufficientBalance,
 )
 from db import postgres as db_postgres
-from scripts.migrate_from_redis import migrate_from_redis as run_redis_migration
+from scripts.migrate_from_redis import MigrationStats, migrate_from_redis as run_redis_migration
 from settings import (
     BANANA_SEND_AS_DOCUMENT,
     CRYPTO_PAYMENT_URL,
@@ -1477,7 +1477,16 @@ REDIS_MIGRATION_LOCK = asyncio.Lock()
 
 
 LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
-DATABASE_URL = _env("DATABASE_URL") or _env("POSTGRES_DSN")
+_DATABASE_URL_RAW = _env("DATABASE_URL") or _env("POSTGRES_DSN")
+if _DATABASE_URL_RAW:
+    try:
+        DATABASE_URL = db_postgres.normalize_dsn(_DATABASE_URL_RAW)
+    except Exception as exc:
+        log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+        raise
+else:
+    DATABASE_URL = ""
+
 if LEDGER_BACKEND != "memory" and not DATABASE_URL:
     raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
 if DATABASE_URL:
@@ -15828,17 +15837,30 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("⛔ У вас нет прав для этой команды.")
         return
     try:
-        stats = await asyncio.to_thread(db_postgres.check_health)
+        overview = await asyncio.to_thread(db_postgres.get_database_overview)
     except Exception as exc:
         log.exception("admin.check_db.failed | actor=%s err=%s", actor.id, exc)
         await message.reply_text(f"❌ Ошибка подключения к PostgreSQL: {exc}")
         return
-    lines = ["✅ PostgreSQL OK"]
-    lines.append(f"Users: {stats.get('users', 0)}")
-    lines.append(f"Balances: {stats.get('balances', 0)}")
-    lines.append(f"Referrals: {stats.get('referrals', 0)}")
-    lines.append(f"Transactions: {stats.get('transactions', 0)}")
-    lines.append(f"Audit log: {stats.get('audit_log', 0)}")
+
+    stats = overview.get("table_counts", {})
+    sizes = overview.get("table_sizes", {})
+    version = overview.get("server_version", "unknown")
+
+    def _fmt_size(value: int) -> str:
+        units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+        size = float(value)
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.1f} {unit}" if unit != "Б" else f"{int(size)} {unit}"
+            size /= 1024
+        return f"{size:.1f} {units[-1]}"
+
+    lines = ["✅ PostgreSQL OK", f"Версия сервера: {version}", "Таблицы:"]
+    for table, count in stats.items():
+        size = int(sizes.get(table, 0))
+        lines.append(f"• {table}: {count} записей, {_fmt_size(size)}")
+
     await message.reply_text("\n".join(lines))
 
 
@@ -15904,8 +15926,6 @@ async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
     if delta == 0:
         await message.reply_text("⚠️ Сумма должна отличаться от нуля.")
         return
-    op_id = f"admin:add:{uuid.uuid4().hex}"
-    meta = {"admin_id": actor.id, "note": note}
     try:
         await asyncio.to_thread(db_postgres.ensure_user, target_id)
     except Exception as exc:
@@ -15916,52 +15936,37 @@ async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
             exc,
         )
     try:
-        ledger_storage.ensure_user(target_id)
-        if delta > 0:
-            result = ledger_storage.credit(target_id, delta, "admin_adjust", op_id, meta)
-        else:
-            try:
-                result = ledger_storage.debit(target_id, -delta, "admin_adjust", op_id, meta)
-            except InsufficientBalance as exc:
-                await message.reply_text(
-                    f"❌ Недостаточно токенов: доступно {exc.balance}, требуется {-delta}."
-                )
-                return
-    except Exception as exc:
-        log.exception("admin_add_tokens_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
-        await message.reply_text("⚠️ Не удалось изменить баланс.")
-        return
-    audit_meta = {"note": note, "op_id": op_id}
-    try:
-        await asyncio.to_thread(
-            db_postgres.log_audit,
+        result = await asyncio.to_thread(
+            db_postgres.apply_balance_delta,
             target_id,
-            "admin_add_tokens",
             delta,
             actor_id=actor.id,
-            meta=audit_meta,
+            reason="admin_add_tokens",
+            note=note,
         )
+    except ValueError as exc:
+        message_text = str(exc)
+        if "insufficient balance" in message_text:
+            await message.reply_text("❌ Недостаточно токенов для списания.")
+        else:
+            await message.reply_text(f"❌ Некорректное изменение баланса: {message_text}.")
+        return
     except Exception as exc:
-        log.warning("audit_log_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
-    try:
-        await asyncio.to_thread(
-            db_postgres.log_transaction,
+        log.exception(
+            "admin_add_tokens_failed | actor=%s target=%s err=%s",
+            actor.id,
             target_id,
-            "credit" if delta > 0 else "debit",
-            abs(delta),
-            balance_after=result.balance,
-            reason="admin_adjust",
-            actor_id=actor.id,
-            meta=audit_meta,
+            exc,
         )
-    except Exception as exc:
-        log.warning("transaction_log_failed | actor=%s target=%s err=%s", actor.id, target_id, exc)
+        await message.reply_text("⚠️ Не удалось изменить баланс. Подробности в логах.")
+        return
+    new_balance = int(result.get("new_balance", 0))
     header = (
-        f"✅ Added {delta}💎 to user {target_id}."
+        f"✅ Добавлено {delta}💎 пользователю {target_id}."
         if delta > 0
-        else f"✅ Deducted {abs(delta)}💎 from user {target_id}."
+        else f"✅ Списано {abs(delta)}💎 у пользователя {target_id}."
     )
-    await message.reply_text(f"{header}\nНовый баланс: {result.balance}💎.")
+    await message.reply_text(f"{header}\nНовый баланс: {new_balance}💎.")
 
 
 async def admin_set_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -16155,15 +16160,47 @@ async def migrate_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     log.info("admin.migrate_redis.start | actor=%s", actor.id)
     async with REDIS_MIGRATION_LOCK:
         status = await message.reply_text("⏳ Запускаю миграцию из Redis в PostgreSQL…")
+        last_progress: Optional[str] = None
+
+        async def _progress_callback(snapshot: MigrationStats, stage: str) -> None:
+            nonlocal last_progress, status
+            stage_titles = {
+                "start": "инициализация",
+                "users": "пользователи",
+                "balances": "балансы",
+                "referrals": "рефералы",
+                "summary": "завершение",
+            }
+            title = stage_titles.get(stage, stage)
+            lines = [
+                "🚚 Миграция из Redis…",
+                f"Этап: {title}",
+                f"Users: {snapshot.users_imported}",
+                f"Balances: {snapshot.balances_imported}",
+                f"Referrals: {snapshot.referrals_imported}",
+            ]
+            if snapshot.skipped_entries:
+                lines.append(f"Пропущено: {snapshot.skipped_entries}")
+            if snapshot.errors and stage == "summary":
+                lines.append(f"Ошибки: {len(snapshot.errors)}")
+            text = "\n".join(lines)
+            if text == last_progress:
+                return
+            try:
+                await status.edit_text(text)
+                last_progress = text
+            except Exception:
+                pass
         try:
-            stats = await run_redis_migration()
+            stats = await run_redis_migration(progress_callback=_progress_callback)
         except Exception as exc:
             log.exception("admin.migrate_redis.failed | actor=%s err=%s", actor.id, exc)
             try:
-                await status.edit_text("❌ Миграция завершилась ошибкой. Подробности в логах.")
+                await status.edit_text(f"❌ Миграция завершилась ошибкой: {exc}")
             except Exception:
                 await message.reply_text("❌ Миграция завершилась ошибкой. Подробности в логах.")
             return
+        last_progress = None
         lines = stats.as_lines()
         if stats.errors:
             preview = stats.errors[:5]

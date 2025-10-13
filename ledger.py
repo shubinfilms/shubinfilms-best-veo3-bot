@@ -10,6 +10,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from db.postgres import normalize_dsn
+
 try:  # psycopg is optional when using the in-memory backend
     import psycopg
     from psycopg.errors import UniqueViolation
@@ -98,6 +100,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
     def __init__(self, dsn: str):
         if not dsn:
             raise RuntimeError("DATABASE_URL is required for ledger storage")
+        dsn = normalize_dsn(dsn)
         if psycopg is None or ConnectionPool is None:
             raise RuntimeError(
                 "Postgres ledger backend requires psycopg and psycopg_pool to be installed"

@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 try:  # psycopg is optional for some environments
@@ -24,10 +23,11 @@ log = logging.getLogger(__name__)
 
 _DSN: str = ""
 _ENGINE: Optional[Engine] = None
+ENGINE: Optional[Engine] = None
 _LOCK = threading.Lock()
 _LOGGED_SUCCESS = False
-_MAX_RETRIES = 3
-_BACKOFF_BASE = 1.0
+_MAX_RETRIES = 6
+_BACKOFF_BASE = 0.5
 _RETRYABLE_MESSAGES = (
     "SSL connection has been closed unexpectedly",
     "server closed the connection unexpectedly",
@@ -97,13 +97,42 @@ CREATE INDEX IF NOT EXISTS idx_transactions_user_created_at
 """
 
 
+def normalize_dsn(url: str) -> str:
+    """Ensure the DSN always uses the psycopg driver and Neon defaults."""
+
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("PostgreSQL DSN must be a non-empty string")
+
+    try:
+        parsed: URL = make_url(raw)
+    except Exception as exc:  # pragma: no cover - invalid DSN formatting
+        raise ValueError(f"Invalid PostgreSQL DSN: {url!r}") from exc
+
+    driver = (parsed.drivername or "").lower()
+    if driver in {"postgresql", "postgresql+psycopg2", "postgres", "postgres+psycopg2"}:
+        parsed = parsed.set(drivername="postgresql+psycopg")
+
+    query = {key: value for key, value in parsed.query.items()}
+    lowered = {key.lower(): key for key in query}
+    if "sslmode" not in lowered:
+        query["sslmode"] = "require"
+        parsed = parsed.set(query=query)
+    else:
+        actual_key = lowered["sslmode"]
+        if not (query.get(actual_key) or "").strip():
+            query[actual_key] = "require"
+            parsed = parsed.set(query=query)
+
+    return parsed.render_as_string(hide_password=False)
+
+
 def configure(dsn: str) -> None:
     """Configure the module with the database connection string."""
 
     global _DSN, _ENGINE
-    dsn = (dsn or "").strip()
-    if not dsn:
-        raise ValueError("PostgreSQL DSN must be a non-empty string")
+    dsn = normalize_dsn(dsn)
+    global ENGINE
     if _DSN and _DSN != dsn:
         with _LOCK:
             if _ENGINE is not None:
@@ -112,7 +141,9 @@ def configure(dsn: str) -> None:
                 except Exception:  # pragma: no cover - best effort cleanup
                     pass
                 _ENGINE = None
+                ENGINE = None
     _DSN = dsn
+    ENGINE = _ENGINE
 
 
 def _iter_exception_chain(exc: BaseException) -> Iterable[BaseException]:
@@ -136,46 +167,34 @@ def _is_retryable_error(exc: BaseException) -> bool:
     return False
 
 
-def _build_connect_args() -> Dict[str, Any]:
-    sslmode = os.getenv("POSTGRES_SSLMODE") or os.getenv("PGSSLMODE") or "require"
-    return {"sslmode": sslmode}
-
-
-def _pool_kwargs() -> Dict[str, int]:
-    try:
-        pool_size = int(os.getenv("POSTGRES_POOL_SIZE", "10"))
-    except ValueError:
-        pool_size = 10
-    try:
-        max_overflow = int(os.getenv("POSTGRES_MAX_OVERFLOW", "20"))
-    except ValueError:
-        max_overflow = 20
-    return {"pool_size": max(1, pool_size), "max_overflow": max(0, max_overflow)}
-
-
 def _test_connection(engine: Engine) -> None:
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
 
 
 def _connect_with_retry() -> Engine:
-    global _LOGGED_SUCCESS
+    global _LOGGED_SUCCESS, ENGINE
     last_error: Optional[BaseException] = None
     for attempt in range(1, _MAX_RETRIES + 1):
         engine: Optional[Engine] = None
         try:
-            log.info("Connecting to PostgreSQL (attempt %s/%s)…", attempt, _MAX_RETRIES)
+            log.info("postgres.connect_attempt | attempt=%s/%s", attempt, _MAX_RETRIES)
             engine = create_engine(
                 _DSN,
                 future=True,
                 pool_pre_ping=True,
-                **_pool_kwargs(),
-                connect_args=_build_connect_args(),
+                pool_size=5,
+                max_overflow=5,
+                pool_recycle=1800,
+                connect_args={"sslmode": "require"},
             )
             _test_connection(engine)
             if not _LOGGED_SUCCESS:
-                log.info("✅ Connected to PostgreSQL successfully.")
+                log.info(
+                    "postgres.connected | driver=%s", engine.url.drivername
+                )
                 _LOGGED_SUCCESS = True
+            ENGINE = engine
             return engine
         except Exception as exc:
             last_error = exc
@@ -186,11 +205,17 @@ def _connect_with_retry() -> Engine:
                     pass
             retryable = _is_retryable_error(exc)
             if not retryable or attempt >= _MAX_RETRIES:
-                log.error("❌ Failed to connect to PostgreSQL: %s", exc, exc_info=True)
+                log.error(
+                    "postgres.initialization_failed | attempt=%s/%s err=%s",
+                    attempt,
+                    _MAX_RETRIES,
+                    exc,
+                    exc_info=True,
+                )
                 raise
-            sleep_for = min(_BACKOFF_BASE * (2 ** (attempt - 1)), 10.0)
+            sleep_for = min(_BACKOFF_BASE * (2 ** (attempt - 1)), 4.0)
             log.warning(
-                "PostgreSQL connection attempt %s/%s failed: %s (retrying in %.1fs)",
+                "postgres.connection_retry | attempt=%s/%s err=%s wait=%.1fs",
                 attempt,
                 _MAX_RETRIES,
                 exc,
@@ -201,7 +226,7 @@ def _connect_with_retry() -> Engine:
 
 
 def _ensure_engine() -> Engine:
-    global _ENGINE
+    global _ENGINE, ENGINE
     if _ENGINE is not None:
         return _ENGINE
     if not _DSN:
@@ -209,6 +234,7 @@ def _ensure_engine() -> Engine:
     with _LOCK:
         if _ENGINE is None:
             _ENGINE = _connect_with_retry()
+            ENGINE = _ENGINE
     return _ENGINE
 
 
@@ -231,17 +257,45 @@ def get_engine() -> Engine:
     return _ensure_engine()
 
 
-def check_health() -> OrderedDict[str, int]:
-    """Return row counts for key tables to assess DB health."""
+def get_database_overview() -> Dict[str, Any]:
+    """Return aggregated information about the PostgreSQL database."""
 
     engine = _ensure_engine()
     tables = ("users", "balances", "referrals", "transactions", "audit_log")
-    stats: "OrderedDict[str, int]" = OrderedDict()
+    counts: "OrderedDict[str, int]" = OrderedDict()
+    sizes: "OrderedDict[str, int]" = OrderedDict()
     with engine.connect() as conn:
+        version = conn.execute(text("SHOW server_version")).scalar()
         for table in tables:
             result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
-            stats[table] = int(result.scalar() or 0)
-    return stats
+            counts[table] = int(result.scalar() or 0)
+        size_query = (
+            text(
+                """
+                SELECT c.relname AS name,
+                       pg_total_relation_size(c.oid) AS size
+                  FROM pg_class AS c
+                  JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'public' AND c.relname = ANY(:tables)
+                """
+            )
+            .bindparams(bindparam("tables", expanding=True))
+        )
+        for row in conn.execute(size_query, {"tables": list(tables)}).mappings():
+            sizes[row["name"]] = int(row["size"] or 0)
+        for table in tables:
+            sizes.setdefault(table, 0)
+    return {
+        "server_version": str(version or "unknown"),
+        "table_counts": counts,
+        "table_sizes": sizes,
+    }
+
+
+def check_health() -> OrderedDict[str, int]:
+    """Return row counts for key tables to assess DB health."""
+
+    return get_database_overview()["table_counts"]
 
 
 def export_balances_snapshot() -> Dict[str, Any]:
@@ -306,6 +360,107 @@ def log_transaction(
                 "meta": payload,
             },
         )
+
+
+def apply_balance_delta(
+    user_id: int,
+    delta: int,
+    *,
+    actor_id: Optional[int] = None,
+    reason: str = "admin_adjust",
+    note: Optional[str] = None,
+) -> Dict[str, int]:
+    """Atomically adjust a user's balance and return old/new values."""
+
+    user_id = int(user_id)
+    delta = int(delta)
+    if delta == 0:
+        raise ValueError("delta must be a non-zero integer")
+
+    engine = _ensure_engine()
+    direction = "credit" if delta > 0 else "debit"
+    amount = abs(delta)
+    metadata: Dict[str, Any] = {"delta": delta}
+    if note:
+        metadata["note"] = note
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO users (id)
+                VALUES (:uid)
+                ON CONFLICT (id) DO NOTHING
+                """
+            ),
+            {"uid": user_id},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO balances (user_id)
+                VALUES (:uid)
+                ON CONFLICT (user_id) DO NOTHING
+                """
+            ),
+            {"uid": user_id},
+        )
+        current_raw = conn.execute(
+            text("SELECT tokens FROM balances WHERE user_id = :uid FOR UPDATE"),
+            {"uid": user_id},
+        ).scalar()
+        current_balance = int(current_raw or 0)
+        new_balance = current_balance + delta
+        if new_balance < 0:
+            raise ValueError(
+                f"insufficient balance: have {current_balance}, need {abs(delta)}"
+            )
+        conn.execute(
+            text(
+                """
+                UPDATE balances
+                   SET tokens = :new_balance,
+                       updated_at = NOW()
+                 WHERE user_id = :uid
+                """
+            ),
+            {"new_balance": new_balance, "uid": user_id},
+        )
+        payload = json.dumps(metadata, ensure_ascii=False)
+        conn.execute(
+            text(
+                """
+                INSERT INTO audit_log (user_id, actor_id, action, amount, meta)
+                VALUES (:user_id, :actor_id, :action, :amount, :meta::jsonb)
+                """
+            ),
+            {
+                "user_id": user_id,
+                "actor_id": int(actor_id) if actor_id is not None else None,
+                "action": reason,
+                "amount": delta,
+                "meta": payload,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO transactions (user_id, direction, amount, balance_after, reason, actor_id, meta)
+                VALUES (:user_id, :direction, :amount, :balance_after, :reason, :actor_id, :meta::jsonb)
+                """
+            ),
+            {
+                "user_id": user_id,
+                "direction": direction,
+                "amount": amount,
+                "balance_after": new_balance,
+                "reason": reason,
+                "actor_id": int(actor_id) if actor_id is not None else None,
+                "meta": payload,
+            },
+        )
+
+    return {"old_balance": current_balance, "new_balance": new_balance}
 
 
 def ensure_user(user_id: int, *, username: Optional[str] = None, referrer_id: Optional[int] = None) -> None:
