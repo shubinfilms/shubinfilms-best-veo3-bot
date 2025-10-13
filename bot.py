@@ -15841,6 +15841,69 @@ def _admin_command_payload(message: Message, ctx: ContextTypes.DEFAULT_TYPE) -> 
     return text.partition(" ")[2].strip()
 
 
+async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        summary = await asyncio.to_thread(db_postgres.check_balance_consistency)
+    except Exception as exc:
+        log.exception("admin.check_balances.failed | actor=%s err=%s", actor.id, exc)
+        await message.reply_text("❌ Не удалось выполнить сверку балансов. Подробности в логах.")
+        return
+
+    mismatches = summary.get("mismatches", []) if isinstance(summary, dict) else []
+    total_balances = int(summary.get("total_balances", 0)) if isinstance(summary, dict) else 0
+    total_transactions = (
+        int(summary.get("total_transactions", 0)) if isinstance(summary, dict) else 0
+    )
+    difference = int(summary.get("difference", 0)) if isinstance(summary, dict) else 0
+
+    def _fmt(value: int) -> str:
+        return format(int(value), ",").replace(",", " ")
+
+    def _mask(uid: int) -> str:
+        digits = str(abs(int(uid)))
+        tail = digits[-3:] if digits else "000"
+        return f"***{tail}"
+
+    totals_line = (
+        f"Σ balances={_fmt(total_balances)}💎, Σ transactions={_fmt(total_transactions)}💎"
+    )
+    diff_line = f"Δ={format(difference, '+,').replace(',', ' ')}" if difference else ""
+
+    if not mismatches:
+        lines = ["✅ Балансы совпадают у всех пользователей.", totals_line]
+        if diff_line:
+            lines.append(diff_line)
+        await message.reply_text("\n".join(lines))
+        return
+
+    lines = ["⚠️ Несовпадения:", totals_line]
+    if diff_line:
+        lines.append(diff_line)
+
+    limit = 20
+    for entry in mismatches[:limit]:
+        uid = int(entry.get("user_id", 0))
+        balance_val = int(entry.get("balance", 0))
+        tx_val = int(entry.get("total_tx", 0))
+        lines.append(
+            f"ID {_mask(uid)} → balance={_fmt(balance_val)}, tx_sum={_fmt(tx_val)}"
+        )
+    extra = len(mismatches) - limit
+    if extra > 0:
+        lines.append(f"… ещё {extra} пользователей")
+
+    await message.reply_text("\n".join(lines))
+
+
 async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -15877,6 +15940,20 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         table_segments.append(f"{name}={rows} ({size_mb:.2f} MB)")
     if table_segments:
         lines.append("Tables: " + ", ".join(table_segments))
+
+    transactions_rows = int(tables.get("transactions", {}).get("rows", 0))
+    formatted_rows = format(transactions_rows, ",").replace(",", " ")
+    lines.append(f"📊 Transactions: {formatted_rows} rows")
+
+    ledger_summary = overview.get("ledger", {})
+    if isinstance(ledger_summary, dict) and ledger_summary.get("error"):
+        lines.append(f"🧾 Ledger check error: {ledger_summary['error']}")
+    else:
+        mismatch_count = int(ledger_summary.get("mismatch_count", 0)) if isinstance(ledger_summary, dict) else 0
+        if mismatch_count:
+            lines.append(f"🧾 Ledger mismatch: {mismatch_count} users")
+        else:
+            lines.append("🧾 Ledger: synchronized ✅")
 
     lines.append(
         "Pool: in_use={in_use} available={available}".format(
@@ -15962,31 +16039,23 @@ async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
     if delta == 0:
         await message.reply_text("⚠️ Сумма должна отличаться от нуля.")
         return
-    try:
-        await asyncio.to_thread(db_postgres.ensure_user, target_id)
-    except Exception as exc:
-        log.warning(
-            "admin_add_tokens.ensure_user_failed | actor=%s target=%s err=%s",
-            actor.id,
-            target_id,
-            exc,
+    if delta <= 0:
+        await message.reply_text(
+            "⚠️ Сумма должна быть положительной. Для списания используйте /spend_tokens."
         )
+        return
+
+    base_reason = "manual admin top-up"
+    tx_reason = f"{base_reason}: {note}" if note else base_reason
+
     try:
         result = await asyncio.to_thread(
-            db_postgres.apply_balance_delta,
+            db_postgres.log_transaction,
             target_id,
+            "credit",
             delta,
-            actor_id=actor.id,
-            reason="admin_add_tokens",
-            note=note,
+            reason=tx_reason,
         )
-    except ValueError as exc:
-        message_text = str(exc)
-        if "insufficient balance" in message_text:
-            await message.reply_text("❌ Недостаточно токенов для списания.")
-        else:
-            await message.reply_text(f"❌ Некорректное изменение баланса: {message_text}.")
-        return
     except Exception as exc:
         log.exception(
             "admin_add_tokens_failed | actor=%s target=%s err=%s",
@@ -15996,13 +16065,76 @@ async def admin_add_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
         )
         await message.reply_text("⚠️ Не удалось изменить баланс. Подробности в логах.")
         return
+
     new_balance = int(result.get("new_balance", 0))
-    header = (
-        f"✅ Добавлено {delta}💎 пользователю {target_id}."
-        if delta > 0
-        else f"✅ Списано {abs(delta)}💎 у пользователя {target_id}."
+    await message.reply_text(
+        f"✅ Добавлено {delta}💎 пользователю {target_id}.\nНовый баланс: {new_balance}💎."
     )
-    await message.reply_text(f"{header}\nНовый баланс: {new_balance}💎.")
+
+
+async def admin_spend_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    payload = _admin_command_payload(message, ctx)
+    if not payload:
+        await message.reply_text("⚠️ Использование: /spend_tokens <user_id> <amount> [примечание]")
+        return
+    parts = payload.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.reply_text("⚠️ Укажите пользователя и сумму.")
+        return
+    try:
+        target_id = int(parts[0])
+        amount = int(parts[1])
+    except ValueError:
+        await message.reply_text("⚠️ user_id и amount должны быть числами.")
+        return
+    if amount <= 0:
+        await message.reply_text("⚠️ Сумма должна быть положительной.")
+        return
+    note = parts[2].strip() if len(parts) > 2 else ""
+    base_reason = "generation cost"
+    tx_reason = f"{base_reason}: {note}" if note else base_reason
+    try:
+        result = await asyncio.to_thread(
+            db_postgres.log_transaction,
+            target_id,
+            "debit",
+            amount,
+            reason=tx_reason,
+        )
+    except ValueError as exc:
+        if "insufficient balance" in str(exc):
+            await message.reply_text("❌ Недостаточно токенов для списания.")
+            return
+        log.warning(
+            "admin_spend_tokens.validation_failed | actor=%s target=%s err=%s",
+            actor.id,
+            target_id,
+            exc,
+        )
+        await message.reply_text(f"⚠️ Некорректная операция: {exc}.")
+        return
+    except Exception as exc:
+        log.exception(
+            "admin_spend_tokens_failed | actor=%s target=%s err=%s",
+            actor.id,
+            target_id,
+            exc,
+        )
+        await message.reply_text("⚠️ Не удалось списать токены. Подробности в логах.")
+        return
+
+    new_balance = int(result.get("new_balance", 0))
+    await message.reply_text(
+        f"✅ Списано {amount}💎 у пользователя {target_id}.\nНовый баланс: {new_balance}💎."
+    )
 
 
 async def admin_set_tokens_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -19625,8 +19757,10 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("suno_debug",), suno_debug_command),
     (("broadcast",), broadcast_command),
     (("check_db",), admin_check_db_command),
+    (("check_balances",), admin_check_balances_command),
     (("backup_db",), admin_backup_db_command),
     (("add_tokens",), admin_add_tokens_command),
+    (("spend_tokens",), admin_spend_tokens_command),
     (("set_tokens",), admin_set_tokens_command),
     (("get_balance",), admin_get_balance_command),
     (("list_referrals",), admin_list_referrals_command),
