@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, cast
 
-import redis.asyncio as aioredis
+import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -230,7 +230,7 @@ async def _execute_with_retry(engine: Engine, stmt: Any, rows: Sequence[Dict[str
     return await _run_with_retry(f"{label}_batch", _run)
 
 
-async def _scan_keys(conn: aioredis.Redis, pattern: str) -> AsyncIterator[str]:
+async def _scan_keys(conn: redis.Redis, pattern: str) -> AsyncIterator[str]:
     cursor: int | str = 0
     while True:
         try:
@@ -251,7 +251,7 @@ async def _scan_keys(conn: aioredis.Redis, pattern: str) -> AsyncIterator[str]:
             break
 
 
-async def _count_keys(conn: aioredis.Redis, pattern: str) -> Optional[int]:
+async def _count_keys(conn: redis.Redis, pattern: str) -> Optional[int]:
     cursor: int | str = 0
     total = 0
     while True:
@@ -365,7 +365,7 @@ async def _execute_referrals(engine: Engine, rows: Sequence[Dict[str, Any]]) -> 
 
 
 async def _gather_ref_keys(
-    conn: aioredis.Redis,
+    conn: redis.Redis,
     prefix: str,
     *,
     skipped: List[str],
@@ -491,10 +491,10 @@ async def migrate_from_redis(
 
     engine = cast(Engine, ENGINE) if ENGINE is not None else db_postgres.get_engine()
 
-    conn: Optional[aioredis.Redis] = None
+    conn: Optional[redis.Redis] = None
     retry_count = 3
     for attempt in range(1, retry_count + 1):
-        candidate = aioredis.from_url(
+        candidate = redis.from_url(
             redis_url,
             encoding="utf-8",
             decode_responses=True,
@@ -850,7 +850,7 @@ async def migrate_from_redis(
     return stats
 
 
-async def cleanup_redis(conn: "aioredis.Redis", redis_prefix: str = "veo3:prod") -> int:
+async def cleanup_redis(conn: "redis.Redis", redis_prefix: str = "veo3:prod") -> int:
     """Remove legacy Redis keys that match the given prefix."""
 
     pattern = f"{redis_prefix}:*"
