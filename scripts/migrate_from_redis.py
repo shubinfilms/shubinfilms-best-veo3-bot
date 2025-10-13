@@ -368,7 +368,7 @@ async def migrate_from_redis(
         await progress_callback(stats.snapshot(), "start")
     skipped: List[str] = []
 
-    db_postgres.configure(database_url)
+    db_postgres.configure_engine(database_url)
     try:
         await asyncio.to_thread(db_postgres.ensure_tables)
     except Exception as exc:

@@ -1477,26 +1477,40 @@ REDIS_MIGRATION_LOCK = asyncio.Lock()
 
 
 LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
-_DATABASE_URL_RAW = _env("DATABASE_URL") or _env("POSTGRES_DSN")
-if _DATABASE_URL_RAW:
-    try:
-        DATABASE_URL = db_postgres.normalize_dsn(_DATABASE_URL_RAW)
-    except Exception as exc:
-        log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
-        raise
-else:
-    DATABASE_URL = ""
 
-if LEDGER_BACKEND != "memory" and not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL (or POSTGRES_DSN) must be set for persistent ledger storage")
-if DATABASE_URL:
-    try:
-        db_postgres.configure(DATABASE_URL)
-        db_postgres.ensure_tables()
-        log.info("postgres.initialized")
-    except Exception as exc:
-        log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
-        raise
+
+def _read_postgres_dsn() -> str:
+    for env_name in ("DATABASE_URL", "POSTGRES_DSN"):
+        value = _env(env_name)
+        if value:
+            return value
+    raise RuntimeError("PostgreSQL DSN not configured")
+
+
+try:
+    _RAW_DATABASE_URL = _read_postgres_dsn()
+    DATABASE_URL = db_postgres.normalize_dsn(_RAW_DATABASE_URL)
+except Exception as exc:
+    log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+    raise
+
+try:
+    db_postgres.configure_engine(DATABASE_URL)
+    db_postgres.ensure_tables()
+except Exception as exc:
+    log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+    raise
+
+_parsed_dsn = urlparse(DATABASE_URL)
+_dsn_query = dict(parse_qsl(_parsed_dsn.query, keep_blank_values=True))
+_startup_sslmode = _dsn_query.get("sslmode", "")
+log.info(
+    "startup.config | ledger_backend=%s postgres_dsn=%s sslmode=%s sqlalchemy_prefix=%s",
+    LEDGER_BACKEND,
+    db_postgres.mask_dsn(DATABASE_URL),
+    _startup_sslmode or "",
+    "yes" if db_postgres.sqlalchemy_prefix_detected() else "no",
+)
 
 def _rk(*parts: str) -> str: return ":".join([REDIS_PREFIX, *parts])
 
@@ -15837,29 +15851,51 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("⛔ У вас нет прав для этой команды.")
         return
     try:
-        overview = await asyncio.to_thread(db_postgres.get_database_overview)
+        overview = await asyncio.to_thread(db_postgres.db_overview)
     except Exception as exc:
         log.exception("admin.check_db.failed | actor=%s err=%s", actor.id, exc)
-        await message.reply_text(f"❌ Ошибка подключения к PostgreSQL: {exc}")
+        text = str(exc)
+        if text.startswith("❌ DSN invalid"):
+            await message.reply_text(text)
+        else:
+            await message.reply_text(f"❌ Ошибка подключения к PostgreSQL: {text}")
         return
 
-    stats = overview.get("table_counts", {})
-    sizes = overview.get("table_sizes", {})
-    version = overview.get("server_version", "unknown")
+    tables = overview.get("tables", {})
+    pool = overview.get("pool", {})
+    sslmode = str(overview.get("sslmode", "") or "")
+    lines = [
+        "✅ Database ready",
+        f"Server: {overview.get('server_version', 'unknown')}",
+        f"DB: {overview.get('database', '')} / {overview.get('schema', '')}",
+    ]
 
-    def _fmt_size(value: int) -> str:
-        units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
-        size = float(value)
-        for unit in units:
-            if size < 1024 or unit == units[-1]:
-                return f"{size:.1f} {unit}" if unit != "Б" else f"{int(size)} {unit}"
-            size /= 1024
-        return f"{size:.1f} {units[-1]}"
+    table_segments = []
+    for name, metrics in tables.items():
+        rows = int(metrics.get("rows", 0))
+        size_mb = float(metrics.get("size_mb", 0.0))
+        table_segments.append(f"{name}={rows} ({size_mb:.2f} MB)")
+    if table_segments:
+        lines.append("Tables: " + ", ".join(table_segments))
 
-    lines = ["✅ PostgreSQL OK", f"Версия сервера: {version}", "Таблицы:"]
-    for table, count in stats.items():
-        size = int(sizes.get(table, 0))
-        lines.append(f"• {table}: {count} записей, {_fmt_size(size)}")
+    lines.append(
+        "Pool: in_use={in_use} available={available}".format(
+            in_use=int(pool.get("in_use", 0)),
+            available=int(pool.get("available", 0)),
+        )
+    )
+    lines.append(f"SSL: {sslmode or 'unknown'}")
+
+    if sslmode.lower() != "require":
+        lines.append(
+            "⚠️ SSL: текущий sslmode=%s. Рекомендуется sslmode=require" % (sslmode or "unknown")
+        )
+
+    if overview.get("sqlalchemy_prefix"):
+        lines.append(
+            "В ENV обнаружен SQLAlchemy-префикс. "
+            "Замените на стандартный DSN вида postgres://user:pass@host:port/db?sslmode=require"
+        )
 
     await message.reply_text("\n".join(lines))
 
