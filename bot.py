@@ -25,7 +25,15 @@ import logger_to_telegram  # noqa: F401,E402
 
 from core.codex_logger import attach_codex_handler
 
-attach_codex_handler()
+_codex_handler = attach_codex_handler()
+if _codex_handler is not None:
+    def _shutdown_codex_handler() -> None:
+        try:
+            _codex_handler.close()
+        except Exception:
+            pass
+
+    atexit.register(_shutdown_codex_handler)
 
 _codex_enabled = os.getenv("CODEX_LOG_ENABLED", "false").lower() == "true"
 _codex_endpoint = "set" if os.getenv("CODEX_LOG_ENDPOINT") else "missing"
@@ -86,7 +94,15 @@ from telegram.ext import (
     PreCheckoutQueryHandler,
     ApplicationHandlerStop,
 )
-from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    RetryAfter,
+    TimedOut,
+    NetworkError,
+    TelegramError,
+    FloodWait,
+)
 
 from helpers.debounce import debounce
 
@@ -3173,7 +3189,7 @@ async def _send_with_retry(func: Callable[[], Awaitable[Any]], *, attempts: int 
             if delay:
                 await asyncio.sleep(delay)
             return await func()
-        except RetryAfter as exc:
+        except (RetryAfter, FloodWait) as exc:
             retry_after = getattr(exc, "retry_after", None)
             try:
                 delay = float(retry_after) if retry_after is not None else 3.0
@@ -10711,7 +10727,15 @@ async def _launch_suno_generation(
                 req_id=req_id,
                 reply_to=reply_to,
             )
-        except (Forbidden, BadRequest, RetryAfter, TimedOut, NetworkError, TelegramError) as exc:
+        except (
+            Forbidden,
+            BadRequest,
+            RetryAfter,
+            FloodWait,
+            TimedOut,
+            NetworkError,
+            TelegramError,
+        ) as exc:
             notify_exc = exc
         except Exception as exc:
             notify_exc = exc
@@ -14367,7 +14391,7 @@ async def poll_veo_and_send(
                     text=text,
                     **params,
                 )
-            except RetryAfter as exc:
+            except (RetryAfter, FloodWait) as exc:
                 delay = getattr(exc, "retry_after", None)
                 sleep_for = max(1, int(delay) if delay else 1)
                 await asyncio.sleep(sleep_for)
@@ -14406,7 +14430,7 @@ async def poll_veo_and_send(
                         document=input_file,
                         **params,
                     )
-            except RetryAfter as exc:
+            except (RetryAfter, FloodWait) as exc:
                 delay = getattr(exc, "retry_after", None)
                 sleep_for = max(1, int(delay) if delay else 1)
                 await asyncio.sleep(sleep_for)
@@ -16765,7 +16789,7 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 await _deliver()
                 sent += 1
                 return
-            except RetryAfter as exc:
+            except (RetryAfter, FloodWait) as exc:
                 last_retry_error = exc
                 await asyncio.sleep(exc.retry_after + 0.1)
                 continue
@@ -16894,7 +16918,24 @@ async def sora2_health_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await _refresh_video_menu_ui(ctx, chat_id=chat_id, message=None)
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error: %s", context.error)
+    err = context.error
+    if isinstance(err, (RetryAfter, FloodWait)):
+        retry_after = getattr(err, "retry_after", None)
+        try:
+            delay = float(retry_after) if retry_after is not None else 3.0
+        except (TypeError, ValueError):
+            delay = 3.0
+        delay = max(delay, 1.0)
+        if delay > 60.0:
+            delay = 60.0
+        log.warning("Telegram rate limit triggered | retry_after=%.1fs", delay)
+        try:
+            await asyncio.sleep(delay)
+        except Exception:
+            pass
+        return
+
+    log.exception("Unhandled error: %s", err)
     try:
         if update and update.effective_chat:
             await context.bot.send_message(update.effective_chat.id, "⚠️ Системная ошибка. Попробуйте ещё раз.")

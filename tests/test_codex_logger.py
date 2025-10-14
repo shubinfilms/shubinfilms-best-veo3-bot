@@ -81,3 +81,37 @@ async def _exercise(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         await runner.cleanup()
         logging.basicConfig(level=logging.INFO)
+
+
+def test_codex_handler_auto_disable(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    asyncio.run(_exercise_auto_disable(monkeypatch, caplog))
+
+
+async def _exercise_auto_disable(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CODEX_LOG_ENABLED", "true")
+    monkeypatch.setenv("CODEX_LOG_ENDPOINT", "http://example.com/api")
+    monkeypatch.setenv("CODEX_LOG_API_KEY", "test-key")
+    monkeypatch.setenv("CODEX_LOG_MAX_RETRY", "3")
+    monkeypatch.setenv("CODEX_LOG_SILENT_MODE", "false")
+    monkeypatch.delenv("TG_LOG_CHAT_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
+
+    monkeypatch.setattr(AsyncCodexHandler, "_start_worker", lambda self: None)
+
+    caplog.set_level(logging.WARNING, logger="codex")
+
+    handler = AsyncCodexHandler()
+    try:
+        assert handler.enabled
+
+        batch = [{"msg": "test"}]
+        for _ in range(handler.max_retry):
+            await handler._handle_flush_failure(batch, "connection failed", connection_failure=True)
+
+        assert not handler.enabled
+        messages = [rec.getMessage() for rec in caplog.records if rec.name == "codex"]
+        assert any("Codex disabled after repeated network errors" in msg for msg in messages)
+    finally:
+        handler.close()

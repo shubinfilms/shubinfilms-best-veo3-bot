@@ -46,6 +46,7 @@ class AsyncCodexHandler(logging.Handler):
         self._queue_ready = threading.Event()
         self._closing = False
         self._failure_streak = 0
+        self._connection_failures = 0
         self._backoff_until = 0.0
         self.last_warning_ts = 0.0
         self._offline_notified = False
@@ -120,21 +121,24 @@ class AsyncCodexHandler(logging.Handler):
             except Exception:
                 pass
 
-    def _disable_logging(self) -> None:
+    def _disable_logging(self, *, due_to_network: bool = False) -> None:
         if not self.enabled:
             self._notify_offline_mode()
             return
 
         if not self._disable_logged and not self.silent_mode:
-            logging.getLogger("codex").warning(
-                "⚠️ Codex logger disabled after repeated connection failures."
-            )
+            if due_to_network:
+                message = "Codex disabled after repeated network errors"
+            else:
+                message = "⚠️ Codex logger disabled"
+            logging.getLogger("codex").warning(message)
             self._disable_logged = True
 
         self.enabled = False
         self._notify_offline_mode()
         self._backoff_until = 0.0
         self._failure_streak = self.max_retry
+        self._connection_failures = self.max_retry
 
         if self.queue is not None:
             self._schedule_on_loop(self._shutdown_async)
@@ -315,6 +319,17 @@ class AsyncCodexHandler(logging.Handler):
         for _ in batch:
             self.queue.task_done()
 
+    def _is_connection_failure(self, exc: BaseException) -> bool:
+        return isinstance(
+            exc,
+            (
+                aiohttp.ClientConnectorError,
+                socket.gaierror,
+                TimeoutError,
+                asyncio.TimeoutError,
+            ),
+        )
+
     async def _send_batch(self, batch: List[Dict[str, Any]]) -> bool:
         if not batch or not self.endpoint or not self.api_key:
             return True
@@ -325,7 +340,9 @@ class AsyncCodexHandler(logging.Handler):
             raise
         except Exception as exc:  # pragma: no cover - defensive
             self._log_warning("session init failed: %s", exc)
-            await self._handle_flush_failure(batch, str(exc))
+            await self._handle_flush_failure(
+                batch, str(exc), connection_failure=self._is_connection_failure(exc)
+            )
             return False
 
         headers = {
@@ -349,25 +366,42 @@ class AsyncCodexHandler(logging.Handler):
             OSError,
         ) as exc:
             self._log_warning("flush error: %s", exc)
-            await self._handle_flush_failure(batch, str(exc))
+            await self._handle_flush_failure(
+                batch,
+                str(exc),
+                connection_failure=self._is_connection_failure(exc),
+            )
             return False
         except Exception as exc:
             self._log_warning("unexpected flush error: %s", exc)
-            await self._handle_flush_failure(batch, str(exc))
+            await self._handle_flush_failure(
+                batch, str(exc), connection_failure=self._is_connection_failure(exc)
+            )
             return False
 
         self._failure_streak = 0
+        self._connection_failures = 0
         self._backoff_until = 0.0
         return True
 
-    async def _handle_flush_failure(self, batch: List[Dict[str, Any]], reason: str) -> None:
+    async def _handle_flush_failure(
+        self,
+        batch: List[Dict[str, Any]],
+        reason: str,
+        *,
+        connection_failure: bool,
+    ) -> None:
         self._failure_streak += 1
+        if connection_failure:
+            self._connection_failures += 1
+        else:
+            self._connection_failures = 0
 
         delay = min(8.0, 2 ** max(0, self._failure_streak - 1))
         self._backoff_until = max(self._backoff_until, time.monotonic() + delay)
 
-        if self._failure_streak >= self.max_retry:
-            self._disable_logging()
+        if connection_failure and self._connection_failures >= self.max_retry:
+            self._disable_logging(due_to_network=True)
 
         if (
             self.silent_mode
@@ -414,10 +448,11 @@ class AsyncCodexHandler(logging.Handler):
             return
 
 
-def attach_codex_handler() -> None:
+def attach_codex_handler() -> Optional[AsyncCodexHandler]:
     handler = AsyncCodexHandler()
     if not handler.enabled:
-        return
+        handler.close()
+        return None
 
     handler.setLevel(getattr(logging, handler.min_level.upper(), logging.INFO))
 
@@ -437,3 +472,4 @@ def attach_codex_handler() -> None:
         logging.getLogger(name).addHandler(handler)
 
     logging.getLogger("codex").info("Codex log handler attached")
+    return handler
