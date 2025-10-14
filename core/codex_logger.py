@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import json
 import logging
@@ -16,6 +17,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import aiohttp
 
 
+_ENABLED_VALUES = {"1", "true", "yes"}
+_SETUP_ATTACHED = False
+_DISABLED_LOGGED = False
+
+
+def _is_enabled() -> bool:
+    return os.getenv("CODEX_LOG_ENABLED", "false").lower() in _ENABLED_VALUES
+
+
 class AsyncCodexHandler(logging.Handler):
     """A logging handler that ships structured logs to Codex asynchronously."""
 
@@ -25,7 +35,7 @@ class AsyncCodexHandler(logging.Handler):
 
     def __init__(self) -> None:
         super().__init__()
-        self.enabled = os.getenv("CODEX_LOG_ENABLED", "false").lower() == "true"
+        self.enabled = _is_enabled()
         self.endpoint = os.getenv("CODEX_LOG_ENDPOINT")
         self.api_key = os.getenv("CODEX_LOG_API_KEY")
         self.app_name = os.getenv("APP_NAME", "veo3-bot")
@@ -449,6 +459,14 @@ class AsyncCodexHandler(logging.Handler):
 
 
 def attach_codex_handler() -> Optional[AsyncCodexHandler]:
+    global _DISABLED_LOGGED
+
+    if not _is_enabled():
+        if not _DISABLED_LOGGED:
+            logging.getLogger("codex").info("Codex logging disabled via CODEX_LOG_ENABLED=false")
+            _DISABLED_LOGGED = True
+        return None
+
     handler = AsyncCodexHandler()
     if not handler.enabled:
         handler.close()
@@ -473,3 +491,25 @@ def attach_codex_handler() -> Optional[AsyncCodexHandler]:
 
     logging.getLogger("codex").info("Codex log handler attached")
     return handler
+
+
+def setup_codex_logger() -> None:
+    """Attach Codex handler once, respecting the environment flag."""
+
+    global _SETUP_ATTACHED
+
+    if _SETUP_ATTACHED:
+        return
+
+    handler = attach_codex_handler()
+    if handler is None:
+        return
+
+    def _shutdown_codex_handler() -> None:
+        try:
+            handler.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    atexit.register(_shutdown_codex_handler)
+    _SETUP_ATTACHED = True
