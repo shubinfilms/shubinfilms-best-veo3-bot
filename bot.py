@@ -23,19 +23,14 @@ log_environment(logging.getLogger("bot"))
 # Configure Telegram log forwarding as early as possible.
 import logger_to_telegram  # noqa: F401,E402
 
-from core.codex_logger import attach_codex_handler
+try:
+    from core.codex_logger import setup_codex_logger
 
-_codex_handler = attach_codex_handler()
-if _codex_handler is not None:
-    def _shutdown_codex_handler() -> None:
-        try:
-            _codex_handler.close()
-        except Exception:
-            pass
+    setup_codex_logger()
+except Exception as exc:
+    print(f"[INIT] Codex logger disabled: {exc}")
 
-    atexit.register(_shutdown_codex_handler)
-
-_codex_enabled = os.getenv("CODEX_LOG_ENABLED", "false").lower() == "true"
+_codex_enabled = os.getenv("CODEX_LOG_ENABLED", "false").lower() in {"1", "true", "yes"}
 _codex_endpoint = "set" if os.getenv("CODEX_LOG_ENDPOINT") else "missing"
 _codex_timeout = os.getenv("CODEX_LOG_TIMEOUT_SEC", "5")
 _codex_max_retry = os.getenv("CODEX_LOG_MAX_RETRY", "3")
@@ -101,7 +96,6 @@ from telegram.error import (
     TimedOut,
     NetworkError,
     TelegramError,
-    FloodWait,
 )
 
 from helpers.debounce import debounce
@@ -3189,7 +3183,7 @@ async def _send_with_retry(func: Callable[[], Awaitable[Any]], *, attempts: int 
             if delay:
                 await asyncio.sleep(delay)
             return await func()
-        except (RetryAfter, FloodWait) as exc:
+        except RetryAfter as exc:
             retry_after = getattr(exc, "retry_after", None)
             try:
                 delay = float(retry_after) if retry_after is not None else 3.0
@@ -10731,7 +10725,6 @@ async def _launch_suno_generation(
             Forbidden,
             BadRequest,
             RetryAfter,
-            FloodWait,
             TimedOut,
             NetworkError,
             TelegramError,
@@ -14391,7 +14384,7 @@ async def poll_veo_and_send(
                     text=text,
                     **params,
                 )
-            except (RetryAfter, FloodWait) as exc:
+            except RetryAfter as exc:
                 delay = getattr(exc, "retry_after", None)
                 sleep_for = max(1, int(delay) if delay else 1)
                 await asyncio.sleep(sleep_for)
@@ -14430,7 +14423,7 @@ async def poll_veo_and_send(
                         document=input_file,
                         **params,
                     )
-            except (RetryAfter, FloodWait) as exc:
+            except RetryAfter as exc:
                 delay = getattr(exc, "retry_after", None)
                 sleep_for = max(1, int(delay) if delay else 1)
                 await asyncio.sleep(sleep_for)
@@ -16789,9 +16782,11 @@ async def broadcast_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 await _deliver()
                 sent += 1
                 return
-            except (RetryAfter, FloodWait) as exc:
+            except RetryAfter as exc:
                 last_retry_error = exc
-                await asyncio.sleep(exc.retry_after + 0.1)
+                retry_after = getattr(exc, "retry_after", None)
+                delay = float(retry_after) if retry_after is not None else 1.0
+                await asyncio.sleep(max(delay, 0.0) + 0.1)
                 continue
             except Forbidden:
                 errors += 1
@@ -16919,7 +16914,7 @@ async def sora2_health_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     err = context.error
-    if isinstance(err, (RetryAfter, FloodWait)):
+    if isinstance(err, RetryAfter):
         retry_after = getattr(err, "retry_after", None)
         try:
             delay = float(retry_after) if retry_after is not None else 3.0
@@ -20547,6 +20542,8 @@ async def run_bot_async() -> None:
                     )
 
                     APPLICATION_READY.set()
+
+                    log.info("🚀 Bot startup complete (Codex disabled mode)")
 
                     try:
                         await stop_event.wait()

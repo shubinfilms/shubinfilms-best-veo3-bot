@@ -209,6 +209,13 @@ def init_logging(app_name: str, level: str | None = None, *, json_logs: bool | N
         extra={"meta": settings.critical_variables()},
     )
 
+    try:
+        from core.codex_logger import setup_codex_logger
+
+        setup_codex_logger()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        print(f"[INIT] Codex logger disabled: {exc}")
+
 
 __all__ = [
     "JsonFormatter",
