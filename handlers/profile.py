@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import time
+from types import SimpleNamespace
 from collections.abc import MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
+from telegram_utils import safe_send
 from .stars import build_stars_kb, open_stars_menu, render_stars_text
 from ui.card import build_card
 from utils.input_state import (
@@ -28,6 +31,13 @@ from utils.input_state import (
 )
 import settings as app_settings
 log = logging.getLogger(__name__)
+
+try:
+    _DEBOUNCE_MS = int(os.getenv("TG_DEBOUNCE_MS", "400") or "0")
+except ValueError:
+    _DEBOUNCE_MS = 400
+_DEBOUNCE_MS = max(_DEBOUNCE_MS, 0)
+_DEBOUNCE_SEC = _DEBOUNCE_MS / 1000 if _DEBOUNCE_MS else 0.0
 
 
 def _simple_profile_enabled() -> bool:
@@ -49,6 +59,27 @@ _HISTORY_TYPE_LABELS = {
     "debit": "Списание",
     "refund": "Возврат",
 }
+
+
+def _profile_log_context(update: Update, chat_id: Optional[int], message_id: Optional[int]) -> dict[str, Any]:
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+    effective_message = getattr(update, "effective_message", None)
+    message_text = None
+    if effective_message is not None:
+        message_text = getattr(effective_message, "text", None) or getattr(
+            effective_message, "caption", None
+        )
+    context = {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "handler": "profile",
+    }
+    if message_text:
+        context["msg"] = message_text
+    if message_id is not None:
+        context["message_id"] = message_id
+    return context
 
 
 def _as_html(text: str) -> str:
@@ -242,6 +273,33 @@ async def profile_update_or_send(
         return None
 
     chat_data = _chat_data(ctx)
+    token_store: MutableMapping[str, Any] | None = chat_data if isinstance(chat_data, MutableMapping) else None
+    if token_store is not None:
+        last_ts_raw = token_store.get("profile_last_ts")
+        try:
+            last_ts = float(last_ts_raw) if last_ts_raw is not None else 0.0
+        except (TypeError, ValueError):
+            last_ts = 0.0
+        now = time.monotonic()
+        token_store["profile_last_ts"] = now
+        token = int(token_store.get("profile_call_token", 0)) + 1
+        token_store["profile_call_token"] = token
+        delay = 0.0
+        if _DEBOUNCE_SEC and last_ts > 0:
+            elapsed = now - last_ts
+            if elapsed < _DEBOUNCE_SEC:
+                delay = _DEBOUNCE_SEC - elapsed
+        if delay > 0:
+            await asyncio.sleep(delay)
+            if token_store.get("profile_call_token") != token:
+                cached = token_store.get("profile_last_result")
+                if cached is not None:
+                    return cached
+                msg_id_cached = _get_profile_msg_id(chat_data)
+                if msg_id_cached:
+                    return SimpleNamespace(message_id=msg_id_cached)
+                return None
+
     msg_id = _get_profile_msg_id(chat_data)
 
     safe_source = tg_html_safe(text)
@@ -249,43 +307,58 @@ async def profile_update_or_send(
     if parse_mode is None:
         safe_mode = None
 
+    log_context = _profile_log_context(update, chat_id, msg_id)
+
     if msg_id:
         try:
-            result = await ctx.bot.edit_message_text(
+            result = await safe_send(
+                ctx.bot.edit_message_text,
+                method_name="edit_message_text",
+                kind="profile_edit",
                 chat_id=chat_id,
                 message_id=msg_id,
                 text=safe_text,
                 reply_markup=markup,
                 parse_mode=safe_mode,
                 disable_web_page_preview=True,
+                _log_context=log_context,
             )
         except BadRequest as exc:
-            log.warning(
-                "profile.edit.failed",
-                extra={
-                    "chat_id": chat_id,
-                    "msg_id": msg_id,
-                    "error": str(exc),
-                },
-            )
+            lowered = str(exc).lower()
+            if "message to edit not found" not in lowered:
+                log.debug(
+                    "profile.edit.failed",
+                    extra={
+                        "chat_id": chat_id,
+                        "msg_id": msg_id,
+                        "error": str(exc),
+                    },
+                )
+            msg_id = None
         else:
-            if isinstance(chat_data, MutableMapping):
-                message_id = getattr(result, "message_id", msg_id)
-                if isinstance(message_id, int):
-                    chat_data[PROFILE_MSG_ID] = message_id
-                    chat_data["profile_last_msg_id"] = message_id
-                else:
-                    chat_data.pop(PROFILE_MSG_ID, None)
-                    chat_data.pop("profile_last_msg_id", None)
-            return result
+            if result is None:
+                response = SimpleNamespace(message_id=msg_id)
+            else:
+                response = result
+                new_id = getattr(result, "message_id", msg_id)
+                if isinstance(chat_data, MutableMapping) and isinstance(new_id, int):
+                    chat_data[PROFILE_MSG_ID] = new_id
+                    chat_data["profile_last_msg_id"] = new_id
+            if token_store is not None:
+                token_store["profile_last_result"] = response
+            return response
 
-    return await send_profile_card(
+    response = await send_profile_card(
         ctx,
         chat_id=chat_id,
         text=text,
         reply_markup=markup,
         parse_mode=parse_mode,
+        log_context=log_context,
     )
+    if token_store is not None:
+        token_store["profile_last_result"] = response
+    return response
 
 
 async def send_profile_card(
@@ -295,6 +368,7 @@ async def send_profile_card(
     text: str,
     reply_markup: InlineKeyboardMarkup,
     parse_mode: ParseMode | str | None = ParseMode.HTML,
+    log_context: Optional[dict[str, Any]] = None,
 ) -> Message | None:
     if chat_id is None:
         log.warning("profile.send.missing_chat")
@@ -316,14 +390,20 @@ async def send_profile_card(
         if plain_text and plain_text != safe_text:
             attempts.append((plain_text, None))
 
+    context_payload = dict(log_context or {})
+
     for body, mode in attempts:
         try:
-            result_msg = await ctx.bot.send_message(
+            result_msg = await safe_send(
+                ctx.bot.send_message,
+                method_name="send_message",
+                kind="profile_send",
                 chat_id=chat_id,
                 text=body,
                 reply_markup=reply_markup,
                 parse_mode=mode,
                 disable_web_page_preview=True,
+                _log_context=context_payload,
             )
         except BadRequest as exc:
             log.warning(

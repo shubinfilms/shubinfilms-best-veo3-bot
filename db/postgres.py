@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -23,6 +24,36 @@ except Exception:  # pragma: no cover - optional dependency missing
 
 
 log = logging.getLogger("db.postgres")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = raw.strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        return default
+
+
+_POOL_SIZE = _env_int("PG_POOL_SIZE", 5)
+_MAX_OVERFLOW = _env_int("PG_MAX_OVERFLOW", 2)
+_POOL_RECYCLE = _env_int("PG_POOL_RECYCLE_SEC", 180)
+_POOL_TIMEOUT = _env_int("PG_POOL_TIMEOUT_SEC", 10)
+_KEEPALIVE_IDLE = _env_int("PG_KEEPALIVE_IDLE", 30)
+_KEEPALIVE_INTERVAL = _env_int("PG_KEEPALIVE_INTERVAL", 10)
+_KEEPALIVE_COUNT = _env_int("PG_KEEPALIVE_COUNT", 3)
+
+_CONNECT_ARGS = {
+    "sslmode": "require",
+    "keepalives": 1,
+    "keepalives_idle": _KEEPALIVE_IDLE,
+    "keepalives_interval": _KEEPALIVE_INTERVAL,
+    "keepalives_count": _KEEPALIVE_COUNT,
+}
 
 _DSN: str = ""
 _ENGINE: Optional[Engine] = None
@@ -264,11 +295,11 @@ def connect_with_retry(dsn: str, attempts: int = 6, backoff: float = 1.5) -> Eng
                 engine_url,
                 future=True,
                 pool_pre_ping=True,
-                pool_recycle=1800,
-                pool_size=5,
-                max_overflow=5,
-                pool_timeout=15,
-                connect_args={"sslmode": "require"},
+                pool_recycle=_POOL_RECYCLE,
+                pool_size=_POOL_SIZE,
+                max_overflow=_MAX_OVERFLOW,
+                pool_timeout=_POOL_TIMEOUT,
+                connect_args=_CONNECT_ARGS,
             )
             _test_connection(engine)
             log.info("postgres.connected | driver=postgresql+psycopg")

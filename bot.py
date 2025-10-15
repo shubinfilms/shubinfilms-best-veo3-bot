@@ -522,6 +522,7 @@ from telegram_utils import (
     download_image_from_update,
     TelegramImageError,
 )
+from utils.telegram_sender import get_sender, sender_snapshot, start_sender, stop_sender
 from utils.api_client import request_with_retries
 from utils.safe_send import safe_delete_message
 from utils.telegram_safe import safe_edit_message
@@ -1288,9 +1289,12 @@ if REDIS_URL and not REDIS_URL.startswith("memory://"):
         REDIS_URL,
         decode_responses=True,
         encoding="utf-8",
-        socket_connect_timeout=5,
-        socket_timeout=10,
-        max_connections=10,
+        socket_connect_timeout=3,
+        socket_timeout=_env_int("REDIS_SOCKET_TIMEOUT_SEC", 5),
+        max_connections=_env_int("REDIS_MAX_CONN", 10),
+        health_check_interval=_env_int("REDIS_HEALTHCHECK_SEC", 15),
+        socket_keepalive=True,
+        retry_on_timeout=True,
     )
     redis_client = redis.Redis(connection_pool=redis_pool)
 else:
@@ -16088,6 +16092,70 @@ async def admin_diag_codex_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
     await message.reply_text("✅ Codex diagnostic triggered. Check dashboard.")
 
 
+async def admin_diag_slow_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    actor = update.effective_user
+    message = update.effective_message
+    if actor is None or message is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    lines: list[str] = []
+
+    try:
+        sender_stats = await sender_snapshot()
+        lines.append(
+            "Sender: queue={queue_depth} inflight={inflight} global_rps={global_rps} per_chat_rps={per_chat_rps}".format(
+                **sender_stats
+            )
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        lines.append(f"Sender: error ({exc})")
+
+    try:
+        engine = db_postgres.get_engine()
+        pool = getattr(engine, "pool", None)
+        if pool is not None:
+            in_use = 0
+            available = 0
+            size = None
+            checkout = getattr(pool, "checkedout", None)
+            if callable(checkout):
+                with suppress(Exception):
+                    value = checkout()
+                    if isinstance(value, int):
+                        in_use = max(value, 0)
+            size_fn = getattr(pool, "size", None)
+            if callable(size_fn):
+                with suppress(Exception):
+                    size_val = size_fn()
+                    if isinstance(size_val, int):
+                        size = size_val
+            if size is not None:
+                available = max(size - in_use, 0)
+            pool_size = size if size is not None else "unknown"
+            lines.append(f"Postgres: in_use={in_use} available={available} pool_size={pool_size}")
+        else:
+            lines.append("Postgres: pool unavailable")
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        lines.append(f"Postgres: error ({exc})")
+
+    if redis_pool is not None:
+        try:
+            created = getattr(redis_pool, "_created_connections", 0) or 0
+            available = len(getattr(redis_pool, "_available_connections", []) or [])
+            in_use = max(created - available, 0)
+            lines.append(f"Redis: created={created} available={available} in_use={in_use}")
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            lines.append(f"Redis: error ({exc})")
+    else:
+        lines.append("Redis: pool unavailable")
+
+    await message.reply_text("\n".join(lines))
+
+
 async def admin_diag_env_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -20220,6 +20288,7 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("check_balances",), admin_check_balances_command),
     (("backup_db",), admin_backup_db_command),
     (("diag_codex",), admin_diag_codex_command),
+    (("diag_slow",), admin_diag_slow_command),
     (("diag_env",), admin_diag_env_command),
     (("add_tokens",), admin_add_tokens_command),
     (("spend_tokens",), admin_spend_tokens_command),
@@ -20485,6 +20554,10 @@ async def run_bot_async() -> None:
                     await application.initialize()
                     initialized = True
 
+                    sender = get_sender()
+                    sender.configure_from_env()
+                    await start_sender()
+
                     try:
                         await _run_suno_probe()
                     except Exception as exc:
@@ -20568,6 +20641,9 @@ async def run_bot_async() -> None:
                     if initialized:
                         with suppress(Exception):
                             await application.shutdown()
+
+                    with suppress(Exception):
+                        await stop_sender()
 
                     SHUTDOWN_EVENT.set()
         except RedisLockBusy:
