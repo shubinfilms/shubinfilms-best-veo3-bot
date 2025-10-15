@@ -33,6 +33,7 @@ from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, Tele
 from metrics import telegram_send_total
 from core.balance_provider import BalanceSnapshot
 from keyboards import CB_VIDEO_MENU, main_menu_kb
+from utils.telegram_sender import get_sender
 
 log = logging.getLogger("telegram.utils")
 
@@ -339,8 +340,43 @@ async def download_image_from_update(update: Any, bot: Any) -> TelegramImage:
     raise TelegramImageError("no_image", "message has no photo or document")
 
 
-async def _call_telegram(method: Callable[..., Awaitable[Any]], **kwargs: Any) -> Any:
-    return await method(**kwargs)
+def _extract_chat_id(payload: Mapping[str, Any]) -> Optional[int]:
+    chat_id = payload.get("chat_id")
+    if isinstance(chat_id, int):
+        return chat_id
+    chat = payload.get("chat")
+    if isinstance(chat, Mapping):
+        candidate = chat.get("id")
+        if isinstance(candidate, int):
+            return candidate
+    return None
+
+
+async def _call_telegram(
+    method: Callable[..., Awaitable[Any]],
+    *,
+    method_name: str,
+    kind: str,
+    log_context: Optional[Mapping[str, Any]] = None,
+    **kwargs: Any,
+) -> Any:
+    payload = dict(kwargs)
+    if log_context is None and "_log_context" in payload:
+        raw_ctx = payload.pop("_log_context")
+        if isinstance(raw_ctx, Mapping):
+            log_context = raw_ctx
+    else:
+        payload.pop("_log_context", None)
+    chat_id = _extract_chat_id(payload)
+    sender = get_sender()
+    return await sender.submit(
+        method,
+        method_name=method_name,
+        kind=kind,
+        chat_id=chat_id,
+        log_context=dict(log_context or {}),
+        **payload,
+    )
 
 
 async def safe_send(
@@ -364,7 +400,13 @@ async def safe_send(
     while attempt < max_attempts:
         attempt += 1
         try:
-            result = await _call_telegram(method, **kwargs)
+            result = await _call_telegram(
+                method,
+                method_name=method_name,
+                kind=kind,
+                log_context=kwargs.get("_log_context"),
+                **kwargs,
+            )
             telegram_send_total.labels(kind=kind, result="ok", **_BOT_LABELS).inc()
             if attempt > 1:
                 log.info(
@@ -381,7 +423,7 @@ async def safe_send(
         except BadRequest as exc:
             if _is_message_not_modified(exc):
                 telegram_send_total.labels(kind=kind, result="ok", **_BOT_LABELS).inc()
-                log.info(
+                log.debug(
                     "telegram send noop",
                     extra={
                         "meta": {
@@ -446,7 +488,8 @@ async def safe_send(
             if delay_base is None:
                 delay = _retry_delay(attempt)
             else:
-                delay = float(delay_base) * random.uniform(0.6, 1.6)
+                jitter = random.uniform(0.05, 0.35)
+                delay = float(delay_base) + jitter
             if attempt < max_attempts:
                 telegram_send_total.labels(kind=kind, result="retry", **_BOT_LABELS).inc()
                 log.warning(
