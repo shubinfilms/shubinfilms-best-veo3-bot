@@ -7,24 +7,25 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
-from db.postgres import normalize_dsn
+from core.db.postgres import create_connection_pool, normalize_dsn
+from core.db.retry import with_db_retries
 
 try:  # psycopg is optional when using the in-memory backend
     import psycopg
     from psycopg.errors import UniqueViolation
-    from psycopg_pool import ConnectionPool
 except ImportError:  # pragma: no cover - optional dependency handling
     psycopg = None  # type: ignore
 
     class UniqueViolation(Exception):  # type: ignore[override]
         pass
 
-    ConnectionPool = None  # type: ignore
-
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -105,14 +106,18 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             raise RuntimeError(
                 "Postgres ledger backend requires psycopg and psycopg_pool to be installed"
             )
-        self.dsn = dsn
-        self.pool = ConnectionPool(conninfo=dsn, max_size=10, kwargs={"autocommit": False})
-        self.pool.wait()
+        self.dsn = normalize_dsn(dsn)
+        self.pool = create_connection_pool(self.dsn, application_name="ledger")
+        self.log = log
         self._prepare()
 
     # ------------------------------------------------------------------
     #   Internal helpers
     # ------------------------------------------------------------------
+    def _with_retry(self, fn: Callable[[], T], *, op: str, **ctx: Any) -> T:
+        context = {"op": op, **ctx}
+        return with_db_retries(fn, logger=self.log, context=context)
+
     def _prepare(self) -> None:
         ddl_users = """
         CREATE TABLE IF NOT EXISTS users (
@@ -159,6 +164,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             type TEXT NOT NULL,
             amount BIGINT NOT NULL,
             reason TEXT,
+            key TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """
@@ -195,6 +201,8 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()",
             "ALTER TABLE transactions ALTER COLUMN created_at SET DEFAULT now()",
             "ALTER TABLE transactions ALTER COLUMN created_at SET NOT NULL",
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS key TEXT",
+            "ALTER TABLE transactions ADD CONSTRAINT IF NOT EXISTS transactions_user_type_key_key UNIQUE (user_id, type, key)",
             """
             UPDATE transactions
                SET amount = CASE
@@ -267,7 +275,7 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             VALUES (%s, %s, %s)
             ON CONFLICT (id) DO UPDATE
                SET username = COALESCE(EXCLUDED.username, users.username),
-                   referrer_id = COALESCE(EXCLUDED.referrer_id, users.referrer_id),
+                   referrer_id = COALESCE(users.referrer_id, EXCLUDED.referrer_id),
                    updated_at = now()
             """,
             (uid, username, referrer_id),
@@ -284,6 +292,8 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         tx_type: str,
         amount: int,
         reason: str,
+        *,
+        key: Optional[str] = None,
     ) -> None:
         amount_val = int(amount)
         if amount_val == 0:
@@ -298,43 +308,120 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             signed_amount = amount_val
         cur.execute(
             """
-            INSERT INTO transactions (user_id, type, amount, reason)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO transactions (user_id, type, amount, reason, key)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, type, key) DO NOTHING
             """,
-            (uid, tx_type_norm, signed_amount, reason_text),
+            (uid, tx_type_norm, signed_amount, reason_text, key),
         )
+
+    def diag_slow(self) -> list[Dict[str, Any]]:
+        diag_user_id = -1
+        probes: list[tuple[str, str, Callable[[], tuple[Any, ...]], bool]] = [
+            ("select_1", "SELECT 1", lambda: (), True),
+            ("count_users", "SELECT COUNT(*) FROM users", lambda: (), True),
+            (
+                "touch_user",
+                """
+                INSERT INTO users (id, username, updated_at)
+                VALUES (%s, %s, now())
+                ON CONFLICT (id) DO UPDATE
+                    SET username = EXCLUDED.username,
+                        updated_at = now()
+                """,
+                lambda: (diag_user_id, "diag_slow"),
+                False,
+            ),
+        ]
+
+        results: list[Dict[str, Any]] = []
+        for name, sql, params_factory, fetch in probes:
+            attempts = {"value": 0}
+            started = time.perf_counter()
+
+            def runner() -> Any:
+                attempts["value"] += 1
+                with self.pool.connection() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            params = params_factory()
+                            cur.execute(sql, params)
+                            if fetch:
+                                return cur.fetchone()
+                            return None
+
+            try:
+                row = self._with_retry(
+                    runner,
+                    op="diag",
+                    query=name,
+                )
+                duration = time.perf_counter() - started
+                entry: Dict[str, Any] = {
+                    "query": name,
+                    "duration": duration,
+                    "attempts": attempts["value"],
+                    "retries": max(attempts["value"] - 1, 0),
+                }
+                if fetch and row is not None:
+                    entry["result"] = row[0] if isinstance(row, tuple) else row
+                results.append(entry)
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                duration = time.perf_counter() - started
+                results.append(
+                    {
+                        "query": name,
+                        "duration": duration,
+                        "attempts": attempts["value"],
+                        "retries": max(attempts["value"] - 1, 0),
+                        "error": str(exc),
+                    }
+                )
+        return results
 
     # ------------------------------------------------------------------
     #   Public API
     # ------------------------------------------------------------------
     def ping(self) -> bool:
-        try:
+        def operation() -> None:
             with self.pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+
+        try:
+            self._with_retry(operation, op="ping")
             return True
         except Exception:
             log.exception("ledger ping failed")
             return False
 
     def get_promo_owner(self, promo_code: str) -> Optional[int]:
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT user_id FROM promo_usages WHERE promo_id=%s ORDER BY used_at ASC LIMIT 1",
-                    (promo_code,),
-                )
-                row = cur.fetchone()
-                return int(row[0]) if row else None
+        def operation() -> Optional[int]:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT user_id FROM promo_usages WHERE promo_id=%s ORDER BY used_at ASC LIMIT 1",
+                            (promo_code,),
+                        )
+                        row = cur.fetchone()
+                        return int(row[0]) if row else None
+
+        return self._with_retry(operation, op="get_promo_owner", promo=promo_code)
 
     def get_balance(self, uid: int) -> int:
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid)
-                cur.execute("SELECT tokens FROM balances WHERE user_id=%s", (uid,))
-                row = cur.fetchone()
-                return int(row[0]) if row else 0
+        def operation() -> int:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(cur, uid)
+                        cur.execute("SELECT tokens FROM balances WHERE user_id=%s", (uid,))
+                        row = cur.fetchone()
+                        return int(row[0]) if row else 0
+
+        return self._with_retry(operation, op="get_balance", uid=uid)
 
     def ensure_user(
         self,
@@ -343,9 +430,20 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         username: Optional[str] = None,
         referrer_id: Optional[int] = None,
     ) -> None:
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid, username=username, referrer_id=referrer_id)
+        def operation() -> None:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(
+                            cur, uid, username=username, referrer_id=referrer_id
+                        )
+
+        context: Dict[str, Any] = {"uid": uid}
+        if username:
+            context["username"] = username
+        if referrer_id is not None:
+            context["referrer_id"] = referrer_id
+        self._with_retry(operation, op="ensure_user", **context)
 
     def credit(
         self,
@@ -362,44 +460,62 @@ class _PostgresLedgerStorage(_LedgerHelpers):
 
         meta_json = self._json_meta(meta)
 
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid)
-                cur.execute(
-                    "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
-                    (uid,),
-                )
-                row = cur.fetchone()
-                old_balance = int(row[0]) if row else 0
+        def operation() -> LedgerOpResult:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(cur, uid)
+                        cur.execute(
+                            "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
+                            (uid,),
+                        )
+                        row = cur.fetchone()
+                        old_balance = int(row[0]) if row else 0
 
-                cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
-                if cur.fetchone():
-                    return LedgerOpResult(False, old_balance, op_id, reason, old_balance, duplicate=True)
+                        cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
+                        if cur.fetchone():
+                            return LedgerOpResult(
+                                False, old_balance, op_id, reason, old_balance, duplicate=True
+                            )
 
-                cur.execute(
-                    """
-                    UPDATE balances
-                       SET tokens = tokens + %s,
-                           updated_at = now()
-                     WHERE user_id = %s
-                     RETURNING tokens
-                    """,
-                    (amount, uid),
-                )
-                new_balance_row = cur.fetchone()
-                new_balance = int(new_balance_row[0]) if new_balance_row else old_balance
+                        cur.execute(
+                            """
+                            UPDATE balances
+                               SET tokens = tokens + %s,
+                                   updated_at = now()
+                             WHERE user_id = %s
+                             RETURNING tokens
+                            """,
+                            (amount, uid),
+                        )
+                        new_balance_row = cur.fetchone()
+                        new_balance = (
+                            int(new_balance_row[0]) if new_balance_row else old_balance
+                        )
 
-                cur.execute(
-                    """
-                    INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
-                    VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
-                    """,
-                    (uid, amount, reason, op_id, meta_json),
-                )
-                self._record_transaction(cur, uid, "credit", amount, reason)
+                        cur.execute(
+                            """
+                            INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
+                            VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
+                            """,
+                            (uid, amount, reason, op_id, meta_json),
+                        )
+                        self._record_transaction(cur, uid, "credit", amount, reason)
 
-        self._log_operation("credit", uid, op_id, amount, reason, old_balance, new_balance, meta)
-        return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
+                        return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
+
+        result = self._with_retry(
+            operation,
+            op="credit",
+            uid=uid,
+            op_id=op_id,
+            amount=amount,
+        )
+        if result.applied:
+            self._log_operation(
+                "credit", uid, op_id, amount, reason, result.old_balance, result.balance, meta
+            )
+        return result
 
     def debit(
         self,
@@ -416,47 +532,65 @@ class _PostgresLedgerStorage(_LedgerHelpers):
 
         meta_json = self._json_meta(meta)
 
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid)
-                cur.execute(
-                    "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
-                    (uid,),
-                )
-                row = cur.fetchone()
-                old_balance = int(row[0]) if row else 0
+        def operation() -> LedgerOpResult:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(cur, uid)
+                        cur.execute(
+                            "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
+                            (uid,),
+                        )
+                        row = cur.fetchone()
+                        old_balance = int(row[0]) if row else 0
 
-                cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
-                if cur.fetchone():
-                    return LedgerOpResult(False, old_balance, op_id, reason, old_balance, duplicate=True)
+                        cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
+                        if cur.fetchone():
+                            return LedgerOpResult(
+                                False, old_balance, op_id, reason, old_balance, duplicate=True
+                            )
 
-                if old_balance < amount:
-                    raise InsufficientBalance(old_balance, amount)
+                        if old_balance < amount:
+                            raise InsufficientBalance(old_balance, amount)
 
-                cur.execute(
-                    """
-                    UPDATE balances
-                       SET tokens = tokens - %s,
-                           updated_at = now()
-                     WHERE user_id = %s
-                     RETURNING tokens
-                    """,
-                    (amount, uid),
-                )
-                new_balance_row = cur.fetchone()
-                new_balance = int(new_balance_row[0]) if new_balance_row else old_balance
+                        cur.execute(
+                            """
+                            UPDATE balances
+                               SET tokens = tokens - %s,
+                                   updated_at = now()
+                             WHERE user_id = %s
+                             RETURNING tokens
+                            """,
+                            (amount, uid),
+                        )
+                        new_balance_row = cur.fetchone()
+                        new_balance = (
+                            int(new_balance_row[0]) if new_balance_row else old_balance
+                        )
 
-                cur.execute(
-                    """
-                    INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
-                    VALUES (%s, 'debit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
-                    """,
-                    (uid, amount, reason, op_id, meta_json),
-                )
-                self._record_transaction(cur, uid, "debit", amount, reason)
+                        cur.execute(
+                            """
+                            INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
+                            VALUES (%s, 'debit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
+                            """,
+                            (uid, amount, reason, op_id, meta_json),
+                        )
+                        self._record_transaction(cur, uid, "debit", amount, reason)
 
-        self._log_operation("debit", uid, op_id, amount, reason, old_balance, new_balance, meta)
-        return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
+                        return LedgerOpResult(True, new_balance, op_id, reason, old_balance)
+
+        result = self._with_retry(
+            operation,
+            op="debit",
+            uid=uid,
+            op_id=op_id,
+            amount=amount,
+        )
+        if result.applied:
+            self._log_operation(
+                "debit", uid, op_id, -amount, reason, result.old_balance, result.balance, meta
+            )
+        return result
 
     def grant_signup_bonus(
         self, uid: int, amount: int, meta: Optional[Dict[str, Any]] = None
@@ -464,72 +598,104 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         amount = int(amount)
         op_id = f"signup:{uid}"
         meta_json = self._json_meta(meta)
+        
+        def operation() -> LedgerOpResult:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(cur, uid)
+                        cur.execute(
+                            "SELECT tokens, signup_bonus_granted FROM balances WHERE user_id=%s FOR UPDATE",
+                            (uid,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            old_balance = int(row[0])
+                            already = bool(row[1])
+                        else:
+                            old_balance = 0
+                            already = False
 
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid)
-                cur.execute(
-                    "SELECT tokens, signup_bonus_granted FROM balances WHERE user_id=%s FOR UPDATE",
-                    (uid,),
-                )
-                row = cur.fetchone()
-                if row:
-                    old_balance = int(row[0])
-                    already = bool(row[1])
-                else:
-                    old_balance = 0
-                    already = False
+                        if already:
+                            return LedgerOpResult(
+                                False,
+                                old_balance,
+                                op_id,
+                                "signup_bonus",
+                                old_balance,
+                                duplicate=True,
+                            )
 
-                if already:
-                    return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
+                        cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
+                        if cur.fetchone():
+                            cur.execute(
+                                "UPDATE balances SET signup_bonus_granted = TRUE WHERE user_id=%s",
+                                (uid,),
+                            )
+                            return LedgerOpResult(
+                                False,
+                                old_balance,
+                                op_id,
+                                "signup_bonus",
+                                old_balance,
+                                duplicate=True,
+                            )
 
-                cur.execute(
-                    """
-                    SELECT 1 FROM ledger WHERE op_id=%s
-                    """,
-                    (op_id,),
-                )
-                if cur.fetchone():
-                    cur.execute(
-                        "UPDATE balances SET signup_bonus_granted = TRUE WHERE user_id=%s",
-                        (uid,),
-                    )
-                    return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
+                        if amount <= 0:
+                            cur.execute(
+                                "UPDATE balances SET signup_bonus_granted = TRUE WHERE user_id=%s",
+                                (uid,),
+                            )
+                            return LedgerOpResult(
+                                False,
+                                old_balance,
+                                op_id,
+                                "signup_bonus",
+                                old_balance,
+                                duplicate=True,
+                            )
 
-                if amount <= 0:
-                    cur.execute(
-                        "UPDATE balances SET signup_bonus_granted = TRUE WHERE user_id=%s",
-                        (uid,),
-                    )
-                    return LedgerOpResult(False, old_balance, op_id, "signup_bonus", old_balance, duplicate=True)
+                        cur.execute(
+                            """
+                            UPDATE balances
+                               SET tokens = tokens + %s,
+                                   signup_bonus_granted = TRUE,
+                                   updated_at = now()
+                             WHERE user_id = %s
+                             RETURNING tokens
+                            """,
+                            (amount, uid),
+                        )
+                        new_balance_row = cur.fetchone()
+                        new_balance = (
+                            int(new_balance_row[0]) if new_balance_row else old_balance
+                        )
 
-                cur.execute(
-                    """
-                    UPDATE balances
-                       SET tokens = tokens + %s,
-                           signup_bonus_granted = TRUE,
-                           updated_at = now()
-                     WHERE user_id = %s
-                     RETURNING tokens
-                    """,
-                    (amount, uid),
-                )
-                new_balance_row = cur.fetchone()
-                new_balance = int(new_balance_row[0]) if new_balance_row else old_balance
+                        cur.execute(
+                            """
+                            INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
+                            VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
+                            """,
+                            (uid, amount, "signup_bonus", op_id, meta_json),
+                        )
+                        self._record_transaction(
+                            cur, uid, "credit", amount, "signup_bonus", key="signup"
+                        )
 
-                cur.execute(
-                    """
-                    INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
-                    VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
-                    """,
-                    (uid, amount, "signup_bonus", op_id, meta_json),
-                )
-                self._record_transaction(cur, uid, "credit", amount, "signup_bonus")
+                        return LedgerOpResult(True, new_balance, op_id, "signup_bonus", old_balance)
 
-        self._log_operation(
-            "credit", uid, op_id, amount, "signup_bonus", old_balance, new_balance, meta
+        result = self._with_retry(
+            operation,
+            op="grant_signup_bonus",
+            uid=uid,
+            op_id=op_id,
+            amount=amount,
         )
-        return LedgerOpResult(True, new_balance, op_id, "signup_bonus", old_balance)
+        if result.applied:
+            self._log_operation(
+                "credit", uid, op_id, amount, "signup_bonus", result.old_balance, result.balance, meta
+            )
+        return result
 
     def apply_promo(
         self,
@@ -542,69 +708,109 @@ class _PostgresLedgerStorage(_LedgerHelpers):
         meta = dict(meta or {})
         meta.setdefault("promo_code", promo_code)
         meta_json = self._json_meta(meta)
+        amount_value = int(amount)
 
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid)
-                cur.execute(
-                    "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
-                    (uid,),
-                )
-                row = cur.fetchone()
-                old_balance = int(row[0]) if row else 0
+        def operation() -> LedgerOpResult:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(cur, uid)
+                        cur.execute(
+                            "SELECT tokens FROM balances WHERE user_id=%s FOR UPDATE",
+                            (uid,),
+                        )
+                        row = cur.fetchone()
+                        old_balance = int(row[0]) if row else 0
 
-                cur.execute("SELECT user_id FROM promo_usages WHERE promo_id=%s ORDER BY used_at ASC LIMIT 1", (promo_code,))
-                owner_row = cur.fetchone()
-                if owner_row:
-                    owner = int(owner_row[0])
-                    if owner != uid:
-                        return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+                        cur.execute(
+                            "SELECT user_id FROM promo_usages WHERE promo_id=%s ORDER BY used_at ASC LIMIT 1",
+                            (promo_code,),
+                        )
+                        owner_row = cur.fetchone()
+                        if owner_row:
+                            owner = int(owner_row[0])
+                            if owner != uid:
+                                return LedgerOpResult(
+                                    False,
+                                    old_balance,
+                                    op_id,
+                                    "promo",
+                                    old_balance,
+                                    duplicate=True,
+                                )
 
-                cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
-                if cur.fetchone():
-                    return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+                        cur.execute("SELECT 1 FROM ledger WHERE op_id=%s", (op_id,))
+                        if cur.fetchone():
+                            return LedgerOpResult(
+                                False, old_balance, op_id, "promo", old_balance, duplicate=True
+                            )
 
-                cur.execute(
-                    """
-                    INSERT INTO promo_usages (user_id, promo_id)
-                    VALUES (%s, %s)
-                    ON CONFLICT DO NOTHING
-                    RETURNING promo_id
-                    """,
-                    (uid, promo_code),
-                )
-                inserted = cur.fetchone()
-                if not inserted:
-                    return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+                        cur.execute(
+                            """
+                            INSERT INTO promo_usages (user_id, promo_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING
+                            RETURNING promo_id
+                            """,
+                            (uid, promo_code),
+                        )
+                        inserted = cur.fetchone()
+                        if not inserted:
+                            return LedgerOpResult(
+                                False, old_balance, op_id, "promo", old_balance, duplicate=True
+                            )
 
-                amount = int(amount)
-                if amount <= 0:
-                    return LedgerOpResult(False, old_balance, op_id, "promo", old_balance, duplicate=True)
+                        if amount_value <= 0:
+                            return LedgerOpResult(
+                                False, old_balance, op_id, "promo", old_balance, duplicate=True
+                            )
 
-                cur.execute(
-                    """
-                    UPDATE balances
-                       SET tokens = tokens + %s,
-                           updated_at = now()
-                     WHERE user_id = %s
-                     RETURNING tokens
-                    """,
-                    (amount, uid),
-                )
-                new_balance_row = cur.fetchone()
-                new_balance = int(new_balance_row[0]) if new_balance_row else old_balance
+                        cur.execute(
+                            """
+                            UPDATE balances
+                               SET tokens = tokens + %s,
+                                   updated_at = now()
+                             WHERE user_id = %s
+                             RETURNING tokens
+                            """,
+                            (amount_value, uid),
+                        )
+                        new_balance_row = cur.fetchone()
+                        new_balance = (
+                            int(new_balance_row[0]) if new_balance_row else old_balance
+                        )
 
-                cur.execute(
-                    """
-                    INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
-                    VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
-                    """,
-                    (uid, amount, "promo", op_id, meta_json),
-                )
-                self._record_transaction(cur, uid, "credit", amount, "promo")
+                        cur.execute(
+                            """
+                            INSERT INTO ledger (user_id, type, amount, reason, op_id, meta)
+                            VALUES (%s, 'credit', %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb))
+                            """,
+                            (uid, amount_value, "promo", op_id, meta_json),
+                        )
+                        self._record_transaction(
+                            cur,
+                            uid,
+                            "credit",
+                            amount_value,
+                            "promo",
+                            key=f"promo:{promo_code}",
+                        )
 
-        self._log_operation("credit", uid, op_id, amount, "promo", old_balance, new_balance, meta)
-        return LedgerOpResult(True, new_balance, op_id, "promo", old_balance)
+                        return LedgerOpResult(True, new_balance, op_id, "promo", old_balance)
+
+        result = self._with_retry(
+            operation,
+            op="apply_promo",
+            uid=uid,
+            op_id=op_id,
+            promo=promo_code,
+            amount=amount_value,
+        )
+        if result.applied:
+            self._log_operation(
+                "credit", uid, op_id, amount_value, "promo", result.old_balance, result.balance, meta
+            )
+        return result
 
     def rename_operation(
         self,
@@ -616,18 +822,27 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             return True
         meta_json = self._json_meta(extra_meta)
         try:
-            with self.pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE ledger
-                           SET op_id = %s,
-                               meta = COALESCE(meta, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb)
-                         WHERE op_id = %s
-                        """,
-                        (new_op_id, meta_json, old_op_id),
-                    )
-                    updated = cur.rowcount
+            def operation() -> int:
+                with self.pool.connection() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE ledger
+                                   SET op_id = %s,
+                                       meta = COALESCE(meta, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb)
+                                 WHERE op_id = %s
+                                """,
+                                (new_op_id, meta_json, old_op_id),
+                            )
+                            return cur.rowcount
+
+            updated = self._with_retry(
+                operation,
+                op="rename_operation",
+                old_op_id=old_op_id,
+                new_op_id=new_op_id,
+            )
             if updated:
                 log.info("ledger rename op_id %s -> %s", old_op_id, new_op_id)
             return bool(updated)
@@ -636,35 +851,43 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             return False
 
     def recalc_user_balance(self, uid: int) -> BalanceRecalcResult:
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                self._ensure_user(cur, uid)
-                cur.execute("SELECT tokens FROM balances WHERE user_id=%s", (uid,))
-                row = cur.fetchone()
-                previous = int(row[0]) if row else 0
+        def operation() -> BalanceRecalcResult:
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        self._ensure_user(cur, uid)
+                        cur.execute("SELECT tokens FROM balances WHERE user_id=%s", (uid,))
+                        row = cur.fetchone()
+                        previous = int(row[0]) if row else 0
 
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(CASE WHEN type='credit' THEN amount ELSE -amount END), 0)
-                      FROM ledger
-                     WHERE user_id = %s
-                    """,
-                    (uid,),
-                )
-                calc_row = cur.fetchone()
-                calculated = int(calc_row[0]) if calc_row else 0
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(CASE WHEN type='credit' THEN amount ELSE -amount END), 0)
+                              FROM ledger
+                             WHERE user_id = %s
+                            """,
+                            (uid,),
+                        )
+                        calc_row = cur.fetchone()
+                        calculated = int(calc_row[0]) if calc_row else 0
 
-                updated = calculated != previous
-                if updated:
-                    cur.execute(
-                        "UPDATE balances SET tokens = %s, updated_at = now() WHERE user_id = %s",
-                        (calculated, uid),
-                    )
-        if updated:
+                        updated = calculated != previous
+                        if updated:
+                            cur.execute(
+                                "UPDATE balances SET tokens = %s, updated_at = now() WHERE user_id = %s",
+                                (calculated, uid),
+                            )
+
+                        return BalanceRecalcResult(
+                            previous=previous, calculated=calculated, updated=updated
+                        )
+
+        result = self._with_retry(operation, op="recalc_user_balance", uid=uid)
+        if result.updated:
             log.info(
-                "ledger recalc user=%s previous=%s calculated=%s", uid, previous, calculated
+                "ledger recalc user=%s previous=%s calculated=%s", uid, result.previous, result.calculated
             )
-        return BalanceRecalcResult(previous=previous, calculated=calculated, updated=updated)
+        return result
 
 
 class _MemoryLedgerStorage(_LedgerHelpers):

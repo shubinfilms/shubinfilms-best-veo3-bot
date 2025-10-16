@@ -16142,6 +16142,28 @@ async def admin_diag_slow_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     except Exception as exc:  # pragma: no cover - diagnostics only
         lines.append(f"Postgres: error ({exc})")
 
+    if hasattr(ledger_storage, "diag_slow"):
+        try:
+            diag_results = await asyncio.to_thread(ledger_storage.diag_slow)
+            for entry in diag_results:
+                duration_ms = entry.get("duration", 0.0) * 1000.0
+                attempts = entry.get("attempts", 0)
+                retries = entry.get("retries", max(attempts - 1, 0))
+                parts = [
+                    f"DB {entry.get('query')}: {duration_ms:.1f}ms",
+                    f"attempts={attempts}",
+                    f"retries={retries}",
+                ]
+                if "result" in entry:
+                    parts.append(f"result={entry['result']}")
+                if "error" in entry:
+                    parts.append(f"error={entry['error']}")
+                lines.append(" ".join(parts))
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            lines.append(f"DB diag error: {exc}")
+    else:
+        lines.append("DB diag unavailable for current backend")
+
     if redis_pool is not None:
         try:
             created = getattr(redis_pool, "_created_connections", 0) or 0
