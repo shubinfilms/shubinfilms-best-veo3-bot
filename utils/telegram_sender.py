@@ -31,11 +31,11 @@ def _read_float(name: str, default: float) -> float:
 
 @dataclass(slots=True)
 class _Request:
+    target_chat_id: Optional[int]
     method: Callable[..., Awaitable[Any]]
     kwargs: Dict[str, Any]
     method_name: str
     kind: str
-    chat_id: Optional[int]
     future: asyncio.Future[Any]
     log_context: Dict[str, Any]
 
@@ -87,25 +87,27 @@ class TelegramSender:
     # ------------------------------------------------------------------
     async def submit(
         self,
+        target_chat_id: Optional[int],
         method: Callable[..., Awaitable[Any]],
         *,
         method_name: str,
         kind: str,
-        chat_id: Optional[int],
         log_context: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
+        if "chat_id" in kwargs:
+            raise TypeError("Do not pass 'chat_id' in kwargs; use positional target_chat_id")
         if self._worker is None or self._worker.done():
             await self.start()
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         payload = _Request(
+            target_chat_id=target_chat_id,
             method=method,
             kwargs=dict(kwargs),
             method_name=method_name,
             kind=kind,
-            chat_id=chat_id,
             future=future,
             log_context=dict(log_context or {}),
         )
@@ -134,11 +136,14 @@ class TelegramSender:
                 request = await self._queue.get()
                 if request is None:  # pragma: no cover - defensive
                     continue
-                await self._wait_for_slot(request.chat_id)
+                await self._wait_for_slot(request.target_chat_id)
                 async with self._stats_lock:
                     self._inflight += 1
                 try:
-                    result = await request.method(**request.kwargs)
+                    call_kwargs = dict(request.kwargs)
+                    if request.target_chat_id is not None:
+                        call_kwargs.setdefault("chat_id", request.target_chat_id)
+                    result = await request.method(**call_kwargs)
                 except BadRequest as exc:
                     lowered = str(exc).lower()
                     if "message is not modified" in lowered:
@@ -147,10 +152,10 @@ class TelegramSender:
                             extra={"meta": {"method": request.method_name, **request.log_context}},
                         )
                         request.future.set_result(None)
-                    elif "message to edit not found" in lowered and request.chat_id is not None:
+                    elif "message to edit not found" in lowered and request.target_chat_id is not None:
                         log.info(
                             "telegram.sender.edit_missing",
-                            extra={"meta": {"chat_id": request.chat_id, **request.log_context}},
+                            extra={"meta": {"chat_id": request.target_chat_id, **request.log_context}},
                         )
                         request.future.set_exception(exc)
                     else:

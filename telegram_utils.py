@@ -368,12 +368,13 @@ async def _call_telegram(
     else:
         payload.pop("_log_context", None)
     chat_id = _extract_chat_id(payload)
+    payload.pop("chat_id", None)
     sender = get_sender()
     return await sender.submit(
+        chat_id,
         method,
         method_name=method_name,
         kind=kind,
-        chat_id=chat_id,
         log_context=dict(log_context or {}),
         **payload,
     )
@@ -410,7 +411,7 @@ async def safe_send(
             telegram_send_total.labels(kind=kind, result="ok", **_BOT_LABELS).inc()
             if attempt > 1:
                 log.info(
-                    "telegram send succeeded",
+                    "SENDER_RETRY_OK",
                     extra={
                         "meta": {
                             "method": method_name,
@@ -493,7 +494,7 @@ async def safe_send(
             if attempt < max_attempts:
                 telegram_send_total.labels(kind=kind, result="retry", **_BOT_LABELS).inc()
                 log.warning(
-                    "telegram retry",
+                    "SENDER_RATE_LIMIT",
                     extra={
                         "meta": {
                             "method": method_name,
