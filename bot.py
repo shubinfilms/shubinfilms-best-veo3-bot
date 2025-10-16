@@ -1547,7 +1547,10 @@ except Exception as exc:
     log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
     raise
 
+PG_POOL = None
+
 try:
+    PG_POOL = asyncio.run(db_postgres.create_pg_pool(DATABASE_URL))
     db_postgres.configure_engine(DATABASE_URL)
     db_postgres.ensure_tables()
 except Exception as exc:

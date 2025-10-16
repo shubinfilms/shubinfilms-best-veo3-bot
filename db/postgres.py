@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -11,8 +13,10 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
 
+import psycopg
+from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -46,6 +50,9 @@ _POOL_TIMEOUT = _env_int("PG_POOL_TIMEOUT_SEC", 10)
 _KEEPALIVE_IDLE = _env_int("PG_KEEPALIVE_IDLE", 30)
 _KEEPALIVE_INTERVAL = _env_int("PG_KEEPALIVE_INTERVAL", 10)
 _KEEPALIVE_COUNT = _env_int("PG_KEEPALIVE_COUNT", 3)
+_CONN_RETRIES = _env_int("PG_CONN_RETRIES", 5)
+_CONN_RETRY_DELAY = _env_int("PG_CONN_RETRY_DELAY_SEC", 3)
+_CONN_KEEPALIVE = _env_int("PG_CONN_KEEPALIVE", 1)
 
 _CONNECT_ARGS = {
     "sslmode": "require",
@@ -58,6 +65,7 @@ _CONNECT_ARGS = {
 _DSN: str = ""
 _ENGINE: Optional[Engine] = None
 ENGINE: Optional[Engine] = None
+_ASYNC_POOL: Optional[AsyncConnectionPool] = None
 _LOCK = threading.Lock()
 _SQLA_PREFIX_DETECTED = False
 _LAST_NORMALIZE_PREFIX = False
@@ -69,6 +77,27 @@ _RETRYABLE_MESSAGES = (
     "timeout expired",
     "timed out",
 )
+
+def _run_async_in_thread(coro: Awaitable[Any]) -> Any:
+    """Execute an async coroutine in a dedicated thread and return the result."""
+
+    result: Dict[str, Any] = {}
+    error: List[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except Exception as exc:  # pragma: no cover - defensive
+            error.append(exc)
+
+    thread = threading.Thread(target=_runner, name="pg-pool-init", daemon=True)
+    thread.start()
+    thread.join()
+
+    if error:
+        raise error[0]
+    return result.get("value")
+
 
 _USERS_DDL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -268,6 +297,110 @@ def _is_retryable_error(exc: BaseException) -> bool:
         if any(token in message for token in _RETRYABLE_MESSAGES):
             return True
     return False
+
+
+async def create_pg_pool(dsn: Optional[str] = None) -> AsyncConnectionPool:
+    """Initialise an async connection pool with retry and keepalive settings."""
+
+    global _ASYNC_POOL, _DSN
+
+    source_dsn = dsn or _DSN or os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
+    if not source_dsn:
+        raise RuntimeError("PostgreSQL DSN not configured")
+
+    normalized = normalize_dsn(source_dsn)
+    retries = max(1, _CONN_RETRIES)
+    delay = max(1, _CONN_RETRY_DELAY)
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            pool = AsyncConnectionPool(
+                conninfo=normalized,
+                min_size=1,
+                max_size=8,
+                timeout=10,
+                kwargs={
+                    "keepalives": _CONN_KEEPALIVE,
+                    "keepalives_idle": _KEEPALIVE_IDLE,
+                    "keepalives_interval": _KEEPALIVE_INTERVAL,
+                    "keepalives_count": _KEEPALIVE_COUNT,
+                },
+            )
+            await pool.wait()
+            print("✅ Postgres connected")
+            old_pool: Optional[AsyncConnectionPool] = None
+            with _LOCK:
+                old_pool = _ASYNC_POOL
+                _ASYNC_POOL = pool
+                _DSN = normalized
+            if old_pool is not None:
+                with contextlib.suppress(Exception):  # pragma: no cover - best effort
+                    await old_pool.close()
+            log.info(
+                "Postgres connected and validated",
+                extra={"logger": "db", "module": "postgres"},
+            )
+            return pool
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            print(f"Postgres retry {attempt}/{retries}: {exc}")
+            await asyncio.sleep(delay)
+
+    raise RuntimeError("Postgres connection failed after retries") from last_error
+
+
+def _reset_pg_connection_sync() -> None:
+    """Reset the SQLAlchemy engine and async pool after a connection failure."""
+
+    global _ENGINE, ENGINE
+
+    previous_engine: Optional[Engine] = None
+    with _LOCK:
+        if _ENGINE is not None:
+            previous_engine = _ENGINE
+        _ENGINE = None
+        ENGINE = None
+
+    if previous_engine is not None:
+        with contextlib.suppress(Exception):  # pragma: no cover - best effort
+            previous_engine.dispose()
+
+    source_dsn = _DSN or os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
+    if not source_dsn:
+        raise RuntimeError("PostgreSQL DSN not configured")
+
+    try:
+        _run_async_in_thread(create_pg_pool(source_dsn))
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning(
+            "postgres.ensure_pg_connection.pool_reset_failed | err=%s",
+            exc,
+            exc_info=True,
+        )
+
+    _ensure_engine()
+
+
+def ensure_pg_connection(func):
+    """Decorator ensuring DB operations recover from transient connection failures."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if not _is_retryable_error(exc):
+                raise
+            log.warning(
+                "postgres.ensure_pg_connection.retry | func=%s err=%s",
+                getattr(func, "__name__", repr(func)),
+                exc,
+            )
+            _reset_pg_connection_sync()
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def _test_connection(engine: Engine) -> None:
@@ -1121,6 +1254,29 @@ def restore_referrals(records: Iterable[Tuple[int, int]]) -> int:
                     exc,
                 )
     return restored
+
+
+_DB_CRITICAL_FUNCTIONS = [
+    "ensure_tables",
+    "db_overview",
+    "export_balances_snapshot",
+    "ensure_user",
+    "set_referrer",
+    "log_transaction",
+    "apply_balance_delta",
+    "increment_referral_earnings",
+    "get_referral_stats",
+    "list_referrals",
+    "get_user_balance",
+    "log_audit",
+    "restore_referrals",
+    "get_referral_total",
+]
+
+for _func_name in _DB_CRITICAL_FUNCTIONS:
+    _func_obj = globals().get(_func_name)
+    if callable(_func_obj):  # pragma: no branch - defensive guard
+        globals()[_func_name] = ensure_pg_connection(_func_obj)  # type: ignore[assignment]
 
 
 __all__ = [
