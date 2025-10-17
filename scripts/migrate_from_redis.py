@@ -484,7 +484,7 @@ async def migrate_from_redis(
 
     db_postgres.configure_engine(database_url)
     try:
-        await asyncio.to_thread(db_postgres.ensure_tables)
+        await db_postgres.ensure_tables_with_retries()
     except Exception as exc:
         log.error("redis-migration.ensure_tables_failed | err=%s", exc, exc_info=True)
         raise RuntimeError("Failed to prepare PostgreSQL tables") from exc

@@ -1551,11 +1551,14 @@ PG_POOL = None
 
 try:
     PG_POOL = asyncio.run(db_postgres.create_pg_pool(DATABASE_URL))
-    db_postgres.configure_engine(DATABASE_URL)
-    db_postgres.ensure_tables()
 except Exception as exc:
+    PG_POOL = None
     log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
-    raise
+
+try:
+    db_postgres.configure_engine(DATABASE_URL)
+except Exception as exc:
+    log.critical("postgres.engine_configuration_failed | err=%s", exc, exc_info=True)
 
 _parsed_dsn = urlparse(DATABASE_URL)
 _dsn_query = dict(parse_qsl(_parsed_dsn.query, keep_blank_values=True))
@@ -20542,6 +20545,26 @@ async def run_bot_async() -> None:
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    background_tasks: list[asyncio.Task[Any]] = []
+
+    async def _async_init_tables() -> None:
+        delay = 5
+        while True:
+            try:
+                await db_postgres.ensure_tables_with_retries()
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - startup resilience
+                log.error("DB init async startup: %s", exc, exc_info=True)
+                await asyncio.sleep(delay)
+
+    background_tasks.append(asyncio.create_task(_async_init_tables()))
+
+    try:
+        background_tasks.append(asyncio.create_task(db_postgres.db_health_check()))
+    except Exception as exc:
+        log.error("DB health check startup failed: %s", exc, exc_info=True)
 
     def request_shutdown(sig: Optional[signal.Signals]) -> None:
         signal_name = getattr(sig, "name", None) or (str(sig) if sig else "external")
@@ -20666,6 +20689,11 @@ async def run_bot_async() -> None:
                     if initialized:
                         with suppress(Exception):
                             await application.shutdown()
+
+                    for task in background_tasks:
+                        task.cancel()
+                        with suppress(Exception):
+                            await task
 
                     with suppress(Exception):
                         await stop_sender()
