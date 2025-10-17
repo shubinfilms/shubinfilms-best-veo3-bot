@@ -15,6 +15,8 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
 
+from logging_utils import log_info
+
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine, text
@@ -314,6 +316,7 @@ async def create_pg_pool(dsn: Optional[str] = None) -> AsyncConnectionPool:
     last_error: Optional[BaseException] = None
 
     for attempt in range(1, retries + 1):
+        pool: Optional[AsyncConnectionPool] = None
         try:
             pool = AsyncConnectionPool(
                 conninfo=normalized,
@@ -327,7 +330,11 @@ async def create_pg_pool(dsn: Optional[str] = None) -> AsyncConnectionPool:
                     "keepalives_count": _KEEPALIVE_COUNT,
                 },
             )
-            await pool.wait()
+            await pool.open()
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT 1")
+                    await cur.fetchone()
             print("✅ Postgres connected")
             old_pool: Optional[AsyncConnectionPool] = None
             with _LOCK:
@@ -337,17 +344,42 @@ async def create_pg_pool(dsn: Optional[str] = None) -> AsyncConnectionPool:
             if old_pool is not None:
                 with contextlib.suppress(Exception):  # pragma: no cover - best effort
                     await old_pool.close()
-            log.info(
+            log_info(
+                log,
                 "Postgres connected and validated",
-                extra={"logger": "db", "module": "postgres"},
+                extra={
+                    "logger": "db",
+                    "meta": {"ctx": {"component": "postgres"}},
+                },
             )
             return pool
         except psycopg.OperationalError as exc:
             last_error = exc
+            if pool is not None:
+                with contextlib.suppress(Exception):  # pragma: no cover - best effort
+                    await pool.close()
             print(f"Postgres retry {attempt}/{retries}: {exc}")
             await asyncio.sleep(delay)
+        except Exception:
+            if pool is not None:
+                with contextlib.suppress(Exception):  # pragma: no cover - best effort
+                    await pool.close()
+            raise
 
     raise RuntimeError("Postgres connection failed after retries") from last_error
+
+
+async def close_pg_pool() -> None:
+    """Close the global async pool if it is initialised."""
+
+    global _ASYNC_POOL
+    pool: Optional[AsyncConnectionPool] = None
+    with _LOCK:
+        pool = _ASYNC_POOL
+        _ASYNC_POOL = None
+    if pool is not None:
+        with contextlib.suppress(Exception):  # pragma: no cover - best effort
+            await pool.close()
 
 
 def _reset_pg_connection_sync() -> None:
