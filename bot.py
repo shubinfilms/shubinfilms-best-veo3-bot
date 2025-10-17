@@ -2964,9 +2964,6 @@ def _acquire_click_lock(user_id: Optional[int], action: str) -> bool:
 # Ledger storage (Postgres / memory)
 ledger_storage = LedgerStorage(DATABASE_URL, backend=LEDGER_BACKEND)
 register_balance_storage(ledger_storage)
-if LEDGER_BACKEND != "memory":
-    if not ledger_storage.ping():
-        raise RuntimeError("Failed to connect to PostgreSQL ledger backend")
 
 
 def _ops_state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -6114,15 +6111,13 @@ async def show_emoji_hub_for_chat(
             await ctx.bot.delete_message(chat_id=chat_id, message_id=hub_msg_id)
         ctx.user_data["hub_msg_id"] = None
 
-    send_payload = dict(card)
-    send_payload["chat_id"] = chat_id
-
     try:
         message = await tg_safe_send(
             ctx.bot.send_message,
             method_name="sendMessage",
             kind="message",
-            **send_payload,
+            chat_id=chat_id,
+            **card,
         )
     except Exception as exc:  # pragma: no cover - network issues
         log.warning("hub.send_failed | user_id=%s err=%s", resolved_uid, exc)
@@ -20552,6 +20547,12 @@ async def run_bot_async() -> None:
         while True:
             try:
                 await db_postgres.ensure_tables_with_retries()
+                if LEDGER_BACKEND != "memory":
+                    try:
+                        await asyncio.to_thread(ledger_storage.start)
+                    except Exception as exc:
+                        log.critical("ledger.pool.start_failed: %s", exc, exc_info=True)
+                        sys.exit(1)
                 break
             except asyncio.CancelledError:
                 raise
@@ -20694,6 +20695,11 @@ async def run_bot_async() -> None:
                         task.cancel()
                         with suppress(Exception):
                             await task
+
+                    try:
+                        ledger_storage.stop()
+                    except Exception:
+                        log.exception("ledger.stop.failed")
 
                     with suppress(Exception):
                         await stop_sender()
