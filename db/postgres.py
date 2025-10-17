@@ -18,6 +18,8 @@ from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple
 from logging_utils import log_info
 
 import psycopg
+from psycopg import InterfaceError as PsycopgInterfaceError
+from psycopg import OperationalError as PsycopgOperationalErrorSync
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, URL, make_url
@@ -55,6 +57,8 @@ _KEEPALIVE_COUNT = _env_int("PG_KEEPALIVE_COUNT", 3)
 _CONN_RETRIES = _env_int("PG_CONN_RETRIES", 5)
 _CONN_RETRY_DELAY = _env_int("PG_CONN_RETRY_DELAY_SEC", 3)
 _CONN_KEEPALIVE = _env_int("PG_CONN_KEEPALIVE", 1)
+_TABLE_RETRY_ATTEMPTS = _env_int("PG_RETRY_ATTEMPTS", 5)
+_TABLE_RETRY_DELAY = _env_int("PG_RETRY_DELAY", 3)
 
 _CONNECT_ARGS = {
     "sslmode": "require",
@@ -440,6 +444,45 @@ def _test_connection(engine: Engine) -> None:
         conn.execute(text("SELECT 1"))
 
 
+def reconnect_pool() -> None:
+    """Dispose the current engine and rebuild it with fresh connections."""
+
+    global _ENGINE, ENGINE
+
+    dsn = _DSN or os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
+    if not dsn:
+        log.error("Reconnection skipped: DSN not configured")
+        return
+
+    existing: Optional[Engine] = None
+    with _LOCK:
+        existing = _ENGINE
+        _ENGINE = None
+        ENGINE = None
+
+    if existing is not None:
+        with contextlib.suppress(Exception):
+            existing.dispose(close=True)
+    log.info("♻️ Disposed old Postgres engine, reconnecting...")
+
+    try:
+        engine = create_engine(
+            dsn,
+            future=True,
+            pool_pre_ping=True,
+            pool_recycle=_POOL_RECYCLE,
+            pool_size=_POOL_SIZE,
+            max_overflow=_MAX_OVERFLOW,
+            pool_timeout=_POOL_TIMEOUT,
+            connect_args=_CONNECT_ARGS,
+        )
+        with _LOCK:
+            _ENGINE = engine
+            ENGINE = engine
+    except Exception as exc:
+        log.error("Reconnection failed: %s", exc, exc_info=True)
+
+
 def connect_with_retry(dsn: str, attempts: int = 6, backoff: float = 1.5) -> Engine:
     """Create a SQLAlchemy engine with retry logic and health check."""
 
@@ -512,14 +555,17 @@ def configure_engine(dsn: str) -> Engine:
     normalized = normalize_dsn(dsn)
     log.info("postgres.configure_engine | dsn=%s", mask_dsn(normalized))
 
+    global _DSN
+    with _LOCK:
+        _DSN = normalized
+
     engine = connect_with_retry(normalized)
 
-    global _DSN, _ENGINE, ENGINE, _SQLA_PREFIX_DETECTED
+    global _ENGINE, ENGINE, _SQLA_PREFIX_DETECTED
     with _LOCK:
         if _ENGINE is not None and _ENGINE is not engine:
             with contextlib.suppress(Exception):  # pragma: no cover - best effort
                 _ENGINE.dispose()
-        _DSN = normalized
         _ENGINE = engine
         ENGINE = engine
         _SQLA_PREFIX_DETECTED = bool(_LAST_NORMALIZE_PREFIX)
@@ -547,9 +593,7 @@ def _ensure_engine() -> Engine:
     return _ENGINE
 
 
-def ensure_tables() -> None:
-    """Create required tables if they do not exist."""
-
+def _ensure_tables_once() -> None:
     engine = _ensure_engine()
     with engine.begin() as conn:
         conn.execute(text(_USERS_DDL))
@@ -569,6 +613,60 @@ def ensure_tables() -> None:
         conn.execute(text(_TRANSACTIONS_INDEX_DDL))
         for statement in _TRANSACTIONS_MIGRATIONS:
             conn.execute(text(statement))
+
+
+async def ensure_tables_with_retries(
+    max_retries: int = _TABLE_RETRY_ATTEMPTS,
+    delay: int = _TABLE_RETRY_DELAY,
+) -> None:
+    """Ensure that required tables exist, retrying on SSL disconnects."""
+
+    retries = max(1, max_retries)
+    base_delay = max(1, delay)
+
+    for attempt in range(retries):
+        try:
+            await asyncio.to_thread(_ensure_tables_once)
+            log.info("✅ Postgres tables ensured successfully")
+            return
+        except (PsycopgOperationalErrorSync, PsycopgInterfaceError, OperationalError) as exc:
+            message = str(exc)
+            if "SSL connection" in message:
+                log.warning(
+                    "Postgres init retry %s/%s: %s",
+                    attempt + 1,
+                    retries,
+                    message,
+                )
+                await asyncio.sleep(base_delay * (attempt + 1))
+                reconnect_pool()
+                continue
+            raise
+
+    raise RuntimeError("Postgres init failed after retries")
+
+
+def ensure_tables() -> None:
+    """Synchronous wrapper for compatibility callers."""
+
+    asyncio.run(ensure_tables_with_retries())
+
+
+async def db_health_check(interval_seconds: int = 60) -> None:
+    """Periodically verify the database connection and reconnect if needed."""
+
+    interval = max(5, int(interval_seconds))
+
+    while True:
+        try:
+            await asyncio.to_thread(_test_connection, _ensure_engine())
+        except Exception as exc:  # pragma: no cover - runtime resilience
+            log.warning(
+                "⚠️ DB health check failed: %s, reconnecting…",
+                exc,
+            )
+            reconnect_pool()
+        await asyncio.sleep(interval)
 
 
 def get_engine() -> Engine:
