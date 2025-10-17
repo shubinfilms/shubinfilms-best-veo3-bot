@@ -7,7 +7,148 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
+
+RESERVED = {
+    "name",
+    "msg",
+    "args",
+    "levelno",
+    "levelname",
+    "pathname",
+    "filename",
+    "module",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "processName",
+    "process",
+    "stack_info",
+    "exc_info",
+    "exc_text",
+    "message",
+    "asctime",
+}
+
+
+def _ensure_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value is None:
+        return {}
+    return {"value": value}
+
+
+def sanitize_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return a copy of ``extra`` safe for ``logging.Logger`` usage."""
+
+    if not extra:
+        return {}
+
+    working: MutableMapping[str, Any] = dict(extra)
+    raw_meta = working.pop("meta", None)
+    meta = _ensure_mapping(raw_meta)
+
+    raw_ctx = meta.get("ctx")
+    ctx = _ensure_mapping(raw_ctx)
+
+    safe: dict[str, Any] = {}
+    for key, value in working.items():
+        if key in RESERVED:
+            ctx[f"x_{key}"] = value
+        else:
+            safe[key] = value
+
+    if ctx:
+        meta["ctx"] = dict(ctx)
+    else:
+        meta.pop("ctx", None)
+
+    result: dict[str, Any] = {}
+    if meta:
+        result["meta"] = meta
+    result.update(safe)
+    return result
+
+
+class SanitizingLogger(logging.Logger):
+    """Logger subclass ensuring ``extra`` dictionaries are safe."""
+
+    def _log(
+        self,
+        level: int,
+        msg: object,
+        args: tuple[Any, ...],
+        exc_info: Any | None = None,
+        extra: Mapping[str, Any] | None = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+    ) -> None:
+        sanitized = sanitize_extra(extra)
+        super()._log(
+            level,
+            msg,
+            args,
+            exc_info=exc_info,
+            extra=sanitized or None,
+            stack_info=stack_info,
+            stacklevel=stacklevel,
+        )
+
+
+class SafeLoggerAdapter(logging.LoggerAdapter):
+    """Adapter that sanitizes ``extra`` payloads automatically."""
+
+    def process(self, msg: Any, kwargs: MutableMapping[str, Any]) -> tuple[Any, MutableMapping[str, Any]]:
+        if "extra" in kwargs:
+            sanitized = sanitize_extra(kwargs["extra"])
+            if sanitized:
+                kwargs["extra"] = sanitized
+            else:
+                kwargs.pop("extra")
+        return msg, kwargs
+
+
+def get_logger(name: str) -> SafeLoggerAdapter:
+    """Return a sanitizing adapter for the named logger."""
+
+    base = logging.getLogger(name)
+    return SafeLoggerAdapter(base, {})
+
+
+def _wrap_extra(kwargs: MutableMapping[str, Any]) -> None:
+    extra = kwargs.pop("extra", None)
+    sanitized = sanitize_extra(extra)
+    if sanitized:
+        kwargs["extra"] = sanitized
+
+
+def log_info(logger: logging.Logger, msg: str, *args: Any, **kwargs: Any) -> None:
+    """Emit an info log with sanitized ``extra`` payload."""
+
+    _wrap_extra(kwargs)
+    logger.info(msg, *args, **kwargs)
+
+
+def log_warning(logger: logging.Logger, msg: str, *args: Any, **kwargs: Any) -> None:
+    """Emit a warning log with sanitized ``extra`` payload."""
+
+    _wrap_extra(kwargs)
+    logger.warning(msg, *args, **kwargs)
+
+
+def log_error(logger: logging.Logger, msg: str, *args: Any, **kwargs: Any) -> None:
+    """Emit an error log with sanitized ``extra`` payload."""
+
+    _wrap_extra(kwargs)
+    logger.error(msg, *args, **kwargs)
+
+
+logging.setLoggerClass(SanitizingLogger)
 
 from core.settings import settings
 
@@ -219,7 +360,14 @@ def init_logging(app_name: str, level: str | None = None, *, json_logs: bool | N
 
 __all__ = [
     "JsonFormatter",
+    "SafeLoggerAdapter",
+    "SanitizingLogger",
+    "get_logger",
     "init_logging",
     "log_environment",
+    "log_error",
+    "log_info",
+    "log_warning",
     "refresh_secret_cache",
+    "sanitize_extra",
 ]

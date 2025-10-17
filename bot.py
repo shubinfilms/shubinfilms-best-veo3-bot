@@ -20669,6 +20669,8 @@ async def run_bot_async() -> None:
 
                     with suppress(Exception):
                         await stop_sender()
+                    with suppress(Exception):
+                        await db_postgres.close_pg_pool()
 
                     SHUTDOWN_EVENT.set()
         except RedisLockBusy:
