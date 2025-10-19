@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 import logging
 from dataclasses import dataclass
 from functools import partial
@@ -76,6 +77,7 @@ def _build_snapshot(value: Optional[int], warning: Optional[str] = None) -> Bala
 def get_balance_snapshot(user_id: int, *, retries: int = 2) -> BalanceSnapshot:
     attempts = max(int(retries), 1)
     if redis_get_balance is not None:
+        value = None
         for attempt in range(attempts):
             try:
                 value = redis_get_balance(user_id)
@@ -87,7 +89,8 @@ def get_balance_snapshot(user_id: int, *, retries: int = 2) -> BalanceSnapshot:
                     exc,
                 )
             else:
-                return _build_snapshot(value)
+                if value is not None:
+                    return _build_snapshot(value)
     else:
         log.warning("balance.redis_unavailable | user=%s", user_id)
 
@@ -104,5 +107,4 @@ def get_balance_snapshot(user_id: int, *, retries: int = 2) -> BalanceSnapshot:
 
 
 async def aget_balance_snapshot(user_id: int, *, retries: int = 2) -> BalanceSnapshot:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(get_balance_snapshot, user_id, retries=retries))
+    return await anyio.to_thread.run_sync(partial(get_balance_snapshot, user_id, retries=retries))
