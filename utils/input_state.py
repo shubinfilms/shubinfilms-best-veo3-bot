@@ -145,9 +145,14 @@ def set_wait_state(user_id: int, state: WaitInputState, *, ttl_seconds: int = _D
     state_with_expiry = _with_new_expiry(state, ttl_seconds)
     payload = json.dumps(state_with_expiry.to_dict(), ensure_ascii=False)
     storage_key = _key(user_id)
+    try:
+        ttl_value = int(float(ttl_seconds))
+    except (TypeError, ValueError):
+        ttl_value = _DEFAULT_TTL_SECONDS
+    ttl_value = max(ttl_value, 1)
     if _redis:
         try:
-            _redis.set(storage_key, payload, ex=24 * 60 * 60)
+            _redis.set(storage_key, payload, ex=ttl_value)
         except Exception:  # pragma: no cover - redis connectivity issues
             _logger.exception("Failed to save wait-state to redis", extra={"user_id": user_id})
             _memory_store[int(user_id)] = state_with_expiry.to_dict()

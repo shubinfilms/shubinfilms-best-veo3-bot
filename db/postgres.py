@@ -1196,55 +1196,54 @@ def check_balance_consistency() -> Dict[str, Any]:
         total_balances_raw = conn.execute(
             text("SELECT COALESCE(SUM(tokens), 0) FROM balances")
         ).scalar()
-        total_transactions_raw = conn.execute(
-            text("SELECT COALESCE(SUM(amount), 0) FROM transactions")
+        total_ledger_raw = conn.execute(
+            text(
+                "SELECT COALESCE(SUM(CASE WHEN type = 'credit' THEN amount ELSE -amount END), 0) FROM ledger"
+            )
         ).scalar()
         mismatch_rows = conn.execute(
             text(
                 """
-                WITH aggregated AS (
-                    SELECT b.user_id AS user_id,
-                           b.tokens AS balance,
-                           COALESCE(SUM(t.amount), 0) AS total_tx
-                      FROM balances AS b
-                 LEFT JOIN transactions AS t ON t.user_id = b.user_id
-                  GROUP BY b.user_id, b.tokens
-                    UNION ALL
-                    SELECT t.user_id AS user_id,
-                           0 AS balance,
-                           COALESCE(SUM(t.amount), 0) AS total_tx
-                      FROM transactions AS t
-                 LEFT JOIN balances AS b ON b.user_id = t.user_id
-                     WHERE b.user_id IS NULL
-                  GROUP BY t.user_id
+                WITH ledger_totals AS (
+                    SELECT user_id,
+                           COALESCE(SUM(CASE WHEN type = 'credit' THEN amount ELSE -amount END), 0) AS ledger_total
+                      FROM ledger
+                     GROUP BY user_id
+                ),
+                balance_totals AS (
+                    SELECT user_id, tokens AS balance
+                      FROM balances
                 )
-                SELECT user_id, balance, total_tx
-                  FROM aggregated
-                 WHERE balance != total_tx
-                 ORDER BY user_id
+                SELECT COALESCE(l.user_id, b.user_id) AS user_id,
+                       COALESCE(b.balance, 0) AS balance,
+                       COALESCE(l.ledger_total, 0) AS ledger_total
+                  FROM ledger_totals AS l
+                  FULL OUTER JOIN balance_totals AS b ON b.user_id = l.user_id
+                 WHERE COALESCE(b.balance, 0) <> COALESCE(l.ledger_total, 0)
+                 ORDER BY COALESCE(l.user_id, b.user_id)
                 """
             )
         ).mappings().all()
 
     total_balances = int(total_balances_raw or 0)
-    total_transactions = int(total_transactions_raw or 0)
+    total_ledger = int(total_ledger_raw or 0)
     mismatches: List[Dict[str, int]] = []
     for row in mismatch_rows:
         user_id_val = row.get("user_id")
         balance_val = row.get("balance")
-        tx_val = row.get("total_tx")
+        ledger_val = row.get("ledger_total")
         mismatches.append(
             {
                 "user_id": int(user_id_val) if user_id_val is not None else 0,
                 "balance": int(balance_val or 0),
-                "total_tx": int(tx_val or 0),
+                "ledger_total": int(ledger_val or 0),
             }
         )
 
     return {
         "total_balances": total_balances,
-        "total_transactions": total_transactions,
-        "difference": total_balances - total_transactions,
+        "total_ledger": total_ledger,
+        "difference": total_balances - total_ledger,
         "mismatches": mismatches,
         "mismatch_count": len(mismatches),
     }

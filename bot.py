@@ -68,7 +68,12 @@ from typing import (
 from datetime import datetime, timedelta, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+try:
+    from psycopg_pool import AsyncConnectionPool
+except Exception:  # pragma: no cover - optional dependency guard
+    AsyncConnectionPool = Any  # type: ignore
 
 import aiohttp
 from aiohttp import ClientError, ClientResponseError, ClientTimeout
@@ -702,6 +707,10 @@ def _suno_pending_key(req_id: str) -> str:
     return f"{REDIS_PREFIX}:suno:pending:{req_id}"
 
 
+def _suno_timeout_followup_key(task_id: str) -> str:
+    return f"{REDIS_PREFIX}:suno:timeout:recheck:{task_id}"
+
+
 def _suno_refund_pending_key(req_id: str) -> str:
     return f"{REDIS_PREFIX}:suno:refund:pending:{req_id}"
 
@@ -1130,6 +1139,11 @@ SUNO_POLL_TIMEOUT = max(
     420.0,
     _env_float("SUNO_POLL_TIMEOUT_SEC", float(SUNO_CONFIG.timeout_sec or 420.0)),
 )
+SUNO_TIMEOUT_RECHECK_DELAY = max(120.0, _env_float("SUNO_TIMEOUT_RECHECK_DELAY_SEC", 180.0))
+SUNO_TIMEOUT_RECHECK_TTL = max(
+    SUNO_TIMEOUT_RECHECK_DELAY * 2.0,
+    _env_float("SUNO_TIMEOUT_RECHECK_TTL_SEC", 600.0),
+)
 SUNO_POLL_NOTIFY_AFTER = max(30.0, min(SUNO_POLL_TIMEOUT, _env_float("SUNO_POLL_NOTIFY_AFTER", 75.0)))
 SUNO_POLL_BACKGROUND_LIMIT = max(
     SUNO_POLL_NOTIFY_AFTER,
@@ -1149,6 +1163,8 @@ DB_METRIC_POOL_AVAILABLE = "db.metrics.pool_available"
 SUNO_SERVICE = SunoService()
 if hasattr(SUNO_SERVICE, "set_retry_404"):
     SUNO_SERVICE.set_retry_404(SUNO_404_RETRY_ENABLED)
+
+_SUNO_TIMEOUT_FOLLOWUPS: Dict[str, asyncio.Task[Any]] = {}
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
 BOT_SINGLETON_DISABLED = bool(SETTINGS_BOT_SINGLETON_DISABLED)
 BOT_LEADER_TTL_MS   = 30_000
@@ -1276,9 +1292,9 @@ log.info(
     "startup.config",
     extra={
         "meta": {
-            "bot_username": SETTINGS_BOT_USERNAME,
+            "bot_username": SETTINGS_BOT_USERNAME or "pending",
             "telegram_token_prefix": _startup_token_prefix,
-            "dialog_enabled": SETTINGS_DIALOG_ENABLED,
+            "dialog_enabled": bool(SETTINGS_DIALOG_ENABLED),
         }
     },
 )
@@ -1307,6 +1323,7 @@ REDIS_LOCK_ENABLED = _env("REDIS_LOCK_ENABLED", "true").lower() == "true"
 REDIS_LOCK_TTL_SEC = max(1, _env_int("REDIS_LOCK_TTL_SEC", 45))
 REDIS_LOCK_HEARTBEAT_SEC = max(1, _env_int("REDIS_LOCK_HEARTBEAT_SEC", 20))
 REDIS_LOCK_TAKEOVER_AFTER_SEC = max(1, _env_int("REDIS_LOCK_TAKEOVER_AFTER_SEC", 90))
+REDIS_KEYS_WARN_THRESHOLD = max(0, _env_int("REDIS_KEYS_WARN_THRESHOLD", 10))
 if REDIS_URL and not REDIS_URL.startswith("memory://"):
     redis_pool = redis.ConnectionPool.from_url(
         REDIS_URL,
@@ -1323,6 +1340,127 @@ if REDIS_URL and not REDIS_URL.startswith("memory://"):
 else:
     redis_pool = None
     redis_client = None
+
+REDIS_CLEAN_INTERVAL_SEC = max(0, _env_int("REDIS_CLEAN_INTERVAL_SEC", 5 * 60))
+REDIS_CLEAN_SCAN_COUNT = max(20, _env_int("REDIS_CLEAN_SCAN_COUNT", 256))
+REDIS_CLEAN_UNLINK_BATCH = max(1, _env_int("REDIS_CLEAN_UNLINK_BATCH", 128))
+_REDIS_CLEAN_PATTERN_CANDIDATES = [
+    f"{REDIS_PREFIX}:lock:*",
+    f"{REDIS_PREFIX}:user:lock:*",
+    f"{REDIS_PREFIX}:menu:lock:*",
+    f"{REDIS_PREFIX}:wait-*",
+]
+REDIS_CLEAN_PATTERNS: Tuple[str, ...] = tuple(
+    dict.fromkeys(pattern for pattern in _REDIS_CLEAN_PATTERN_CANDIDATES if pattern)
+)
+
+
+@dataclass
+class RedisCleanupStats:
+    scanned: int = 0
+    deleted: int = 0
+    patterns: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class RedisKeysSummary:
+    count: Optional[int] = None
+    error: Optional[str] = None
+
+
+def _chunked(items: Sequence[str], size: int) -> Iterable[List[str]]:
+    chunk_size = max(1, int(size))
+    if chunk_size <= 0:
+        chunk_size = 1
+    total = len(items)
+    for index in range(0, total, chunk_size):
+        yield list(items[index : index + chunk_size])
+
+
+def _redis_cleanup_scan(
+    client: "redis.Redis",
+    *,
+    patterns: Sequence[str],
+    scan_count: int,
+    unlink_batch: int,
+) -> RedisCleanupStats:
+    stats = RedisCleanupStats()
+    scan_count = max(1, int(scan_count))
+    unlink_batch = max(1, int(unlink_batch))
+    for pattern in patterns:
+        if not pattern:
+            continue
+        cursor = 0
+        while True:
+            try:
+                cursor, keys = client.scan(cursor=cursor, match=pattern, count=scan_count)
+            except Exception as exc:
+                log.debug("redis.cleanup.scan_failed | pattern=%s err=%s", pattern, exc)
+                break
+            if not keys:
+                if cursor == 0:
+                    break
+                continue
+            stats.scanned += len(keys)
+            stale_keys: List[str] = []
+            for key in keys:
+                try:
+                    ttl_value = client.ttl(key)
+                except Exception as exc:
+                    log.debug("redis.cleanup.ttl_failed | key=%s err=%s", key, exc)
+                    continue
+                if ttl_value is None or int(ttl_value) < 0:
+                    stale_keys.append(key)
+            if stale_keys:
+                for group in _chunked(stale_keys, unlink_batch):
+                    try:
+                        client.unlink(*group)
+                    except Exception as exc:
+                        log.debug("redis.cleanup.unlink_failed | keys=%s err=%s", group, exc)
+                        continue
+                    stats.deleted += len(group)
+                    stats.patterns[pattern] = stats.patterns.get(pattern, 0) + len(group)
+            if cursor == 0:
+                break
+    return stats
+
+
+def _redis_cleanup_once() -> Optional[RedisCleanupStats]:
+    if not REDIS_URL or REDIS_URL.startswith("memory://") or redis_pool is None:
+        return None
+    client = redis.Redis(connection_pool=redis_pool)
+    return _redis_cleanup_scan(
+        client,
+        patterns=REDIS_CLEAN_PATTERNS,
+        scan_count=REDIS_CLEAN_SCAN_COUNT,
+        unlink_batch=REDIS_CLEAN_UNLINK_BATCH,
+    )
+
+
+def _count_redis_keys_sync() -> int:
+    if redis_pool is None:
+        return 0
+    client = redis.Redis(connection_pool=redis_pool)
+    cursor = 0
+    total = 0
+    pattern = f"{REDIS_PREFIX}:*"
+    while True:
+        cursor, keys = client.scan(cursor=cursor, match=pattern, count=1000)
+        total += len(keys)
+        if cursor == 0:
+            break
+    return total
+
+
+async def _fetch_redis_keys_summary() -> RedisKeysSummary:
+    if not REDIS_URL or REDIS_URL.startswith("memory://") or redis_pool is None:
+        return RedisKeysSummary(count=None)
+    try:
+        total = await asyncio.to_thread(_count_redis_keys_sync)
+    except Exception as exc:
+        log.warning("redis.keys.scan_failed | err=%s", exc)
+        return RedisKeysSummary(count=None, error=str(exc))
+    return RedisKeysSummary(count=total)
 
 
 def _build_leader_key() -> str:
@@ -1553,6 +1691,8 @@ REDIS_MIGRATION_LOCK = asyncio.Lock()
 
 
 LEDGER_BACKEND = _env("LEDGER_BACKEND", "postgres").lower()
+LEDGER_AUTORECON_INTERVAL_SEC = max(300.0, _env_float("LEDGER_AUTORECON_INTERVAL_SEC", 900.0))
+LEDGER_RECONCILE_BATCH = max(50, _env_int("LEDGER_RECONCILE_BATCH", 200))
 
 
 def _read_postgres_dsn() -> str:
@@ -6831,6 +6971,56 @@ _PROFILE_CARD_KEY_TMPL = f"{REDIS_PREFIX}:profile:card_msg_id:{{chat_id}}"
 _CALLBACK_LOCK_KEY_TMPL = f"{REDIS_PREFIX}:lock:cb:{{chat_id}}:{{message_id}}"
 _profile_card_memory: Dict[int, int] = {}
 _callback_lock_memory: Dict[tuple[int, int], float] = {}
+_callback_debounce_memory: Dict[tuple[int, str], float] = {}
+
+_CALLBACK_DEBOUNCE_WINDOW = max(0.0, float(os.getenv("TG_CALLBACK_DEBOUNCE_MS", "650") or "650") / 1000.0)
+
+
+def _callback_debounce_key(chat_id: int, data: str) -> tuple[int, str]:
+    return int(chat_id), data
+
+
+def _should_process_callback(chat_id: Optional[int], data: str) -> bool:
+    if chat_id is None or not data or _CALLBACK_DEBOUNCE_WINDOW <= 0:
+        return True
+    normalized = data.strip()
+    if not normalized:
+        return True
+
+    ttl = _CALLBACK_DEBOUNCE_WINDOW
+    redis_key = None
+    if rds is not None:
+        try:
+            digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+        except TypeError:  # pragma: no cover - Python <3.9 fallback
+            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+        redis_key = f"{REDIS_PREFIX}:cb:debounce:{int(chat_id)}:{digest}"
+        try:
+            stored = rds.set(redis_key, "1", nx=True, px=max(1, int(ttl * 1000)))
+        except Exception:
+            stored = None
+        else:
+            if stored:
+                return True
+
+    now = time.monotonic()
+    key = _callback_debounce_key(int(chat_id), normalized)
+    expires = _callback_debounce_memory.get(key)
+    if expires and expires > now:
+        return False
+    _callback_debounce_memory[key] = now + ttl
+
+    stale_threshold = now - (ttl * 4)
+    for entry_key, entry_exp in list(_callback_debounce_memory.items()):
+        if entry_exp <= stale_threshold:
+            _callback_debounce_memory.pop(entry_key, None)
+
+    if redis_key and rds is not None:
+        try:
+            rds.pexpire(redis_key, max(1, int(ttl * 1000)))
+        except Exception:
+            pass
+    return True
 
 
 def _profile_card_key(chat_id: int) -> str:
@@ -11445,6 +11635,36 @@ async def _suno_reconcile_once() -> None:
             )
 
 
+async def _ledger_reconcile_worker(stop_event: asyncio.Event) -> None:
+    if LEDGER_AUTORECON_INTERVAL_SEC <= 0:
+        return
+    log.info(
+        "ledger.auto_reconcile.start | interval=%.0fs batch=%d",
+        LEDGER_AUTORECON_INTERVAL_SEC,
+        LEDGER_RECONCILE_BATCH,
+    )
+    try:
+        while not stop_event.is_set():
+            try:
+                updated, total_delta = await _ledger_reconcile_balances(LEDGER_RECONCILE_BATCH)
+                if updated:
+                    log.info(
+                        "ledger.auto_reconcile.applied",
+                        extra={"updated": updated, "delta": total_delta},
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("ledger.auto_reconcile.failed | err=%s", exc, exc_info=True)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=LEDGER_AUTORECON_INTERVAL_SEC)
+                break
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        log.info("ledger.auto_reconcile.stop")
+
+
 async def _suno_reconcile_worker(stop_event: asyncio.Event) -> None:
     if SUNO_RECONCILE_INTERVAL <= 0:
         return
@@ -11469,6 +11689,49 @@ async def _suno_reconcile_worker(stop_event: asyncio.Event) -> None:
                 continue
     finally:
         log.info("[SUNO] reconciliation worker stopped")
+
+
+async def _redis_cleanup_worker(stop_event: asyncio.Event) -> None:
+    if (
+        REDIS_CLEAN_INTERVAL_SEC <= 0
+        or not REDIS_CLEAN_PATTERNS
+        or not REDIS_URL
+        or REDIS_URL.startswith("memory://")
+        or redis_pool is None
+    ):
+        return
+    log.info(
+        "redis.cleanup.start | interval=%.0fs patterns=%d",
+        REDIS_CLEAN_INTERVAL_SEC,
+        len(REDIS_CLEAN_PATTERNS),
+    )
+    try:
+        while not stop_event.is_set():
+            stats: Optional[RedisCleanupStats]
+            try:
+                stats = await asyncio.to_thread(_redis_cleanup_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("redis.cleanup.iteration_failed | err=%s", exc, exc_info=True)
+                stats = None
+            else:
+                if stats and stats.deleted:
+                    log.info(
+                        "redis.cleanup.removed",
+                        extra={
+                            "deleted": stats.deleted,
+                            "scanned": stats.scanned,
+                            "patterns": stats.patterns,
+                        },
+                    )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=REDIS_CLEAN_INTERVAL_SEC)
+                break
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        log.info("redis.cleanup.stop")
 
 
 async def _poll_suno_and_send(
@@ -11541,6 +11804,105 @@ async def _poll_suno_and_send(
         except Exception as exc:
             log.debug("[SUNO] clear_wait_failed | chat_id=%s err=%s", chat_id, exc)
 
+    async def _deliver_ready_payload(
+        payload: Mapping[str, Any],
+        *,
+        via: str,
+        tracks: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        prepared_tracks = tracks if tracks is not None else _poll_tracks(payload)
+        if not prepared_tracks:
+            return False
+        delivered = await asyncio.to_thread(
+            _suno_deliver_record_info_payload,
+            task_id,
+            payload,
+            req_id=req_id_value,
+            delivery_via=via,
+            tracks=prepared_tracks,
+        )
+        if not delivered:
+            log.warning("[SUNO] %s delivery skipped | task_id=%s", via, task_id)
+            return False
+        return True
+
+    def _schedule_timeout_follow_up() -> None:
+        if SUNO_TIMEOUT_RECHECK_DELAY <= 0:
+            return
+        existing = _SUNO_TIMEOUT_FOLLOWUPS.get(task_id)
+        if existing and not existing.done():
+            return
+        redis_key = _suno_timeout_followup_key(task_id)
+        should_schedule = True
+        if rds is not None:
+            try:
+                should_schedule = bool(
+                    rds.set(
+                        redis_key,
+                        str(int(time.time())),
+                        nx=True,
+                        ex=max(1, int(SUNO_TIMEOUT_RECHECK_TTL)),
+                    )
+                )
+            except Exception as exc:
+                should_schedule = True
+                log.warning("[SUNO] timeout follow-up redis error | task_id=%s err=%s", task_id, exc)
+        if not should_schedule:
+            return
+
+        async def _follow_up() -> None:
+            try:
+                await asyncio.sleep(SUNO_TIMEOUT_RECHECK_DELAY)
+                follow_result = await _suno_poll_record_info(task_id, user_id=user_id)
+                payload = dict(follow_result.payload) if isinstance(follow_result.payload, Mapping) else {}
+                if follow_result.state == "ready":
+                    log.info(
+                        "[SUNO] timeout follow-up ready | task_id=%s attempts=%s elapsed=%.1f",
+                        task_id,
+                        follow_result.attempts,
+                        follow_result.elapsed,
+                    )
+                    delivered = await _deliver_ready_payload(payload, via="timeout_followup")
+                    if delivered:
+                        await _clear_wait()
+                    return
+                if follow_result.state == "hard_error":
+                    reason_text = _clean_reason(follow_result.message or follow_result.error)
+                    message = _suno_error_message(follow_result.status_code, reason_text)
+                    await _issue_refund(message, reason="suno:refund:timeout_final")
+                    return
+                if follow_result.state == "timeout":
+                    await _issue_refund(_suno_timeout_text(), reason="suno:refund:timeout_final")
+                    return
+                # Pending or other non-terminal state after grace window
+                await _issue_refund(
+                    _suno_timeout_text(),
+                    reason="suno:refund:timeout_final",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("[SUNO] timeout follow-up failed | task_id=%s err=%s", task_id, exc)
+                await _issue_refund(
+                    _suno_error_message(None, _clean_reason(str(exc))),
+                    reason="suno:refund:timeout_followup_err",
+                )
+            finally:
+                _SUNO_TIMEOUT_FOLLOWUPS.pop(task_id, None)
+                if rds is not None:
+                    try:
+                        rds.delete(redis_key)
+                    except Exception:
+                        pass
+
+        task = asyncio.create_task(_follow_up())
+        _SUNO_TIMEOUT_FOLLOWUPS[task_id] = task
+        log.info(
+            "[SUNO] timeout follow-up scheduled | task_id=%s delay=%.0fs",
+            task_id,
+            SUNO_TIMEOUT_RECHECK_DELAY,
+        )
+
     try:
         try:
             existing_record = await asyncio.to_thread(SUNO_SERVICE.get_task_record, task_id)
@@ -11578,11 +11940,8 @@ async def _poll_suno_and_send(
                 poll_result.attempts,
                 poll_result.elapsed,
             )
-            timeout_message = "⚠️ Suno не ответил вовремя."
-            await _issue_refund(
-                timeout_message,
-                reason="suno:refund:timeout",
-            )
+            await _notify_timeout_once()
+            _schedule_timeout_follow_up()
             return
 
         if state_value == "hard_error":
@@ -11656,16 +12015,9 @@ async def _poll_suno_and_send(
             },
         )
 
-        delivered = await asyncio.to_thread(
-            _suno_deliver_record_info_payload,
-            task_id,
-            details,
-            req_id=req_id_value,
-            delivery_via="poll",
-            tracks=tracks_payload,
-        )
-        if not delivered:
-            log.warning("[SUNO] poll delivery skipped | task_id=%s", task_id)
+        delivered = await _deliver_ready_payload(details, via="poll", tracks=tracks_payload)
+        if delivered:
+            await _clear_wait()
         return
 
     except asyncio.CancelledError:
@@ -15957,7 +16309,9 @@ async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, A
     uptime_seconds = max(0, int(time.monotonic() - BOT_START_TIME))
 
     redis_status: str
+    payload_redis_keys: Optional[Dict[str, Any]] = None
     redis_latency_ms: Optional[float] = None
+    redis_keys_summary: Optional[RedisKeysSummary] = None
     if redis_client is None:
         redis_status = "disabled"
     else:
@@ -15969,6 +16323,21 @@ async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, A
         else:
             redis_status = "ok"
             redis_latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            redis_keys_summary = await _fetch_redis_keys_summary()
+            if redis_keys_summary.error:
+                redis_status = f"error: {redis_keys_summary.error}"
+            elif redis_keys_summary.count is not None:
+                status = "ok"
+                if redis_keys_summary.count > REDIS_KEYS_WARN_THRESHOLD:
+                    status = "warn"
+                payload_redis_keys = {
+                    "count": redis_keys_summary.count,
+                    "threshold": REDIS_KEYS_WARN_THRESHOLD,
+                    "status": status,
+                }
+                # Payload defined later; store for later injection.
+            else:
+                payload_redis_keys = None
 
     telegram_status = "ok"
     telegram_user: Optional[Dict[str, Any]] = None
@@ -15997,6 +16366,13 @@ async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, A
 
     if redis_latency_ms is not None:
         payload["redis_latency_ms"] = redis_latency_ms
+    if payload_redis_keys is not None:
+        payload["redis_keys"] = payload_redis_keys
+        if (
+            payload.get("status") == "ok"
+            and payload_redis_keys.get("status") == "warn"
+        ):
+            payload["status"] = "warn"
     if telegram_user is not None:
         payload["telegram_user"] = telegram_user
 
@@ -16575,6 +16951,46 @@ async def admin_diag_version_command(update: Update, ctx: ContextTypes.DEFAULT_T
     await message.reply_text(line)
 
 
+async def _load_balance_summary() -> Dict[str, Any]:
+    summary = await asyncio.to_thread(db_postgres.check_balance_consistency)
+    return summary if isinstance(summary, dict) else {}
+
+
+async def _ledger_reconcile_balances(limit: int = LEDGER_RECONCILE_BATCH) -> tuple[int, int]:
+    summary = await _load_balance_summary()
+    mismatches = summary.get("mismatches", []) if isinstance(summary, dict) else []
+    if not mismatches:
+        return 0, 0
+    pool = PG_POOL
+    if pool is None:
+        raise RuntimeError("Postgres pool unavailable for reconciliation")
+    updated = 0
+    total_delta = 0
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for entry in mismatches[:limit]:
+                user_id = int(entry.get("user_id") or 0)
+                ledger_total = max(int(entry.get("ledger_total") or 0), 0)
+                balance_val = int(entry.get("balance") or 0)
+                total_delta += abs(ledger_total - balance_val)
+                await cur.execute(
+                    """
+                    INSERT INTO balances (user_id, tokens, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET tokens = EXCLUDED.tokens, updated_at = NOW()
+                    """,
+                    (user_id, ledger_total),
+                )
+                updated += 1
+        await conn.commit()
+    log.info(
+        "ledger.reconciled",
+        extra={"updated": updated, "delta": total_delta},
+    )
+    return updated, total_delta
+
+
 async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -16586,7 +17002,7 @@ async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT
         return
 
     try:
-        summary = await asyncio.to_thread(db_postgres.check_balance_consistency)
+        summary = await _load_balance_summary()
     except Exception as exc:
         log.exception("admin.check_balances.failed | actor=%s err=%s", actor.id, exc)
         await message.reply_text("❌ Не удалось выполнить сверку балансов. Подробности в логах.")
@@ -16594,9 +17010,7 @@ async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT
 
     mismatches = summary.get("mismatches", []) if isinstance(summary, dict) else []
     total_balances = int(summary.get("total_balances", 0)) if isinstance(summary, dict) else 0
-    total_transactions = (
-        int(summary.get("total_transactions", 0)) if isinstance(summary, dict) else 0
-    )
+    total_ledger = int(summary.get("total_ledger", 0)) if isinstance(summary, dict) else 0
     difference = int(summary.get("difference", 0)) if isinstance(summary, dict) else 0
 
     def _fmt(value: int) -> str:
@@ -16608,7 +17022,7 @@ async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT
         return f"***{tail}"
 
     totals_line = (
-        f"Σ balances={_fmt(total_balances)}💎, Σ transactions={_fmt(total_transactions)}💎"
+        f"Σ balances={_fmt(total_balances)}💎, Σ ledger={_fmt(total_ledger)}💎"
     )
     diff_line = f"Δ={format(difference, '+,').replace(',', ' ')}" if difference else ""
 
@@ -16627,9 +17041,9 @@ async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT
     for entry in mismatches[:limit]:
         uid = int(entry.get("user_id", 0))
         balance_val = int(entry.get("balance", 0))
-        tx_val = int(entry.get("total_tx", 0))
+        ledger_val = int(entry.get("ledger_total", 0))
         lines.append(
-            f"ID {_mask(uid)} → balance={_fmt(balance_val)}, tx_sum={_fmt(tx_val)}"
+            f"ID {_mask(uid)} → balance={_fmt(balance_val)}, ledger={_fmt(ledger_val)}"
         )
     extra = len(mismatches) - limit
     if extra > 0:
@@ -16682,11 +17096,13 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     ledger_summary = overview.get("ledger", {})
     ledger_error: Optional[str] = None
     mismatch_count = 0
+    ledger_difference = 0
     if isinstance(ledger_summary, dict):
         if ledger_summary.get("error"):
             ledger_error = str(ledger_summary.get("error"))
         else:
             mismatch_count = int(ledger_summary.get("mismatch_count", 0))
+            ledger_difference = int(ledger_summary.get("difference", 0))
 
     if ledger_error:
         lines.append(f"⚠️ Ledger synced: error ({ledger_error})")
@@ -16694,30 +17110,25 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         lines.append(f"⚠️ Ledger synced: {mismatch_count} mismatches")
     else:
         lines.append("✅ Ledger synced")
+    if ledger_difference:
+        lines.append(f"Δ ledger={ledger_difference:+}")
 
     redis_keys_line = None
-    if REDIS_URL and not REDIS_URL.startswith("memory://") and redis_pool is not None:
-        def _count_redis_keys() -> int:
-            client = redis.Redis(connection_pool=redis_pool)
-            pattern = f"{REDIS_PREFIX}:*"
-            total = 0
-            cursor = 0
-            while True:
-                cursor, keys = client.scan(cursor=cursor, match=pattern, count=1000)
-                total += len(keys)
-                if cursor == 0:
-                    break
-            return total
-
-        try:
-            remaining_keys = await asyncio.to_thread(_count_redis_keys)
-            if remaining_keys == 0:
-                redis_keys_line = "⚙️ Redis keys remaining: 0"
-            else:
-                redis_keys_line = f"⚠️ Redis keys remaining: {remaining_keys}"
-        except Exception as exc:
-            log.warning("admin.check_db.redis_scan_failed | actor=%s err=%s", actor.id, exc)
-            redis_keys_line = f"⚠️ Redis keys remaining: error ({exc})"
+    if redis_pool is not None and REDIS_URL and not REDIS_URL.startswith("memory://"):
+        summary = await _fetch_redis_keys_summary()
+        if summary.error:
+            log.warning(
+                "admin.check_db.redis_scan_failed | actor=%s err=%s", actor.id, summary.error
+            )
+            redis_keys_line = f"⚠️ Redis keys remaining: error ({summary.error})"
+        elif summary.count is None:
+            redis_keys_line = "⚙️ Redis keys remaining: unknown"
+        elif summary.count <= REDIS_KEYS_WARN_THRESHOLD:
+            redis_keys_line = f"⚙️ Redis keys remaining: {summary.count}"
+        else:
+            redis_keys_line = (
+                f"⚠️ Redis keys remaining: {summary.count} (> {REDIS_KEYS_WARN_THRESHOLD})"
+            )
     else:
         redis_keys_line = "⚙️ Redis keys remaining: n/a"
 
@@ -16746,6 +17157,76 @@ async def admin_check_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("\n".join(lines))
 
 
+async def admin_balances_audit_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        summary = await _load_balance_summary()
+    except Exception as exc:
+        await message.reply_text(f"❌ Аудит не выполнен: {exc}")
+        return
+
+    mismatches = summary.get("mismatches", []) if isinstance(summary, dict) else []
+    if not mismatches:
+        await message.reply_text("✅ Несоответствия не найдены.")
+        return
+
+    def _fmt(value: int) -> str:
+        return format(int(value), ",").replace(",", " ")
+
+    lines = ["⚙️ Топ несоответствий (user_id → balance vs ledger):"]
+    for entry in mismatches[:10]:
+        uid = int(entry.get("user_id", 0))
+        balance_val = int(entry.get("balance", 0))
+        ledger_val = int(entry.get("ledger_total", 0))
+        lines.append(
+            f"{uid}: {_fmt(balance_val)}💎 / {_fmt(ledger_val)}💎 (Δ={_fmt(balance_val - ledger_val)})"
+        )
+    remaining = len(mismatches) - 10
+    if remaining > 0:
+        lines.append(f"… ещё {remaining}")
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_reconcile_now_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        updated, total_delta = await _ledger_reconcile_balances()
+    except Exception as exc:
+        log.exception("ledger.reconcile.manual_failed | actor=%s err=%s", actor.id, exc)
+        await message.reply_text(f"❌ Ошибка выравнивания: {exc}")
+        return
+
+    if not updated:
+        await message.reply_text("✅ Балансы уже синхронизированы.")
+        return
+
+    def _fmt(value: int) -> str:
+        return format(int(value), ",").replace(",", " ")
+
+    await message.reply_text(
+        "✅ Балансы синхронизированы: исправлено {updated}, суммарное отклонение {delta}💎".format(
+            updated=updated,
+            delta=_fmt(total_delta),
+        )
+    )
+
+
 async def admin_diag_codex_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     message = update.effective_message
@@ -16756,12 +17237,25 @@ async def admin_diag_codex_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
         await message.reply_text("⛔ У вас нет прав для этой команды.")
         return
 
-    log = logging.getLogger("veo3-bot")
-    log.info("DIAG_CODEX: test info")
+    diag_log = logging.getLogger("veo3-bot")
+    diag_log.info(
+        "diag_codex.trigger",
+        extra={"meta": {"test": True, "actor": actor.id}},
+    )
     try:
-        raise ValueError("DIAG_CODEX: simulated error")
-    except Exception:
-        log.exception("DIAG_CODEX: test exception")
+        raise ValueError("diag_codex simulated error")
+    except ValueError as exc:
+        diag_log.info(
+            "diag_codex.simulated_error",
+            extra={"meta": {"test": True, "message": str(exc)}},
+        )
+    except Exception as exc:
+        summary_lines = [line.strip() for line in traceback.format_exception(exc.__class__, exc, exc.__traceback__)]
+        summary = [line for line in summary_lines if line][:3]
+        diag_log.warning(
+            "diag_codex.unexpected_error",
+            extra={"meta": {"test": True, "summary": summary, "actor": actor.id}},
+        )
 
     await message.reply_text("✅ Codex diagnostic triggered. Check dashboard.")
 
@@ -17934,7 +18428,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    data = (q.data or "").strip()
+    raw_data = (q.data or "").strip()
+    data = raw_data
     s = state(ctx)
     message = q.message
     chat = update.effective_chat
@@ -17944,6 +18439,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = message.chat_id
     elif chat is not None:
         chat_id = chat.id
+
+    if chat_id is not None and not _should_process_callback(chat_id, raw_data):
+        log.debug(
+            "callback.debounced",
+            extra={"meta": {"chat_id": chat_id, "data": raw_data}},
+        )
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
 
     if data == PROFILE_CB_TRANSACTIONS:
         data = "tx:open"
@@ -20965,6 +21471,8 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("check_db",), admin_check_db_command),
     (("cleanup_redis",), admin_cleanup_redis_command),
     (("check_balances",), admin_check_balances_command),
+    (("balances_audit",), admin_balances_audit_command),
+    (("reconcile_now",), admin_reconcile_now_command),
     (("backup_db",), admin_backup_db_command),
     (("diag_codex",), admin_diag_codex_command),
     (("diag_slow",), admin_diag_slow_command),
@@ -21172,24 +21680,37 @@ def register_handlers(application: Any) -> None:
 # ==========================
 #   Entry (fixed for PTB 21.x)
 # ==========================
-async def run_bot_async() -> None:
-    if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
-    if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
-    if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
+_PG_INIT_MAX_ATTEMPTS = 5
+_PG_INIT_INITIAL_DELAY = 2.0
 
-    application = (ApplicationBuilder()
-                   .token(TELEGRAM_TOKEN)
-                   .rate_limiter(AIORateLimiter())
-                   .build())
+
+async def _initialise_pg_pool_with_retry() -> AsyncConnectionPool:
+    """Initialise the global Postgres pool with retry/backoff handling."""
 
     global PG_POOL
-    try:
-        PG_POOL = await db_postgres.create_pg_pool(DATABASE_URL)
-    except Exception as exc:
-        PG_POOL = None
-        log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
-        raise
-    else:
+
+    delay = _PG_INIT_INITIAL_DELAY
+    attempt = 0
+    last_error: Optional[BaseException] = None
+
+    while attempt < _PG_INIT_MAX_ATTEMPTS:
+        attempt += 1
+        try:
+            pool = await db_postgres.create_pg_pool(DATABASE_URL)
+        except Exception as exc:
+            last_error = exc
+            log.error(
+                "postgres.init.retry",
+                extra={"attempt": attempt, "max": _PG_INIT_MAX_ATTEMPTS, "delay": round(delay, 2)},
+                exc_info=True,
+            )
+            if attempt >= _PG_INIT_MAX_ATTEMPTS:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, 60.0)
+            continue
+
+        PG_POOL = pool
         try:
             stats = PG_POOL.get_stats() if hasattr(PG_POOL, "get_stats") else None
         except Exception:
@@ -21200,6 +21721,26 @@ async def run_bot_async() -> None:
             max_size = float(getattr(stats, "max_size", getattr(stats, "max", 0)))
             _metric_update_gauge(DB_METRIC_POOL_IN_USE, borrowed, maximum=max_size or None)
             _metric_update_gauge(DB_METRIC_POOL_AVAILABLE, available, maximum=max_size or None)
+        return pool
+
+    message = "Postgres connection failed"
+    if last_error is not None:
+        message = f"{message}: {last_error}"
+    log.critical("postgres.initialization_failed", extra={"attempts": attempt})
+    raise SystemExit(message)
+
+
+async def run_bot_async() -> None:
+    if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
+    if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
+    if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
+
+    application = (ApplicationBuilder()
+                   .token(TELEGRAM_TOKEN)
+                   .rate_limiter(AIORateLimiter())
+                   .build())
+
+    await _initialise_pg_pool_with_retry()
 
     try:
         if not application.bot_data.get(HANDLERS_FLAG):
@@ -21246,6 +21787,16 @@ async def run_bot_async() -> None:
     except Exception as exc:
         log.error("DB health check startup failed: %s", exc, exc_info=True)
 
+    try:
+        background_tasks.append(asyncio.create_task(_ledger_reconcile_worker(stop_event)))
+    except Exception as exc:
+        log.error("ledger.auto_reconcile.start_failed | err=%s", exc, exc_info=True)
+
+    try:
+        background_tasks.append(asyncio.create_task(_redis_cleanup_worker(stop_event)))
+    except Exception as exc:
+        log.error("redis.cleanup.start_failed | err=%s", exc, exc_info=True)
+
     if SUNO_CONFIG.enabled:
         try:
             background_tasks.append(asyncio.create_task(_suno_reconcile_worker(stop_event)))
@@ -21287,6 +21838,19 @@ async def run_bot_async() -> None:
                 try:
                     await application.initialize()
                     initialized = True
+
+                    try:
+                        me = await application.bot.get_me()
+                    except Exception as exc:
+                        log.warning("startup.bot_identity_failed", extra={"error": str(exc)})
+                    else:
+                        username = getattr(me, "username", None)
+                        if username:
+                            application.bot_data[_BOT_USERNAME_CACHE_KEY] = username
+                            log.info(
+                                "startup.bot_identity",
+                                extra={"meta": {"bot_username": username}},
+                            )
 
                     sender = get_sender()
                     sender.configure_from_env()

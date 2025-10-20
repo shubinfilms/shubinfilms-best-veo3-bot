@@ -72,7 +72,7 @@ async def test_reconcile_delivers_late_result(monkeypatch):
         reply_to=None,
     )
 
-    assert refunds == ["suno:refund:timeout"]
+    assert not refunds
 
     ready_payload = {
         "data": {
@@ -138,4 +138,4 @@ async def test_reconcile_delivers_late_result(monkeypatch):
 
     assert len(delivered) == 1
     assert delivered[0]["via"] == "reconcile"
-    assert len(refunds) == 1
+    assert not refunds
