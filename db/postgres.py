@@ -733,6 +733,17 @@ async def ensure_tables_with_retries(
 def ensure_tables() -> None:
     """Synchronous wrapper for compatibility callers."""
 
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        raise RuntimeError(
+            "ensure_tables() cannot run inside an active event loop; "
+            "await ensure_tables_with_retries() instead",
+        )
+
     asyncio.run(ensure_tables_with_retries())
 
 

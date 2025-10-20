@@ -416,10 +416,10 @@ class SunoService:
         self._status_path = _STATUS_PATH
         self._status_url = _STATUS_URL
         summary = {
-            "suno_enabled": bool(SUNO_ENABLED),
-            "api_base": self._api_base,
+            "enabled": bool(SUNO_ENABLED),
+            "base": self._api_base,
             "status_path": self._status_path,
-            "callback_configured": bool(SUNO_CALLBACK_URL and SUNO_CALLBACK_SECRET),
+            "callback_url": SUNO_CALLBACK_URL,
         }
         log.info("configuration summary", extra={"meta": summary})
         cleanup_old_directories()

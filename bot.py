@@ -138,6 +138,10 @@ from kie_banana import (
 import redis
 from redis.exceptions import WatchError
 import redis.asyncio as aioredis
+try:
+    from psycopg_pool import AsyncConnectionPool
+except Exception:  # pragma: no cover - optional dependency guard
+    AsyncConnectionPool = Any  # type: ignore[assignment]
 import billing
 
 from hub_router import (
@@ -1037,18 +1041,16 @@ def _normalize_prefix(value: str) -> str:
 def _load_suno_config() -> SunoConfig:
     base = (_env("SUNO_API_BASE", "https://api.kie.ai") or "https://api.kie.ai").strip().rstrip("/")
     prefix = _normalize_prefix(_env("SUNO_API_PREFIX", ""))
-    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/suno-api/generate"), "/suno-api/generate")
-    status_path = _normalize_suno_path(
-        _env("SUNO_STATUS_PATH", "/suno-api/record-info"),
-        "/suno-api/record-info",
-    )
+    gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/api/v1/generate"), "/api/v1/generate")
+    status_raw = _env("SUNO_TASK_STATUS_PATH") or _env("SUNO_STATUS_PATH")
+    status_path = _normalize_suno_path(status_raw or "/api/v1/generate/record-info", "/api/v1/generate/record-info")
     extend_path = _normalize_suno_path(
-        _env("SUNO_EXTEND_PATH", "/suno-api/generate/extend"),
-        "/suno-api/generate/extend",
+        _env("SUNO_EXTEND_PATH", "/api/v1/generate/extend"),
+        "/api/v1/generate/extend",
     )
     lyrics_path = _normalize_suno_path(
-        _env("SUNO_LYRICS_PATH", "/suno-api/generate/get-timestamped-lyrics"),
-        "/suno-api/generate/get-timestamped-lyrics",
+        _env("SUNO_LYRICS_PATH", "/api/v1/generate/get-timestamped-lyrics"),
+        "/api/v1/generate/get-timestamped-lyrics",
     )
     model = os.getenv("SUNO_MODEL", "V5").upper()  # всегда "V5"
     price = _env_int("SUNO_PRICE", 30)
@@ -1069,18 +1071,19 @@ def _load_suno_config() -> SunoConfig:
         enabled=enabled,
         has_key=has_key,
     )
+    summary_meta = {
+        "base": base,
+        "gen_path": gen_path,
+        "status_path": status_path,
+        "extend_path": extend_path,
+        "lyrics_path": lyrics_path,
+        "callback_url": SETTINGS_SUNO_CALLBACK_URL,
+        "enabled": enabled,
+    }
     if enabled:
         logging.getLogger("veo3-bot").info(
             "suno configuration",
-            extra={
-                "meta": {
-                    "base": base,
-                    "gen_path": gen_path,
-                    "status_path": status_path,
-                    "callback_url": SETTINGS_SUNO_CALLBACK_URL,
-                    "enabled": enabled,
-                }
-            },
+            extra={"meta": summary_meta},
         )
     return config
 
@@ -1554,13 +1557,39 @@ except Exception as exc:
     log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
     raise
 
-PG_POOL = None
+PG_POOL: Optional[AsyncConnectionPool] = None
+_PG_POOL_LOCK = asyncio.Lock()
+_PG_POOL_ERROR: Optional[str] = None
 
-try:
-    PG_POOL = asyncio.run(db_postgres.create_pg_pool(DATABASE_URL))
-except Exception as exc:
-    PG_POOL = None
-    log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+
+async def ensure_pg_pool_initialized() -> Optional[AsyncConnectionPool]:
+    """Initialise the global async Postgres pool if needed."""
+
+    global PG_POOL, _PG_POOL_ERROR
+
+    if PG_POOL is not None:
+        return PG_POOL
+
+    async with _PG_POOL_LOCK:
+        if PG_POOL is not None:
+            return PG_POOL
+
+        try:
+            pool = await db_postgres.create_pg_pool(DATABASE_URL)
+        except Exception as exc:
+            _PG_POOL_ERROR = str(exc)
+            log.critical("postgres.initialization_failed | err=%s", exc)
+            if LEDGER_BACKEND == "postgres":
+                raise
+            return None
+
+        PG_POOL = pool
+        _PG_POOL_ERROR = None
+        log.info(
+            "postgres.initialized",
+            extra={"dsn": db_postgres.mask_dsn(DATABASE_URL)},
+        )
+        return PG_POOL
 
 try:
     db_postgres.configure_engine(DATABASE_URL)
@@ -15919,9 +15948,35 @@ async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, A
         telegram_user = me.to_dict()
 
     ready = APPLICATION_READY.is_set()
+
+    postgres_status = "disabled"
+    postgres_counts: Optional[Dict[str, int]] = None
+    if PG_POOL is not None:
+        try:
+            counts = await asyncio.to_thread(db_postgres.check_health)
+        except Exception as exc:
+            postgres_status = f"error: {exc}"
+        else:
+            postgres_status = "ok"
+            postgres_counts = dict(counts)
+    elif _PG_POOL_ERROR:
+        postgres_status = f"error: {_PG_POOL_ERROR}"
+
+    leader_status = "disabled"
+    if runner_lock_state.get("enabled"):
+        leader_status = "active" if runner_lock_state.get("owned") else "standby"
+
+    suno_status = (
+        SUNO_STATUS_URL
+        if SUNO_CONFIG.enabled and SUNO_STATUS_URL
+        else ("disabled" if not SUNO_CONFIG.enabled else "unconfigured")
+    )
+
     payload: Dict[str, Any] = {
         "status": "ok"
-        if telegram_status == "ok" and redis_status in {"ok", "disabled"}
+        if telegram_status == "ok"
+        and redis_status in {"ok", "disabled"}
+        and postgres_status in {"ok", "disabled"}
         else "error",
         "state": "ready" if ready else "starting",
         "ready": ready,
@@ -15932,23 +15987,38 @@ async def _collect_health_payload(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, A
         "git": GIT_REVISION,
         "mode": "polling",
         "ptb": getattr(_tg, "__version__", "unknown") if _tg else "unknown",
+        "components": {
+            "postgres": postgres_status,
+            "redis": redis_status,
+            "leader": leader_status,
+            "suno_api": suno_status,
+        },
     }
 
     if redis_latency_ms is not None:
         payload["redis_latency_ms"] = redis_latency_ms
     if telegram_user is not None:
         payload["telegram_user"] = telegram_user
+    if postgres_counts is not None:
+        payload["postgres_counts"] = postgres_counts
 
     return payload
 
 
 async def _reply_with_health_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     payload = await _collect_health_payload(ctx)
-    text = json.dumps(payload, ensure_ascii=False)
+    components = payload.get("components", {}) if isinstance(payload, dict) else {}
+    lines = [
+        f"postgres: {components.get('postgres', 'unknown')}",
+        f"redis: {components.get('redis', 'unknown')}",
+        f"leader: {components.get('leader', 'unknown')}",
+        f"suno_api: {components.get('suno_api', 'unknown')}",
+    ]
 
     message = update.effective_message
     if message is not None:
-        await message.reply_text(text)
+        await message.reply_text("\n".join(lines))
+        log.info("health.payload", extra={"payload": payload})
     else:
         log.info("health.payload", extra={"payload": payload})
 
@@ -16233,10 +16303,12 @@ async def admin_diag_codex_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
     log = logging.getLogger("veo3-bot")
     log.info("DIAG_CODEX: test info")
-    try:
-        raise ValueError("DIAG_CODEX: simulated error")
-    except Exception:
-        log.exception("DIAG_CODEX: test exception")
+    log.warning("DIAG_CODEX: test warning")
+    log.error(
+        "DIAG_CODEX: test.exception",
+        extra={"meta": {"error": "simulated error"}},
+        exc_info=False,
+    )
 
     await message.reply_text("✅ Codex diagnostic triggered. Check dashboard.")
 
@@ -20587,7 +20659,6 @@ def register_handlers(application: Any) -> None:
         filters.TEXT,
         handle_card_input,
     )
-    card_input_handler.block = False
     application.add_handler(card_input_handler, group=1)
 
     kb_text_handler = MessageHandler(
@@ -20596,7 +20667,6 @@ def register_handlers(application: Any) -> None:
         & filters.Regex(r"(?i)^\s*(?:📚\s*)?база\s+знаний\s*$"),
         handle_quick_kb_button,
     )
-    kb_text_handler.block = False
     application.add_handler(kb_text_handler, group=0)
 
     for names, callback in PRIORITY_COMMAND_SPECS:
@@ -20630,14 +20700,12 @@ def register_handlers(application: Any) -> None:
             filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
             handler,
         )
-        quick_button_handler.block = False
         application.add_handler(quick_button_handler, group=0)
 
     sora2_text_handler = MessageHandler(
         filters.TEXT & filters.Regex(r"(?i)^\s*/?sora2\s*$"),
         sora2_open_text,
     )
-    sora2_text_handler.block = False
     application.add_handler(sora2_text_handler, group=0)
 
     for text, handler in REPLY_BUTTON_ROUTES:
@@ -20646,7 +20714,6 @@ def register_handlers(application: Any) -> None:
             filters.TEXT & ~filters.COMMAND & filters.Regex(pattern),
             handler,
         )
-        quick_handler.block = False
         application.add_handler(
             quick_handler,
             group=3,
@@ -20658,7 +20725,6 @@ def register_handlers(application: Any) -> None:
         application.add_handler(MessageHandler(nav_filter, on_text_nav), group=0)
 
     pm_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_master_handle_text)
-    pm_handler.block = False
     application.add_handler(pm_handler, group=2)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=10)
@@ -20671,6 +20737,15 @@ async def run_bot_async() -> None:
     if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
     if not KIE_BASE_URL:   raise RuntimeError("KIE_BASE_URL is not set")
     if not KIE_API_KEY:    raise RuntimeError("KIE_API_KEY is not set")
+
+    try:
+        pool = await ensure_pg_pool_initialized()
+    except Exception:
+        log.critical("postgres.pool_startup_failed")
+        raise
+
+    if pool is None:
+        log.warning("postgres.pool.unavailable - continuing without Postgres pool")
 
     application = (ApplicationBuilder()
                    .token(TELEGRAM_TOKEN)
@@ -20701,6 +20776,9 @@ async def run_bot_async() -> None:
         delay = 5
         while True:
             try:
+                if PG_POOL is None:
+                    log.info("DB init skipped: postgres pool unavailable")
+                    return
                 await db_postgres.ensure_tables_with_retries()
                 if LEDGER_BACKEND != "memory":
                     try:
@@ -20717,10 +20795,13 @@ async def run_bot_async() -> None:
 
     background_tasks.append(asyncio.create_task(_async_init_tables()))
 
-    try:
-        background_tasks.append(asyncio.create_task(db_postgres.db_health_check()))
-    except Exception as exc:
-        log.error("DB health check startup failed: %s", exc, exc_info=True)
+    if PG_POOL is not None:
+        try:
+            background_tasks.append(asyncio.create_task(db_postgres.db_health_check()))
+        except Exception as exc:
+            log.error("DB health check startup failed: %s", exc, exc_info=True)
+    else:
+        log.info("DB health check skipped: postgres pool unavailable")
 
     if SUNO_CONFIG.enabled:
         try:
