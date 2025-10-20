@@ -327,6 +327,7 @@ async def create_pg_pool(dsn: Optional[str] = None) -> AsyncConnectionPool:
                 min_size=1,
                 max_size=8,
                 timeout=10,
+                open=False,
                 kwargs={
                     "keepalives": _CONN_KEEPALIVE,
                     "keepalives_idle": _KEEPALIVE_IDLE,
