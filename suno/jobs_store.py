@@ -423,6 +423,7 @@ class SunoJobStore:
             SunoJobState.TIMEOUT,
             SunoJobState.PENDING,
             SunoJobState.RECONCILING,
+            SunoJobState.FAILED,
         ),
     ) -> List[SunoJobRecord]:
         def _collect() -> List[SunoJobRecord]:

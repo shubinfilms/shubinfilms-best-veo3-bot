@@ -503,6 +503,11 @@ from metrics import (
     suno_notify_ok,
     suno_notify_total,
     suno_refund_total,
+    suno_poll_status_total,
+    suno_ready_latency_seconds,
+    suno_late_delivery_total,
+    suno_timeout_total,
+    suno_refund_trigger_total,
     chat_messages_total,
     chat_latency_ms,
     chat_context_tokens,
@@ -711,6 +716,10 @@ def _suno_pending_key(req_id: str) -> str:
 
 def _suno_timeout_followup_key(task_id: str) -> str:
     return f"{REDIS_PREFIX}:suno:timeout:recheck:{task_id}"
+
+
+def _suno_failure_followup_key(task_id: str) -> str:
+    return f"{REDIS_PREFIX}:suno:failure:followup:{task_id}"
 
 
 def _suno_refund_pending_key(req_id: str) -> str:
@@ -1130,7 +1139,7 @@ def _parse_backoff_series(raw: str) -> List[float]:
     return values or [8.0, 13.0, 21.0, 34.0]
 
 
-SUNO_POLL_FIRST_DELAY = max(0.5, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 5.0))
+SUNO_POLL_FIRST_DELAY = max(0.5, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 3.0))
 _SUNO_POLL_BACKOFF_SERIES_RAW = _env("SUNO_POLL_BACKOFF_SERIES", "5,8,13,21,34")
 _parsed_backoff = _parse_backoff_series(_SUNO_POLL_BACKOFF_SERIES_RAW)
 if _parsed_backoff and abs(_parsed_backoff[0] - SUNO_POLL_FIRST_DELAY) < 1e-3:
@@ -1141,6 +1150,7 @@ SUNO_POLL_TIMEOUT = max(
     420.0,
     _env_float("SUNO_POLL_TIMEOUT_SEC", float(SUNO_CONFIG.timeout_sec or 420.0)),
 )
+SUNO_REFUND_GRACE = max(60.0, _env_float("SUNO_REFUND_GRACE_SEC", 900.0))
 SUNO_TIMEOUT_RECHECK_DELAY = max(120.0, _env_float("SUNO_TIMEOUT_RECHECK_DELAY_SEC", 180.0))
 SUNO_TIMEOUT_RECHECK_TTL = max(
     SUNO_TIMEOUT_RECHECK_DELAY * 2.0,
@@ -1167,6 +1177,7 @@ if hasattr(SUNO_SERVICE, "set_retry_404"):
     SUNO_SERVICE.set_retry_404(SUNO_404_RETRY_ENABLED)
 
 _SUNO_TIMEOUT_FOLLOWUPS: Dict[str, asyncio.Task[Any]] = {}
+_SUNO_FAILURE_FOLLOWUPS: Dict[str, asyncio.Task[Any]] = {}
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
 BOT_SINGLETON_DISABLED = bool(SETTINGS_BOT_SINGLETON_DISABLED)
 BOT_LEADER_TTL_MS   = 30_000
@@ -11458,6 +11469,11 @@ async def _suno_poll_record_info(
             meta["message"] = result.message
 
         payload_mapping = result.payload if isinstance(result.payload, Mapping) else None
+        suno_poll_status_total.labels(
+            http_status=str(result.status_code or 0),
+            state=result.state,
+            **_METRIC_LABELS,
+        ).inc()
         if result.state in {"pending", "retry"}:
             SUNO_JOB_STORE.mark_pending(
                 task_id,
@@ -11502,6 +11518,9 @@ async def _suno_poll_record_info(
         if result.state == "ready":
             tracks = SunoService._tracks_from_payload(result.payload)
             durations = SunoService._durations_from_tracks(tracks)
+            suno_ready_latency_seconds.labels(**_METRIC_LABELS).observe(
+                max(result.elapsed, 0.0)
+            )
             log.info(
                 "[SUNO] poll ready",
                 extra={
@@ -11537,6 +11556,7 @@ async def _suno_poll_record_info(
                     }
                 },
             )
+            suno_timeout_total.labels(stage="loop", **_METRIC_LABELS).inc()
             result.state = "timeout"
             return result
 
@@ -11931,6 +11951,165 @@ async def _poll_suno_and_send(
             return False
         return True
 
+    def _schedule_failure_follow_up(
+        *,
+        message: str,
+        reason: str,
+        payload: Mapping[str, Any],
+        stage: str,
+    ) -> None:
+        delay = max(0.0, SUNO_REFUND_GRACE)
+        if delay <= 0:
+            async def _immediate() -> None:
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=message,
+                    payload=payload,
+                    final=True,
+                    refunded=True,
+                )
+                suno_refund_trigger_total.labels(stage=stage, **_METRIC_LABELS).inc()
+                await _issue_refund(message, reason=reason)
+
+            asyncio.create_task(_immediate())
+            return
+
+        existing = _SUNO_FAILURE_FOLLOWUPS.get(task_id)
+        if existing and not existing.done():
+            return
+
+        redis_key = _suno_failure_followup_key(task_id)
+        should_schedule = True
+        if rds is not None:
+            try:
+                should_schedule = bool(
+                    rds.set(
+                        redis_key,
+                        str(int(time.time())),
+                        nx=True,
+                        ex=max(1, int(delay * 2)),
+                    )
+                )
+            except Exception as exc:
+                should_schedule = True
+                log.warning(
+                    "[SUNO] failure follow-up redis error | task_id=%s err=%s",
+                    task_id,
+                    exc,
+                )
+        if not should_schedule:
+            return
+
+        SUNO_JOB_STORE.mark_failed(
+            task_id,
+            message=message,
+            payload=payload,
+            final=False,
+            refunded=False,
+        )
+
+        async def _follow_up_failure() -> None:
+            try:
+                await asyncio.sleep(delay)
+                poll_result = await asyncio.to_thread(
+                    SUNO_SERVICE.poll_record_info_once,
+                    task_id,
+                    user_id=user_id,
+                )
+                payload_latest = (
+                    dict(poll_result.payload)
+                    if isinstance(poll_result.payload, Mapping)
+                    else {}
+                )
+                if poll_result.state == "ready":
+                    delivered = await _deliver_ready_payload(
+                        payload_latest or payload,
+                        via=f"{stage}_followup",
+                    )
+                    if delivered:
+                        suno_late_delivery_total.labels(
+                            trigger=stage, **_METRIC_LABELS
+                        ).inc()
+                        SUNO_JOB_STORE.mark_delivered(
+                            task_id, delivery_key=f"suno:{task_id}"
+                        )
+                        await _clear_wait()
+                        return
+                if poll_result.state == "retry" or poll_result.state == "pending":
+                    log.info(
+                        "[SUNO] failure follow-up pending | task_id=%s state=%s",
+                        task_id,
+                        poll_result.state,
+                    )
+                    _SUNO_FAILURE_FOLLOWUPS.pop(task_id, None)
+                    if rds is not None:
+                        try:
+                            rds.delete(redis_key)
+                        except Exception:
+                            pass
+                    # reschedule another grace cycle
+                    _schedule_failure_follow_up(
+                        message=message,
+                        reason=reason,
+                        payload=payload_latest or payload,
+                        stage=stage,
+                    )
+                    return
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=message,
+                    payload=payload_latest or payload,
+                    final=True,
+                    refunded=True,
+                )
+                suno_refund_trigger_total.labels(stage=stage, **_METRIC_LABELS).inc()
+                await _issue_refund(message, reason=reason)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception(
+                    "[SUNO] failure follow-up crash | task_id=%s err=%s",
+                    task_id,
+                    exc,
+                )
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=str(exc),
+                    payload=payload,
+                    final=True,
+                )
+                suno_refund_trigger_total.labels(stage=f"{stage}_error", **_METRIC_LABELS).inc()
+                await _issue_refund(
+                    _suno_error_message(None, _clean_reason(str(exc))),
+                    reason="suno:refund:followup_err",
+                )
+            finally:
+                _SUNO_FAILURE_FOLLOWUPS.pop(task_id, None)
+                if rds is not None:
+                    try:
+                        rds.delete(redis_key)
+                    except Exception:
+                        pass
+
+        task = asyncio.create_task(_follow_up_failure())
+        _SUNO_FAILURE_FOLLOWUPS[task_id] = task
+        log.info(
+            "[SUNO] failure follow-up scheduled | task_id=%s delay=%.0fs stage=%s",
+            task_id,
+            delay,
+            stage,
+        )
+
+    def _cancel_failure_follow_up() -> None:
+        pending = _SUNO_FAILURE_FOLLOWUPS.pop(task_id, None)
+        if pending and not pending.done():
+            pending.cancel()
+        if rds is not None:
+            try:
+                rds.delete(_suno_failure_followup_key(task_id))
+            except Exception:
+                pass
+
     def _schedule_timeout_follow_up() -> None:
         if SUNO_TIMEOUT_RECHECK_DELAY <= 0:
             return
@@ -11958,7 +12137,6 @@ async def _poll_suno_and_send(
         SUNO_JOB_STORE.mark_reconciling(task_id)
 
         async def _follow_up() -> None:
-            failure_states = {"FAILED", "EXPIRED", "TIMEOUT", "ERROR", "CANCELLED", "CANCELED"}
             deadline = time.monotonic() + max(SUNO_TIMEOUT_RECHECK_TTL, SUNO_TIMEOUT_RECHECK_DELAY)
             attempt = 0
             try:
@@ -11996,16 +12174,14 @@ async def _poll_suno_and_send(
                     if poll_result.state == "hard_error":
                         reason_text = _clean_reason(poll_result.message or poll_result.error)
                         message = _suno_error_message(poll_result.status_code, reason_text)
-                        should_refund = normalized_follow_status in failure_states
-                        SUNO_JOB_STORE.mark_failed(
-                            task_id,
+                        stage_label = "timeout"
+                        refund_reason = "suno:refund:timeout_final"
+                        _schedule_failure_follow_up(
                             message=message,
+                            reason=refund_reason,
                             payload=payload,
-                            final=True,
-                            refunded=should_refund,
+                            stage=stage_label,
                         )
-                        if should_refund:
-                            await _issue_refund(message, reason="suno:refund:timeout_final")
                         return
                     if poll_result.state == "timeout":
                         SUNO_JOB_STORE.mark_timeout(task_id)
@@ -12015,25 +12191,21 @@ async def _poll_suno_and_send(
                             payload=payload,
                             status=normalized_follow_status,
                         )
-                SUNO_JOB_STORE.mark_failed(
-                    task_id,
-                    message="timeout",
-                    final=True,
-                    refunded=True,
+                _schedule_failure_follow_up(
+                    message=_suno_timeout_text(),
+                    reason="suno:refund:timeout_final",
+                    payload={},
+                    stage="timeout",
                 )
-                await _issue_refund(_suno_timeout_text(), reason="suno:refund:timeout_final")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.exception("[SUNO] timeout follow-up failed | task_id=%s err=%s", task_id, exc)
-                SUNO_JOB_STORE.mark_failed(
-                    task_id,
-                    message=str(exc),
-                    final=True,
-                )
-                await _issue_refund(
-                    _suno_error_message(None, _clean_reason(str(exc))),
+                _schedule_failure_follow_up(
+                    message=_suno_error_message(None, _clean_reason(str(exc))),
                     reason="suno:refund:timeout_followup_err",
+                    payload={},
+                    stage="timeout_error",
                 )
             finally:
                 _SUNO_TIMEOUT_FOLLOWUPS.pop(task_id, None)
@@ -12078,6 +12250,7 @@ async def _poll_suno_and_send(
         normalized_status = status_label.upper() if isinstance(status_label, str) else None
 
         if state_value == "delivered":
+            _cancel_failure_follow_up()
             log.info("[SUNO] poll delivered via webhook | task_id=%s", task_id)
             return
 
@@ -12088,6 +12261,7 @@ async def _poll_suno_and_send(
                 poll_result.attempts,
                 poll_result.elapsed,
             )
+            suno_timeout_total.labels(stage="poll", **_METRIC_LABELS).inc()
             await _notify_timeout_once()
             _schedule_timeout_follow_up()
             return
@@ -12109,30 +12283,19 @@ async def _poll_suno_and_send(
                     task_id,
                     notify_exc,
                 )
-            refund_states = {"FAILED", "EXPIRED", "TIMEOUT", "ERROR"}
-            if normalized_status in refund_states:
-                await _issue_refund(message, reason="suno:refund:status_err")
-                SUNO_JOB_STORE.mark_failed(
-                    task_id,
-                    message=message,
-                    payload=details,
-                    final=True,
-                    refunded=True,
-                )
-                await _clear_wait()
-            else:
+            if normalized_status:
                 log.info(
-                    "[SUNO] poll hard error without refund | task_id=%s status=%s",
+                    "[SUNO] poll hard error | task_id=%s status=%s",
                     task_id,
                     normalized_status,
                 )
-                SUNO_JOB_STORE.mark_failed(
-                    task_id,
-                    message=message,
-                    payload=details,
-                    final=True,
-                )
-                await _clear_wait()
+            _schedule_failure_follow_up(
+                message=message,
+                reason="suno:refund:status_err",
+                payload=details,
+                stage="hard_error",
+            )
+            await _clear_wait()
             return
 
         if state_value != "ready":
@@ -12146,6 +12309,7 @@ async def _poll_suno_and_send(
             return
 
         tracks_payload = _poll_tracks(details)
+        _cancel_failure_follow_up()
         if not tracks_payload:
             log.info(
                 "[SUNO] poll success without tracks | task_id=%s",
