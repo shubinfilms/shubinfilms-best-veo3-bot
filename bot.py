@@ -64,6 +64,7 @@ from typing import (
     MutableMapping,
     Sequence,
     Iterable,
+    Mapping,
 )
 from datetime import datetime, timedelta, timezone
 from contextlib import suppress
@@ -455,6 +456,7 @@ from suno.cover_source import (
     upload_url as upload_cover_url,
     validate_audio_file as validate_cover_audio_file,
 )
+from suno.jobs_store import jobs_store as SUNO_JOB_STORE
 from suno.service import SunoService, SunoAPIError, RecordInfoPollResult
 from sora2_client import (
     CreateTaskResponse,
@@ -11315,6 +11317,19 @@ async def _launch_suno_generation(
         meta["task_id"] = task_id
         _suno_update_last_debit_meta(user_id, {"task_id": task_id})
 
+        try:
+            job_user_id = int(user_id)
+        except (TypeError, ValueError):
+            job_user_id = None
+        SUNO_JOB_STORE.record_enqueue(
+            task_id,
+            user_id=job_user_id,
+            chat_id=int(chat_id),
+            request_id=req_id,
+            title=title,
+            payload={"params": params, "meta": meta},
+        )
+
         pending_meta.update(
             {
                 "task_id": task_id,
@@ -11442,6 +11457,26 @@ async def _suno_poll_record_info(
         if result.message:
             meta["message"] = result.message
 
+        payload_mapping = result.payload if isinstance(result.payload, Mapping) else None
+        if result.state in {"pending", "retry"}:
+            SUNO_JOB_STORE.mark_pending(
+                task_id,
+                payload=payload_mapping,
+                status=normalized_status,
+            )
+        elif result.state == "ready":
+            SUNO_JOB_STORE.mark_ready(task_id, payload=payload_mapping)
+        elif result.state == "hard_error":
+            SUNO_JOB_STORE.mark_failed(
+                task_id,
+                message=result.message or result.error,
+                payload=payload_mapping,
+            )
+        elif result.state == "timeout":
+            SUNO_JOB_STORE.mark_timeout(task_id)
+        elif result.state == "delivered":
+            SUNO_JOB_STORE.mark_delivered(task_id, delivery_key=f"suno:{task_id}")
+
         should_log_retry = False
         if result.status_code == 404 and result.state in {"pending", "retry"}:
             should_log_retry = True
@@ -11556,6 +11591,69 @@ def _suno_reconcile_should_attempt(task_id: str, now: float) -> bool:
 async def _suno_reconcile_once() -> None:
     if SUNO_RECONCILE_BATCH <= 0:
         return
+    now_dt = datetime.now(timezone.utc)
+    cutoff = now_dt - timedelta(seconds=SUNO_RECONCILE_MAX_AGE)
+    now_monotonic = time.monotonic()
+    processed = 0
+    processed_ids: set[str] = set()
+    jobs_candidates = SUNO_JOB_STORE.iter_reconcilable(since=cutoff, limit=SUNO_RECONCILE_BATCH)
+    if jobs_candidates:
+        for job in jobs_candidates:
+            if processed >= SUNO_RECONCILE_BATCH:
+                break
+            task_id = job.job_id
+            if not task_id:
+                continue
+            if task_id in processed_ids:
+                continue
+            processed += 1
+            processed_ids.add(task_id)
+            try:
+                poll_result = await asyncio.to_thread(
+                    SUNO_SERVICE.poll_record_info_once,
+                    task_id,
+                    user_id=job.user_id,
+                )
+            except Exception as exc:
+                log.warning("[SUNO] reconcile poll failed | task_id=%s err=%s", task_id, exc)
+                continue
+            payload = poll_result.payload if isinstance(poll_result.payload, Mapping) else {}
+            status_value = None
+            if isinstance(payload, Mapping):
+                status_value = SunoService._status_from_payload(payload)
+            normalized_status = status_value.upper() if isinstance(status_value, str) else None
+            if poll_result.state == "ready":
+                SUNO_JOB_STORE.mark_ready(task_id, payload=payload)
+                req_id_value = job.request_id or SUNO_SERVICE.get_request_id(task_id)
+                delivered = await asyncio.to_thread(
+                    _suno_deliver_record_info_payload,
+                    task_id,
+                    payload,
+                    req_id=req_id_value,
+                    delivery_via="reconcile",
+                )
+                if delivered:
+                    SUNO_JOB_STORE.mark_delivered(task_id, delivery_key=f"suno:{task_id}")
+                else:
+                    log.warning("[SUNO] reconcile delivery skipped | task_id=%s", task_id)
+                continue
+            if poll_result.state == "hard_error" and normalized_status in {"FAILED", "ERROR", "CANCELLED", "CANCELED", "EXPIRED"}:
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=poll_result.message or poll_result.error or normalized_status,
+                    payload=payload,
+                    final=True,
+                )
+                continue
+            SUNO_JOB_STORE.mark_pending(
+                task_id,
+                payload=payload,
+                status=normalized_status,
+            )
+
+    if processed >= SUNO_RECONCILE_BATCH:
+        return
+
     try:
         records = await asyncio.to_thread(
             SUNO_SERVICE.list_last_tasks,
@@ -11564,10 +11662,6 @@ async def _suno_reconcile_once() -> None:
     except Exception as exc:
         log.warning("[SUNO] reconcile fetch failed | err=%s", exc)
         return
-    now_dt = datetime.now(timezone.utc)
-    cutoff = now_dt - timedelta(seconds=SUNO_RECONCILE_MAX_AGE)
-    now_monotonic = time.monotonic()
-    processed = 0
     for record in records:
         if processed >= SUNO_RECONCILE_BATCH:
             break
@@ -11575,6 +11669,8 @@ async def _suno_reconcile_once() -> None:
             continue
         task_id = str(record.get("task_id") or record.get("taskId") or "").strip()
         if not task_id:
+            continue
+        if task_id in processed_ids:
             continue
         tracks = record.get("tracks")
         if isinstance(tracks, list) and tracks:
@@ -11606,6 +11702,7 @@ async def _suno_reconcile_once() -> None:
         state = poll_result.state
         if state == "ready":
             payload = poll_result.payload if isinstance(poll_result.payload, Mapping) else {}
+            SUNO_JOB_STORE.mark_ready(task_id, payload=payload)
             req_id_value = record.get("req_id") or SUNO_SERVICE.get_request_id(task_id)
             durations = SunoService._durations_from_tracks(  # type: ignore[attr-defined]
                 SunoService._tracks_from_payload(payload)  # type: ignore[attr-defined]
@@ -11626,12 +11723,20 @@ async def _suno_reconcile_once() -> None:
             )
             if not delivered:
                 log.warning("[SUNO] reconcile delivery skipped | task_id=%s", task_id)
+            else:
+                SUNO_JOB_STORE.mark_delivered(task_id, delivery_key=f"suno:{task_id}")
         elif state == "hard_error":
             log.warning(
                 "[SUNO] reconcile hard error | task_id=%s status=%s http=%s",
                 task_id,
                 poll_result.message or poll_result.error or state,
                 poll_result.status_code,
+            )
+            SUNO_JOB_STORE.mark_failed(
+                task_id,
+                message=poll_result.message or poll_result.error or state,
+                payload=payload,
+                final=True,
             )
 
 
@@ -11850,39 +11955,82 @@ async def _poll_suno_and_send(
         if not should_schedule:
             return
 
+        SUNO_JOB_STORE.mark_reconciling(task_id)
+
         async def _follow_up() -> None:
+            failure_states = {"FAILED", "EXPIRED", "TIMEOUT", "ERROR", "CANCELLED", "CANCELED"}
+            deadline = time.monotonic() + max(SUNO_TIMEOUT_RECHECK_TTL, SUNO_TIMEOUT_RECHECK_DELAY)
+            attempt = 0
             try:
-                await asyncio.sleep(SUNO_TIMEOUT_RECHECK_DELAY)
-                follow_result = await _suno_poll_record_info(task_id, user_id=user_id)
-                payload = dict(follow_result.payload) if isinstance(follow_result.payload, Mapping) else {}
-                if follow_result.state == "ready":
-                    log.info(
-                        "[SUNO] timeout follow-up ready | task_id=%s attempts=%s elapsed=%.1f",
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(SUNO_TIMEOUT_RECHECK_DELAY, max(0.0, remaining)))
+                    attempt += 1
+                    poll_result = await asyncio.to_thread(
+                        SUNO_SERVICE.poll_record_info_once,
                         task_id,
-                        follow_result.attempts,
-                        follow_result.elapsed,
+                        user_id=user_id,
                     )
-                    delivered = await _deliver_ready_payload(payload, via="timeout_followup")
-                    if delivered:
-                        await _clear_wait()
-                    return
-                if follow_result.state == "hard_error":
-                    reason_text = _clean_reason(follow_result.message or follow_result.error)
-                    message = _suno_error_message(follow_result.status_code, reason_text)
-                    await _issue_refund(message, reason="suno:refund:timeout_final")
-                    return
-                if follow_result.state == "timeout":
-                    await _issue_refund(_suno_timeout_text(), reason="suno:refund:timeout_final")
-                    return
-                # Pending or other non-terminal state after grace window
-                await _issue_refund(
-                    _suno_timeout_text(),
-                    reason="suno:refund:timeout_final",
+                    payload = (
+                        dict(poll_result.payload)
+                        if isinstance(poll_result.payload, Mapping)
+                        else {}
+                    )
+                    status_value = None
+                    if isinstance(payload, Mapping):
+                        status_value = SunoService._status_from_payload(payload)
+                    normalized_follow_status = status_value.upper() if isinstance(status_value, str) else None
+                    if poll_result.state == "ready":
+                        log.info(
+                            "[SUNO] timeout follow-up ready | task_id=%s attempts=%s",
+                            task_id,
+                            attempt,
+                        )
+                        delivered = await _deliver_ready_payload(payload, via="timeout_followup")
+                        if delivered:
+                            SUNO_JOB_STORE.mark_delivered(task_id, delivery_key=f"suno:{task_id}")
+                            await _clear_wait()
+                        return
+                    if poll_result.state == "hard_error":
+                        reason_text = _clean_reason(poll_result.message or poll_result.error)
+                        message = _suno_error_message(poll_result.status_code, reason_text)
+                        should_refund = normalized_follow_status in failure_states
+                        SUNO_JOB_STORE.mark_failed(
+                            task_id,
+                            message=message,
+                            payload=payload,
+                            final=True,
+                            refunded=should_refund,
+                        )
+                        if should_refund:
+                            await _issue_refund(message, reason="suno:refund:timeout_final")
+                        return
+                    if poll_result.state == "timeout":
+                        SUNO_JOB_STORE.mark_timeout(task_id)
+                    else:
+                        SUNO_JOB_STORE.mark_pending(
+                            task_id,
+                            payload=payload,
+                            status=normalized_follow_status,
+                        )
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message="timeout",
+                    final=True,
+                    refunded=True,
                 )
+                await _issue_refund(_suno_timeout_text(), reason="suno:refund:timeout_final")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.exception("[SUNO] timeout follow-up failed | task_id=%s err=%s", task_id, exc)
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=str(exc),
+                    final=True,
+                )
                 await _issue_refund(
                     _suno_error_message(None, _clean_reason(str(exc))),
                     reason="suno:refund:timeout_followup_err",
@@ -11961,15 +12109,28 @@ async def _poll_suno_and_send(
                     task_id,
                     notify_exc,
                 )
-            refund_states = {"FAILED", "EXPIRED", "TIMEOUT"}
+            refund_states = {"FAILED", "EXPIRED", "TIMEOUT", "ERROR"}
             if normalized_status in refund_states:
                 await _issue_refund(message, reason="suno:refund:status_err")
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=message,
+                    payload=details,
+                    final=True,
+                    refunded=True,
+                )
                 await _clear_wait()
             else:
                 log.info(
                     "[SUNO] poll hard error without refund | task_id=%s status=%s",
                     task_id,
                     normalized_status,
+                )
+                SUNO_JOB_STORE.mark_failed(
+                    task_id,
+                    message=message,
+                    payload=details,
+                    final=True,
                 )
                 await _clear_wait()
             return
@@ -12017,6 +12178,7 @@ async def _poll_suno_and_send(
 
         delivered = await _deliver_ready_payload(details, via="poll", tracks=tracks_payload)
         if delivered:
+            SUNO_JOB_STORE.mark_delivered(task_id, delivery_key=f"suno:{task_id}")
             await _clear_wait()
         return
 
@@ -12026,6 +12188,13 @@ async def _poll_suno_and_send(
     except Exception as exc:
         log.exception("[SUNO] poll unexpected failure | task_id=%s err=%s", task_id, exc)
         await _issue_refund(_suno_error_message(None, _clean_reason(str(exc))), reason="suno:refund:poll_err")
+        SUNO_JOB_STORE.mark_failed(
+            task_id,
+            message=str(exc),
+            payload=details,
+            final=True,
+            refunded=True,
+        )
         await _clear_wait()
     finally:
         s = state(ctx)
