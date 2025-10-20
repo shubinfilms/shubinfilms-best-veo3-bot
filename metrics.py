@@ -64,6 +64,28 @@ telegram_send_total = Counter(
     registry=REGISTRY,
 )
 
+ui_callback_ack_total = Counter(
+    "ui_callback_ack_total",
+    "Callback query acknowledgement attempts grouped by result.",
+    labelnames=("result", "env", "service"),
+    registry=REGISTRY,
+)
+
+ui_callback_ack_latency_ms = Histogram(
+    "ui_callback_ack_latency_ms",
+    "Latency of callback query acknowledgements in milliseconds.",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 150, 250, 500, 1000),
+)
+
+ui_callback_dedup_total = Counter(
+    "ui_callback_dedup_total",
+    "Callback query deduplication decisions grouped by action.",
+    labelnames=("action", "env", "service"),
+    registry=REGISTRY,
+)
+
 faq_root_views_total = Counter(
     "faq_root_views_total",
     "Total number of FAQ root menu views",

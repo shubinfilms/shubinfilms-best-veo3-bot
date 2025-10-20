@@ -76,3 +76,14 @@ def snapshot() -> Dict[str, MutableMapping[str, float]]:
             "counters": dict(_COUNTERS),
             "gauges": {name: dict(payload) for name, payload in _GAUGES.items()},
         }
+
+
+def increment_ui_callback_counter(kind: str, result: str) -> int:
+    """Increment a structured callback counter (ui.callback.<kind>.<result>)."""
+
+    if not kind:
+        raise ValueError("kind must be provided")
+    if not result:
+        raise ValueError("result must be provided")
+    name = f"ui.callback.{kind}.{result}"
+    return increment_counter(name)

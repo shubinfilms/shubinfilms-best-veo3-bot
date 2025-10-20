@@ -1,13 +1,14 @@
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tests.suno_test_utils import FakeBot, bot_module
+from telegram_utils import safe_answer
 import handlers.knowledge_base as kb_module  # noqa: E402
 
 
@@ -189,3 +190,20 @@ def test_menu_suppresses_dialog_notice(monkeypatch):
         assert not bot.sent
 
     asyncio.run(scenario())
+
+
+def test_reused_msg_suppresses_answer():
+    calls: list[dict] = []
+
+    class _Query:
+        def __init__(self) -> None:
+            self.answered = True
+
+        async def answer(self, **kwargs):
+            calls.append(kwargs)
+
+    query = _Query()
+    result = asyncio.run(safe_answer(query))
+
+    assert result == "skipped"
+    assert calls == []

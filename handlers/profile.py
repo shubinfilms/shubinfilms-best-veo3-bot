@@ -19,7 +19,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
-from telegram_utils import safe_send
+from telegram_utils import safe_answer, safe_send
 from .stars import build_stars_kb, open_stars_menu, render_stars_text
 from ui.card import build_card
 from utils.input_state import (
@@ -519,7 +519,7 @@ async def handle_profile_view(
 
             if query is not None:
                 with suppress(BadRequest):
-                    await query.answer()
+                    await safe_answer(query)
 
             chat_state = _chat_data(ctx)
             if isinstance(chat_state, MutableMapping):
@@ -568,9 +568,9 @@ async def handle_profile_view(
         if query is not None:
             with suppress(BadRequest):
                 if answer_text is None:
-                    await query.answer()
+                    await safe_answer(query)
                 else:
-                    await query.answer(answer_text, show_alert=False)
+                    await safe_answer(query, text=answer_text, show_alert=False)
 
         chat_state = _chat_data(ctx)
         if isinstance(chat_state, MutableMapping):
@@ -955,10 +955,10 @@ async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if query is not None:
         if isinstance(chat_data, MutableMapping) and chat_data.get(_PROFILE_LOCK_KEY):
             with suppress(BadRequest):
-                await query.answer("Открываю профиль…")
+                await safe_answer(query, text="Открываю профиль…")
             return
         with suppress(BadRequest):
-            await query.answer()
+            await safe_answer(query)
 
     await open_profile(update, ctx, source="menu", suppress_nav=True)
 

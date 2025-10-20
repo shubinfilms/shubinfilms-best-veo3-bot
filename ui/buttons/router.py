@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
+from metrics import ui_callback_dedup_total
+from runtime_metrics import increment_ui_callback_counter
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from .errors import ButtonAccessDenied, ButtonFeatureDisabled, ButtonNotFound
 from .guards import guard_access, guard_feature, resolve_user_tier
-from .idempotency import with_idempotency
-from .results import UIResult, show_error
+from .idempotency import should_process, with_idempotency
+from .results import UIResult, acknowledge, show_error
 from .telemetry import log_click, log_error, log_success, measure_latency
 from .types import ButtonContext, ButtonId, ButtonSpec
+from telegram_utils import safe_answer
 
 log = logging.getLogger(__name__)
+_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+_BOT_LABELS = {"env": _ENV, "service": "bot"}
 
 
 @dataclass(slots=True)
@@ -57,6 +63,26 @@ class ButtonRouter:
             chat_id=chat_id,
             user_id=user_id,
         )
+
+        if query is not None:
+            ack_result = await safe_answer(query, cache_time=0)
+            context.mark_acknowledged(ack_result)
+
+            callback_data = getattr(query, "data", None)
+            if not should_process(user_id, callback_data):
+                ui_callback_dedup_total.labels(action="dropped", **_BOT_LABELS).inc()
+                increment_ui_callback_counter("dedup", "dropped")
+                log.debug(
+                    "ui.button.dedup_dropped",
+                    extra={
+                        "button": spec.id,
+                        "user_id": user_id,
+                        "callback_data": callback_data,
+                    },
+                )
+                return acknowledge(spec.id, message="duplicate_click")
+            ui_callback_dedup_total.labels(action="passed", **_BOT_LABELS).inc()
+            increment_ui_callback_counter("dedup", "passed")
 
         user_tier = resolve_user_tier(ctx, user_id)
         log_click(spec.id, user_tier)

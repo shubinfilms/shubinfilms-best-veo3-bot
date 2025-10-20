@@ -7,6 +7,7 @@ from telegram import CallbackQuery, Update
 from telegram.ext import ContextTypes
 
 from .results import UIResult
+from telegram_utils import safe_answer
 
 ButtonId = Literal[
     "profile",
@@ -52,6 +53,8 @@ class ButtonContext:
     query: Optional[CallbackQuery]
     chat_id: Optional[int]
     user_id: Optional[int]
+    ack_result: Optional[str] = None
+    acknowledged: bool = False
 
     def as_dict(self) -> dict[str, object]:
         """Return a structured representation for logging/debugging."""
@@ -63,15 +66,18 @@ class ButtonContext:
             "request_id": self.request_id,
         }
 
+    def mark_acknowledged(self, result: str) -> None:
+        self.ack_result = result
+        if result != "error":
+            self.acknowledged = True
+
     async def answer(self, text: str, *, show_alert: bool = False) -> None:
         """Answer the callback query if available."""
 
         if self.query is None:
             return
-        try:
-            await self.query.answer(text=text, show_alert=show_alert)
-        except Exception:  # pragma: no cover - network errors are ignored
-            pass
+        result = await safe_answer(self.query, text=text, show_alert=show_alert)
+        self.mark_acknowledged(result)
 
 
 ButtonFactory = Callable[[ButtonSpec], ButtonHandler]
