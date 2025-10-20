@@ -12,7 +12,7 @@ import handlers.knowledge_base as kb_module  # noqa: E402
 
 
 def test_menu_callbacks_route_ok(monkeypatch):
-    ctx = SimpleNamespace(chat_data={}, user_data={}, application=SimpleNamespace(bot_data={}))
+    ctx = SimpleNamespace(chat_data={}, user_data={"is_paid": True}, application=SimpleNamespace(bot_data={}))
 
     calls: list[tuple[str, tuple, dict]] = []
 
@@ -68,7 +68,7 @@ def test_menu_callbacks_route_ok(monkeypatch):
     monkeypatch.setattr(bot_module, "video_open_menu", fake_video)
     monkeypatch.setattr(bot_module, "dialog_open_menu", fake_dialog)
 
-    async def fake_answer():
+    async def fake_answer(**kwargs):
         return None
 
     tests = [
@@ -123,7 +123,7 @@ def test_menu_open_no_duplicates(monkeypatch):
 
     monkeypatch.setattr(kb_module, "open_root", fake_open_root)
 
-    async def fake_answer():
+    async def fake_answer(**kwargs):
         return None
 
     query = SimpleNamespace(
@@ -158,7 +158,7 @@ def test_menu_suppresses_dialog_notice(monkeypatch):
         assert context.chat_data.get("nav_in_progress") is True
         return 888
 
-    async def fake_answer():
+    async def fake_answer(**kwargs):
         return None
 
     async def fake_ensure(update):

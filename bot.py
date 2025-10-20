@@ -6551,33 +6551,51 @@ async def _open_menu_section(
 
 
 async def kb_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _perform_menu_open(
-        "kb",
-        update=update,
-        ctx=ctx,
-        query=update.callback_query,
-        log_click=False,
-    )
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button("kb", update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(
+            "kb",
+            update=update,
+            ctx=ctx,
+            query=update.callback_query,
+            log_click=False,
+        )
 
 
 async def photo_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _perform_menu_open(
-        "photo",
-        update=update,
-        ctx=ctx,
-        query=update.callback_query,
-        log_click=False,
-    )
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button("photo", update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(
+            "photo",
+            update=update,
+            ctx=ctx,
+            query=update.callback_query,
+            log_click=False,
+        )
 
 
 async def music_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _perform_menu_open(
-        "music",
-        update=update,
-        ctx=ctx,
-        query=update.callback_query,
-        log_click=False,
-    )
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button("music", update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(
+            "music",
+            update=update,
+            ctx=ctx,
+            query=update.callback_query,
+            log_click=False,
+        )
 
 
 async def video_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6585,23 +6603,35 @@ async def video_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if query is not None:
         with suppress(BadRequest):
             await query.answer(cache_time=0)
-    await _perform_menu_open(
-        "video",
-        update=update,
-        ctx=ctx,
-        query=update.callback_query,
-        log_click=False,
-    )
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button("video", update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(
+            "video",
+            update=update,
+            ctx=ctx,
+            query=update.callback_query,
+            log_click=False,
+        )
 
 
 async def dialog_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _perform_menu_open(
-        "dialog",
-        update=update,
-        ctx=ctx,
-        query=update.callback_query,
-        log_click=False,
-    )
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button("dialog", update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(
+            "dialog",
+            update=update,
+            ctx=ctx,
+            query=update.callback_query,
+            log_click=False,
+        )
 
 
 async def handle_main_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6614,7 +6644,13 @@ async def handle_main_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TY
         return
 
     item = data.split(":", 1)[1]
-    await _perform_menu_open(item, update=update, ctx=ctx, query=query, log_click=True)
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button(item, update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(item, update=update, ctx=ctx, query=query, log_click=True)
 
 
 async def handle_hub_open_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6628,23 +6664,27 @@ async def handle_hub_open_callback(update: Update, ctx: ContextTypes.DEFAULT_TYP
             await query.answer()
         return
 
-    if data == "hub:open:profile":
-        await profile_open(update, ctx, edit_in_place=True)
-        return
-
-    item = {
+    mapping = {
+        "hub:open:profile": "profile",
         "hub:open:kb": "kb",
         "hub:open:photo": "photo",
         "hub:open:music": "music",
         "hub:open:video": "video",
         "hub:open:dialog": "dialog",
-    }.get(data)
+    }
+    item = mapping.get(data)
     if not item:
         with suppress(BadRequest):
             await query.answer()
         return
 
-    await _perform_menu_open(item, update=update, ctx=ctx, query=query, log_click=True)
+    from ui.buttons.errors import ButtonNotFound
+    from ui.buttons.router import dispatch as dispatch_button
+
+    try:
+        await dispatch_button(item, update=update, ctx=ctx)
+    except ButtonNotFound:
+        await _perform_menu_open(item, update=update, ctx=ctx, query=query, log_click=True)
 
 
 async def show_emoji_hub(
