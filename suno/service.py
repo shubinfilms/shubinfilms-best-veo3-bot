@@ -31,12 +31,14 @@ from stickers import pop_wait_sticker_id
 from settings import (
     HTTP_POOL_CONNECTIONS,
     HTTP_POOL_PER_HOST,
+    KIE_BASE_URL,
     REDIS_PREFIX,
     SUNO_API_BASE,
     SUNO_API_TOKEN,
     SUNO_CALLBACK_SECRET,
     SUNO_CALLBACK_URL,
     SUNO_ENABLED,
+    SUNO_TASK_STATUS_PATH,
 )
 from telegram_utils import mask_tokens
 from utils.audio_post import prepare_audio_file_sync
@@ -53,7 +55,35 @@ except Exception:  # pragma: no cover - optional import
 
 log = logging.getLogger("suno.service")
 
-API_BASE = SUNO_API_BASE
+_DEFAULT_API_BASE = "https://api.kie.ai"
+
+
+def _resolve_api_base() -> str:
+    raw = (SUNO_API_BASE or KIE_BASE_URL or _DEFAULT_API_BASE) or _DEFAULT_API_BASE
+    text = str(raw).strip()
+    if not text:
+        text = _DEFAULT_API_BASE
+    return text.rstrip("/")
+
+
+def _normalize_status_path(raw: Optional[str]) -> str:
+    candidate = (raw or "").strip()
+    if not candidate:
+        candidate = "/api/v1/generate/record-info"
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        return candidate
+    if not candidate.startswith("/"):
+        candidate = "/" + candidate
+    return candidate
+
+
+API_BASE = _resolve_api_base()
+_STATUS_PATH = _normalize_status_path(SUNO_TASK_STATUS_PATH)
+_STATUS_URL = (
+    _STATUS_PATH
+    if _STATUS_PATH.startswith(("http://", "https://"))
+    else f"{API_BASE}{_STATUS_PATH}"
+)
 API_KEY = SUNO_API_TOKEN
 CALLBACK_URL = SUNO_CALLBACK_URL
 
@@ -147,8 +177,9 @@ def _post(path: str, payload: Dict[str, Any]) -> ApiEnvelope:
 
 
 def _get(path: str, params: Dict[str, Any]) -> ApiEnvelope:
+    url = path if path.startswith(("http://", "https://")) else f"{API_BASE}{path}"
     response = requests.get(
-        f"{API_BASE}{path}",
+        url,
         headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else None,
         params=params,
         timeout=15,
@@ -243,7 +274,7 @@ def suno_add_vocals(
 
 
 def suno_record_info(task_id: str) -> Dict[str, Any]:
-    envelope = _get("/api/v1/generate/record-info", {"taskId": task_id})
+    envelope = _get(_STATUS_URL, {"taskId": task_id})
     data = envelope.data or {}
     if isinstance(data, Mapping):
         return dict(data)
@@ -381,9 +412,13 @@ class SunoService:
             self._poll_first_delay,
             _env_float("SUNO_POLL_TIMEOUT_SEC", _POLL_DEFAULT_TIMEOUT),
         )
+        self._api_base = API_BASE
+        self._status_path = _STATUS_PATH
+        self._status_url = _STATUS_URL
         summary = {
             "suno_enabled": bool(SUNO_ENABLED),
-            "api_base": SUNO_API_BASE,
+            "api_base": self._api_base,
+            "status_path": self._status_path,
             "callback_configured": bool(SUNO_CALLBACK_URL and SUNO_CALLBACK_SECRET),
         }
         log.info("configuration summary", extra={"meta": summary})
@@ -538,7 +573,7 @@ class SunoService:
         headers: Dict[str, str] = {}
         if API_KEY:
             headers["Authorization"] = f"Bearer {API_KEY}"
-        url = f"{API_BASE}/api/v1/generate/record-info"
+        url = self._status_url
         try:
             response = self._api_session.get(url, params=params, headers=headers or None, timeout=20)
         except requests.RequestException as exc:

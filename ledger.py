@@ -309,7 +309,20 @@ class _PostgresLedgerStorage(_LedgerHelpers):
             "ALTER TABLE transactions ALTER COLUMN created_at SET DEFAULT now()",
             "ALTER TABLE transactions ALTER COLUMN created_at SET NOT NULL",
             "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS key TEXT",
-            "ALTER TABLE transactions ADD CONSTRAINT IF NOT EXISTS transactions_user_type_key_key UNIQUE (user_id, type, key)",
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint
+                     WHERE conname = 'transactions_user_type_key_key'
+                ) THEN
+                    ALTER TABLE transactions
+                        ADD CONSTRAINT transactions_user_type_key_key UNIQUE (user_id, type, key);
+                END IF;
+            END;
+            $$;
+            """,
             """
             UPDATE transactions
                SET amount = CASE

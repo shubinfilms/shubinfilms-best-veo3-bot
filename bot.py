@@ -64,7 +64,7 @@ from typing import (
     Sequence,
     Iterable,
 )
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import suppress
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from dataclasses import dataclass
@@ -582,6 +582,7 @@ _SUNO_START_LOCK_TTL = 300
 _SUNO_PENDING_TTL = 20 * 60
 _SUNO_PENDING_LOCK = threading.Lock()
 _SUNO_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
+_SUNO_RECONCILE_ATTEMPTS: Dict[str, float] = {}
 
 _SUNO_REFUND_PENDING_LOCK = threading.Lock()
 _SUNO_REFUND_PENDING_MEMORY: Dict[str, tuple[float, str]] = {}
@@ -854,8 +855,10 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+def _parse_iso8601(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
         return None
     text = value.strip()
     if not text:
@@ -1126,6 +1129,9 @@ SUNO_POLL_BACKGROUND_LIMIT = max(
     SUNO_POLL_NOTIFY_AFTER,
     _env_float("SUNO_POLL_BACKGROUND_LIMIT", 600.0),
 )
+SUNO_RECONCILE_INTERVAL = max(30.0, _env_float("SUNO_RECONCILE_INTERVAL_SEC", 180.0))
+SUNO_RECONCILE_MAX_AGE = max(60.0, _env_float("SUNO_RECONCILE_MAX_AGE_SEC", 24 * 3600.0))
+SUNO_RECONCILE_BATCH = max(1, _env_int("SUNO_RECONCILE_BATCH", 40))
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
 BOT_SINGLETON_DISABLED = bool(SETTINGS_BOT_SINGLETON_DISABLED)
 BOT_LEADER_TTL_MS   = 30_000
@@ -11259,6 +11265,161 @@ async def _suno_poll_record_info(
             return result
 
 
+def _suno_deliver_record_info_payload(
+    task_id: str,
+    payload: Mapping[str, Any],
+    *,
+    req_id: Optional[str],
+    delivery_via: str = "poll",
+    tracks: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    try:
+        tracks_payload = tracks if tracks is not None else _poll_tracks(payload)
+        if not tracks_payload:
+            return False
+        envelope_payload = {
+            "code": payload.get("code") or 200,
+            "msg": payload.get("message") or payload.get("msg"),
+            "data": {
+                "taskId": task_id,
+                "callbackType": "complete",
+                "response": {"tracks": tracks_payload},
+            },
+        }
+        callback_task = SunoTask.from_envelope(CallbackEnvelope.model_validate(envelope_payload))
+        callback_task = callback_task.model_copy(
+            update={"code": envelope_payload["code"], "msg": envelope_payload.get("msg")}
+        )
+        SUNO_SERVICE.handle_callback(callback_task, req_id=req_id, delivery_via=delivery_via)
+        return True
+    except Exception:
+        log.exception("[SUNO] deliver failed | task_id=%s via=%s", task_id, delivery_via)
+        return False
+
+
+def _suno_reconcile_should_attempt(task_id: str, now: float) -> bool:
+    if not task_id:
+        return False
+    min_gap = max(30.0, min(SUNO_RECONCILE_INTERVAL, 300.0))
+    last_attempt = _SUNO_RECONCILE_ATTEMPTS.get(task_id)
+    if last_attempt is not None and now - last_attempt < min_gap:
+        return False
+    _SUNO_RECONCILE_ATTEMPTS[task_id] = now
+    stale_threshold = now - max(SUNO_RECONCILE_MAX_AGE, 3600.0)
+    for key, ts in list(_SUNO_RECONCILE_ATTEMPTS.items()):
+        if ts < stale_threshold:
+            _SUNO_RECONCILE_ATTEMPTS.pop(key, None)
+    return True
+
+
+async def _suno_reconcile_once() -> None:
+    if SUNO_RECONCILE_BATCH <= 0:
+        return
+    try:
+        records = await asyncio.to_thread(
+            SUNO_SERVICE.list_last_tasks,
+            max(SUNO_RECONCILE_BATCH * 2, SUNO_RECONCILE_BATCH),
+        )
+    except Exception as exc:
+        log.warning("[SUNO] reconcile fetch failed | err=%s", exc)
+        return
+    now_dt = datetime.now(timezone.utc)
+    cutoff = now_dt - timedelta(seconds=SUNO_RECONCILE_MAX_AGE)
+    now_monotonic = time.monotonic()
+    processed = 0
+    for record in records:
+        if processed >= SUNO_RECONCILE_BATCH:
+            break
+        if not isinstance(record, Mapping):
+            continue
+        task_id = str(record.get("task_id") or record.get("taskId") or "").strip()
+        if not task_id:
+            continue
+        tracks = record.get("tracks")
+        if isinstance(tracks, list) and tracks:
+            continue
+        if SUNO_SERVICE._recently_delivered(task_id):  # type: ignore[attr-defined]
+            continue
+        updated_at = _parse_iso8601(record.get("updated_at"))
+        created_at = _parse_iso8601(record.get("created_at"))
+        reference_time = updated_at or created_at or now_dt
+        if reference_time < cutoff:
+            continue
+        if not _suno_reconcile_should_attempt(task_id, now_monotonic):
+            continue
+        try:
+            user_id_raw = record.get("user_id")
+            user_id_value = int(user_id_raw) if user_id_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            user_id_value = None
+        processed += 1
+        try:
+            poll_result = await asyncio.to_thread(
+                SUNO_SERVICE.poll_record_info_once,
+                task_id,
+                user_id=user_id_value,
+            )
+        except Exception as exc:
+            log.warning("[SUNO] reconcile poll failed | task_id=%s err=%s", task_id, exc)
+            continue
+        state = poll_result.state
+        if state == "ready":
+            payload = poll_result.payload if isinstance(poll_result.payload, Mapping) else {}
+            req_id_value = record.get("req_id") or SUNO_SERVICE.get_request_id(task_id)
+            durations = SunoService._durations_from_tracks(  # type: ignore[attr-defined]
+                SunoService._tracks_from_payload(payload)  # type: ignore[attr-defined]
+            )
+            log.info(
+                "[SUNO] reconcile ready | task_id=%s attempts=%s elapsed=%.1f durations=%s",
+                task_id,
+                poll_result.attempts,
+                poll_result.elapsed,
+                durations,
+            )
+            delivered = await asyncio.to_thread(
+                _suno_deliver_record_info_payload,
+                task_id,
+                payload,
+                req_id=req_id_value,
+                delivery_via="reconcile",
+            )
+            if not delivered:
+                log.warning("[SUNO] reconcile delivery skipped | task_id=%s", task_id)
+        elif state == "hard_error":
+            log.warning(
+                "[SUNO] reconcile hard error | task_id=%s status=%s http=%s",
+                task_id,
+                poll_result.message or poll_result.error or state,
+                poll_result.status_code,
+            )
+
+
+async def _suno_reconcile_worker(stop_event: asyncio.Event) -> None:
+    if SUNO_RECONCILE_INTERVAL <= 0:
+        return
+    log.info(
+        "[SUNO] reconciliation worker started | interval=%.1fs batch=%d max_age=%.0fs",
+        SUNO_RECONCILE_INTERVAL,
+        SUNO_RECONCILE_BATCH,
+        SUNO_RECONCILE_MAX_AGE,
+    )
+    try:
+        while not stop_event.is_set():
+            try:
+                await _suno_reconcile_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("[SUNO] reconcile iteration failed")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=SUNO_RECONCILE_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        log.info("[SUNO] reconciliation worker stopped")
+
+
 async def _poll_suno_and_send(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -11411,16 +11572,6 @@ async def _poll_suno_and_send(
             await _notify_timeout_once()
             return
 
-        envelope_payload = {
-            "code": details.get("code") or 200,
-            "msg": details.get("message") or details.get("msg"),
-            "data": {
-                "taskId": task_id,
-                "callbackType": "complete",
-                "response": {"tracks": tracks_payload},
-            },
-        }
-
         duration_value = _poll_duration(details)
         audio_url_preview = ""
         if tracks_payload:
@@ -11443,19 +11594,16 @@ async def _poll_suno_and_send(
             },
         )
 
-        try:
-            callback_task = SunoTask.from_envelope(CallbackEnvelope.model_validate(envelope_payload))
-            callback_task = callback_task.model_copy(
-                update={"code": envelope_payload["code"], "msg": envelope_payload.get("msg")}
-            )
-            await asyncio.to_thread(
-                SUNO_SERVICE.handle_callback,
-                callback_task,
-                req_id=req_id_value,
-                delivery_via="poll",
-            )
-        except Exception as exc:
-            log.exception("[SUNO] poll delivery failed | task_id=%s err=%s", task_id, exc)
+        delivered = await asyncio.to_thread(
+            _suno_deliver_record_info_payload,
+            task_id,
+            details,
+            req_id=req_id_value,
+            delivery_via="poll",
+            tracks=tracks_payload,
+        )
+        if not delivered:
+            log.warning("[SUNO] poll delivery skipped | task_id=%s", task_id)
         return
 
     except asyncio.CancelledError:
@@ -12603,7 +12751,6 @@ def _poll_duration(payload: Mapping[str, Any]) -> Optional[float]:
                 except ValueError:
                     continue
     return None
-
 def _kie_request_with_endpoint(
     service: str,
     kind: str,
@@ -20566,6 +20713,12 @@ async def run_bot_async() -> None:
         background_tasks.append(asyncio.create_task(db_postgres.db_health_check()))
     except Exception as exc:
         log.error("DB health check startup failed: %s", exc, exc_info=True)
+
+    if SUNO_CONFIG.enabled:
+        try:
+            background_tasks.append(asyncio.create_task(_suno_reconcile_worker(stop_event)))
+        except Exception as exc:
+            log.error("[SUNO] reconcile worker start failed: %s", exc, exc_info=True)
 
     def request_shutdown(sig: Optional[signal.Signals]) -> None:
         signal_name = getattr(sig, "name", None) or (str(sig) if sig else "external")
