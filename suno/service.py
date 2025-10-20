@@ -28,6 +28,7 @@ from suno.client import (
 )
 from suno.schemas import ApiEnvelope, CallbackEnvelope, SunoTask, SunoTrack
 from suno.tempfiles import cleanup_old_directories, schedule_unlink, task_directory
+from suno.jobs_store import jobs_store
 from stickers import pop_wait_sticker_id
 from settings import (
     HTTP_POOL_CONNECTIONS,
@@ -2367,6 +2368,23 @@ class SunoService:
         incoming_status = (task.callback_type or "").lower()
         existing_status = str(existing_record.get("status") or "").lower()
         final_states = {"complete", "error", "failed", "success"}
+        try:
+            jobs_store.mark_webhook_seen(task.task_id)
+        except Exception:
+            log.debug("SunoService webhook state update failed", exc_info=True)
+
+        normalized_callback = incoming_status.upper()
+        if normalized_callback in {"COMPLETE", "SUCCESS", "SUCCEEDED", "READY"}:
+            with suppress(Exception):
+                jobs_store.mark_ready(task.task_id, payload=task.model_dump(exclude_none=True))
+        elif normalized_callback in {"FAILED", "ERROR"}:
+            with suppress(Exception):
+                jobs_store.mark_failed(
+                    task.task_id,
+                    message=task.msg or incoming_status,
+                    payload=task.model_dump(exclude_none=True),
+                    final=True,
+                )
         if incoming_status in final_states:
             self._delete_wait_sticker(int(chat_id))
         if incoming_status in final_states and self._recently_delivered(task.task_id):
@@ -2710,6 +2728,11 @@ class SunoService:
             self._save_task_record(task.task_id, record)
             if incoming_status in final_states:
                 self._mark_delivered(task.task_id)
+                with suppress(Exception):
+                    jobs_store.mark_delivered(
+                        task.task_id,
+                        delivery_key=f"suno:{task.task_id}",
+                    )
                 log.info(
                     "Suno ready",
                     extra={

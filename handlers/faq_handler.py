@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Optional
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest
 
 from keyboards import CB_FAQ_PREFIX, faq_keyboard
 from texts import FAQ_INTRO, FAQ_SECTIONS
@@ -73,11 +74,16 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id if update.effective_user else None
     logger.info("faq.callback | user_id=%s data=%s", user_id, query.data)
 
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        if "Query is too old" not in str(exc):
+            raise
+
     data = query.data
     key = data.removeprefix(CB_FAQ_PREFIX)
 
     if key == "back":
-        await query.answer()
         if callable(_show_main_menu):
             await _show_main_menu(update, context)
             return
@@ -101,7 +107,6 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:  # pragma: no cover - metrics should not break flow
             logger.exception("faq.section_metric_failed | section=%s", key)
 
-    await query.answer()
     message = query.message
     if message is None:
         return

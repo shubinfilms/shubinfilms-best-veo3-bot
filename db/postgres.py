@@ -282,6 +282,33 @@ _TRANSACTIONS_MIGRATIONS = [
     """,
 ]
 
+_SUNO_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS suno_jobs (
+    id TEXT PRIMARY KEY,
+    user_id BIGINT,
+    chat_id BIGINT,
+    request_id TEXT,
+    title TEXT,
+    state TEXT NOT NULL DEFAULT 'ENQUEUED',
+    refund_state TEXT NOT NULL DEFAULT 'ESCROW',
+    last_error TEXT,
+    ledger_txn_id TEXT,
+    payload JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    delivered_at TIMESTAMPTZ,
+    webhook_seen_at TIMESTAMPTZ,
+    last_polled_at TIMESTAMPTZ,
+    retries INTEGER NOT NULL DEFAULT 0,
+    delivery_key TEXT
+);
+"""
+
+_SUNO_JOBS_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_suno_jobs_state_updated
+    ON suno_jobs (state, updated_at DESC);
+"""
+
 
 def _render_postgres_url(url: URL) -> str:
     rendered = url.render_as_string(hide_password=False)
@@ -697,6 +724,8 @@ def _ensure_tables_once() -> None:
         conn.execute(text(_TRANSACTIONS_INDEX_DDL))
         for statement in _TRANSACTIONS_MIGRATIONS:
             conn.execute(text(statement))
+        conn.execute(text(_SUNO_JOBS_DDL))
+        conn.execute(text(_SUNO_JOBS_INDEX_DDL))
 
 
 async def ensure_tables_with_retries(
