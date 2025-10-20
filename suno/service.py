@@ -404,7 +404,7 @@ class SunoService:
             ttl_value = _DELIVERY_DEDUP_TTL_DEFAULT
         self._delivery_store_ttl = max(300, ttl_value)
         self._delivery_store_prefix = f"{REDIS_PREFIX}:suno:posted"
-        self._poll_first_delay = max(0.1, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 5.0))
+        self._poll_first_delay = max(0.1, _env_float("SUNO_POLL_FIRST_DELAY_SEC", 3.0))
         backoff_raw = os.getenv("SUNO_POLL_BACKOFF_SERIES", "5,8,13,21,34") or ""
         parsed_backoff = _parse_backoff_series(backoff_raw)
         if parsed_backoff and abs(parsed_backoff[0] - self._poll_first_delay) < 1e-3:
@@ -414,7 +414,6 @@ class SunoService:
             self._poll_first_delay,
             _env_float("SUNO_POLL_TIMEOUT_SEC", _POLL_DEFAULT_TIMEOUT),
         )
-        self._poll_404_grace = max(0.0, _env_float("SUNO_POLL_404_GRACE_SEC", 90.0))
         self._api_base = API_BASE
         self._status_path = _STATUS_PATH
         self._status_url = _STATUS_URL
@@ -662,11 +661,7 @@ class SunoService:
             result = self.poll_record_info_once(task_id, user_id=user_id)
             result.attempts = attempts
             result.elapsed = time.monotonic() - start
-            if (
-                result.status_code == 404
-                and result.state == "hard_error"
-                and result.elapsed < self._poll_404_grace
-            ):
+            if result.status_code == 404 and result.state == "hard_error":
                 result.state = "pending"
             meta = {
                 "taskId": task_id,

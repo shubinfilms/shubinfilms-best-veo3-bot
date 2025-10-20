@@ -188,6 +188,41 @@ suno_enqueue_duration_seconds = Histogram(
     registry=REGISTRY,
 )
 
+suno_poll_status_total = Counter(
+    "suno_poll_status_total",
+    "Suno record-info poll outcomes grouped by HTTP status and mapped state",
+    labelnames=("http_status", "state", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_ready_latency_seconds = Histogram(
+    "suno_ready_latency_seconds",
+    "Time from poll start to ready state",
+    labelnames=("env", "service"),
+    registry=REGISTRY,
+)
+
+suno_late_delivery_total = Counter(
+    "suno_late_delivery_total",
+    "Late Suno deliveries grouped by trigger",
+    labelnames=("trigger", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_timeout_total = Counter(
+    "suno_timeout_total",
+    "Suno polling timeouts grouped by stage",
+    labelnames=("stage", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_refund_trigger_total = Counter(
+    "suno_refund_trigger_total",
+    "Suno refund triggers grouped by stage",
+    labelnames=("stage", "env", "service"),
+    registry=REGISTRY,
+)
+
 process_uptime_seconds = Gauge(
     "process_uptime_seconds",
     "Process uptime in seconds",

@@ -59,8 +59,11 @@ def test_suno_poll_error_refunds(monkeypatch):
 
     ctx = SimpleNamespace(bot=SimpleNamespace(), user_data={})
 
-    asyncio.run(
-        bot._poll_suno_and_send(
+    original_grace = bot.SUNO_REFUND_GRACE
+    bot.SUNO_REFUND_GRACE = 0.05
+
+    async def _run() -> None:
+        await bot._poll_suno_and_send(
             chat_id=333,
             ctx=ctx,
             user_id=5,
@@ -70,9 +73,12 @@ def test_suno_poll_error_refunds(monkeypatch):
             req_id="req-error",
             reply_to=None,
         )
-    )
+        await asyncio.sleep(0.08)
 
-    assert refunds, "hard error should trigger refund"
+    asyncio.run(_run())
+
+    assert refunds, "refund should trigger after grace"
     assert refunds[0]["reason"] == "suno:refund:status_err"
     assert "Invalid request" in refunds[0]["error"]
     assert notifications, "user should be notified about the error"
+    bot.SUNO_REFUND_GRACE = original_grace
