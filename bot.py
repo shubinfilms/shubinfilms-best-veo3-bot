@@ -18523,6 +18523,17 @@ async def sora2_health_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     err = context.error
+    if isinstance(err, BadRequest):
+        message = str(err)
+        if message and (
+            "query is too old" in message.lower()
+            or "query id is invalid" in message.lower()
+        ):
+            log.debug(
+                "telegram.error_handler.late_query",  # pragma: no cover - logging only
+                extra={"error": message},
+            )
+            return
     if isinstance(err, RetryAfter):
         retry_after = getattr(err, "retry_after", None)
         try:

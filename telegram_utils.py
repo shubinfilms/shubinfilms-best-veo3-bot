@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import re
+import time
 from asyncio.subprocess import PIPE
 from contextlib import suppress
 from dataclasses import dataclass
@@ -26,11 +27,12 @@ from PIL import Image
 import requests
 from requests import Response
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
+from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
-from metrics import telegram_send_total
+from metrics import telegram_send_total, ui_callback_ack_latency_ms, ui_callback_ack_total
+from runtime_metrics import increment_ui_callback_counter
 from core.balance_provider import BalanceSnapshot
 from keyboards import CB_VIDEO_MENU, main_menu_kb
 from utils.telegram_sender import get_sender
@@ -39,6 +41,104 @@ log = logging.getLogger("telegram.utils")
 
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
+_LATE_QUERY_PATTERNS = (
+    "query is too old",
+    "query id is invalid",
+    "query is too old and response timeout expired",
+)
+
+
+def _is_late_query_error(message: str) -> bool:
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(pattern in lowered for pattern in _LATE_QUERY_PATTERNS)
+
+
+def _record_ack_result(result: str, *, started_at: float | None) -> None:
+    try:
+        ui_callback_ack_total.labels(result=result, **_BOT_LABELS).inc()
+    except Exception:  # pragma: no cover - Prometheus registry failures
+        log.debug("metrics.safe_answer.ack_total_failed", exc_info=True)
+    if result != "ok" or started_at is None:
+        return
+    try:
+        latency_ms = max((time.perf_counter() - started_at) * 1000.0, 0.0)
+        ui_callback_ack_latency_ms.labels(**_BOT_LABELS).observe(latency_ms)
+    except Exception:  # pragma: no cover - Prometheus registry failures
+        log.debug("metrics.safe_answer.ack_latency_failed", exc_info=True)
+
+
+async def safe_answer(
+    query: CallbackQuery | None,
+    *,
+    text: str | None = None,
+    show_alert: bool = False,
+    cache_time: int | None = 0,
+) -> str:
+    """Acknowledge a callback query and swallow benign Telegram errors.
+
+    Returns one of ``{"ok", "late", "error", "skipped"}`` describing the outcome.
+    """
+
+    if query is None:
+        return "skipped"
+
+    already_answered = bool(getattr(query, "answered", False))
+    wants_notification = bool(text) or bool(show_alert)
+    if already_answered and not wants_notification:
+        return "skipped"
+
+    payload: dict[str, object] = {"show_alert": show_alert}
+    if text is not None:
+        payload["text"] = text
+    if cache_time is not None:
+        payload["cache_time"] = cache_time
+
+    started_at = time.perf_counter()
+    try:
+        await query.answer(**payload)
+    except BadRequest as exc:
+        message = str(exc)
+        if _is_late_query_error(message):
+            _record_ack_result("late", started_at=started_at)
+            increment_ui_callback_counter("ack", "late")
+            log.debug(
+                "telegram.safe_answer.late",  # pragma: no cover - logging only
+                extra={"query_id": getattr(query, "id", None), "error": message},
+            )
+            return "late"
+        _record_ack_result("error", started_at=started_at)
+        increment_ui_callback_counter("ack", "error")
+        log.warning(
+            "telegram.safe_answer.bad_request",  # pragma: no cover - logging only
+            extra={"query_id": getattr(query, "id", None), "error": message},
+        )
+        return "error"
+    except (TelegramError, NetworkError) as exc:
+        _record_ack_result("error", started_at=started_at)
+        increment_ui_callback_counter("ack", "error")
+        log.warning(
+            "telegram.safe_answer.error",  # pragma: no cover - logging only
+            extra={"query_id": getattr(query, "id", None), "error": str(exc)},
+        )
+        return "error"
+    except Exception as exc:  # pragma: no cover - defensive
+        _record_ack_result("error", started_at=started_at)
+        increment_ui_callback_counter("ack", "error")
+        log.warning(
+            "telegram.safe_answer.unexpected",  # pragma: no cover - logging only
+            extra={"query_id": getattr(query, "id", None), "error": str(exc)},
+        )
+        return "error"
+
+    _record_ack_result("ok", started_at=started_at)
+    increment_ui_callback_counter("ack", "ok")
+    try:
+        setattr(query, "answered", True)
+    except Exception:  # pragma: no cover - best-effort attribute update
+        pass
+    return "ok"
 _RETRY_SCHEDULE = (0.6, 1.0, 1.6)
 _TEMP_ERROR_CODES = {409, 420, 429}
 _PERM_ERROR_CODES = {400, 403, 404}
@@ -1232,6 +1332,7 @@ __all__ = [
     "send_photo_request",
     "send_audio_request",
     "is_remote_file_error",
+    "safe_answer",
 ]
 class TelegramImageError(RuntimeError):
     """Raised when Telegram image download fails."""

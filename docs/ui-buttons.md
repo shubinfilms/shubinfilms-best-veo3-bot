@@ -16,11 +16,15 @@ small and composable, while the router provides idempotency, telemetry and safet
   - `feature_flag` – optional gate for staged rollouts.
 - **Router** – `ui.buttons.router.dispatch` validates flags, enforces access, applies a
   Redis-backed idempotency lock (`chat_id + button_id`), emits Prometheus metrics and wraps
-  handler failures into soft, user-facing errors.
+  handler failures into soft, user-facing errors. The router also performs an immediate
+  callback acknowledgement (to dismiss Telegram's loading spinner) and debounces repeated
+  clicks from the same user for a short window (default 400 ms).
 - **Results** – handlers return a `UIResult` describing the expected UI. Tests assert
   against the result instead of raw Telegram side-effects.
 - **Idempotency** – `ui.buttons.idempotency.with_idempotency` rejects duplicate clicks
-  while the first handler execution is in-flight.
+  while the first handler execution is in-flight. A lightweight in-process debounce window
+  shields the handlers from button chatter (rapid tapping) and records telemetry in
+  `ui_callback_dedup_total`.
 
 ## Adding a new button
 

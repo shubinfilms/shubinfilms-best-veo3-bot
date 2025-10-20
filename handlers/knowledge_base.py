@@ -8,6 +8,7 @@ from telegram import InlineKeyboardButton, Update
 from telegram.ext import ContextTypes
 
 from ui.card import build_card
+from telegram_utils import safe_answer
 
 log = logging.getLogger(__name__)
 
@@ -275,27 +276,27 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     chat = update.effective_chat or (query.message.chat if query.message else None)
     chat_id = chat.id if chat else None
     if chat_id is None:
-        await query.answer()
+        await safe_answer(query)
         return
 
     if data == KB_ROOT:
-        await query.answer()
+        await safe_answer(query)
         await open_root(ctx, chat_id)
         return
     if data == KB_EXAMPLES:
-        await query.answer()
+        await safe_answer(query)
         await show_examples(ctx, chat_id)
         return
     if data == KB_TEMPLATES:
-        await query.answer()
+        await safe_answer(query)
         await show_templates(ctx, chat_id)
         return
     if data == KB_MINI_LESSONS:
-        await query.answer()
+        await safe_answer(query)
         await show_lessons(ctx, chat_id)
         return
     if data == KB_FAQ:
-        await query.answer()
+        await safe_answer(query)
         await open_root(ctx, chat_id)
         if callable(_faq_handler):
             await _faq_handler(update, ctx)
@@ -306,18 +307,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
         return
     if data in _TEMPLATE_MESSAGES:
-        await query.answer()
+        await safe_answer(query)
         await ctx.bot.send_message(chat_id=chat_id, text=_TEMPLATE_MESSAGES[data])
         return
 
     if data.startswith(KB_TEMPLATE_PREFIX):
         log.warning("[KB] unknown template", extra={"chat_id": chat_id, "data": data})
-        await query.answer("Шаблон недоступен", show_alert=True)
+        await safe_answer(query, text="Шаблон недоступен", show_alert=True)
         return
 
     if data.startswith(KB_PREFIX):
         log.warning("[KB] unknown callback", extra={"chat_id": chat_id, "data": data})
-        await query.answer()
+        await safe_answer(query)
 
 
 async def kb_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -327,7 +328,7 @@ async def kb_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query is None:
         return
 
-    await query.answer()
+    await safe_answer(query)
     await _kb_render_or_send(update, context, origin="callback")
 
 
