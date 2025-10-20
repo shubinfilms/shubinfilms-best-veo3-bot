@@ -19,6 +19,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from metrics import bot_telegram_send_fail_total, suno_requests_total, suno_task_store_total
+import runtime_metrics
 from suno.client import (
     AMBIENT_NATURE_PRESET_ID,
     SunoClient,
@@ -415,6 +416,7 @@ class SunoService:
         self._api_base = API_BASE
         self._status_path = _STATUS_PATH
         self._status_url = _STATUS_URL
+        self._retry_404_enabled = _env_bool("SUNO_404_RETRY_ENABLED", True)
         summary = {
             "suno_enabled": bool(SUNO_ENABLED),
             "api_base": self._api_base,
@@ -590,7 +592,13 @@ class SunoService:
         message = payload.get("message") or payload.get("msg") if isinstance(payload, Mapping) else None
         status_code = response.status_code
         if status_code == 404:
-            return RecordInfoPollResult(state="pending", status_code=status_code, payload=payload, message=message)
+            state = "pending" if self.retry_404_enabled else "hard_error"
+            return RecordInfoPollResult(
+                state=state,
+                status_code=status_code,
+                payload=payload,
+                message=message,
+            )
         if status_code == 429 or 500 <= status_code < 600:
             return RecordInfoPollResult(state="retry", status_code=status_code, payload=payload, message=message)
         if 400 <= status_code < 500:
@@ -610,7 +618,7 @@ class SunoService:
                 error=error_code,
             )
         success_states = {"SUCCESS", "SUCCEEDED", "COMPLETE", "COMPLETED", "READY"}
-        failure_states = {"FAILED", "ERROR", "TIMEOUT", "CANCELLED", "CANCELED"}
+        failure_states = {"FAILED", "EXPIRED", "TIMEOUT", "ERROR", "CANCELLED", "CANCELED"}
         if tracks and (status_value is None or status_value in success_states):
             return RecordInfoPollResult(state="ready", status_code=status_code, payload=payload, message=message)
         if status_value in failure_states:
@@ -1699,6 +1707,13 @@ class SunoService:
     def _log_delivery(event: str, **meta: Any) -> None:
         log.info(event, extra={"meta": meta})
 
+    @property
+    def retry_404_enabled(self) -> bool:
+        return bool(self._retry_404_enabled)
+
+    def set_retry_404(self, enabled: bool) -> None:
+        self._retry_404_enabled = bool(enabled)
+
     def _normalize_take_title(
         self,
         track: SunoTrack,
@@ -2697,6 +2712,11 @@ class SunoService:
                             "durations": durations,
                         }
                     },
+                )
+                total_success = runtime_metrics.increment_counter("suno.metrics.generated_success_total")
+                log.info(
+                    "suno.metrics.generated_success_total",
+                    extra={"meta": {"task_id": task.task_id, "total": total_success}},
                 )
                 if strict_warning:
                     try:

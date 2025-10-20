@@ -20,6 +20,7 @@ os.environ.setdefault("KIE_API_KEY", "test-key")
 os.environ.setdefault("KIE_BASE_URL", "https://example.com")
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 os.environ.setdefault("LEDGER_BACKEND", "memory")
+os.environ["REDIS_URL"] = "memory://"
 os.environ.setdefault("LOG_JSON", "false")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from telegram.error import BadRequest
-from telegram.ext import ApplicationHandlerStop
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -92,10 +91,7 @@ class NotModifiedBot(NeutralBot):
 
 
 def _run(coro):
-    try:
-        asyncio.run(coro)
-    except ApplicationHandlerStop:
-        pass
+    asyncio.run(coro)
 
 
 def test_router_updates_veo_prompt() -> None:

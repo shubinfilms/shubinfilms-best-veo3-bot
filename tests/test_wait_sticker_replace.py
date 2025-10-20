@@ -18,7 +18,7 @@ def bot_module(monkeypatch):
     monkeypatch.setenv("SUNO_API_BASE", "https://example.com")
     monkeypatch.setenv("SUNO_API_TOKEN", "token")
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
-    monkeypatch.setenv("DATABASE_URL", "postgres://test")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/testdb")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://bot.example")
     module = importlib.import_module("bot")
     return importlib.reload(module)

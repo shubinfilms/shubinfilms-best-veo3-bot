@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 os.environ.setdefault("LEDGER_BACKEND", "memory")
 os.environ.setdefault("TELEGRAM_TOKEN", "dummy-token")
-os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("REDIS_URL", "memory://")
 os.environ.setdefault("KIE_API_KEY", "dummy-key")
 os.environ.setdefault("SUNO_CALLBACK_URL", "https://example.com/callback")
 os.environ.setdefault("LOG_LEVEL", "ERROR")

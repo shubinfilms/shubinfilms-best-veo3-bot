@@ -56,7 +56,7 @@ SUNO_ENABLED=true
 SUNO_API_BASE=https://api.kie.ai
 SUNO_API_PREFIX=
 SUNO_GEN_PATH=/suno-api/generate
-SUNO_STATUS_PATH=/suno-api/record-info
+SUNO_STATUS_PATH=/api/v1/generate/record-info
 SUNO_EXTEND_PATH=/suno-api/generate/extend
 SUNO_LYRICS_PATH=/suno-api/generate/get-timestamped-lyrics
 

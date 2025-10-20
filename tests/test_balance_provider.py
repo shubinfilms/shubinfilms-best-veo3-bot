@@ -20,7 +20,7 @@ def test_balance_provider_fallback_on_redis_miss(
     assert snapshot.value == 42
 
 
-@pytest.mark.anyio
+@pytest.mark.anyio("asyncio")
 @patch("core.balance_provider._get_ledger_storage")
 @patch("core.balance_provider.redis_get_balance", return_value=None)
 async def test_balance_provider_fallback_on_redis_miss_async(

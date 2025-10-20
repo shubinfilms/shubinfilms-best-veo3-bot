@@ -17,7 +17,6 @@ from utils.input_state import (  # noqa: E402
     get_wait_state,
     set_wait_state,
 )
-from telegram.ext import ApplicationHandlerStop  # noqa: E402
 
 
 @pytest.fixture
@@ -26,7 +25,7 @@ def bot_module(monkeypatch):
     monkeypatch.setenv("SUNO_API_BASE", "https://example.com")
     monkeypatch.setenv("SUNO_API_TOKEN", "token")
     monkeypatch.setenv("LEDGER_BACKEND", "memory")
-    monkeypatch.setenv("DATABASE_URL", "postgres://test")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/testdb")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://bot.example")
     monkeypatch.setenv("SORA2_ENABLED", "true")
     monkeypatch.setenv("KIE_API_KEY", "kie-key")
@@ -170,8 +169,7 @@ def test_sora2_prompt_without_funds(monkeypatch, bot_module):
     message.from_user = SimpleNamespace(id=user_id)
     update = SimpleNamespace(effective_message=message, effective_user=message.from_user)
 
-    with pytest.raises(ApplicationHandlerStop):
-        asyncio.run(bot_module.handle_card_input(update, ctx))
+    asyncio.run(bot_module.handle_card_input(update, ctx))
 
     assert bot.sent_messages, "user should be notified about insufficient funds"
     assert "Недостаточно токенов" in bot.sent_messages[0]["text"]
@@ -206,8 +204,7 @@ def test_sora2_prompt_success_flow(monkeypatch, bot_module):
     message.from_user = SimpleNamespace(id=user_id)
     update = SimpleNamespace(effective_message=message, effective_user=message.from_user)
 
-    with pytest.raises(ApplicationHandlerStop):
-        asyncio.run(bot_module.handle_card_input(update, ctx))
+    asyncio.run(bot_module.handle_card_input(update, ctx))
 
     assert bot.sent_videos, "video must be sent on success"
     assert bot.sent_videos[0]["video"].startswith("https://example.com")
@@ -245,8 +242,7 @@ def test_sora2_prompt_failure_refunds(monkeypatch, bot_module):
     message.from_user = SimpleNamespace(id=user_id)
     update = SimpleNamespace(effective_message=message, effective_user=message.from_user)
 
-    with pytest.raises(ApplicationHandlerStop):
-        asyncio.run(bot_module.handle_card_input(update, ctx))
+    asyncio.run(bot_module.handle_card_input(update, ctx))
 
     assert refunds and refunds[0][0] == user_id
     assert bot.sent_messages
@@ -265,8 +261,7 @@ def test_sora2_prompt_requires_text(monkeypatch, bot_module):
     message.from_user = SimpleNamespace(id=user_id)
     update = SimpleNamespace(effective_message=message, effective_user=message.from_user)
 
-    with pytest.raises(ApplicationHandlerStop):
-        asyncio.run(bot_module.handle_card_input(update, ctx))
+    asyncio.run(bot_module.handle_card_input(update, ctx))
 
     assert message.reply_calls and "Введите текст" in message.reply_calls[0]
     clear_wait_state(user_id)
