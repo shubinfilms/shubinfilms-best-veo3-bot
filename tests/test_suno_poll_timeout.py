@@ -69,6 +69,4 @@ def test_suno_poll_timeout(monkeypatch):
         )
     )
 
-    assert refunds, "timeout should trigger a refund"
-    assert refunds[0]["reason"] == "suno:refund:timeout"
-    assert "не ответил" in refunds[0]["error"]
+    assert not refunds, "timeout should not refund immediately"

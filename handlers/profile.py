@@ -804,7 +804,7 @@ async def open_profile(
             except (TypeError, ValueError):
                 last_open = 0.0
             if now - last_open < 0.5:
-                log.info(
+                log.debug(
                     "profile.open.debounced",
                     extra={"source": source, "delta": now - last_open},
                 )
@@ -826,7 +826,7 @@ async def open_profile(
         )
 
         reused = bool(result.reused) if isinstance(result, OpenedProfile) else False
-        log.info(
+        log.debug(
             "profile.open",
             extra={"source": source, "reused_msg": reused},
         )
@@ -843,7 +843,7 @@ async def _open_profile_card_impl(
     suppress_nav: bool = True,
     source: str = "menu",
 ) -> OpenedProfile:
-    log.info(
+    log.debug(
         "profile.open(chat_id=%s, user_id=%s, source=%s, suppress_nav=%s)",
         chat_id,
         user_id,
@@ -877,7 +877,7 @@ async def _open_profile_card_impl(
         chat_data["nav_event"] = True
         chat_data["nav_in_progress"] = True
         if chat_data.get(_PROFILE_LOCK_KEY):
-            log.info(
+            log.debug(
                 "profile.open.skip_duplicate",
                 extra={"chat_id": resolved_chat_id, "user_id": user_id},
             )
@@ -907,7 +907,7 @@ async def _open_profile_card_impl(
         and message_id == previous_mid
     )
 
-    log.info(
+    log.debug(
         "profile.opened reused=%s msg_id=%s",
         reused_actual,
         message_id,

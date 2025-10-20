@@ -413,6 +413,7 @@ class SunoService:
             self._poll_first_delay,
             _env_float("SUNO_POLL_TIMEOUT_SEC", _POLL_DEFAULT_TIMEOUT),
         )
+        self._poll_404_grace = max(0.0, _env_float("SUNO_POLL_404_GRACE_SEC", 90.0))
         self._api_base = API_BASE
         self._status_path = _STATUS_PATH
         self._status_url = _STATUS_URL
@@ -660,6 +661,12 @@ class SunoService:
             result = self.poll_record_info_once(task_id, user_id=user_id)
             result.attempts = attempts
             result.elapsed = time.monotonic() - start
+            if (
+                result.status_code == 404
+                and result.state == "hard_error"
+                and result.elapsed < self._poll_404_grace
+            ):
+                result.state = "pending"
             meta = {
                 "taskId": task_id,
                 "attempt": attempts,

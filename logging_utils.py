@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Mapping, MutableMapping
 
@@ -89,6 +91,15 @@ class SanitizingLogger(logging.Logger):
         stacklevel: int = 1,
     ) -> None:
         sanitized = sanitize_extra(extra)
+        if exc_info and level <= logging.WARNING and self.getEffectiveLevel() > logging.DEBUG:
+            if exc_info is True:
+                exc_info = sys.exc_info()
+            if isinstance(exc_info, tuple):
+                exc_type, exc_value, _ = exc_info
+                summary_lines = traceback.format_exception_only(exc_type, exc_value)
+                summary_text = summary_lines[-1].strip() if summary_lines else str(exc_value)
+                msg = f"{msg} | {summary_text}" if summary_text else msg
+                exc_info = None
         super()._log(
             level,
             msg,
