@@ -22,6 +22,7 @@ log_environment(logging.getLogger("bot"))
 
 # Configure Telegram log forwarding as early as possible.
 import logger_to_telegram  # noqa: F401,E402
+import runtime_metrics
 
 try:
     from core.codex_logger import setup_codex_logger
@@ -426,6 +427,7 @@ from settings import (
     SUNO_API_TOKEN as SETTINGS_SUNO_API_TOKEN,
     SUNO_LOG_KEY,
     SUNO_READY,
+    SUNO_TASK_STATUS_PATH as SETTINGS_SUNO_STATUS_PATH,
     SORA2,
     SORA2_ENABLED,
     SORA2_DEFAULT_AR,
@@ -539,6 +541,7 @@ except Exception:  # pragma: no cover - fallback if asyncio interface unavailabl
 # ==========================
 APP_VERSION = "2025-09-14r4"
 BOT_START_TIME = time.monotonic()
+PROCESS_START_TIME = time.time()
 
 
 def _detect_git_revision() -> str:
@@ -553,14 +556,18 @@ def _detect_git_revision() -> str:
 
 
 GIT_REVISION = _detect_git_revision()
+APP_BRANCH = (
+    os.getenv("GIT_BRANCH")
+    or os.getenv("RENDER_GIT_BRANCH")
+    or os.getenv("APP_BRANCH")
+    or "unknown"
+)
 
 
 ACTIVE_TASKS: Dict[int, str] = {}
 _SORA2_POLLERS: Dict[str, asyncio.Task[None]] = {}
 SHUTDOWN_EVENT = threading.Event()
 APPLICATION_READY = threading.Event()
-
-SUNO_SERVICE = SunoService()
 
 _METRIC_ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _METRIC_LABELS = {"env": _METRIC_ENV, "service": "bot"}
@@ -1038,10 +1045,8 @@ def _load_suno_config() -> SunoConfig:
     base = (_env("SUNO_API_BASE", "https://api.kie.ai") or "https://api.kie.ai").strip().rstrip("/")
     prefix = _normalize_prefix(_env("SUNO_API_PREFIX", ""))
     gen_path = _normalize_suno_path(_env("SUNO_GEN_PATH", "/suno-api/generate"), "/suno-api/generate")
-    status_path = _normalize_suno_path(
-        _env("SUNO_STATUS_PATH", "/suno-api/record-info"),
-        "/suno-api/record-info",
-    )
+    status_default = (SETTINGS_SUNO_STATUS_PATH or "/api/v1/generate/record-info").strip() or "/api/v1/generate/record-info"
+    status_path = _normalize_suno_path(status_default, "/api/v1/generate/record-info")
     extend_path = _normalize_suno_path(
         _env("SUNO_EXTEND_PATH", "/suno-api/generate/extend"),
         "/suno-api/generate/extend",
@@ -1133,6 +1138,17 @@ SUNO_POLL_BACKGROUND_LIMIT = max(
 SUNO_RECONCILE_INTERVAL = max(30.0, _env_float("SUNO_RECONCILE_INTERVAL_SEC", 180.0))
 SUNO_RECONCILE_MAX_AGE = max(60.0, _env_float("SUNO_RECONCILE_MAX_AGE_SEC", 24 * 3600.0))
 SUNO_RECONCILE_BATCH = max(1, _env_int("SUNO_RECONCILE_BATCH", 40))
+SUNO_404_RETRY_ENABLED = _env_bool("SUNO_404_RETRY_ENABLED", True)
+
+SUNO_METRIC_SUCCESS = "suno.metrics.generated_success_total"
+SUNO_METRIC_RETRY_404 = "suno.metrics.retry_404_total"
+SUNO_METRIC_REFUND = "suno.metrics.refund_total"
+DB_METRIC_POOL_IN_USE = "db.metrics.pool_in_use"
+DB_METRIC_POOL_AVAILABLE = "db.metrics.pool_available"
+
+SUNO_SERVICE = SunoService()
+if hasattr(SUNO_SERVICE, "set_retry_404"):
+    SUNO_SERVICE.set_retry_404(SUNO_404_RETRY_ENABLED)
 ENV_NAME            = _env("ENV_NAME", "prod") or "prod"
 BOT_SINGLETON_DISABLED = bool(SETTINGS_BOT_SINGLETON_DISABLED)
 BOT_LEADER_TTL_MS   = 30_000
@@ -1554,13 +1570,7 @@ except Exception as exc:
     log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
     raise
 
-PG_POOL = None
-
-try:
-    PG_POOL = asyncio.run(db_postgres.create_pg_pool(DATABASE_URL))
-except Exception as exc:
-    PG_POOL = None
-    log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+PG_POOL: Optional[Any] = None
 
 try:
     db_postgres.configure_engine(DATABASE_URL)
@@ -4147,6 +4157,28 @@ def event(tag: str, **kw):
 def kie_event(stage: str, **kw):
     log_evt(f"KIE_{stage}", **kw)
 
+
+def _metric_increment(name: str, *, value: int = 1, **fields: Any) -> int:
+    total = runtime_metrics.increment_counter(name, value)
+    log_evt("METRIC", metric=name, delta=value, total=total, **fields)
+    return total
+
+
+def _metric_update_gauge(
+    name: str,
+    value: float,
+    *,
+    maximum: Optional[float] = None,
+) -> Dict[str, float]:
+    payload = runtime_metrics.update_gauge(name, value, maximum=maximum)
+    log_evt(
+        "METRIC_GAUGE",
+        metric=name,
+        value=value,
+        **({"max": payload.get("max")} if maximum is not None else {}),
+    )
+    return payload
+
 def tg_direct_file_url(bot_token: str, file_path: str) -> str:
     p = (file_path or "").strip()
     if p.startswith("http://") or p.startswith("https://"): return p
@@ -4872,11 +4904,11 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     if message.text is None:
         await message.reply_text("⚠️ Отправьте текстовое сообщение.")
-        raise ApplicationHandlerStop
+        return
 
     if is_command_or_button(message):
         touch_wait(user_id)
-        raise ApplicationHandlerStop
+        return
 
     meta = wait_state.meta if isinstance(wait_state.meta, Mapping) else {}
     suppress_ack = bool(meta.get("suppress_ack"))
@@ -4891,7 +4923,7 @@ async def handle_card_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         touch_wait(user_id)
         if not suppress_ack:
             await _wait_acknowledge(message)
-        raise ApplicationHandlerStop
+        return
 
 async def _handle_suno_waiting_input(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -6632,7 +6664,7 @@ async def handle_quick_profile_button(
         log.info("nav.finish", extra={"kind": "profile", "chat_id": chat_id})
         _nav_finish(nav_chat_data, started=nav_started)
 
-    raise ApplicationHandlerStop
+    return
 
 
 async def handle_quick_kb_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6672,7 +6704,7 @@ async def handle_quick_kb_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         log.info("nav.finish", extra={"kind": "kb", "chat_id": chat_id})
         _nav_finish(nav_chat_data, started=nav_started)
 
-    raise ApplicationHandlerStop
+    return
 
 
 async def show_images_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10282,6 +10314,7 @@ async def _suno_issue_refund(
             log.exception("Suno refund failed | task=%s err=%s", task_id, exc)
             new_balance = None
         status = "done"
+        _metric_increment(SUNO_METRIC_REFUND, reason=reason)
     else:
         new_balance = None
         status = "skipped"
@@ -11219,6 +11252,23 @@ async def _suno_poll_record_info(
         if result.message:
             meta["message"] = result.message
 
+        should_log_retry = False
+        if result.status_code == 404 and result.state in {"pending", "retry"}:
+            should_log_retry = True
+        if normalized_status in {"PENDING", "PROCESSING"} and result.state in {"pending", "retry"}:
+            should_log_retry = True
+        if should_log_retry:
+            total_retry = _metric_increment(SUNO_METRIC_RETRY_404)
+            event(
+                "SUNO_POLL_RETRY",
+                task_id=task_id,
+                attempt=attempt,
+                elapsed=round(result.elapsed, 2),
+                http_status=result.status_code,
+                status=normalized_status or "",
+                total=total_retry,
+            )
+
         if result.state == "retry":
             log.warning("[SUNO] poll retry", extra={"meta": meta})
         elif result.state != "pending":
@@ -11514,6 +11564,8 @@ async def _poll_suno_and_send(
         details = dict(poll_result.payload) if isinstance(poll_result.payload, Mapping) else {}
         http_status = poll_result.status_code
         state_value = poll_result.state
+        status_label = SunoService._status_from_payload(details) if isinstance(details, Mapping) else None
+        normalized_status = status_label.upper() if isinstance(status_label, str) else None
 
         if state_value == "delivered":
             log.info("[SUNO] poll delivered via webhook | task_id=%s", task_id)
@@ -11550,8 +11602,17 @@ async def _poll_suno_and_send(
                     task_id,
                     notify_exc,
                 )
-            await _issue_refund(message, reason="suno:refund:status_err")
-            await _clear_wait()
+            refund_states = {"FAILED", "EXPIRED", "TIMEOUT"}
+            if normalized_status in refund_states:
+                await _issue_refund(message, reason="suno:refund:status_err")
+                await _clear_wait()
+            else:
+                log.info(
+                    "[SUNO] poll hard error without refund | task_id=%s status=%s",
+                    task_id,
+                    normalized_status,
+                )
+                await _clear_wait()
             return
 
         if state_value != "ready":
@@ -15791,7 +15852,7 @@ async def handle_chat_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ensure_user_record(update)
     await open_profile_card(update, ctx, edit=True)
-    raise ApplicationHandlerStop
+    return
 
 
 
@@ -16048,6 +16109,470 @@ def _admin_command_payload(message: Message, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return " ".join(str(arg) for arg in args)
     text = message.text or message.caption or ""
     return text.partition(" ")[2].strip()
+
+
+def _format_timespan_short(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or hours:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return "".join(parts)
+
+
+async def _pg_pool_snapshot() -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {"ok": False}
+    pool = PG_POOL
+    if pool is None:
+        snapshot["error"] = "pool unavailable"
+        return snapshot
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT current_database(), current_schema()")
+                row = await cur.fetchone()
+                if row:
+                    snapshot["database"] = row[0]
+                    if len(row) > 1:
+                        snapshot["schema"] = row[1]
+        snapshot["ok"] = True
+    except Exception as exc:
+        snapshot["error"] = str(exc)
+
+    try:
+        stats = pool.get_stats()
+    except Exception:
+        stats = None
+    if stats is not None:
+        in_use = int(getattr(stats, "borrowed", getattr(stats, "in_use", 0)) or 0)
+        available = int(getattr(stats, "available", getattr(stats, "free", 0)) or 0)
+        max_size = int(getattr(stats, "max_size", getattr(stats, "max", 0)) or 0)
+        snapshot.update({"in_use": in_use, "available": available, "max": max_size})
+        _metric_update_gauge(DB_METRIC_POOL_IN_USE, float(in_use), maximum=float(max_size) if max_size else None)
+        _metric_update_gauge(DB_METRIC_POOL_AVAILABLE, float(available), maximum=float(max_size) if max_size else None)
+    return snapshot
+
+
+async def _redis_lock_snapshot() -> Dict[str, Any]:
+    details = dict(runner_lock_state)
+    lock_key = _rk("lock", "runner")
+    ttl_ms: Optional[int] = None
+    payload: Dict[str, Any] = {}
+    if redis_client is not None:
+        try:
+            ttl_ms = await asyncio.to_thread(redis_client.pttl, lock_key)
+        except Exception:
+            ttl_ms = None
+        try:
+            raw = await asyncio.to_thread(redis_client.get, lock_key)
+        except Exception:
+            raw = None
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+    details.update({"ttl_ms": ttl_ms, "payload": payload, "key": lock_key})
+    return details
+
+
+async def _redis_key_counts() -> Dict[str, int]:
+    if redis_client is None:
+        return {}
+
+    async def _count(match: str) -> int:
+        def runner() -> int:
+            cursor = 0
+            count = 0
+            while True:
+                cursor, keys = redis_client.scan(cursor=cursor, match=match, count=200)
+                count += len(keys)
+                if cursor == 0:
+                    break
+            return count
+
+        return await asyncio.to_thread(runner)
+
+    total = int(await asyncio.to_thread(redis_client.dbsize))
+    user = await _count(f"{REDIS_PREFIX}:user*")
+    bal = await _count(f"{REDIS_PREFIX}:bal*")
+    other = max(total - user - bal, 0)
+    return {"total": total, "user": user, "bal": bal, "other": other}
+
+
+async def admin_diag_health_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if not _is_admin(actor.id):
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    pool_snapshot = await _pg_pool_snapshot()
+    uptime_text = _format_timespan_short(time.time() - PROCESS_START_TIME)
+    application = ctx.application
+    handler_count = sum(len(group) for group in application.handlers.values()) if application else 0
+    updater = getattr(application, "updater", None)
+    ptb_mode = "polling" if updater and getattr(updater, "running", False) else "idle"
+    ptb_version = getattr(_tg, "__version__", "unknown") if _tg else "unknown"
+
+    redis_state = "off"
+    if redis_client is not None:
+        try:
+            await asyncio.to_thread(redis_client.ping)
+        except Exception as exc:
+            redis_state = f"error ({exc})"
+        else:
+            redis_state = "on"
+
+    lock_snapshot = await _redis_lock_snapshot()
+    ttl_ms = lock_snapshot.get("ttl_ms")
+    if isinstance(ttl_ms, (int, float)) and ttl_ms >= 0:
+        ttl_text = f"{int(round(ttl_ms / 1000))}s"
+    elif isinstance(ttl_ms, (int, float)):
+        ttl_text = "missing"
+    else:
+        ttl_text = "unknown"
+    lock_owned = bool(lock_snapshot.get("owned"))
+    lock_payload = lock_snapshot.get("payload") if isinstance(lock_snapshot.get("payload"), dict) else {}
+    owner_host = lock_snapshot.get("host") or lock_payload.get("host") or "n/a"
+    owner_pid = lock_snapshot.get("pid") or lock_payload.get("pid") or "n/a"
+
+    try:
+        webhook_info = await ctx.bot.get_webhook_info()
+    except Exception as exc:
+        webhook_status = f"error ({exc})"
+        drop_pending = "unknown"
+    else:
+        webhook_status = "deleted" if not webhook_info.url else webhook_info.url
+        drop_pending = "true" if not webhook_info.url else "false"
+
+    polling_text = "active" if updater and getattr(updater, "running", False) else "inactive"
+
+    if pool_snapshot.get("ok"):
+        pool_line = f"DB: connected (in_use={pool_snapshot.get('in_use', 0)} available={pool_snapshot.get('available', 0)})"
+    elif pool_snapshot.get("error"):
+        pool_line = f"DB: error ({pool_snapshot['error']})"
+    else:
+        pool_line = "DB: unavailable"
+
+    if not REDIS_LOCK_ENABLED:
+        lock_line = "Redis lock: disabled"
+    elif lock_owned:
+        lock_line = f"Redis lock: acquired (ttl={ttl_text})"
+    else:
+        lock_line = f"Redis lock: held by {owner_host}#{owner_pid} (ttl={ttl_text})"
+
+    lines = [
+        "Health: OK",
+        f"App: {os.getenv('APP_NAME', 'veo3-bot')}@{APP_BRANCH} ({GIT_REVISION})",
+        f"Uptime: {uptime_text}",
+        f"PTB: {ptb_mode}, handlers={handler_count}, version={ptb_version}",
+        lock_line,
+        pool_line,
+        f"Suno: enabled={str(bool(SUNO_CONFIG.enabled)).lower()} base={SUNO_BASE_URL} status_path={SUNO_STATUS_PATH}",
+        f"Redis: {redis_state}",
+        f"Webhook: {webhook_status}, polling={polling_text}, drop_pending_updates={drop_pending}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_db_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        overview = await asyncio.to_thread(db_postgres.db_overview)
+    except Exception as exc:
+        await message.reply_text(f"❌ Не удалось получить информацию о БД: {exc}")
+        return
+
+    pool_info = overview.get("pool", {}) if isinstance(overview, dict) else {}
+    in_use = int(pool_info.get("in_use", 0) or 0)
+    available = int(pool_info.get("available", 0) or 0)
+    max_pool = max(in_use + available, 0)
+    if max_pool:
+        _metric_update_gauge(DB_METRIC_POOL_IN_USE, float(in_use), maximum=float(max_pool))
+        _metric_update_gauge(DB_METRIC_POOL_AVAILABLE, float(available), maximum=float(max_pool))
+
+    schema = overview.get("schema", "unknown") if isinstance(overview, dict) else "unknown"
+    db_name = overview.get("database", "unknown") if isinstance(overview, dict) else "unknown"
+
+    tables_info = overview.get("tables", {}) if isinstance(overview, dict) else {}
+    ensured = "ensured" if tables_info else "unknown"
+
+    lines = [
+        f"DB: OK (driver=psycopg, name={db_name})",
+        f"Pool: in_use={in_use} available={available}",
+        f"Schema: {schema}",
+        f"Tables: {ensured}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    if redis_client is None:
+        await message.reply_text("Redis: недоступен")
+        return
+
+    counts = await _redis_key_counts()
+    lock_snapshot = await _redis_lock_snapshot()
+    ttl_ms = lock_snapshot.get("ttl_ms")
+    if isinstance(ttl_ms, (int, float)) and ttl_ms >= 0:
+        ttl_text = f"{int(round(ttl_ms / 1000))}s"
+    elif isinstance(ttl_ms, (int, float)):
+        ttl_text = "missing"
+    else:
+        ttl_text = "unknown"
+    lock_payload = lock_snapshot.get("payload") if isinstance(lock_snapshot.get("payload"), dict) else {}
+    owner_host = lock_snapshot.get("host") or lock_payload.get("host") or "n/a"
+    owner_pid = lock_snapshot.get("pid") or lock_payload.get("pid") or "n/a"
+
+    lines = [
+        "Redis: OK",
+        f"Lock: {lock_snapshot.get('key')} (owner={owner_host} pid={owner_pid} ttl={ttl_text})",
+    ]
+    if counts:
+        lines.append(
+            f"Keys: user={counts.get('user', 0)} bal={counts.get('bal', 0)} other={counts.get('other', 0)}"
+        )
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_suno_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    probe_id = f"diag-{uuid.uuid4().hex}"
+    try:
+        result = await asyncio.to_thread(SUNO_SERVICE.poll_record_info_once, probe_id)
+        probe_status = result.status_code
+    except Exception as exc:
+        probe_status = f"error ({exc})"
+
+    backoff_text = ",".join(
+        str(int(val)) if abs(val - int(val)) < 1e-3 else str(val) for val in SUNO_POLL_BACKOFF_SERIES
+    )
+    lines = [
+        f"Suno: reachable, probe={probe_status} (expected)",
+        f"Polling: timeout={int(SUNO_POLL_TIMEOUT)}s, backoff=[{backoff_text}], on404={'RETRY' if SUNO_404_RETRY_ENABLED else 'FAIL'}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_lock_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    lock_snapshot = await _redis_lock_snapshot()
+    ttl_ms = lock_snapshot.get("ttl_ms")
+    if isinstance(ttl_ms, (int, float)) and ttl_ms >= 0:
+        ttl_text = f"{int(round(ttl_ms / 1000))}s"
+    elif isinstance(ttl_ms, (int, float)):
+        ttl_text = "missing"
+    else:
+        ttl_text = "unknown"
+
+    attempt_result = "not attempted"
+    if redis_client is not None and (ttl_ms is None or (isinstance(ttl_ms, (int, float)) and ttl_ms < 0)):
+        payload = json.dumps(
+            {
+                "host": socket.gethostname(),
+                "pid": os.getpid(),
+                "timestamp": _utcnow_iso(),
+                "version": APP_VERSION,
+            }
+        )
+
+        def _probe_lock() -> bool:
+            acquired = redis_client.set(lock_snapshot.get("key"), payload, nx=True, px=3000)
+            if acquired:
+                redis_client.delete(lock_snapshot.get("key"))
+            return bool(acquired)
+
+        try:
+            acquired = await asyncio.to_thread(_probe_lock)
+        except Exception as exc:
+            attempt_result = f"error ({exc})"
+        else:
+            attempt_result = "acquired" if acquired else "busy"
+
+    payload = lock_snapshot.get("payload") if isinstance(lock_snapshot.get("payload"), dict) else {}
+    owner_host = lock_snapshot.get("host") or payload.get("host") or "n/a"
+    owner_pid = lock_snapshot.get("pid") or payload.get("pid") or "n/a"
+
+    lines = [
+        f"Lock: key={lock_snapshot.get('key')} ttl={ttl_text}",
+        f"Owner: {owner_host}#{owner_pid}",
+        f"Probe: {attempt_result}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_env_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    app_env = os.getenv("APP_ENV", "prod") or "prod"
+    lines = [
+        f"Env: APP_ENV={app_env}, REDIS_PREFIX={REDIS_PREFIX}",
+        f"KIE_BASE_URL={KIE_BASE_URL}",
+        f"SUNO_ENABLED={str(bool(SUNO_CONFIG.enabled)).lower()}, SUNO_MODEL={SUNO_MODEL}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_webhook_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        info = await ctx.bot.get_webhook_info()
+    except Exception as exc:
+        await message.reply_text(f"Telegram: webhook=error ({exc})")
+        return
+
+    updater = getattr(ctx.application, "updater", None)
+    polling_text = "active" if updater and getattr(updater, "running", False) else "inactive"
+    drop_pending = "true" if not info.url else "false"
+    webhook_status = "deleted" if not info.url else info.url
+    lines = [
+        f"Telegram: webhook={webhook_status}, polling={polling_text}, drop_pending_updates={drop_pending}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_ledger_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    pool = PG_POOL
+    if pool is None:
+        await message.reply_text("Ledger: база данных недоступна")
+        return
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT COUNT(*) FROM users")
+                users_count = int((await cur.fetchone() or [0])[0])
+                await cur.execute("SELECT COUNT(*) FROM balances")
+                balances_count = int((await cur.fetchone() or [0])[0])
+                await cur.execute("SELECT COALESCE(MAX(created_at), NOW()) FROM ledger")
+                last_tx_row = await cur.fetchone()
+                last_tx = last_tx_row[0].isoformat() if last_tx_row and last_tx_row[0] else "unknown"
+    except Exception as exc:
+        await message.reply_text(f"Ledger: error ({exc})")
+        return
+
+    lines = [
+        "Ledger: OK",
+        f"users={users_count}, balances={balances_count}, last_tx={last_tx}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_metrics_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    success_total = runtime_metrics.get_counter(SUNO_METRIC_SUCCESS)
+    retry_404_total = runtime_metrics.get_counter(SUNO_METRIC_RETRY_404)
+    refund_total = runtime_metrics.get_counter(SUNO_METRIC_REFUND)
+    pool_in_use = runtime_metrics.get_gauge(DB_METRIC_POOL_IN_USE)
+    pool_available = runtime_metrics.get_gauge(DB_METRIC_POOL_AVAILABLE)
+
+    lines = [
+        "Metrics:",
+        f"suno.generated_success_total={success_total}",
+        f"suno.retry_404_total={retry_404_total}",
+        f"suno.refund_total={refund_total}",
+    ]
+    if pool_in_use:
+        lines.append(
+            f"db.pool.in_use={int(pool_in_use.get('value', 0))} peak={int(pool_in_use.get('peak', 0))}"
+        )
+    if pool_available:
+        lines.append(f"db.pool.max={int(pool_available.get('max', 0))}")
+    await message.reply_text("\n".join(lines))
+
+
+async def admin_diag_version_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await ensure_user_record(update)
+    message = update.effective_message
+    actor = update.effective_user
+    if message is None or actor is None:
+        return
+    if actor.id not in ADMIN_IDS:
+        await message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    build_time = (
+        os.getenv("BUILD_TIMESTAMP")
+        or os.getenv("BUILD_TIME")
+        or os.getenv("RENDER_GIT_COMMIT_TIMESTAMP")
+        or "unknown"
+    )
+    line = f"Version: {APP_BRANCH} ({GIT_REVISION}) built={build_time}"
+    await message.reply_text(line)
 
 
 async def admin_check_balances_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -16325,35 +16850,6 @@ async def admin_diag_slow_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         lines.append("Redis: pool unavailable")
 
     await message.reply_text("\n".join(lines))
-
-
-async def admin_diag_env_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ensure_user_record(update)
-    message = update.effective_message
-    actor = update.effective_user
-    if message is None or actor is None:
-        return
-    if actor.id not in ADMIN_IDS:
-        await message.reply_text("⛔ У вас нет прав для этой команды.")
-        return
-
-    keys = [
-        "CODEX_LOG_ENABLED",
-        "CODEX_LOG_ENDPOINT",
-        "CODEX_LOG_API_KEY",
-        "APP_NAME",
-        "APP_ENV",
-    ]
-    envs = []
-    for key in keys:
-        raw = os.getenv(key, "(missing)")
-        if raw and raw not in {"(missing)", ""}:
-            masked = f"{raw[:6]}***"
-        else:
-            masked = "(missing)"
-        envs.append(f"{key}={masked}")
-
-    await message.reply_text("🔧 Codex ENV:\n" + "\n".join(envs))
 
 
 async def admin_cleanup_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -18967,19 +19463,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             if btn == "база знаний":
                 await open_kb_card(update, ctx, suppress_nav=True)
-                raise ApplicationHandlerStop
+                return
             if btn == "фото":
                 await show_images_menu(chat_id, ctx)
-                raise ApplicationHandlerStop
+                return
             if btn == "музыка":
                 await show_music_menu(chat_id, ctx)
-                raise ApplicationHandlerStop
+                return
             if btn == "видео":
                 await show_video_menu(chat_id, ctx)
-                raise ApplicationHandlerStop
+                return
             if btn == "диалог":
                 await show_dialog_menu(chat_id, ctx)
-                raise ApplicationHandlerStop
+                return
         finally:
             if is_profile_btn:
                 setattr(ctx, "nav_event", nav_prev_attr)
@@ -20460,6 +20956,11 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("users_count",), users_count_command),
     (("whoami",), whoami_command),
     (("suno_debug",), suno_debug_command),
+    (("diag_health",), admin_diag_health_command),
+    (("diag_db",), admin_diag_db_command),
+    (("diag_redis",), admin_diag_redis_command),
+    (("diag_suno",), admin_diag_suno_command),
+    (("diag_lock",), admin_diag_lock_command),
     (("broadcast",), broadcast_command),
     (("check_db",), admin_check_db_command),
     (("cleanup_redis",), admin_cleanup_redis_command),
@@ -20468,6 +20969,10 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("diag_codex",), admin_diag_codex_command),
     (("diag_slow",), admin_diag_slow_command),
     (("diag_env",), admin_diag_env_command),
+    (("diag_webhook",), admin_diag_webhook_command),
+    (("diag_ledger",), admin_diag_ledger_command),
+    (("diag_metrics",), admin_diag_metrics_command),
+    (("diag_version",), admin_diag_version_command),
     (("add_tokens",), admin_add_tokens_command),
     (("spend_tokens",), admin_spend_tokens_command),
     (("set_tokens",), admin_set_tokens_command),
@@ -20676,6 +21181,25 @@ async def run_bot_async() -> None:
                    .token(TELEGRAM_TOKEN)
                    .rate_limiter(AIORateLimiter())
                    .build())
+
+    global PG_POOL
+    try:
+        PG_POOL = await db_postgres.create_pg_pool(DATABASE_URL)
+    except Exception as exc:
+        PG_POOL = None
+        log.critical("postgres.initialization_failed | err=%s", exc, exc_info=True)
+        raise
+    else:
+        try:
+            stats = PG_POOL.get_stats() if hasattr(PG_POOL, "get_stats") else None
+        except Exception:
+            stats = None
+        if stats is not None:
+            borrowed = float(getattr(stats, "borrowed", getattr(stats, "in_use", 0)))
+            available = float(getattr(stats, "available", getattr(stats, "free", 0)))
+            max_size = float(getattr(stats, "max_size", getattr(stats, "max", 0)))
+            _metric_update_gauge(DB_METRIC_POOL_IN_USE, borrowed, maximum=max_size or None)
+            _metric_update_gauge(DB_METRIC_POOL_AVAILABLE, available, maximum=max_size or None)
 
     try:
         if not application.bot_data.get(HANDLERS_FLAG):

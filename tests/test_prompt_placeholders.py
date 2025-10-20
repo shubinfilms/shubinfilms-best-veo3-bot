@@ -4,8 +4,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from telegram.ext import ApplicationHandlerStop
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -42,10 +40,7 @@ class DummyMessage:
 
 
 def _run(coro):
-    try:
-        asyncio.run(coro)
-    except ApplicationHandlerStop:
-        pass
+    asyncio.run(coro)
 
 
 def test_veo_card_opens_with_empty_prompt() -> None:

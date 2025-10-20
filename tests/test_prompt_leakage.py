@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from telegram.ext import ApplicationHandlerStop
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -67,8 +66,7 @@ def test_menu_labels_not_saved_as_prompt() -> None:
     message = DummyMessage(chat_id=777, text=" 🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ")
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=user_id))
 
-    with pytest.raises(ApplicationHandlerStop):
-        _run(bot_module.handle_card_input(update, ctx))
+    _run(bot_module.handle_card_input(update, ctx))
     clear_wait_state(user_id)
 
     assert state["last_prompt"] is None
@@ -94,8 +92,7 @@ def test_user_text_saved_and_acknowledged() -> None:
     bot_module.show_mj_prompt_card = fake_show  # type: ignore[assignment]
 
     try:
-        with pytest.raises(ApplicationHandlerStop):
-            _run(bot_module.handle_card_input(update, ctx))
+        _run(bot_module.handle_card_input(update, ctx))
     finally:
         bot_module.show_mj_prompt_card = original_show  # type: ignore[assignment]
         clear_wait_state(user_id)
