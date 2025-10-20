@@ -27,3 +27,4 @@ psycopg[binary,pool]>=3.1,<4.0
 # Вспомогательные пакеты для сборки
 wheel>=0.43
 setuptools>=69
+ruff>=0.4,<0.5

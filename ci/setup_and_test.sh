@@ -23,5 +23,6 @@ fi
 python -m pip install -U pip
 pip install -r requirements.txt
 
-# Run tests
+# Run lint and tests
+ruff check --select F821 handlers scripts tests
 pytest -q
