@@ -681,19 +681,22 @@ async def migrate_from_redis(
         for user_id, record in user_records.items():
             username_candidate = _sanitize_text(record.get("username"))
             normalized_referrer = _normalize_referrer(record.get("referrer_id"))
-            if username_candidate is None and normalized_referrer is None:
-                source_keys = sorted(user_sources.get(user_id, []))
-                key_info = ", ".join(source_keys) if source_keys else f"user:{user_id}"
-                log.warning("redis-migration.users.skip | reason=missing_identity key=%s", key_info)
-                skipped.append(f"malformed user record: {key_info}")
-                stats.redis_profiles_skipped += 1
-                continue
             row = dict(record)
             row["username"] = username_candidate
             row["referrer_id"] = normalized_referrer
             source_keys = sorted(user_sources.get(user_id, []))
             if source_keys:
                 row["_source"] = ", ".join(source_keys)
+            if username_candidate is None and normalized_referrer is None:
+                joined_value = row.get("joined_at")
+                if not isinstance(joined_value, datetime):
+                    joined_value = datetime.now(timezone.utc)
+                row["joined_at"] = joined_value
+                log.info(
+                    "redis-migration.user.stubbed | user_id=%s sources=%s",
+                    user_id,
+                    row.get("_source", "unknown"),
+                )
             user_batches.append(row)
             stats.redis_profiles_processed += 1
         balance_batch = [

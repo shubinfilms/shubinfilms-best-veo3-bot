@@ -111,10 +111,91 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT,
     referrer_id BIGINT,
     joined_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    referral_earned_total BIGINT NOT NULL DEFAULT 0
+    referral_earned_total BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
+
+_USERS_MIGRATIONS = [
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'users'
+               AND column_name = 'joined_at'
+        ) THEN
+            ALTER TABLE users ADD COLUMN joined_at TIMESTAMPTZ;
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'users'
+               AND column_name = 'updated_at'
+        ) THEN
+            ALTER TABLE users ADD COLUMN updated_at TIMESTAMPTZ;
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'users'
+               AND column_name = 'referral_earned_total'
+        ) THEN
+            ALTER TABLE users ADD COLUMN referral_earned_total BIGINT;
+        END IF;
+
+        ALTER TABLE users ALTER COLUMN joined_at SET DEFAULT NOW();
+        BEGIN
+            ALTER TABLE users ALTER COLUMN joined_at DROP NOT NULL;
+        EXCEPTION
+            WHEN undefined_column THEN NULL;
+        END;
+
+        ALTER TABLE users ALTER COLUMN updated_at SET DEFAULT NOW();
+        IF EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'users'
+               AND column_name = 'updated_at'
+        ) THEN
+            UPDATE users
+               SET updated_at = NOW()
+             WHERE updated_at IS NULL;
+            BEGIN
+                ALTER TABLE users ALTER COLUMN updated_at SET NOT NULL;
+            EXCEPTION
+                WHEN undefined_column THEN NULL;
+            END;
+        END IF;
+
+        ALTER TABLE users ALTER COLUMN referral_earned_total SET DEFAULT 0;
+        IF EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'users'
+               AND column_name = 'referral_earned_total'
+        ) THEN
+            UPDATE users
+               SET referral_earned_total = 0
+             WHERE referral_earned_total IS NULL;
+            BEGIN
+                ALTER TABLE users ALTER COLUMN referral_earned_total SET NOT NULL;
+            EXCEPTION
+                WHEN undefined_column THEN NULL;
+            END;
+        END IF;
+    END;
+    $$;
+    """,
+]
 
 _BALANCES_DDL = """
 CREATE TABLE IF NOT EXISTS balances (
@@ -607,6 +688,8 @@ def _ensure_tables_once() -> None:
                 """
             )
         )
+        for statement in _USERS_MIGRATIONS:
+            conn.execute(text(statement))
         conn.execute(text(_BALANCES_DDL))
         conn.execute(text(_REFERRALS_DDL))
         conn.execute(text(_AUDIT_DDL))

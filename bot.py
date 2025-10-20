@@ -513,6 +513,7 @@ from telegram_utils import (
     safe_send_photo,
     safe_send_text,
     safe_send_placeholder,
+    safe_edit_long_message,
     safe_edit_markdown_v2,
     safe_send_sticker,
     run_ffmpeg,
@@ -16934,7 +16935,14 @@ async def migrate_redis_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             )
         summary = "\n".join(summary_lines)
         try:
-            await status.edit_text(summary)
+            await safe_edit_long_message(
+                bot=ctx.bot,
+                message=status,
+                chat_id=message.chat_id if message else None,
+                text=summary,
+                caption="Redis migration summary",
+                filename="redis_migration_summary.txt",
+            )
         except Exception:
             await message.reply_text(summary)
         log.info(

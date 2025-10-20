@@ -26,7 +26,7 @@ from PIL import Image
 import requests
 from requests import Response
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
@@ -1051,6 +1051,47 @@ async def safe_send_sticker(
     )
 
 
+async def safe_edit_long_message(
+    *,
+    bot: Bot | Any,
+    message: Message | None,
+    chat_id: int | None,
+    text: str,
+    caption: Optional[str] = None,
+    filename: str = "migration_summary.txt",
+    limit: int = 3500,
+) -> Message:
+    """Edit ``message`` with ``text`` falling back to a document when too long."""
+
+    payload = text or ""
+    max_length = max(1, int(limit))
+    target_chat = chat_id or (message.chat_id if message is not None else None)
+    if target_chat is None:
+        raise ValueError("chat_id or message must be provided")
+
+    if len(payload) <= max_length:
+        if message is not None:
+            try:
+                return await message.edit_text(payload)
+            except BadRequest as exc:
+                description = (exc.message or str(exc) or "").lower()
+                if "message is not modified" in description:
+                    return message
+                if "message is too long" not in description:
+                    raise
+        return await bot.send_message(target_chat, payload)
+
+    buffer = io.BytesIO(payload.encode("utf-8"))
+    buffer.name = filename or "message.txt"
+    buffer.seek(0)
+    caption_text = caption or "Migration summary"
+    log.info(
+        "tg.message.long.fallback | strategy=document | size=%s",
+        len(payload),
+    )
+    return await bot.send_document(target_chat, document=buffer, caption=caption_text)
+
+
 async def run_ffmpeg(input_bytes: bytes, args: list[str], timeout: float = 40.0) -> bytes:
     ffmpeg_bin = (os.getenv("FFMPEG_BIN") or "ffmpeg").strip() or "ffmpeg"
     cmd = [ffmpeg_bin, *args]
@@ -1178,6 +1219,7 @@ __all__ = [
     "safe_send_media_group",
     "safe_send_placeholder",
     "safe_send_sticker",
+    "safe_edit_long_message",
     "safe_edit_text",
     "safe_edit_markdown_v2",
     "run_ffmpeg",
