@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -11,6 +12,8 @@ from .results import UIResult, acknowledge
 from .types import ButtonContext, ButtonHandler
 from runtime_metrics import increment_ui_callback_counter
 
+
+log = logging.getLogger(__name__)
 
 _DEFAULT_TTL = max(int(os.getenv("UI_BUTTONS_LOCK_TTL", "1") or "1"), 1)
 _DEBOUNCE_MS = float(os.getenv("UI_BUTTONS_DEBOUNCE_WINDOW_MS", "450") or "450")
@@ -37,6 +40,13 @@ def should_process(user_id: Optional[int], callback_data: Optional[str]) -> bool
     with _DEBOUNCE_LOCK:
         expires = _RECENT_CLICKS.get(key, 0.0)
         if expires and expires > current:
+            log.debug(
+                "ui.click.coalesced",
+                extra={
+                    "user_id": int(user_id),
+                    "callback_data": normalized,
+                },
+            )
             return False
         _RECENT_CLICKS[key] = current + _DEBOUNCE_WINDOW
 

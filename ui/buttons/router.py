@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
-from metrics import ui_callback_dedup_total
+from metrics import ui_callback_dedup_total, ui_callback_unmatched_total
 from runtime_metrics import increment_ui_callback_counter
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -67,6 +67,11 @@ class ButtonRouter:
         if query is not None:
             ack_result = await safe_answer(query, cache_time=0)
             context.mark_acknowledged(ack_result)
+            try:
+                setattr(update, "_ui_button_handled", True)
+                setattr(query, "_ui_button_handled", True)
+            except Exception:  # pragma: no cover - best effort attribute assignment
+                pass
 
             callback_data = getattr(query, "data", None)
             if not should_process(user_id, callback_data):
@@ -144,3 +149,50 @@ async def dispatch(
 ) -> UIResult:
     router = _get_default_router()
     return await router.dispatch(button_id, update=update, ctx=ctx, request_id=request_id)
+
+
+async def handle_unmatched_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    del ctx  # context is unused but part of PTB signature
+
+    query = getattr(update, "callback_query", None)
+    if query is None:
+        return
+
+    if getattr(query, "_ui_button_handled", False) or getattr(update, "_ui_button_handled", False):
+        return
+
+    data = getattr(query, "data", None)
+    if not data:
+        return
+
+    if not isinstance(data, str):
+        return
+
+    if not (
+        data.startswith("menu:")
+        or data.startswith("hub:open:")
+        or data.startswith("kb_open")
+        or data.startswith("dialog:")
+    ):
+        return
+
+    user = getattr(update, "effective_user", None)
+    message = getattr(query, "message", None)
+    message_id = getattr(message, "message_id", None)
+    user_id = getattr(user, "id", None)
+
+    ack_result = await safe_answer(query, cache_time=0)
+
+    log.info(
+        "ui.callback.unmatched",
+        extra={
+            "data": data,
+            "user_id": user_id,
+            "message_id": message_id,
+            "ack_result": ack_result,
+        },
+    )
+    try:
+        ui_callback_unmatched_total.labels(source="telegram", **_BOT_LABELS).inc()
+    except Exception:  # pragma: no cover - defensive metrics guard
+        log.debug("ui.callback.unmatched.metric_failed", exc_info=True)

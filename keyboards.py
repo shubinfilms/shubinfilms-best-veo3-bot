@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -11,6 +12,9 @@ from telegram import (
 )
 
 from utils.text_normalizer import normalize_btn_text
+
+
+log = logging.getLogger(__name__)
 
 
 
@@ -285,6 +289,7 @@ def _row(*buttons: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
 def kb_btn(text: str, callback: str) -> InlineKeyboardButton:
     """Единая фабрика кнопок для инлайн-клавиатуры."""
 
+    log.debug('[UI] render button %s data="%s"', text, callback)
     return InlineKeyboardButton(text=text, callback_data=callback)
 
 
