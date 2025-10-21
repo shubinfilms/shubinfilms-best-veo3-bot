@@ -10,6 +10,18 @@ if str(ROOT) not in sys.path:
 from tests.suno_test_utils import FakeBot, bot_module
 from telegram_utils import safe_answer
 import handlers.knowledge_base as kb_module  # noqa: E402
+import keyboards as keyboards_module  # noqa: E402
+
+
+def test_profile_button_present_with_correct_data():
+    markup = keyboards_module.kb_main()
+    profile_callbacks = [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if getattr(button, "callback_data", None) == keyboards_module.HOME_CB_PROFILE
+    ]
+    assert profile_callbacks == [keyboards_module.HOME_CB_PROFILE]
 
 
 def test_menu_callbacks_route_ok(monkeypatch):

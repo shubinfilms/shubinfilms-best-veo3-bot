@@ -503,11 +503,13 @@ from metrics import (
     suno_notify_ok,
     suno_notify_total,
     suno_refund_total,
+    suno_delivery_total,
     suno_poll_status_total,
     suno_ready_latency_seconds,
     suno_late_delivery_total,
     suno_timeout_total,
     suno_refund_trigger_total,
+    suno_refund_outcome_total,
     chat_messages_total,
     chat_latency_ms,
     chat_context_tokens,
@@ -11962,6 +11964,7 @@ async def _poll_suno_and_send(
             user_message=refund_text,
         )
         await _clear_wait()
+        suno_refund_outcome_total.labels(result="executed", **_METRIC_LABELS).inc()
 
     async def _clear_wait() -> None:
         try:
@@ -11986,10 +11989,14 @@ async def _poll_suno_and_send(
             delivery_via=via,
             tracks=prepared_tracks,
         )
-        if not delivered:
-            log.warning("[SUNO] %s delivery skipped | task_id=%s", via, task_id)
-            return False
-        return True
+        if delivered:
+            outcome = "late" if via not in {"poll", "webhook"} else "sent"
+            suno_delivery_total.labels(result=outcome, **_METRIC_LABELS).inc()
+            return True
+
+        log.warning("[SUNO] %s delivery skipped | task_id=%s", via, task_id)
+        suno_delivery_total.labels(result="failed", **_METRIC_LABELS).inc()
+        return False
 
     def _schedule_failure_follow_up(
         *,
@@ -12047,6 +12054,7 @@ async def _poll_suno_and_send(
             final=False,
             refunded=False,
         )
+        suno_refund_outcome_total.labels(result="scheduled", **_METRIC_LABELS).inc()
 
         async def _follow_up_failure() -> None:
             try:
@@ -12073,6 +12081,7 @@ async def _poll_suno_and_send(
                         SUNO_JOB_STORE.mark_delivered(
                             task_id, delivery_key=f"suno:{task_id}"
                         )
+                        suno_refund_outcome_total.labels(result="canceled", **_METRIC_LABELS).inc()
                         await _clear_wait()
                         return
                 if poll_result.state == "retry" or poll_result.state == "pending":
@@ -12144,6 +12153,7 @@ async def _poll_suno_and_send(
         pending = _SUNO_FAILURE_FOLLOWUPS.pop(task_id, None)
         if pending and not pending.done():
             pending.cancel()
+            suno_refund_outcome_total.labels(result="canceled", **_METRIC_LABELS).inc()
         if rds is not None:
             try:
                 rds.delete(_suno_failure_followup_key(task_id))
@@ -12384,6 +12394,15 @@ async def _poll_suno_and_send(
         if delivered:
             SUNO_JOB_STORE.mark_delivered(task_id, delivery_key=f"suno:{task_id}")
             await _clear_wait()
+            return
+
+        failure_message = _suno_error_message(None, "delivery failed")
+        _schedule_failure_follow_up(
+            message=failure_message,
+            reason="suno:refund:delivery_failed",
+            payload=details,
+            stage="delivery",
+        )
         return
 
     except asyncio.CancelledError:
@@ -22015,6 +22034,15 @@ def register_handlers(application: Any) -> None:
             application.add_handler(CallbackQueryHandler(callback))
         else:
             application.add_handler(CallbackQueryHandler(callback, pattern=pattern))
+
+    try:
+        from ui.buttons.router import handle_unmatched_callback  # local import to avoid cycles
+
+        unmatched_handler = CallbackQueryHandler(handle_unmatched_callback, pattern=r".*")
+        unmatched_handler.block = False
+        application.add_handler(unmatched_handler, group=1)
+    except Exception as exc:  # pragma: no cover - defensive registration
+        log.warning("handlers.unmatched_registration_failed", extra={"error": str(exc)})
 
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

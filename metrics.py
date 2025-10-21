@@ -86,6 +86,13 @@ ui_callback_dedup_total = Counter(
     registry=REGISTRY,
 )
 
+ui_callback_unmatched_total = Counter(
+    "ui_callback_unmatched_total",
+    "Callback queries that did not match any UI handler grouped by source.",
+    labelnames=("source", "env", "service"),
+    registry=REGISTRY,
+)
+
 faq_root_views_total = Counter(
     "faq_root_views_total",
     "Total number of FAQ root menu views",
@@ -231,6 +238,13 @@ suno_late_delivery_total = Counter(
     registry=REGISTRY,
 )
 
+suno_delivery_total = Counter(
+    "suno_delivery_total",
+    "Suno delivery attempts grouped by result",
+    labelnames=("result", "env", "service"),
+    registry=REGISTRY,
+)
+
 suno_timeout_total = Counter(
     "suno_timeout_total",
     "Suno polling timeouts grouped by stage",
@@ -242,6 +256,13 @@ suno_refund_trigger_total = Counter(
     "suno_refund_trigger_total",
     "Suno refund triggers grouped by stage",
     labelnames=("stage", "env", "service"),
+    registry=REGISTRY,
+)
+
+suno_refund_outcome_total = Counter(
+    "suno_refund_outcome_total",
+    "Suno refund outcomes grouped by result",
+    labelnames=("result", "env", "service"),
     registry=REGISTRY,
 )
 

@@ -8,7 +8,7 @@ from ui.buttons import BUTTONS
 from ui.buttons.idempotency import _RECENT_CLICKS
 from ui.buttons import idempotency as idemp
 from ui.buttons.results import UIResult, acknowledge
-from ui.buttons.router import ButtonRouter
+from ui.buttons.router import ButtonRouter, handle_unmatched_callback
 from ui.buttons.types import ButtonSpec
 
 
@@ -242,3 +242,27 @@ def test_debounce_same_button_quickly(monkeypatch):
     assert first.kind == "menu"
     assert second == acknowledge("test", message="duplicate_click")
     assert len(executions) == 1
+
+
+def test_unmatched_callback_logged_but_not_crash(caplog):
+    async def answer(**kwargs):
+        setattr(query, "answered", True)
+        return None
+
+    message = SimpleNamespace(chat=SimpleNamespace(id=55), chat_id=55, message_id=777)
+    query = SimpleNamespace(
+        data="menu:missing", answer=answer, message=message, from_user=SimpleNamespace(id=42)
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=message.chat,
+        effective_user=query.from_user,
+    )
+
+    ctx = SimpleNamespace()
+
+    with caplog.at_level("INFO"):
+        asyncio.run(handle_unmatched_callback(update, ctx))
+
+    assert getattr(query, "answered", False) is True
+    assert any(record.message == "ui.callback.unmatched" for record in caplog.records)
