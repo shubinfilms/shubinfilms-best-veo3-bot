@@ -44,7 +44,7 @@ def test_open_profile_sends_message_without_html_and_callbacks(monkeypatch):
     assert payload.get("parse_mode") is None
     assert "Баланс: 123" in payload["text"]
     keyboard = payload["reply_markup"].inline_keyboard
-    assert keyboard[0][0].callback_data == "profile:topup"
+    assert keyboard[0][0].callback_data == "btn:profile|view=topup"
 
 
 def test_history_empty(monkeypatch):
@@ -63,7 +63,7 @@ def test_history_empty(monkeypatch):
         answered["value"] = True
 
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), chat_id=chat_id, message_id=555)
-    query = SimpleNamespace(data="profile:history", message=message, answer=fake_answer)
+    query = SimpleNamespace(data="btn:profile|view=history", message=message, answer=fake_answer)
     update = SimpleNamespace(
         callback_query=query,
         effective_chat=message.chat,
@@ -77,7 +77,7 @@ def test_history_empty(monkeypatch):
     assert bot.deleted and bot.deleted[-1]["message_id"] == 555
     payload = bot.sent[-1]
     assert "История операций пока пуста." in payload["text"]
-    assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "profile:open"
+    assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "btn:profile"
 
 
 def test_invite_without_botname_fallback(monkeypatch):
@@ -95,7 +95,7 @@ def test_invite_without_botname_fallback(monkeypatch):
 
     chat_id = 303
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), chat_id=chat_id, message_id=10)
-    query = SimpleNamespace(data="profile:invite", message=message, answer=fake_answer)
+    query = SimpleNamespace(data="btn:profile|view=invite", message=message, answer=fake_answer)
     update = SimpleNamespace(
         callback_query=query,
         effective_chat=message.chat,
@@ -109,7 +109,7 @@ def test_invite_without_botname_fallback(monkeypatch):
     payload = bot.sent[-1]
     assert "Скоро включим приглашения." in payload["text"]
     keyboard = payload["reply_markup"].inline_keyboard
-    assert keyboard[0][0].callback_data == "profile:open"
+    assert keyboard[0][0].callback_data == "btn:profile"
 
 
 def test_topup_stub(monkeypatch):
@@ -124,7 +124,7 @@ def test_topup_stub(monkeypatch):
 
     chat_id = 404
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), chat_id=chat_id, message_id=11)
-    query = SimpleNamespace(data="profile:topup", message=message, answer=fake_answer)
+    query = SimpleNamespace(data="btn:profile|view=topup", message=message, answer=fake_answer)
     update = SimpleNamespace(
         callback_query=query,
         effective_chat=message.chat,
@@ -137,7 +137,7 @@ def test_topup_stub(monkeypatch):
     assert answered["value"], "Callback query should be answered"
     payload = bot.sent[-1]
     assert payload["text"].startswith("💎 Пополнение — скоро.")
-    assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "profile:open"
+    assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "btn:profile"
 
 
 def test_back_returns_to_menu(monkeypatch):
@@ -161,7 +161,7 @@ def test_back_returns_to_menu(monkeypatch):
     profile_simple._store_last_message_id(chat_id, 900)
 
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), chat_id=chat_id, message_id=900)
-    query = SimpleNamespace(data="profile:back", message=message, answer=fake_answer)
+    query = SimpleNamespace(data="btn:profile|view=back", message=message, answer=fake_answer)
     update = SimpleNamespace(
         callback_query=query,
         effective_chat=message.chat,

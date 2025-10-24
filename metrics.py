@@ -109,6 +109,14 @@ ui_ack_latency_ms = Histogram(
     buckets=(5, 10, 25, 50, 100, 150, 250, 500, 1000, 2000),
 )
 
+callback_ack_latency_ms = Histogram(
+    "callback_ack_latency_ms",
+    "End-to-end latency of callback acknowledgements in milliseconds.",
+    labelnames=("source", "env", "service"),
+    registry=REGISTRY,
+    buckets=(5, 10, 25, 50, 75, 100, 150, 250, 400, 600, 1000),
+)
+
 ui_callback_total = Counter(
     "ui_callback_total",
     "Callback processing outcomes grouped by action and result.",
@@ -137,17 +145,32 @@ ui_callback_legacy_forwarded_total = Counter(
     registry=REGISTRY,
 )
 
+router_callback_legacy_total = Counter(
+    "router_callback_legacy_total",
+    "Legacy callback payloads forwarded to namespace router handlers.",
+    labelnames=("namespace", "action"),
+    registry=REGISTRY,
+)
+
 profile_open_total = Counter(
     "profile_open_total",
-    "Profile open attempts grouped by force refresh, reuse decision and result.",
-    labelnames=("force_refresh", "reused", "source", "result", "env", "service"),
+    "Profile open attempts grouped by force refresh decision and result.",
+    labelnames=("force_refresh", "source", "result"),
     registry=REGISTRY,
 )
 
 profile_render_ms = Histogram(
     "profile_render_ms",
     "Latency of rendering the profile screen in milliseconds.",
-    labelnames=("force_refresh", "source", "env", "service"),
+    labelnames=("force_refresh", "source"),
+    registry=REGISTRY,
+    buckets=(25, 50, 100, 150, 200, 300, 400, 600, 1000, 1500),
+)
+
+profile_first_paint_ms = Histogram(
+    "profile_first_paint_ms",
+    "Latency between callback reception and first profile render in milliseconds.",
+    labelnames=("force_refresh", "source"),
     registry=REGISTRY,
     buckets=(25, 50, 100, 150, 200, 300, 400, 600, 1000, 1500),
 )
@@ -197,6 +220,13 @@ chat_autoswitch_total = Counter(
     "chat_autoswitch_total",
     "Automatic chat mode routing events grouped by outcome",
     labelnames=("outcome",),
+    registry=REGISTRY,
+)
+
+stars_buy_total = Counter(
+    "stars_buy_total",
+    "Telegram Stars purchase attempts grouped by amount and result.",
+    labelnames=("amount", "result"),
     registry=REGISTRY,
 )
 

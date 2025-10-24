@@ -154,6 +154,7 @@ from hub_router import (
     route_text as hub_route_text,
     set_fallback as set_hub_fallback,
 )
+from handlers import payments as payments_handlers
 from handlers import profile as profile_handlers
 from handlers.stars import open_stars_menu
 
@@ -271,9 +272,9 @@ from keyboards import (
     menu_pay_unified,
 )
 
-PROFILE_CB_TRANSACTIONS = "profile:history"
-PROFILE_CB_INVITE = "profile:invite"
-PROFILE_CB_PROMO = "profile:promo"
+PROFILE_CB_TRANSACTIONS = "btn:profile|view=history"
+PROFILE_CB_INVITE = "btn:profile|view=invite"
+PROFILE_CB_PROMO = "btn:profile|view=promo"
 
 
 def _profile_simple_enabled() -> bool:
@@ -6984,7 +6985,7 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "home:dialog": "ai_modes",
     "home:chat": "ai_modes",
     PROFILE_MENU_CB: "balance",
-    "profile:menu": "balance",
+    "btn:profile|view=menu": "balance",
     KNOWLEDGE_MENU_CB: "knowledge",
     "menu:kb": "knowledge",
     "kb:menu": "knowledge",
@@ -7019,7 +7020,6 @@ _HUB_ACTION_ALIASES: Dict[str, str] = {
     "nav:music": "music",
     "nav:video": "video",
     "nav:dialog": "ai_modes",
-    "profile": "balance",
     "back_main": "profile_topup",
 }
 
@@ -8543,6 +8543,11 @@ async def handle_profile_menu(callback: HubCallbackContext) -> None:
 @register_callback_action("profile", "back", module="profile")
 async def handle_profile_back(callback: HubCallbackContext) -> None:
     await profile_handlers.on_profile_back(callback.update, callback.application_context)
+
+
+@register_callback_action("payments", "stars_buy", module="payments")
+async def handle_payments_stars_buy(callback: HubCallbackContext) -> None:
+    await payments_handlers.stars_buy(callback.update, callback.application_context)
 
 
 async def _build_balance_menu_with_referral(

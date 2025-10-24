@@ -210,7 +210,7 @@ def set_fallback(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitabl
 
 
 LEGACY_ALIASES: Dict[str, str] = {
-    "nav:profile": btn_data("profile"),
+    "nav:profile": "menu:profile",
     "nav:kbase": "hub:open:kb",
     "nav:photo": "hub:open:photo",
     "nav:music": "hub:open:music",
@@ -234,10 +234,17 @@ LEGACY_ALIASES: Dict[str, str] = {
     "dialog_default": "dialog:plain",
     "dialog:menu": "hub:open:dialog",
     "menu_main": "menu:root",
-    "PROFILE_TRANSACTIONS": "profile:history",
-    "PROFILE_PROMO": "profile:promo",
-    "PROFILE_INVITE": "profile:invite",
-    "PROFILE_BACK": "profile:back",
+    "btn:profile": "menu:profile",
+    "btn:profile|view=topup": "profile:topup",
+    "btn:profile|view=history": "profile:history",
+    "btn:profile|view=invite": "profile:invite",
+    "btn:profile|view=promo": "profile:promo",
+    "btn:profile|view=menu": "profile:menu",
+    "btn:profile|view=back": "profile:back",
+    "PROFILE_TRANSACTIONS": "btn:profile|view=history",
+    "PROFILE_PROMO": "btn:profile|view=promo",
+    "PROFILE_INVITE": "btn:profile|view=invite",
+    "PROFILE_BACK": "btn:profile|view=back",
 }
 
 _TEXT_ACTION_FALLBACKS: Dict[str, str] = {

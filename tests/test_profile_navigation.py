@@ -57,7 +57,7 @@ def test_profile_open_no_duplicates(monkeypatch):
         bot_module,
         "balance_menu_kb",
         lambda **_: InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Пополнить", callback_data="profile:topup")]]
+            [[InlineKeyboardButton("Пополнить", callback_data="btn:profile|view=topup")]]
         ),
     )
 
@@ -110,16 +110,16 @@ def test_profile_buttons_route(monkeypatch):
     async def fake_answer():
         return None
 
-    message = SimpleNamespace(chat=SimpleNamespace(id=900), message_id=10)
+    message = SimpleNamespace(chat=SimpleNamespace(id=900), chat_id=900, message_id=10)
     user = SimpleNamespace(id=501)
 
     async def _scenario():
         for payload, label in [
-            ("profile:topup", "topup"),
-            ("profile:history", "history"),
-            ("profile:invite", "invite"),
-            ("profile:promo", "promo"),
-            ("profile:menu", "menu"),
+            ("btn:profile|view=topup", "topup"),
+            ("btn:profile|view=history", "history"),
+            ("btn:profile|view=invite", "invite"),
+            ("btn:profile|view=promo", "promo"),
+            ("btn:profile|view=menu", "menu"),
         ]:
             calls.clear()
             query = SimpleNamespace(

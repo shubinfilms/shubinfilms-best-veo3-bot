@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,44 +13,32 @@ if str(ROOT) not in sys.path:
 import ui.buttons.router as router
 
 
-class _DummyCounter:
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    def labels(self, **labels):
-        self.calls.append(labels)
-        return self
-
-    def inc(self):
-        return None
-
-
 @pytest.mark.parametrize(
-    "raw,expected_source",
+    "raw,expected_action,expected_source",
     [
-        ("profile", "button"),
-        ("profile.open", "button"),
-        ("open:profile", "menu"),
-        ("quick:profile", "quick"),
+        ("profile", "open", "button"),
+        ("profile.open", "open", "button"),
+        ("open:profile", "open", "menu"),
+        ("quick:profile", "open", "quick"),
+        ("profile:invite", "invite", "button"),
+        ("profile:promo", "promo", "button"),
     ],
 )
-def test_legacy_payloads_route_to_profile(raw, expected_source, monkeypatch):
+def test_legacy_profile_payloads_bridge_to_namespace(raw, expected_action, expected_source, monkeypatch):
     ack_calls: list[int] = []
+    dispatched: list[router.NormalizedCallback] = []
 
     async def fake_safe_answer(query, cache_time=0):
         ack_calls.append(cache_time)
         return "ok"
 
-    dispatched: list[tuple] = []
-
-    async def fake_dispatch(action, update, ctx, *, raw_data, payload=None, legacy=False):
-        dispatched.append((action, raw_data, payload, legacy))
-
-    legacy_counter = _DummyCounter()
+    async def fake_namespace_dispatch(normalized, update, ctx):
+        dispatched.append(normalized)
 
     monkeypatch.setattr(router, "safe_answer", fake_safe_answer)
-    monkeypatch.setattr(router, "dispatch_via_registry", fake_dispatch)
-    monkeypatch.setattr(router, "ui_callback_legacy_forwarded_total", legacy_counter)
+    monkeypatch.setattr(router, "dispatch_via_registry", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("registry should not be used")))
+    monkeypatch.setattr(router, "_dispatch_namespace_callback", fake_namespace_dispatch)
+    monkeypatch.setattr(router, "_legacy_bridge_enabled", lambda: True)
 
     query = SimpleNamespace(data=raw)
     update = SimpleNamespace(
@@ -62,10 +51,45 @@ def test_legacy_payloads_route_to_profile(raw, expected_source, monkeypatch):
     asyncio.run(router.on_callback(update, ctx))
 
     assert ack_calls, "callback should be acknowledged"
-    assert dispatched and dispatched[0][0] == "profile"
-    assert dispatched[0][1] == "btn:profile"
-    assert dispatched[0][3] is True
-    payload = dispatched[0][2] or {}
+    assert dispatched, "namespace dispatch should be used"
+    normalized = dispatched[0]
+    assert normalized.namespace == "profile"
+    assert normalized.action == expected_action
+    assert normalized.legacy is True
+    payload = dict(normalized.payload)
     assert payload.get("legacy") is True
     assert payload.get("source") == expected_source
-    assert legacy_counter.calls and legacy_counter.calls[0]["target"] == "profile"
+
+
+def test_stars_buy_routes_to_payments(monkeypatch):
+    ack_calls: list[int] = []
+    dispatched: list[router.NormalizedCallback] = []
+
+    async def fake_safe_answer(query, cache_time=0):
+        ack_calls.append(cache_time)
+        return "ok"
+
+    async def fake_namespace_dispatch(normalized, update, ctx):
+        dispatched.append(normalized)
+
+    monkeypatch.setattr(router, "safe_answer", fake_safe_answer)
+    monkeypatch.setattr(router, "dispatch_via_registry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(router, "_dispatch_namespace_callback", fake_namespace_dispatch)
+    monkeypatch.setattr(router, "_legacy_bridge_enabled", lambda: True)
+
+    query = SimpleNamespace(data="stars:buy:50")
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=10),
+        effective_user=SimpleNamespace(id=20),
+    )
+    ctx = SimpleNamespace()
+
+    asyncio.run(router.on_callback(update, ctx))
+
+    assert ack_calls
+    assert dispatched, "payments namespace should be dispatched"
+    normalized = dispatched[0]
+    assert normalized.namespace == "payments"
+    assert normalized.action == "stars_buy"
+    assert dict(normalized.payload).get("amount") == 50

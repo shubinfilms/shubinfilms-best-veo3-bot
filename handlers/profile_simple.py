@@ -126,16 +126,16 @@ def _extract_context(update: Update) -> _ProfileContext:
 
 def _profile_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton("💎 Пополнить баланс", callback_data="profile:topup")],
-        [InlineKeyboardButton("🧾 История операций", callback_data="profile:history")],
-        [InlineKeyboardButton("👥 Пригласить друга", callback_data="profile:invite")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")],
+        [InlineKeyboardButton("💎 Пополнить баланс", callback_data="btn:profile|view=topup")],
+        [InlineKeyboardButton("🧾 История операций", callback_data="btn:profile|view=history")],
+        [InlineKeyboardButton("👥 Пригласить друга", callback_data="btn:profile|view=invite")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")],
     ]
     return InlineKeyboardMarkup(buttons)
 
 
 def _back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в профиль", callback_data="profile:open")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в профиль", callback_data="btn:profile")]])
 
 
 async def _send_profile_message(
@@ -300,7 +300,7 @@ async def profile_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Скопировать ссылку", url=invite_link)],
-                [InlineKeyboardButton("⬅️ Назад в профиль", callback_data="profile:open")],
+                [InlineKeyboardButton("⬅️ Назад в профиль", callback_data="btn:profile")],
             ]
         )
     else:
