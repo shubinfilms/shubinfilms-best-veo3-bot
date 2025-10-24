@@ -11,6 +11,8 @@ from tests.suno_test_utils import FakeBot, bot_module
 from telegram_utils import safe_answer
 import handlers.knowledge_base as kb_module  # noqa: E402
 import keyboards as keyboards_module  # noqa: E402
+import ui.buttons.router as router_module  # noqa: E402
+from ui.buttons.registry import btn_data  # noqa: E402
 
 
 def test_profile_button_present_with_correct_data():
@@ -81,7 +83,7 @@ def test_menu_callbacks_route_ok(monkeypatch):
     monkeypatch.setattr(bot_module, "video_open_menu", fake_video)
     monkeypatch.setattr(bot_module, "dialog_open_menu", fake_dialog)
 
-    async def fake_answer(**kwargs):
+    async def fake_answer(*args, **kwargs):
         return None
 
     tests = [
@@ -97,8 +99,9 @@ def test_menu_callbacks_route_ok(monkeypatch):
         for item, key, mid in tests:
             calls.clear()
             ctx.chat_data.clear()
+            data = btn_data("profile") if item == "profile" else f"menu:{item}"
             query = SimpleNamespace(
-                data=f"menu:{item}",
+                data=data,
                 message=SimpleNamespace(
                     chat=SimpleNamespace(id=500 + len(item)),
                     chat_id=500 + len(item),
@@ -112,7 +115,11 @@ def test_menu_callbacks_route_ok(monkeypatch):
                 effective_user=query.from_user,
             )
 
-            await bot_module.handle_main_menu_callback(update, ctx)
+            if item == "profile":
+                monkeypatch.setattr(router_module, "safe_answer", fake_answer)
+                await router_module.on_callback(update, ctx)
+            else:
+                await bot_module.handle_main_menu_callback(update, ctx)
 
             assert calls and calls[0][0] == item
             assert calls[0][2]["suppress_nav"] is True

@@ -6,6 +6,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from telegram_utils import build_hub_keyboard, build_hub_text
+from ui.buttons.registry import btn_data
 
 
 def test_build_hub_keyboard_layout():
@@ -26,7 +27,7 @@ def test_build_hub_keyboard_layout():
         "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
-        "menu:profile",
+        btn_data("profile"),
         "kb_open",
         "menu:photo",
         "menu:music",

@@ -834,6 +834,43 @@ async def open_profile(
         _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
+async def open(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    payload: dict[str, object] | None = None,
+    *,
+    suppress_nav: bool = True,
+    reuse: bool = True,
+) -> None:
+    payload = payload or {}
+    source = str(payload.get("source", "button") or "button")
+    suppress_override = payload.get("suppress_nav")
+    if suppress_override is not None:
+        suppress_nav = bool(suppress_override)
+    reuse_override = payload.get("reuse")
+    if reuse_override is not None:
+        reuse = bool(reuse_override)
+
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    chat_id = getattr(chat, "id", None)
+    user_id = getattr(user, "id", None)
+
+    log.info(
+        "profile.open(chat_id=%s, user_id=%s, suppress_nav=%s)",
+        chat_id,
+        user_id,
+        suppress_nav,
+    )
+
+    if not reuse:
+        chat_data = _chat_data(ctx)
+        if isinstance(chat_data, MutableMapping):
+            chat_data.pop(PROFILE_MSG_ID, None)
+
+    await open_profile(update, ctx, source=source, suppress_nav=suppress_nav)
+
+
 async def _open_profile_card_impl(
     chat_id: Optional[int],
     user_id: Optional[int],
@@ -1383,6 +1420,7 @@ __all__ = [
     "handle_promo_timeout",
     "is_waiting_for_promo",
     "OpenedProfile",
+    "open",
     "open_profile",
     "open_profile_card",
     "on_profile_history",

@@ -16,7 +16,7 @@ from runtime_metrics import increment_ui_callback_counter
 log = logging.getLogger(__name__)
 
 _DEFAULT_TTL = max(int(os.getenv("UI_BUTTONS_LOCK_TTL", "1") or "1"), 1)
-_DEBOUNCE_MS = float(os.getenv("UI_BUTTONS_DEBOUNCE_WINDOW_MS", "450") or "450")
+_DEBOUNCE_MS = float(os.getenv("UI_BUTTONS_DEBOUNCE_WINDOW_MS", "500") or "500")
 _DEBOUNCE_MS = max(_DEBOUNCE_MS, 0.0)
 _DEBOUNCE_WINDOW = _DEBOUNCE_MS / 1000.0 if _DEBOUNCE_MS else 0.0
 _DEBOUNCE_LOCK = threading.Lock()
