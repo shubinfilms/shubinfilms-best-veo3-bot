@@ -15,6 +15,28 @@ _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 def _labels(service: str) -> dict[str, str]:
     return {"env": _ENV, "service": service}
 
+
+def inc(
+    metric_name: str,
+    *,
+    value: float = 1.0,
+    tags: dict[str, str] | None = None,
+    service: str = "bot",
+) -> None:
+    """Increment a Prometheus metric by name with provided tags."""
+
+    metric = globals().get(metric_name)
+    if metric is None:
+        raise ValueError(f"unknown metric {metric_name!r}")
+
+    labels = dict(tags or {})
+    label_names = tuple(getattr(metric, "_labelnames", ()) or ())
+    if "env" in label_names:
+        labels.setdefault("env", _ENV)
+    if "service" in label_names:
+        labels.setdefault("service", service)
+    metric.labels(**labels).inc(value)
+
 suno_requests_total = Counter(
     "suno_requests_total",
     "Total Suno requests grouped by outcome",
@@ -77,6 +99,21 @@ ui_callback_ack_latency_ms = Histogram(
     labelnames=("env", "service"),
     registry=REGISTRY,
     buckets=(5, 10, 25, 50, 100, 150, 250, 500, 1000),
+)
+
+ui_ack_latency_ms = Histogram(
+    "ui_ack_latency_ms",
+    "Latency between receiving and acknowledging a callback query in milliseconds.",
+    labelnames=("source", "env", "service"),
+    registry=REGISTRY,
+    buckets=(5, 10, 25, 50, 100, 150, 250, 500, 1000, 2000),
+)
+
+ui_callback_total = Counter(
+    "ui_callback_total",
+    "Callback processing outcomes grouped by action and result.",
+    labelnames=("action", "result", "env", "service"),
+    registry=REGISTRY,
 )
 
 ui_callback_dedup_total = Counter(
@@ -284,6 +321,7 @@ def render_metrics() -> bytes:
 
 __all__: Iterable[str] = [
     "REGISTRY",
+    "inc",
     "suno_requests_total",
     "suno_callback_download_fail_total",
     "suno_task_store_total",
@@ -309,6 +347,12 @@ __all__: Iterable[str] = [
     "chat_voice_total",
     "chat_voice_latency_ms",
     "chat_transcribe_latency_ms",
+    "ui_ack_latency_ms",
+    "ui_callback_total",
+    "ui_callback_ack_total",
+    "ui_callback_ack_latency_ms",
+    "ui_callback_dedup_total",
+    "ui_callback_unmatched_total",
     "process_uptime_seconds",
     "render_metrics",
 ]

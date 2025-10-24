@@ -15,6 +15,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from keyboards import TEXT_TO_ACTION
+from ui.buttons.registry import btn_data
 from redis_utils import release_user_lock, user_lock
 from state import CardInfo, StateLockTimeout, state
 from utils.text_normalizer import normalize_btn_text
@@ -209,7 +210,7 @@ def set_fallback(handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitabl
 
 
 LEGACY_ALIASES: Dict[str, str] = {
-    "nav:profile": "hub:open:profile",
+    "nav:profile": btn_data("profile"),
     "nav:kbase": "hub:open:kb",
     "nav:photo": "hub:open:photo",
     "nav:music": "hub:open:music",

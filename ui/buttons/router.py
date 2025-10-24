@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
-from metrics import ui_callback_dedup_total, ui_callback_unmatched_total
+from metrics import (
+    inc as metrics_inc,
+    ui_ack_latency_ms,
+    ui_callback_ack_latency_ms,
+    ui_callback_ack_total,
+    ui_callback_dedup_total,
+    ui_callback_total,
+)
 from runtime_metrics import increment_ui_callback_counter
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -17,6 +25,7 @@ from .idempotency import should_process, with_idempotency
 from .results import UIResult, acknowledge, show_error
 from .telemetry import log_click, log_error, log_success, measure_latency
 from .types import ButtonContext, ButtonId, ButtonSpec
+from .registry import REGISTRY
 from telegram_utils import safe_answer
 
 log = logging.getLogger(__name__)
@@ -151,9 +160,92 @@ async def dispatch(
     return await router.dispatch(button_id, update=update, ctx=ctx, request_id=request_id)
 
 
-async def handle_unmatched_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    del ctx  # context is unused but part of PTB signature
+async def dispatch_via_registry(
+    action: str,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    raw_data: str,
+) -> None:
+    query = getattr(update, "callback_query", None)
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    user_id = getattr(user, "id", None)
+    chat_id = getattr(chat, "id", None)
 
+    entry = REGISTRY.get(action)
+    if entry is None:
+        await _log_unmatched(raw_data, update)
+        return
+
+    if not should_process(user_id, raw_data):
+        try:
+            ui_callback_dedup_total.labels(action=action, **_BOT_LABELS).inc()
+        except Exception:  # pragma: no cover - metrics guard
+            log.debug("ui.callback.dedup.metric_failed", exc_info=True)
+        metrics_inc("ui_callback_total", tags={"action": action, "result": "coalesced"})
+        increment_ui_callback_counter("dedup", "coalesced")
+        return
+
+    handler = entry.resolve_handler()
+    try:
+        setattr(update, "_ui_button_handled", True)
+        if query is not None:
+            setattr(query, "_ui_button_handled", True)
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+    log.info(
+        "ui.callback.matched",
+        extra={
+            "action": action,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "data": raw_data,
+        },
+    )
+
+    try:
+        await handler(update, ctx, payload=None)
+    except Exception:
+        try:
+            ui_callback_total.labels(action=action, result="error", **_BOT_LABELS).inc()
+        except Exception:  # pragma: no cover - metrics guard
+            log.debug("ui.callback.total.metric_failed", exc_info=True)
+        increment_ui_callback_counter("callback", "error")
+        log.exception(
+            "ui.callback.failed",
+            extra={"action": action, "user_id": user_id, "chat_id": chat_id},
+        )
+        raise
+
+    try:
+        ui_callback_total.labels(action=action, result="ok", **_BOT_LABELS).inc()
+    except Exception:  # pragma: no cover - metrics guard
+        log.debug("ui.callback.total.metric_failed", exc_info=True)
+    increment_ui_callback_counter("callback", "ok")
+
+
+async def _log_unmatched(data: str, update: Update) -> None:
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    user_id = getattr(user, "id", None)
+    chat_id = getattr(chat, "id", None)
+
+    log.info(
+        "ui.callback.unmatched data=%r user_id=%s chat_id=%s",
+        data,
+        user_id,
+        chat_id,
+    )
+    try:
+        metrics_inc("ui_callback_unmatched_total", tags={"source": "telegram"})
+    except Exception:  # pragma: no cover - metrics guard
+        log.debug("ui.callback.unmatched.metric_failed", exc_info=True)
+    increment_ui_callback_counter("callback", "unmatched")
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = getattr(update, "callback_query", None)
     if query is None:
         return
@@ -161,38 +253,33 @@ async def handle_unmatched_callback(update: Update, ctx: ContextTypes.DEFAULT_TY
     if getattr(query, "_ui_button_handled", False) or getattr(update, "_ui_button_handled", False):
         return
 
-    data = getattr(query, "data", None)
+    started = time.perf_counter()
+    ack_result = await safe_answer(query, cache_time=0)
+    latency_ms = max((time.perf_counter() - started) * 1000.0, 0.0)
+
+    try:
+        label_result = (ack_result or "ok").strip() or "ok"
+        ui_callback_ack_total.labels(result=label_result, **_BOT_LABELS).inc()
+        ui_callback_ack_latency_ms.labels(**_BOT_LABELS).observe(latency_ms)
+        ui_ack_latency_ms.labels(source="telegram", **_BOT_LABELS).observe(latency_ms)
+    except Exception:  # pragma: no cover - metrics guard
+        log.debug("ui.callback.ack.metric_failed", exc_info=True)
+
+    raw_data = getattr(query, "data", "")
+    data = (raw_data or "").strip()
     if not data:
         return
 
-    if not isinstance(data, str):
+    if data.startswith("btn:"):
+        action = data.split(":", 1)[1].strip()
+        if not action:
+            await _log_unmatched(data, update)
+            return
+        await dispatch_via_registry(action, update, ctx, raw_data=data)
         return
 
-    if not (
-        data.startswith("menu:")
-        or data.startswith("hub:open:")
-        or data.startswith("kb_open")
-        or data.startswith("dialog:")
-    ):
-        return
+    await _log_unmatched(data, update)
 
-    user = getattr(update, "effective_user", None)
-    message = getattr(query, "message", None)
-    message_id = getattr(message, "message_id", None)
-    user_id = getattr(user, "id", None)
 
-    ack_result = await safe_answer(query, cache_time=0)
-
-    log.info(
-        "ui.callback.unmatched",
-        extra={
-            "data": data,
-            "user_id": user_id,
-            "message_id": message_id,
-            "ack_result": ack_result,
-        },
-    )
-    try:
-        ui_callback_unmatched_total.labels(source="telegram", **_BOT_LABELS).inc()
-    except Exception:  # pragma: no cover - defensive metrics guard
-        log.debug("ui.callback.unmatched.metric_failed", exc_info=True)
+async def handle_unmatched_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await on_callback(update, ctx)

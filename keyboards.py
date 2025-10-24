@@ -29,7 +29,7 @@ EMOJI = {
     "pay": "💎",
 }
 
-NAV_PROFILE = "menu:profile"
+NAV_PROFILE = "btn:profile"
 NAV_KB = "kb_open"
 NAV_PHOTO = "menu:photo"
 NAV_MUSIC = "menu:music"
@@ -43,7 +43,7 @@ HOME_CB_MUSIC = NAV_MUSIC
 HOME_CB_VIDEO = NAV_VIDEO
 HOME_CB_DIALOG = NAV_DIALOG
 
-HUB_INLINE_CB_PROFILE = "hub:open:profile"
+HUB_INLINE_CB_PROFILE = NAV_PROFILE
 HUB_INLINE_CB_KB = "hub:open:kb"
 HUB_INLINE_CB_PHOTO = "hub:open:photo"
 HUB_INLINE_CB_MUSIC = "hub:open:music"
@@ -211,6 +211,12 @@ def reply_kb_home() -> ReplyKeyboardMarkup:
     return build_main_reply_kb()
 
 
+def main_menu_buttons() -> List[InlineKeyboardButton]:
+    """Return a flat list of inline buttons displayed in the main menu."""
+
+    return [button for row in _build_inline_home_rows() for button in row]
+
+
 def build_main_reply_kb() -> ReplyKeyboardMarkup:
     layout = _get_home_menu_layout()
     rows: List[List[KeyboardButton]] = []
@@ -240,7 +246,7 @@ def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:
     for row in layout:
         buttons: List[InlineKeyboardButton] = []
         for label, callback in row:
-            buttons.append(InlineKeyboardButton(text=label, callback_data=callback))
+            buttons.append(kb_btn(label, callback))
         rows.append(buttons)
     if len(rows) == 4:
         merged = rows[:2]
@@ -251,6 +257,8 @@ def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:
 
 @lru_cache(maxsize=1)
 def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], ...], ...]:
+    from ui.buttons.registry import btn_data
+
     from texts import (
         TXT_KB_AI_DIALOG,
         TXT_KB_KNOWLEDGE,
@@ -260,9 +268,11 @@ def _get_home_menu_layout() -> Tuple[Tuple[Tuple[str, str], ...], ...]:
         TXT_KB_VIDEO,
     )
 
+    profile_cb = btn_data("profile")
+
     return (
         (
-            (TXT_KB_PROFILE, HOME_CB_PROFILE),
+            (TXT_KB_PROFILE, profile_cb),
             (TXT_KB_KNOWLEDGE, HOME_CB_KB),
         ),
         (
@@ -289,7 +299,10 @@ def _row(*buttons: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
 def kb_btn(text: str, callback: str) -> InlineKeyboardButton:
     """Единая фабрика кнопок для инлайн-клавиатуры."""
 
-    log.debug('[UI] render button %s data="%s"', text, callback)
+    if callback == HOME_CB_PROFILE:
+        log.debug('[UI] render button profile data="%s"', callback)
+    else:
+        log.debug('[UI] render button %s data="%s"', text, callback)
     return InlineKeyboardButton(text=text, callback_data=callback)
 
 

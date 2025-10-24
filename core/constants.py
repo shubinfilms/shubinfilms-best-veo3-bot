@@ -7,7 +7,7 @@ SORA2_MODEL_TEXT_TO_VIDEO = "sora-2-text-to-video"
 SORA2_MODEL_IMAGE_TO_VIDEO = "sora-2-image-to-video"
 
 KEYBOARD_NS_MAIN_MENU = "menu:home"
-KEYBOARD_NS_PROFILE = "menu:profile"
+KEYBOARD_NS_PROFILE = "btn:profile"
 KEYBOARD_NS_VIDEO = "menu:video"
 KEYBOARD_NS_IMAGE = "menu:photo"
 KEYBOARD_NS_MUSIC = "menu:music"

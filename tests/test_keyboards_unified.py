@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from keyboards import kb_home_menu, menu_pay_unified
+from ui.buttons.registry import btn_data
 
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 os.environ.setdefault("LEDGER_BACKEND", "memory")
@@ -31,7 +32,7 @@ def test_kb_home_menu_layout():
         "🧠 Диалог с ИИ",
     ]
     assert callbacks == [
-        "menu:profile",
+        btn_data("profile"),
         "kb_open",
         "menu:photo",
         "menu:music",

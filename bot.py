@@ -6666,8 +6666,10 @@ async def handle_hub_open_callback(update: Update, ctx: ContextTypes.DEFAULT_TYP
             await query.answer()
         return
 
+    from ui.buttons.registry import btn_data
+
     mapping = {
-        "hub:open:profile": "profile",
+        btn_data("profile"): "profile",
         "hub:open:kb": "kb",
         "hub:open:photo": "photo",
         "hub:open:music": "music",
@@ -22036,9 +22038,9 @@ def register_handlers(application: Any) -> None:
             application.add_handler(CallbackQueryHandler(callback, pattern=pattern))
 
     try:
-        from ui.buttons.router import handle_unmatched_callback  # local import to avoid cycles
+        from ui.buttons.router import on_callback  # local import to avoid cycles
 
-        unmatched_handler = CallbackQueryHandler(handle_unmatched_callback, pattern=r".*")
+        unmatched_handler = CallbackQueryHandler(on_callback, pattern=r".*")
         unmatched_handler.block = False
         application.add_handler(unmatched_handler, group=1)
     except Exception as exc:  # pragma: no cover - defensive registration
