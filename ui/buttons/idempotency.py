@@ -19,6 +19,7 @@ _DEFAULT_TTL = max(int(os.getenv("UI_BUTTONS_LOCK_TTL", "1") or "1"), 1)
 _DEBOUNCE_MS = float(os.getenv("UI_BUTTONS_DEBOUNCE_WINDOW_MS", "500") or "500")
 _DEBOUNCE_MS = max(_DEBOUNCE_MS, 0.0)
 _DEBOUNCE_WINDOW = _DEBOUNCE_MS / 1000.0 if _DEBOUNCE_MS else 0.0
+_PROFILE_DEBOUNCE_WINDOW = 0.3
 _DEBOUNCE_LOCK = threading.Lock()
 _RECENT_CLICKS: dict[tuple[int, str], float] = {}
 
@@ -28,14 +29,26 @@ def _now() -> float:
 
 
 def should_process(user_id: Optional[int], callback_data: Optional[str]) -> bool:
-    if user_id is None or not callback_data or _DEBOUNCE_WINDOW <= 0:
+    if user_id is None or not callback_data:
         return True
 
     normalized = callback_data.strip()
     if not normalized:
         return True
 
-    key = (int(user_id), normalized)
+    base = normalized
+    window = _DEBOUNCE_WINDOW
+    if normalized.startswith("btn:"):
+        base = normalized.split("|", 1)[0]
+    if base == "btn:profile":
+        window = _PROFILE_DEBOUNCE_WINDOW
+        key = (int(user_id), base)
+    else:
+        key = (int(user_id), normalized)
+
+    if window <= 0:
+        return True
+
     current = _now()
     with _DEBOUNCE_LOCK:
         expires = _RECENT_CLICKS.get(key, 0.0)
@@ -48,10 +61,11 @@ def should_process(user_id: Optional[int], callback_data: Optional[str]) -> bool
                 },
             )
             return False
-        _RECENT_CLICKS[key] = current + _DEBOUNCE_WINDOW
+        _RECENT_CLICKS[key] = current + window
 
         # Garbage collect stale entries lazily.
-        cutoff = current - (_DEBOUNCE_WINDOW * 4)
+        cleanup_window = max(window, _DEBOUNCE_WINDOW)
+        cutoff = current - (cleanup_window * 4)
         if cutoff > 0:
             stale = [item for item, exp in _RECENT_CLICKS.items() if exp <= cutoff]
             for item in stale:
