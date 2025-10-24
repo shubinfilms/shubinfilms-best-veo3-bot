@@ -26,10 +26,12 @@ from utils.input_state import (
     WaitInputState,
     WaitKind,
     clear_wait_state,
+    force_clear_user_state,
     get_wait_state,
     input_state,
     set_wait_state,
 )
+from metrics import profile_open_total, profile_render_ms
 import settings as app_settings
 log = logging.getLogger(__name__)
 
@@ -787,6 +789,7 @@ async def open_profile(
     *,
     source: str,
     suppress_nav: bool = True,
+    force_refresh: bool = False,
 ) -> None:
     if _simple_profile_enabled():
         from . import profile_simple
@@ -818,18 +821,43 @@ async def open_profile(
             chat_data[NAV_UNTIL] = max(previous_deadline, now + 2.0)
             chat_data["suppress_dialog_notice"] = True
 
-        result = await open_profile_card(
-            update,
-            ctx,
-            source=source,
-            suppress_nav=suppress_nav,
-        )
-
-        reused = bool(result.reused) if isinstance(result, OpenedProfile) else False
-        log.debug(
-            "profile.open",
-            extra={"source": source, "reused_msg": reused},
-        )
+        started = time.perf_counter()
+        metrics_result = "ok"
+        reused = False
+        try:
+            result = await open_profile_card(
+                update,
+                ctx,
+                source=source,
+                suppress_nav=suppress_nav,
+                force_refresh=force_refresh,
+            )
+            reused = bool(result.reused) if isinstance(result, OpenedProfile) else False
+            log.debug(
+                "profile.open",
+                extra={"source": source, "reused_msg": reused, "force_refresh": force_refresh},
+            )
+        except Exception:
+            metrics_result = "error"
+            raise
+        finally:
+            elapsed_ms = max((time.perf_counter() - started) * 1000.0, 0.0)
+            try:
+                profile_render_ms.labels(
+                    force_refresh="true" if force_refresh else "false",
+                    source=(source or "unknown").strip() or "unknown",
+                ).observe(elapsed_ms)
+            except Exception:
+                log.debug("profile.metrics.render_failed", exc_info=True)
+            try:
+                profile_open_total.labels(
+                    force_refresh="true" if force_refresh else "false",
+                    reused="true" if reused else "false",
+                    source=(source or "unknown").strip() or "unknown",
+                    result=metrics_result,
+                ).inc()
+            except Exception:
+                log.debug("profile.metrics.open_failed", exc_info=True)
     finally:
         _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
@@ -841,6 +869,7 @@ async def open(
     *,
     suppress_nav: bool = True,
     reuse: bool = True,
+    force_refresh: bool | None = None,
 ) -> None:
     payload = payload or {}
     source = str(payload.get("source", "button") or "button")
@@ -850,6 +879,16 @@ async def open(
     reuse_override = payload.get("reuse")
     if reuse_override is not None:
         reuse = bool(reuse_override)
+    if force_refresh is None:
+        default_force = source in {"button", "quick", "menu"}
+        force_refresh = bool(payload.get("force_refresh", default_force))
+    else:
+        force_refresh = bool(force_refresh)
+    if force_refresh:
+        reuse = False
+
+    if source in {"button", "quick"} and suppress_override is None:
+        suppress_nav = False
 
     chat = getattr(update, "effective_chat", None)
     user = getattr(update, "effective_user", None)
@@ -857,18 +896,35 @@ async def open(
     user_id = getattr(user, "id", None)
 
     log.info(
-        "profile.open(chat_id=%s, user_id=%s, suppress_nav=%s)",
+        "profile.open(chat_id=%s, user_id=%s, suppress_nav=%s, force_refresh=%s)",
         chat_id,
         user_id,
         suppress_nav,
+        force_refresh,
     )
+
+    if user_id is not None:
+        try:
+            await force_clear_user_state(user_id, reason="profile_open")
+        except Exception:
+            log.debug(
+                "profile.force_clear_failed",
+                exc_info=True,
+                extra={"user_id": user_id},
+            )
 
     if not reuse:
         chat_data = _chat_data(ctx)
         if isinstance(chat_data, MutableMapping):
             chat_data.pop(PROFILE_MSG_ID, None)
 
-    await open_profile(update, ctx, source=source, suppress_nav=suppress_nav)
+    await open_profile(
+        update,
+        ctx,
+        source=source,
+        suppress_nav=suppress_nav,
+        force_refresh=bool(force_refresh),
+    )
 
 
 async def _open_profile_card_impl(
@@ -879,6 +935,7 @@ async def _open_profile_card_impl(
     ctx: ContextTypes.DEFAULT_TYPE,
     suppress_nav: bool = True,
     source: str = "menu",
+    force_refresh: bool = False,
 ) -> OpenedProfile:
     log.debug(
         "profile.open(chat_id=%s, user_id=%s, source=%s, suppress_nav=%s)",
@@ -908,7 +965,7 @@ async def _open_profile_card_impl(
 
     chat_data = _chat_data(ctx)
     previous_mid = _get_profile_msg_id(chat_data)
-    reuse_existing = previous_mid is not None
+    reuse_existing = previous_mid is not None and not force_refresh
 
     if isinstance(chat_data, MutableMapping):
         chat_data["nav_event"] = True
@@ -958,6 +1015,7 @@ async def open_profile_card(
     *,
     source: str = "menu",
     suppress_nav: bool = True,
+    force_refresh: bool = False,
 ) -> OpenedProfile:
     chat = getattr(update, "effective_chat", None)
     message = getattr(update, "effective_message", None)
@@ -977,6 +1035,7 @@ async def open_profile_card(
         ctx=ctx,
         suppress_nav=suppress_nav,
         source=source,
+        force_refresh=force_refresh,
     )
 
 

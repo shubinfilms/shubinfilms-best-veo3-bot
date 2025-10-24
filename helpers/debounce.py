@@ -4,7 +4,7 @@ import time
 from threading import RLock
 from typing import Hashable
 
-__all__ = ["debounce"]
+__all__ = ["debounce", "reset"]
 
 
 _last_clicks: dict[tuple[Hashable, Hashable], float] = {}
@@ -28,3 +28,21 @@ def debounce(user_id: Hashable, action: Hashable, *, delay: float = 1.0) -> bool
             return False
         _last_clicks[key] = now
     return True
+
+
+def reset(user_id: Hashable | None = None, action: Hashable | None = None) -> None:
+    """Clear stored debounce entries matching ``user_id``/``action`` filters."""
+
+    with _lock:
+        if user_id is None and action is None:
+            _last_clicks.clear()
+            return
+
+        keys = [
+            key
+            for key in _last_clicks
+            if (user_id is None or key[0] == user_id)
+            and (action is None or key[1] == action)
+        ]
+        for key in keys:
+            _last_clicks.pop(key, None)

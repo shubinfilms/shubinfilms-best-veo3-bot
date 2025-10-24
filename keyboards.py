@@ -472,7 +472,7 @@ def menu_main_like() -> InlineKeyboardMarkup:
     return build_menu(
         [
             [
-                (f"{EMOJI['profile']} Профиль", "profile"),
+                (f"{EMOJI['profile']} Профиль", "btn:profile|src=hub"),
                 ("📚 База знаний", "kb_docs"),
             ],
             [
@@ -497,7 +497,7 @@ def menu_bottom_unified() -> InlineKeyboardMarkup:
             [(f"{EMOJI['music']} Генерация музыки", "nav_music")],
             [(f"{EMOJI['prompt']} Prompt-Master", "nav_prompt")],
             [(f"{EMOJI['chat']} Обычный чат", "nav_chat")],
-            [(f"{EMOJI['profile']} Профиль", "profile")],
+            [(f"{EMOJI['profile']} Профиль", "btn:profile|src=nav")],
         ]
     )
 

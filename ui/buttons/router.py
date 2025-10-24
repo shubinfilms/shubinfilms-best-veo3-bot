@@ -13,6 +13,7 @@ from metrics import (
     ui_callback_ack_latency_ms,
     ui_callback_ack_total,
     ui_callback_dedup_total,
+    ui_callback_legacy_forwarded_total,
     ui_callback_total,
 )
 from runtime_metrics import increment_ui_callback_counter
@@ -31,6 +32,81 @@ from telegram_utils import safe_answer
 log = logging.getLogger(__name__)
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
+
+
+@dataclass(slots=True)
+class NormalizedCallback:
+    raw: str
+    normalized: str | None
+    action: str | None
+    payload: dict[str, object]
+    legacy: bool
+    dedupe_key: str
+
+
+_LEGACY_PROFILE_ALIASES: dict[str, tuple[str, str]] = {
+    "profile": ("profile", "button"),
+    "profile.open": ("profile", "button"),
+    "open:profile": ("profile", "menu"),
+    "quick:profile": ("profile", "quick"),
+    "stars:profile": ("profile", "button"),
+}
+
+
+def _parse_params(parts: list[str]) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for part in parts:
+        chunk = (part or "").strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        params[key] = value
+    return params
+
+
+def normalize_callback_data(data: str) -> NormalizedCallback:
+    stripped = (data or "").strip()
+    payload: dict[str, object] = {}
+    if not stripped:
+        return NormalizedCallback(stripped, None, None, payload, False, stripped)
+
+    lowered = stripped.lower()
+    if stripped.startswith("btn:"):
+        base, *extra = stripped.split("|")
+        params = _parse_params(extra)
+        src = params.pop("src", None)
+        if src:
+            payload["source"] = src
+        for key, value in params.items():
+            payload.setdefault(key, value)
+        action = base.split(":", 1)[1].strip() if ":" in base else None
+        return NormalizedCallback(
+            raw=stripped,
+            normalized=base,
+            action=action,
+            payload=payload,
+            legacy=False,
+            dedupe_key=base,
+        )
+
+    legacy_payload = _LEGACY_PROFILE_ALIASES.get(lowered)
+    if legacy_payload:
+        action, source = legacy_payload
+        payload = {"source": source, "legacy": True}
+        normalized = f"btn:{action}"
+        return NormalizedCallback(
+            raw=stripped,
+            normalized=normalized,
+            action=action,
+            payload=payload,
+            legacy=True,
+            dedupe_key=normalized,
+        )
+
+    legacy = ":" in stripped and not stripped.startswith("btn:")
+    return NormalizedCallback(stripped, None, None, payload, legacy, stripped)
 
 
 @dataclass(slots=True)
@@ -166,6 +242,8 @@ async def dispatch_via_registry(
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
     raw_data: str,
+    payload: dict[str, object] | None = None,
+    legacy: bool = False,
 ) -> None:
     query = getattr(update, "callback_query", None)
     user = getattr(update, "effective_user", None)
@@ -175,7 +253,7 @@ async def dispatch_via_registry(
 
     entry = REGISTRY.get(action)
     if entry is None:
-        await _log_unmatched(raw_data, update)
+        await _log_unmatched(raw_data, update, legacy=legacy)
         return
 
     if not should_process(user_id, raw_data):
@@ -202,11 +280,12 @@ async def dispatch_via_registry(
             "user_id": user_id,
             "chat_id": chat_id,
             "data": raw_data,
+            "legacy": legacy,
         },
     )
 
     try:
-        await handler(update, ctx, payload=None)
+        await handler(update, ctx, payload=payload)
     except Exception:
         try:
             ui_callback_total.labels(action=action, result="error", **_BOT_LABELS).inc()
@@ -226,20 +305,24 @@ async def dispatch_via_registry(
     increment_ui_callback_counter("callback", "ok")
 
 
-async def _log_unmatched(data: str, update: Update) -> None:
+async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> None:
     user = getattr(update, "effective_user", None)
     chat = getattr(update, "effective_chat", None)
     user_id = getattr(user, "id", None)
     chat_id = getattr(chat, "id", None)
 
     log.info(
-        "ui.callback.unmatched data=%r user_id=%s chat_id=%s",
+        "ui.callback.unmatched data=%r user_id=%s chat_id=%s legacy=%s",
         data,
         user_id,
         chat_id,
+        legacy,
     )
     try:
-        metrics_inc("ui_callback_unmatched_total", tags={"source": "telegram"})
+        metrics_inc(
+            "ui_callback_unmatched_total",
+            tags={"source": "telegram", "legacy": "true" if legacy else "false"},
+        )
     except Exception:  # pragma: no cover - metrics guard
         log.debug("ui.callback.unmatched.metric_failed", exc_info=True)
     increment_ui_callback_counter("callback", "unmatched")
@@ -266,19 +349,43 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.debug("ui.callback.ack.metric_failed", exc_info=True)
 
     raw_data = getattr(query, "data", "")
-    data = (raw_data or "").strip()
-    if not data:
+    normalized = normalize_callback_data(raw_data)
+    if not normalized.raw:
         return
 
-    if data.startswith("btn:"):
-        action = data.split(":", 1)[1].strip()
-        if not action:
-            await _log_unmatched(data, update)
-            return
-        await dispatch_via_registry(action, update, ctx, raw_data=data)
+    payload = dict(normalized.payload)
+    if normalized.action and normalized.normalized:
+        if normalized.legacy:
+            user = getattr(update, "effective_user", None)
+            chat = getattr(update, "effective_chat", None)
+            user_id = getattr(user, "id", None)
+            chat_id = getattr(chat, "id", None)
+            log.info(
+                "ui.callback.legacy_forwarded",
+                extra={
+                    "target": normalized.action,
+                    "raw": normalized.raw,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                },
+            )
+            try:
+                ui_callback_legacy_forwarded_total.labels(
+                    target=normalized.action, **_BOT_LABELS
+                ).inc()
+            except Exception:  # pragma: no cover - metrics guard
+                log.debug("ui.callback.legacy.metric_failed", exc_info=True)
+        await dispatch_via_registry(
+            normalized.action,
+            update,
+            ctx,
+            raw_data=normalized.dedupe_key,
+            payload=payload or None,
+            legacy=normalized.legacy,
+        )
         return
 
-    await _log_unmatched(data, update)
+    await _log_unmatched(normalized.raw, update, legacy=normalized.legacy)
 
 
 async def handle_unmatched_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

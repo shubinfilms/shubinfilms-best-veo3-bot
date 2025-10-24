@@ -126,7 +126,36 @@ ui_callback_dedup_total = Counter(
 ui_callback_unmatched_total = Counter(
     "ui_callback_unmatched_total",
     "Callback queries that did not match any UI handler grouped by source.",
-    labelnames=("source", "env", "service"),
+    labelnames=("source", "legacy", "env", "service"),
+    registry=REGISTRY,
+)
+
+ui_callback_legacy_forwarded_total = Counter(
+    "ui_callback_legacy_forwarded_total",
+    "Legacy callback payloads forwarded to registered actions.",
+    labelnames=("target", "env", "service"),
+    registry=REGISTRY,
+)
+
+profile_open_total = Counter(
+    "profile_open_total",
+    "Profile open attempts grouped by force refresh, reuse decision and result.",
+    labelnames=("force_refresh", "reused", "source", "result", "env", "service"),
+    registry=REGISTRY,
+)
+
+profile_render_ms = Histogram(
+    "profile_render_ms",
+    "Latency of rendering the profile screen in milliseconds.",
+    labelnames=("force_refresh", "source", "env", "service"),
+    registry=REGISTRY,
+    buckets=(25, 50, 100, 150, 200, 300, 400, 600, 1000, 1500),
+)
+
+ui_wait_clear_all_total = Counter(
+    "ui_wait_clear_all_total",
+    "Forced wait/input state clears grouped by reason.",
+    labelnames=("reason", "env", "service"),
     registry=REGISTRY,
 )
 

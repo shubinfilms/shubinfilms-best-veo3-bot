@@ -6,9 +6,11 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Tuple, Literal
+import inspect
 
 import time
 
+from metrics import inc as metrics_inc
 from settings import REDIS_PREFIX
 
 from utils.telegram_utils import should_capture_to_prompt
@@ -339,4 +341,72 @@ class InputRegistry:
 
 
 input_state = InputRegistry()
+
+
+async def force_clear_user_state(user_id: int, *, reason: str = "profile_open") -> None:
+    """Forcefully drop wait/input locks and related user state."""
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return
+
+    _logger.info("WAIT_CLEAR_ALL user_id=%s reason=%s", uid, reason)
+    try:
+        metrics_inc("ui_wait_clear_all_total", tags={"reason": str(reason)})
+    except Exception:  # pragma: no cover - metrics are best effort
+        _logger.debug("wait_clear_all.metric_failed", exc_info=True)
+
+    for handler, label in (
+        (lambda: clear_wait_state(uid, reason=reason), "wait_state"),
+        (lambda: input_state.clear(uid, reason=reason), "input_registry"),
+    ):
+        try:
+            handler()
+        except Exception:
+            _logger.debug(
+                "wait_clear_all.failed", extra={"user_id": uid, "stage": label}, exc_info=True
+            )
+
+    try:
+        from redis_utils import clear_mode_state as _clear_mode_state, release_user_lock as _release_user_lock
+    except Exception:  # pragma: no cover - optional dependencies
+        _clear_mode_state = None
+        _release_user_lock = None
+
+    lock_keys = ("video_menu", "reply-nav", "dialog", "kb", "mode_reset")
+    if _release_user_lock is not None:
+        for key in lock_keys:
+            try:
+                _release_user_lock(uid, key)
+            except Exception:
+                _logger.debug(
+                    "wait_clear_all.release_failed",
+                    extra={"user_id": uid, "lock": key},
+                    exc_info=True,
+                )
+
+    if _clear_mode_state is not None:
+        try:
+            result = _clear_mode_state(uid)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            _logger.debug(
+                "wait_clear_all.mode_reset_failed", extra={"user_id": uid}, exc_info=True
+            )
+
+    try:
+        from helpers import debounce as _debounce
+    except Exception:  # pragma: no cover - optional helper
+        _debounce = None
+
+    if _debounce is not None:
+        try:
+            _debounce.reset(uid)
+        except Exception:
+            _logger.debug(
+                "wait_clear_all.debounce_failed", extra={"user_id": uid}, exc_info=True
+            )
+
 
