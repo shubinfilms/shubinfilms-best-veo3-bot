@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import os
 import time
 import uuid
@@ -8,7 +9,9 @@ from dataclasses import dataclass
 from typing import Mapping, Optional
 
 from metrics import (
+    callback_ack_latency_ms,
     inc as metrics_inc,
+    router_callback_legacy_total,
     ui_ack_latency_ms,
     ui_callback_ack_latency_ms,
     ui_callback_ack_total,
@@ -29,15 +32,40 @@ from .types import ButtonContext, ButtonId, ButtonSpec
 from .registry import REGISTRY
 from telegram_utils import safe_answer
 
+import settings as app_settings
+
 log = logging.getLogger(__name__)
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
+
+
+def _legacy_bridge_enabled() -> bool:
+    try:
+        return bool(getattr(app_settings, "ROUTER_LEGACY_BRIDGE"))
+    except Exception:  # pragma: no cover - defensive
+        return True
+
+
+def _attach_payload(update: Update, payload: Mapping[str, object]) -> None:
+    if not payload:
+        return
+    try:
+        setattr(update, "_ui_router_payload", payload)
+    except Exception:  # pragma: no cover - best effort
+        pass
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        try:
+            setattr(query, "_ui_router_payload", payload)
+        except Exception:  # pragma: no cover - best effort
+            pass
 
 
 @dataclass(slots=True)
 class NormalizedCallback:
     raw: str
     normalized: str | None
+    namespace: str | None
     action: str | None
     payload: dict[str, object]
     legacy: bool
@@ -45,12 +73,16 @@ class NormalizedCallback:
 
 
 _LEGACY_PROFILE_ALIASES: dict[str, tuple[str, str]] = {
-    "profile": ("profile", "button"),
-    "profile.open": ("profile", "button"),
-    "open:profile": ("profile", "menu"),
-    "quick:profile": ("profile", "quick"),
-    "stars:profile": ("profile", "button"),
+    "profile": ("open", "button"),
+    "profile.open": ("open", "button"),
+    "open:profile": ("open", "menu"),
+    "quick:profile": ("open", "quick"),
+    "stars:profile": ("open", "button"),
+    "profile:invite": ("invite", "button"),
+    "profile:promo": ("promo", "button"),
 }
+
+_STARS_BUY_PATTERN = re.compile(r"^stars:buy:(\d+)$", re.IGNORECASE)
 
 
 def _parse_params(parts: list[str]) -> dict[str, str]:
@@ -70,9 +102,28 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
     stripped = (data or "").strip()
     payload: dict[str, object] = {}
     if not stripped:
-        return NormalizedCallback(stripped, None, None, payload, False, stripped)
+        return NormalizedCallback(stripped, None, None, None, payload, False, stripped)
 
     lowered = stripped.lower()
+
+    stars_match = _STARS_BUY_PATTERN.match(stripped)
+    if stars_match:
+        try:
+            amount = int(stars_match.group(1))
+        except (TypeError, ValueError):
+            amount = None
+        if amount is not None:
+            payload = {"amount": amount, "legacy": True}
+            return NormalizedCallback(
+                raw=stripped,
+                normalized="stars:buy",
+                namespace="payments",
+                action="stars_buy",
+                payload=payload,
+                legacy=True,
+                dedupe_key=f"stars:buy:{amount}",
+            )
+
     if stripped.startswith("btn:"):
         base, *extra = stripped.split("|")
         params = _parse_params(extra)
@@ -82,31 +133,42 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
         for key, value in params.items():
             payload.setdefault(key, value)
         action = base.split(":", 1)[1].strip() if ":" in base else None
+        namespace: str | None = None
+        dedupe_key = base
+        if action == "profile":
+            view_raw = payload.pop("view", None)
+            view = str(view_raw or "").strip().lower()
+            if view and view != "open":
+                namespace = "profile"
+                action = view
+                dedupe_key = f"{base}|view={view}"
         return NormalizedCallback(
             raw=stripped,
             normalized=base,
+            namespace=namespace,
             action=action,
             payload=payload,
             legacy=False,
-            dedupe_key=base,
+            dedupe_key=dedupe_key,
         )
 
     legacy_payload = _LEGACY_PROFILE_ALIASES.get(lowered)
     if legacy_payload:
         action, source = legacy_payload
         payload = {"source": source, "legacy": True}
-        normalized = f"btn:{action}"
+        normalized = "btn:profile"
         return NormalizedCallback(
             raw=stripped,
             normalized=normalized,
+            namespace="profile",
             action=action,
             payload=payload,
             legacy=True,
-            dedupe_key=normalized,
+            dedupe_key=f"legacy:profile:{action}",
         )
 
     legacy = ":" in stripped and not stripped.startswith("btn:")
-    return NormalizedCallback(stripped, None, None, payload, legacy, stripped)
+    return NormalizedCallback(stripped, None, None, None, payload, legacy, stripped)
 
 
 @dataclass(slots=True)
@@ -305,6 +367,94 @@ async def dispatch_via_registry(
     increment_ui_callback_counter("callback", "ok")
 
 
+async def _dispatch_namespace_callback(
+    normalized: NormalizedCallback,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    namespace = normalized.namespace
+    action = normalized.action
+    if not namespace or not action:
+        return
+
+    if normalized.legacy and not _legacy_bridge_enabled():
+        await _log_unmatched(normalized.raw, update, legacy=True)
+        return
+
+    query = getattr(update, "callback_query", None)
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+
+    if not should_process(user_id, normalized.dedupe_key):
+        action_label = f"{namespace}:{action}"
+        try:
+            ui_callback_dedup_total.labels(action=action_label, **_BOT_LABELS).inc()
+        except Exception:  # pragma: no cover - metrics guard
+            log.debug("ui.callback.dedup.metric_failed", exc_info=True)
+        increment_ui_callback_counter("dedup", "coalesced")
+        return
+
+    payload = dict(normalized.payload)
+    if payload:
+        _attach_payload(update, payload)
+
+    if normalized.legacy:
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+        log.info(
+            "ui.callback.legacy_forwarded",
+            extra={
+                "target": normalized.action,
+                "raw": normalized.raw,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "namespace": namespace,
+            },
+        )
+        try:
+            ui_callback_legacy_forwarded_total.labels(target=normalized.action, **_BOT_LABELS).inc()
+        except Exception:  # pragma: no cover - metrics guard
+            log.debug("ui.callback.legacy.metric_failed", exc_info=True)
+        try:
+            router_callback_legacy_total.labels(
+                namespace=namespace,
+                action=action,
+                **_BOT_LABELS,
+            ).inc()
+        except Exception:  # pragma: no cover - metrics guard
+            log.debug("router.callback.legacy.metric_failed", exc_info=True)
+
+    try:
+        from hub_router import _dispatch_route as hub_dispatch  # type: ignore
+    except Exception:
+        log.exception(
+            "ui.callback.legacy_dispatch_import_failed",
+            extra={"namespace": namespace, "action": action},
+        )
+        await _log_unmatched(normalized.raw, update, legacy=normalized.legacy)
+        return
+
+    try:
+        handled = await hub_dispatch(
+            namespace,
+            action,
+            update=update,
+            ctx=ctx,
+            source="legacy" if normalized.legacy else "ui-router",
+            query=query,
+        )
+    except Exception:
+        increment_ui_callback_counter("callback", "error")
+        log.exception(
+            "ui.callback.namespace_failed",
+            extra={"namespace": namespace, "action": action, "legacy": normalized.legacy},
+        )
+        raise
+
+    if not handled:
+        await _log_unmatched(normalized.raw, update, legacy=normalized.legacy)
+
+
 async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> None:
     user = getattr(update, "effective_user", None)
     chat = getattr(update, "effective_chat", None)
@@ -337,6 +487,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     started = time.perf_counter()
+    try:
+        setattr(update, "_ui_callback_started_at", started)
+        setattr(query, "_ui_callback_started_at", started)
+    except Exception:  # pragma: no cover - best effort
+        pass
     ack_result = await safe_answer(query, cache_time=0)
     latency_ms = max((time.perf_counter() - started) * 1000.0, 0.0)
 
@@ -345,6 +500,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ui_callback_ack_total.labels(result=label_result, **_BOT_LABELS).inc()
         ui_callback_ack_latency_ms.labels(**_BOT_LABELS).observe(latency_ms)
         ui_ack_latency_ms.labels(source="telegram", **_BOT_LABELS).observe(latency_ms)
+        callback_ack_latency_ms.labels(source="telegram", **_BOT_LABELS).observe(latency_ms)
     except Exception:  # pragma: no cover - metrics guard
         log.debug("ui.callback.ack.metric_failed", exc_info=True)
 
@@ -354,27 +510,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     payload = dict(normalized.payload)
+    payload.setdefault("callback_started_at", started)
+    normalized.payload = payload
+
+    if normalized.namespace and normalized.action:
+        await _dispatch_namespace_callback(normalized, update, ctx)
+        return
+
     if normalized.action and normalized.normalized:
-        if normalized.legacy:
-            user = getattr(update, "effective_user", None)
-            chat = getattr(update, "effective_chat", None)
-            user_id = getattr(user, "id", None)
-            chat_id = getattr(chat, "id", None)
-            log.info(
-                "ui.callback.legacy_forwarded",
-                extra={
-                    "target": normalized.action,
-                    "raw": normalized.raw,
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                },
-            )
-            try:
-                ui_callback_legacy_forwarded_total.labels(
-                    target=normalized.action, **_BOT_LABELS
-                ).inc()
-            except Exception:  # pragma: no cover - metrics guard
-                log.debug("ui.callback.legacy.metric_failed", exc_info=True)
         await dispatch_via_registry(
             normalized.action,
             update,

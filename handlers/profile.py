@@ -10,7 +10,7 @@ from collections.abc import MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from html import escape
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -31,7 +31,7 @@ from utils.input_state import (
     input_state,
     set_wait_state,
 )
-from metrics import profile_open_total, profile_render_ms
+from metrics import profile_first_paint_ms, profile_open_total, profile_render_ms
 import settings as app_settings
 log = logging.getLogger(__name__)
 
@@ -62,6 +62,159 @@ _HISTORY_TYPE_LABELS = {
     "debit": "Списание",
     "refund": "Возврат",
 }
+
+
+def _resolve_callback_started_at(
+    update: Update,
+    payload: Mapping[str, object] | None = None,
+) -> Optional[float]:
+    candidates: list[Any] = []
+    if isinstance(payload, Mapping):
+        candidates.append(payload.get("callback_started_at"))
+    attr_payload = getattr(update, "_ui_router_payload", None)
+    if isinstance(attr_payload, Mapping):
+        candidates.append(attr_payload.get("callback_started_at"))
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        candidates.append(getattr(query, "_ui_callback_started_at", None))
+        q_payload = getattr(query, "_ui_router_payload", None)
+        if isinstance(q_payload, Mapping):
+            candidates.append(q_payload.get("callback_started_at"))
+    candidates.append(getattr(update, "_ui_callback_started_at", None))
+
+    for value in candidates:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _normalize_source_label(value: Any) -> str:
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+    else:
+        candidate = str(value).strip().lower() if value else ""
+    if candidate in {"button", "quick", "menu"}:
+        return candidate
+    return "unknown"
+
+
+def _extract_source_label(payload: Mapping[str, object] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return "unknown"
+    source_value = payload.get("source")
+    return _normalize_source_label(source_value)
+
+
+def _extract_force_refresh(payload: Mapping[str, object] | None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    value = payload.get("force_refresh")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+@dataclass(slots=True)
+class _FirstPaintTracker:
+    started_at: Optional[float]
+    force_refresh: bool
+    source: str
+
+    def observe(self) -> None:
+        if self.started_at is None:
+            return
+        latency_ms = max((time.perf_counter() - float(self.started_at)) * 1000.0, 0.0)
+        try:
+            profile_first_paint_ms.labels(
+                force_refresh="true" if self.force_refresh else "false",
+                source=_normalize_source_label(self.source),
+            ).observe(latency_ms)
+        except Exception:
+            log.debug("profile.metrics.first_paint_failed", exc_info=True)
+
+
+@dataclass(slots=True)
+class RootPayloadPreparation:
+    payload: dict[str, Any]
+    referral_task: asyncio.Task[Optional[str]] | None = None
+
+    async def finalize(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        message: Message | SimpleNamespace,
+    ) -> None:
+        if self.referral_task is None:
+            return
+        try:
+            referral_url = await self.referral_task
+        except asyncio.CancelledError:  # pragma: no cover - propagation
+            raise
+        except Exception:
+            log.debug("profile.referral.async_failed", exc_info=True)
+            return
+
+        if not referral_url:
+            return
+
+        msg_id = getattr(message, "message_id", None)
+        if not isinstance(msg_id, int):
+            return
+
+        chat = update.effective_chat
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            effective = update.effective_message
+            if effective is not None:
+                chat_id = getattr(getattr(effective, "chat", None), "id", None)
+            if chat_id is None and effective is not None:
+                chat_id = getattr(effective, "chat_id", None)
+        if chat_id is None:
+            return
+
+        try:
+            from bot import balance_menu_kb
+        except Exception:
+            log.debug("profile.referral.keyboard_failed", exc_info=True)
+            return
+
+        markup = balance_menu_kb(referral_url=referral_url)
+        try:
+            await ctx.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=markup,
+            )
+        except BadRequest:
+            log.debug(
+                "profile.referral.update_failed",
+                extra={"chat_id": chat_id, "message_id": msg_id},
+                exc_info=True,
+            )
+            return
+
+        self.payload["referral_url"] = referral_url
+
+        chat_state = _chat_data(ctx)
+        if isinstance(chat_state, MutableMapping):
+            state_payload = chat_state.get("profile_render_state")
+            if isinstance(state_payload, MutableMapping):
+                state_payload["referral_url"] = referral_url
+            else:
+                chat_state["profile_render_state"] = {
+                    "snapshot_target": self.payload.get("snapshot_target"),
+                    "chat_id": self.payload.get("chat_id"),
+                    "referral_url": referral_url,
+                }
 
 
 def _profile_log_context(update: Update, chat_id: Optional[int], message_id: Optional[int]) -> dict[str, Any]:
@@ -188,7 +341,7 @@ def _render_history_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
     else:
         body_lines = ("История операций пока пуста",)
 
-    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")]]
     card = build_card(
         "🧾 История операций",
         "Последние операции",
@@ -209,14 +362,19 @@ def _render_invite_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
     if link_text:
         body_lines: Sequence[str] = ("Ваша ссылка:", link_text)
         rows = [
-            [InlineKeyboardButton("Скопировать ссылку", callback_data="profile:invite_copy")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")],
+            [
+                InlineKeyboardButton(
+                    "Скопировать ссылку",
+                    callback_data="btn:profile|view=invite_copy",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")],
         ]
     else:
         body_lines = (
             "Ссылка станет доступна позже — мы работаем над запуском",
         )
-        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")]]
     card = build_card(
         "👥 Пригласить друга",
         "Поделитесь ссылкой и получите бонус после первой оплаты друга.",
@@ -227,7 +385,7 @@ def _render_invite_view(payload: dict) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def _render_promo_view() -> tuple[str, InlineKeyboardMarkup]:
-    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")]]
     body = (
         "Отправьте промокод в чат одним сообщением.",
         "Мы автоматически проверим и начислим бонусы.",
@@ -237,7 +395,7 @@ def _render_promo_view() -> tuple[str, InlineKeyboardMarkup]:
 
 
 def _render_unknown_view(view: str) -> tuple[str, InlineKeyboardMarkup]:
-    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+    rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")]]
     body = ("Этот раздел пока недоступен. Попробуйте позже.",)
     card = build_card(
         "ℹ️ Профиль",
@@ -484,6 +642,14 @@ async def handle_profile_view(
     else:
         normalized = raw_view
 
+    router_payload_obj = getattr(update, "_ui_router_payload", None)
+    payload_mapping = router_payload_obj if isinstance(router_payload_obj, Mapping) else None
+    tracker = _FirstPaintTracker(
+        started_at=_resolve_callback_started_at(update, payload_mapping),
+        force_refresh=_extract_force_refresh(payload_mapping),
+        source=_extract_source_label(payload_mapping),
+    )
+
     source_suffix = f"_{subaction}" if subaction else ""
     source = f"profile_{normalized}{source_suffix}"
     chat_data, flag, previous_nav = _set_nav_event(ctx, source=source)
@@ -497,8 +663,10 @@ async def handle_profile_view(
             clear_promo_wait(ctx)
 
         data: dict[str, Any]
+        root_payload: RootPayloadPreparation | None = None
         if normalized == "root":
-            data = await _prepare_root_payload(update, ctx)
+            root_payload = await _prepare_root_payload(update, ctx)
+            data = dict(root_payload.payload)
         elif normalized == "topup":
             message_obj = getattr(update, "effective_message", None)
             if query is not None and getattr(query, "message", None) is not None:
@@ -567,6 +735,8 @@ async def handle_profile_view(
         if result is None:
             return None
 
+        tracker.observe()
+
         if query is not None:
             with suppress(BadRequest):
                 if answer_text is None:
@@ -578,8 +748,9 @@ async def handle_profile_view(
         if isinstance(chat_state, MutableMapping):
             chat_state["profile_last_view"] = normalized
 
-        if normalized == "root":
-            _store_root_context(ctx, data, result, update)
+        if normalized == "root" and root_payload is not None:
+            await root_payload.finalize(update, ctx, result)
+            _store_root_context(ctx, root_payload.payload, result, update)
         elif normalized == "promo":
             user_id = _resolve_profile_user_id(update, ctx)
             chat = update.effective_chat
@@ -618,17 +789,32 @@ async def on_profile_cbq(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     query = update.callback_query
     data = getattr(query, "data", "") if query else ""
-    if not isinstance(data, str) or not data.startswith("profile:"):
+    if not isinstance(data, str):
         return
 
-    _, _, raw_view = data.partition(":")
-    await handle_profile_view(update, ctx, raw_view or "root")
+    raw_view: str | None = None
+    if data.startswith("btn:profile"):
+        _, _, tail = data.partition("|")
+        if tail:
+            for chunk in tail.split("|"):
+                key, _, value = chunk.partition("=")
+                if key == "view":
+                    raw_view = value or None
+                    break
+        if raw_view is None:
+            raw_view = "root"
+    elif data.startswith("profile:"):
+        _, _, raw_view = data.partition(":")
+    else:
+        return
+
+    await handle_profile_view(update, ctx, (raw_view or "root"))
 
 
 async def _prepare_root_payload(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
-) -> dict[str, Any]:
+) -> RootPayloadPreparation:
     chat = update.effective_chat
     message = update.effective_message
     chat_id = getattr(chat, "id", None)
@@ -641,19 +827,6 @@ async def _prepare_root_payload(
     from bot import get_user_id
 
     resolved_user = user_id or get_user_id(ctx) or chat_id
-
-    referral_url: Optional[str] = None
-    if resolved_user is not None:
-        from bot import _build_referral_link
-
-        try:
-            referral_url = await _build_referral_link(int(resolved_user), ctx)
-        except Exception as exc:
-            log.warning(
-                "profile.view.referral_failed",
-                extra={"user": resolved_user, "error": str(exc)},
-            )
-            referral_url = None
 
     if resolved_user is not None:
         snapshot_target: Optional[int] = int(resolved_user)
@@ -668,12 +841,56 @@ async def _prepare_root_payload(
 
         snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
 
-    return {
+    chat_state = _chat_data(ctx)
+    state_payload: dict[str, Any]
+    if isinstance(chat_state, MutableMapping):
+        raw_state = chat_state.get("profile_render_state")
+        state_payload = dict(raw_state) if isinstance(raw_state, MutableMapping) else {}
+    else:
+        state_payload = {}
+
+    referral_cached = state_payload.get("referral_url")
+    referral_url: Optional[str] = referral_cached if isinstance(referral_cached, str) else None
+
+    referral_task: asyncio.Task[Optional[str]] | None = None
+    if resolved_user is not None:
+        from bot import _build_referral_link
+
+        lazy_invite = bool(getattr(app_settings, "PROFILE_LAZY_INVITE", True))
+        if lazy_invite:
+            async def _fetch_referral() -> Optional[str]:
+                try:
+                    return await _build_referral_link(int(resolved_user), ctx)
+                except Exception as exc:  # pragma: no cover - network errors
+                    log.warning(
+                        "profile.view.referral_failed",
+                        extra={"user": resolved_user, "error": str(exc)},
+                    )
+                    return None
+
+            referral_task = asyncio.create_task(
+                _fetch_referral(),
+                name=f"profile.referral:{resolved_user}",
+            )
+        else:
+            try:
+                referral_url = await _build_referral_link(int(resolved_user), ctx)
+            except Exception as exc:
+                log.warning(
+                    "profile.view.referral_failed",
+                    extra={"user": resolved_user, "error": str(exc)},
+                )
+                referral_url = None
+
+    payload = {
         "snapshot": snapshot,
         "snapshot_target": snapshot_target,
         "referral_url": referral_url,
+        "referral_url_cached": referral_cached if isinstance(referral_cached, str) else None,
         "chat_id": chat_id,
     }
+
+    return RootPayloadPreparation(payload=payload, referral_task=referral_task)
 
 
 def _store_root_context(
@@ -845,15 +1062,14 @@ async def open_profile(
             try:
                 profile_render_ms.labels(
                     force_refresh="true" if force_refresh else "false",
-                    source=(source or "unknown").strip() or "unknown",
+                    source=_normalize_source_label(source),
                 ).observe(elapsed_ms)
             except Exception:
                 log.debug("profile.metrics.render_failed", exc_info=True)
             try:
                 profile_open_total.labels(
                     force_refresh="true" if force_refresh else "false",
-                    reused="true" if reused else "false",
-                    source=(source or "unknown").strip() or "unknown",
+                    source=_normalize_source_label(source),
                     result=metrics_result,
                 ).inc()
             except Exception:

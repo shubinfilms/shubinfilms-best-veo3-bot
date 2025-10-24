@@ -120,6 +120,9 @@ def _populate_from_settings() -> None:
     g["BOT_SINGLETON_DISABLED"] = bool(settings.BOT_SINGLETON_DISABLED)
     g["ENABLE_VERTICAL_NORMALIZE"] = bool(settings.ENABLE_VERTICAL_NORMALIZE)
     g["FEATURE_PROFILE_SIMPLE"] = bool(settings.FEATURE_PROFILE_SIMPLE)
+    g["PROFILE_LAZY_INVITE"] = bool(settings.PROFILE_LAZY_INVITE)
+    g["ROUTER_LEGACY_BRIDGE"] = bool(settings.ROUTER_LEGACY_BRIDGE)
+    g["PAYMENTS_STARS_ENABLED"] = bool(settings.PAYMENTS_STARS_ENABLED)
 
     g["PUBLIC_BASE_URL"] = settings.PUBLIC_BASE_URL
 

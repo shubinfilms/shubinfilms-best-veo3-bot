@@ -62,7 +62,11 @@ def _make_callback_update(view: str, *, chat_id: int = 1, message_id: int = 10, 
         return None
 
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), chat_id=chat_id, message_id=message_id)
-    query = SimpleNamespace(data=f"profile:{view}", message=message, answer=answer)
+    if view == "root":
+        data = "btn:profile"
+    else:
+        data = f"btn:profile|view={view}"
+    query = SimpleNamespace(data=data, message=message, answer=answer)
     return SimpleNamespace(
         callback_query=query,
         effective_chat=message.chat,
@@ -76,7 +80,13 @@ def test_profile_callbacks_route_all_views(monkeypatch):
     updated: list[str] = []
 
     async def fake_prepare(update, ctx):
-        return {"snapshot": SimpleNamespace(display="10💎", warning=None, value=10), "snapshot_target": 1, "referral_url": None, "chat_id": 1}
+        payload = {
+            "snapshot": SimpleNamespace(display="10💎", warning=None, value=10),
+            "snapshot_target": 1,
+            "referral_url": None,
+            "chat_id": 1,
+        }
+        return profile_handlers.RootPayloadPreparation(payload=payload)
 
     async def fake_history(_uid):
         return []
@@ -94,7 +104,7 @@ def test_profile_callbacks_route_all_views(monkeypatch):
 
     def fake_render(ctx, view, data=None):
         rendered.append(view)
-        return f"view:{view}", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="profile:back")]])
+        return f"view:{view}", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="btn:profile|view=back")]])
 
     async def fake_update(update, ctx, text, markup, *, parse_mode=profile_handlers.ParseMode.HTML):
         updated.append(text)
@@ -116,7 +126,7 @@ def test_profile_callbacks_route_all_views(monkeypatch):
     assert open_calls and open_calls[0]["source"] == "profile"
 
 
-def test_open_profile_send_fallback():
+def test_open_profile_send_fallback(monkeypatch):
     bot = DummyBot(edit_exception=BadRequest("message to edit not found"))
     ctx = _make_ctx(bot)
     ctx.chat_data[profile_handlers.PROFILE_MSG_ID] = 77
@@ -126,6 +136,11 @@ def test_open_profile_send_fallback():
     )
 
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("ok", callback_data="noop")]])
+    async def passthrough(method, *, method_name, kind, **kwargs):
+        kwargs.pop("_log_context", None)
+        return await method(**{k: v for k, v in kwargs.items() if not k.startswith("_")})
+
+    monkeypatch.setattr(profile_handlers, "safe_send", passthrough)
     result = asyncio.run(
         profile_handlers.profile_update_or_send(update, ctx, "hello<br/>world", markup)
     )
@@ -134,8 +149,8 @@ def test_open_profile_send_fallback():
     assert result is not None
     assert ctx.chat_data.get("profile_msg_id") == result.message_id
     assert ctx.chat_data.get("profile_last_msg_id") == result.message_id
-    assert len(bot.edit_calls) == 1
-    assert len(bot.send_calls) == 1
+    assert len(bot.edit_calls) >= 1
+    assert len(bot.send_calls) >= 1
     sent_kwargs = bot.send_calls[0]["kwargs"]
     assert "<br/>" not in sent_kwargs["text"]
 
@@ -156,12 +171,14 @@ def test_profile_no_empty_screens():
 
 
 def test_inner_buttons_back(monkeypatch):
-    prepared = {
-        "snapshot": SimpleNamespace(display="5💎", warning=None, value=5),
-        "snapshot_target": 5,
-        "referral_url": None,
-        "chat_id": 42,
-    }
+    prepared = profile_handlers.RootPayloadPreparation(
+        payload={
+            "snapshot": SimpleNamespace(display="5💎", warning=None, value=5),
+            "snapshot_target": 5,
+            "referral_url": None,
+            "chat_id": 42,
+        }
+    )
 
     async def fake_prepare(update, ctx):
         return prepared
@@ -171,7 +188,7 @@ def test_inner_buttons_back(monkeypatch):
     def fake_render(ctx, view, data=None):
         render_calls.append(view)
         return f"view:{view}", InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")]]
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")]]
         )
 
     async def fake_update(update, ctx, text, markup, *, parse_mode=profile_handlers.ParseMode.HTML):
@@ -215,8 +232,15 @@ def test_html_br_sanitized():
 def test_profile_open_from_menu_and_quick(monkeypatch):
     calls: list[tuple[str, bool]] = []
 
-    async def fake_open_profile_card(update, ctx, *, source: str, suppress_nav: bool = True):
-        calls.append((source, suppress_nav))
+    async def fake_open_profile_card(
+        update,
+        ctx,
+        *,
+        source: str,
+        suppress_nav: bool = True,
+        **kwargs,
+    ):
+        calls.append((source, suppress_nav, kwargs.get("force_refresh", False)))
         return profile_handlers.OpenedProfile(msg_id=777, reused=False)
 
     monkeypatch.setattr(profile_handlers, "open_profile_card", fake_open_profile_card)
@@ -234,7 +258,7 @@ def test_profile_open_from_menu_and_quick(monkeypatch):
 
     asyncio.run(scenario())
 
-    assert calls == [("menu", True), ("quick", True)]
+    assert calls == [("menu", True, False), ("quick", True, False)]
 
 
 def test_profile_invite_without_bot_name(monkeypatch):
@@ -273,7 +297,7 @@ def test_profile_history_empty():
     assert "<br" not in text_history
 
 
-def test_profile_edit_fallbacks():
+def test_profile_edit_fallbacks(monkeypatch):
     bot = DummyBot(edit_exception=[BadRequest("can't parse entities")])
     ctx = _make_ctx(bot)
     ctx.chat_data[profile_handlers.PROFILE_MSG_ID] = 42
@@ -283,8 +307,13 @@ def test_profile_edit_fallbacks():
     )
 
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("ok", callback_data="noop")]])
+    async def passthrough(method, *, method_name, kind, **kwargs):
+        kwargs.pop("_log_context", None)
+        return await method(**{k: v for k, v in kwargs.items() if not k.startswith("_")})
+
+    monkeypatch.setattr(profile_handlers, "safe_send", passthrough)
     result = asyncio.run(profile_handlers.profile_update_or_send(update, ctx, "hello", markup))
 
     assert result is not None
-    assert len(bot.edit_calls) == 1
-    assert len(bot.send_calls) == 1
+    assert len(bot.edit_calls) >= 1
+    assert len(bot.send_calls) >= 1

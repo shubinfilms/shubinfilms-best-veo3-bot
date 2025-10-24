@@ -30,11 +30,11 @@ def build_main_menu_card() -> dict:
 
 def build_profile_card(balance: str, warning: str | None = None) -> dict:
     rows = [
-        [InlineKeyboardButton("💎 Пополнить баланс", callback_data="profile:topup")],
-        [InlineKeyboardButton("🧾 История операций", callback_data="profile:history")],
-        [InlineKeyboardButton("👥 Пригласить друга", callback_data="profile:invite")],
-        [InlineKeyboardButton("🎁 Активировать промокод", callback_data="profile:promo")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="profile:back")],
+        [InlineKeyboardButton("💎 Пополнить баланс", callback_data="btn:profile|view=topup")],
+        [InlineKeyboardButton("🧾 История операций", callback_data="btn:profile|view=history")],
+        [InlineKeyboardButton("👥 Пригласить друга", callback_data="btn:profile|view=invite")],
+        [InlineKeyboardButton("🎁 Активировать промокод", callback_data="btn:profile|view=promo")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="btn:profile|view=back")],
     ]
     body: Sequence[str] | None = (warning,) if warning else None
     return build_card(TXT_KB_PROFILE, f"Ваш баланс: {balance} 💎", rows, body_lines=body)
