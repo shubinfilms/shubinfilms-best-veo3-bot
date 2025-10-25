@@ -1,6 +1,7 @@
 """Prometheus metrics helpers shared across bot and web services."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Iterable
@@ -10,6 +11,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, gene
 REGISTRY = CollectorRegistry()
 
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
+_log = logging.getLogger(__name__)
 
 
 def _labels(service: str) -> dict[str, str]:
@@ -154,25 +156,24 @@ router_callback_legacy_total = Counter(
 
 profile_open_total = Counter(
     "profile_open_total",
-    "Profile open attempts grouped by force refresh decision and result.",
-    labelnames=("force_refresh", "source", "result"),
+    "Profile open attempts grouped by source and result.",
+    labelnames=("source", "result"),
     registry=REGISTRY,
-)
-
-profile_render_ms = Histogram(
-    "profile_render_ms",
-    "Latency of rendering the profile screen in milliseconds.",
-    labelnames=("force_refresh", "source"),
-    registry=REGISTRY,
-    buckets=(25, 50, 100, 150, 200, 300, 400, 600, 1000, 1500),
 )
 
 profile_first_paint_ms = Histogram(
     "profile_first_paint_ms",
     "Latency between callback reception and first profile render in milliseconds.",
-    labelnames=("force_refresh", "source"),
+    labelnames=("source",),
     registry=REGISTRY,
     buckets=(25, 50, 100, 150, 200, 300, 400, 600, 1000, 1500),
+)
+
+router_callback_unmatched_total = Counter(
+    "router_callback_unmatched_total",
+    "Namespace router callbacks that were not matched to any handler.",
+    labelnames=("data",),
+    registry=REGISTRY,
 )
 
 ui_wait_clear_all_total = Counter(
@@ -378,9 +379,24 @@ def render_metrics() -> bytes:
     return generate_latest(REGISTRY)
 
 
+def lbl_safe(metric, /, **labels):
+    """Return a labelled child instance without propagating errors."""
+
+    try:
+        return metric.labels(**labels)
+    except Exception:  # pragma: no cover - defensive guard
+        _log.debug(
+            "metrics.lbl_safe.failed",
+            exc_info=True,
+            extra={"metric": getattr(metric, "_name", None), "labels": labels},
+        )
+        return None
+
+
 __all__: Iterable[str] = [
     "REGISTRY",
     "inc",
+    "lbl_safe",
     "suno_requests_total",
     "suno_callback_download_fail_total",
     "suno_task_store_total",
@@ -412,6 +428,9 @@ __all__: Iterable[str] = [
     "ui_callback_ack_latency_ms",
     "ui_callback_dedup_total",
     "ui_callback_unmatched_total",
+    "profile_open_total",
+    "profile_first_paint_ms",
+    "router_callback_unmatched_total",
     "process_uptime_seconds",
     "render_metrics",
 ]

@@ -122,6 +122,7 @@ def _populate_from_settings() -> None:
     g["FEATURE_PROFILE_SIMPLE"] = bool(settings.FEATURE_PROFILE_SIMPLE)
     g["PROFILE_LAZY_INVITE"] = bool(settings.PROFILE_LAZY_INVITE)
     g["ROUTER_LEGACY_BRIDGE"] = bool(settings.ROUTER_LEGACY_BRIDGE)
+    g["ROUTER_LEGACY_OFF"] = bool(settings.ROUTER_LEGACY_OFF)
     g["PAYMENTS_STARS_ENABLED"] = bool(settings.PAYMENTS_STARS_ENABLED)
 
     g["PUBLIC_BASE_URL"] = settings.PUBLIC_BASE_URL

@@ -588,40 +588,56 @@ async def kie_create_sora2_task(
 
     endpoint = _kie_create_endpoint()
     headers = _kie_headers(json_payload=True)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(endpoint, json=payload, headers=headers)
-    if response.status_code == 404:
-        logger.error(
-            "sora2.fail_404",
-            extra={"url": endpoint, "payload": _sanitize_payload_for_log(payload)},
+    async def _submit_once() -> tuple[Optional[str], bool]:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(endpoint, json=payload, headers=headers)
+        if response.status_code == 404:
+            logger.error(
+                "sora2.fail_404",
+                extra={"url": endpoint, "payload": _sanitize_payload_for_log(payload)},
+            )
+            return None, False
+        logger.info(
+            "kie.http.create",
+            extra={
+                "status": response.status_code,
+                "elapsed_ms": _elapsed_ms(response),
+            },
         )
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except Exception as exc:  # pragma: no cover - unexpected payload
+            raise RuntimeError("KIE: invalid JSON response") from exc
+        task_id: Optional[str] = None
+        if isinstance(data, Mapping):
+            data_block = data.get("data")
+            if isinstance(data_block, Mapping):
+                raw_task = data_block.get("taskId") or data_block.get("task_id")
+                if raw_task:
+                    task_id = str(raw_task)
+            if not task_id:
+                raw_task = data.get("taskId") or data.get("task_id")
+                if raw_task:
+                    task_id = str(raw_task)
+        return task_id, True
+
+    task_id, retryable = await _submit_once()
+    if task_id:
+        return task_id
+    if not retryable:
         return None
-    logger.info(
-        "kie.http.create",
-        extra={
-            "status": response.status_code,
-            "elapsed_ms": _elapsed_ms(response),
-        },
+
+    await asyncio.sleep(0.18)
+    task_id, _ = await _submit_once()
+    if task_id:
+        return task_id
+
+    logger.error(
+        "sora2.submit_failed",
+        extra={"url": endpoint, "payload": _sanitize_payload_for_log(payload)},
     )
-    response.raise_for_status()
-    try:
-        data = response.json()
-    except Exception as exc:  # pragma: no cover - unexpected payload
-        raise RuntimeError("KIE: invalid JSON response") from exc
-    task_id: Optional[str] = None
-    if isinstance(data, Mapping):
-        data_block = data.get("data")
-        if isinstance(data_block, Mapping):
-            raw_task = data_block.get("taskId") or data_block.get("task_id")
-            if raw_task:
-                task_id = str(raw_task)
-        if not task_id:
-            raw_task = data.get("taskId") or data.get("task_id")
-            if raw_task:
-                task_id = str(raw_task)
-    if not task_id:
-        raise RuntimeError("KIE: taskId is empty")
-    return task_id
+    return None
 
 
 async def kie_poll_sora2(

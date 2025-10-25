@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Tuple, Literal
+from typing import Any, Dict, Mapping, Optional, Tuple, Literal, Collection
 import inspect
 
 import time
@@ -212,6 +212,31 @@ def clear_wait_state(user_id: int, *, reason: str = "manual") -> None:
             _logger.exception("Failed to clear wait-state in redis", extra={"user_id": user_id})
     _memory_store.pop(int(user_id), None)
     _logger.info("WAIT_CLEAR user_id=%s reason=%s", user_id, reason)
+
+
+def clear_wait_states(
+    user_id: int,
+    *,
+    exclude: Collection[str] | None = None,
+    reason: str = "manual",
+) -> bool:
+    """Clear wait state for ``user_id`` unless ``kind`` is excluded."""
+
+    state = get_wait_state(user_id)
+    if not state:
+        return False
+
+    excluded: set[str]
+    if exclude:
+        excluded = {str(item).strip().lower() for item in exclude if str(item).strip()}
+    else:
+        excluded = set()
+
+    if state.kind.value.strip().lower() in excluded:
+        return False
+
+    clear_wait_state(user_id, reason=reason)
+    return True
 
 
 def refresh_card_pointer(user_id: int, new_message_id: int) -> None:

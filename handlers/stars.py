@@ -1,7 +1,15 @@
+import json
 import logging
+from contextlib import suppress
 from typing import List, Optional, Sequence
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, Update
+from telegram.error import BadRequest
+from telegram.ext import ContextTypes
+
+from telegram_utils import safe_answer
+
+import settings as app_settings
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +22,9 @@ STARS_TIERS: Sequence[tuple[int, int]] = (
     (500, 550),
 )
 
+_DEFAULT_DISPLAY_TIERS: Sequence[int] = (50, 100, 300)
+_STARS_PACK_MAP = {stars: gems for stars, gems in STARS_TIERS}
+
 
 def render_stars_text() -> str:
     """Render the Stars top-up description."""
@@ -24,9 +35,11 @@ def render_stars_text() -> str:
     )
 
 
-def build_stars_kb() -> InlineKeyboardMarkup:
+def build_stars_kb(*, tiers: Sequence[int] | None = None) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    for stars, gems in STARS_TIERS:
+    selected = list(tiers) if tiers is not None else [stars for stars, _ in STARS_TIERS]
+    for stars in selected:
+        gems = _STARS_PACK_MAP.get(stars, stars)
         rows.append(
             [
                 InlineKeyboardButton(
@@ -80,6 +93,7 @@ async def open_stars_menu(
     message_id: Optional[int] = None,
     edit_message: bool = True,
     source: Optional[str] = None,
+    tiers: Optional[Sequence[int]] = None,
 ) -> Optional[Message]:
     """Show the Stars purchase screen."""
 
@@ -94,7 +108,7 @@ async def open_stars_menu(
     log.info("stars.open", extra={"source": source or "unknown", "chat_id": target_chat_id})
 
     text = render_stars_text()
-    keyboard = build_stars_kb()
+    keyboard = build_stars_kb(tiers=tiers or _DEFAULT_DISPLAY_TIERS)
 
     if edit_message and target_chat_id is not None and target_message_id is not None:
         try:
@@ -126,4 +140,130 @@ async def open_stars_menu(
         reply_markup=keyboard,
         parse_mode="HTML",
         disable_web_page_preview=True,
+    )
+
+
+async def open(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    update: Optional[Update] = None,
+    chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    source: str = "profile",
+    tiers: Optional[Sequence[int]] = None,
+) -> Optional[Message]:
+    """Render the Stars menu with the configured tiers."""
+
+    resolved_chat_id = chat_id
+    resolved_message_id = message_id
+    if update is not None:
+        query = getattr(update, "callback_query", None)
+        message = getattr(query, "message", None)
+        if message is None:
+            message = getattr(update, "effective_message", None)
+        if resolved_chat_id is None:
+            chat_obj = getattr(update, "effective_chat", None)
+            resolved_chat_id = getattr(chat_obj, "id", None)
+            if resolved_chat_id is None and message is not None:
+                resolved_chat_id = getattr(message, "chat_id", None)
+        if resolved_message_id is None and message is not None:
+            resolved_message_id = getattr(message, "message_id", None)
+
+    return await open_stars_menu(
+        ctx,
+        chat_id=resolved_chat_id,
+        message_id=resolved_message_id,
+        edit_message=True,
+        source=source,
+        tiers=tiers,
+    )
+
+
+async def buy(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    amount: int,
+    update: Optional[Update] = None,
+    source: str = "stars",
+) -> None:
+    """Initiate a Telegram Stars invoice for the desired ``amount``."""
+
+    try:
+        normalized_amount = int(amount)
+    except (TypeError, ValueError):
+        normalized_amount = 0
+
+    if normalized_amount <= 0:
+        log.warning("stars.buy.invalid_amount", extra={"amount": amount})
+        return
+
+    if not getattr(app_settings, "PAYMENTS_STARS_ENABLED", True):
+        log.info("stars.buy.disabled", extra={"amount": amount})
+        return
+
+    query = getattr(update, "callback_query", None) if update is not None else None
+    message = getattr(query, "message", None)
+    if message is None and update is not None:
+        message = getattr(update, "effective_message", None)
+
+    chat_id = None
+    if message is not None:
+        chat_obj = getattr(message, "chat", None)
+        chat_id = getattr(chat_obj, "id", None)
+        if chat_id is None:
+            chat_id = getattr(message, "chat_id", None)
+    if chat_id is None and update is not None:
+        chat_obj = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat_obj, "id", None)
+
+    if normalized_amount not in _STARS_PACK_MAP:
+        if query is not None:
+            with suppress(BadRequest):
+                await safe_answer(query, text="Пакет недоступен", show_alert=True)
+        log.warning("stars.buy.invalid", extra={"amount": normalized_amount, "source": source})
+        return
+
+    target_chat_id = chat_id
+    if target_chat_id is None:
+        log.warning("stars.buy.missing_chat", extra={"amount": normalized_amount, "source": source})
+        return
+
+    diamonds = _STARS_PACK_MAP.get(normalized_amount, normalized_amount)
+    title = f"{normalized_amount}⭐ → {diamonds}💎"
+    invoice_payload = json.dumps(
+        {
+            "type": "stars_pack",
+            "stars": normalized_amount,
+            "diamonds": diamonds,
+            "bonus": max(diamonds - normalized_amount, 0),
+        }
+    )
+
+    try:
+        await ctx.bot.send_invoice(
+            chat_id=int(target_chat_id),
+            title=title,
+            description="Пакет пополнения токенов",
+            payload=invoice_payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=normalized_amount)],
+        )
+    except Exception as exc:  # pragma: no cover - network issues
+        log.exception(
+            "stars.buy.invoice_failed",
+            extra={"amount": normalized_amount, "chat_id": target_chat_id, "error": str(exc)},
+        )
+        if query is not None:
+            with suppress(BadRequest):
+                await safe_answer(query, text="Не удалось открыть счёт", show_alert=True)
+        return
+
+    if query is not None:
+        with suppress(BadRequest):
+            await safe_answer(query)
+
+    log.info(
+        "stars.buy.invoice_sent",
+        extra={"amount": normalized_amount, "diamonds": diamonds, "chat_id": target_chat_id, "source": source},
     )
