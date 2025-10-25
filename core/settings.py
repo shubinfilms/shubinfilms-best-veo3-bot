@@ -178,6 +178,7 @@ class Settings(BaseSettings):
 
     PROFILE_LAZY_INVITE: bool = Field(default=True)
     ROUTER_LEGACY_BRIDGE: bool = Field(default=True)
+    ROUTER_LEGACY_OFF: bool = Field(default=True)
     PAYMENTS_STARS_ENABLED: bool = Field(default=True)
 
     DIALOG_ENABLED: Optional[bool] = Field(default=None)

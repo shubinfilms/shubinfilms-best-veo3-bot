@@ -154,9 +154,12 @@ from hub_router import (
     route_text as hub_route_text,
     set_fallback as set_hub_fallback,
 )
-from handlers import payments as payments_handlers
 from handlers import profile as profile_handlers
-from handlers.stars import open_stars_menu
+from handlers.stars import buy as stars_buy_handler, open_stars_menu
+from mj_client import (
+    build_status_candidates as mj_status_candidates,
+    remember_status_path as remember_mj_status_path,
+)
 
 from state import state as redis_state
 from scripts.migrate_from_redis import cleanup_redis
@@ -1262,13 +1265,19 @@ else:
 
 _KIE_MJ_STATUS_DEFAULT = "/api/v1/mj/recordInfo"
 _KIE_MJ_STATUS_RAW = _env("KIE_MJ_STATUS", _KIE_MJ_STATUS_DEFAULT)
-KIE_MJ_STATUS_PATHS = _normalize_endpoint_values(
+KIE_MJ_STATUS_BASE_PATHS = _normalize_endpoint_values(
+    "/api/v1/mj/record-info",
     _KIE_MJ_STATUS_RAW,
     _KIE_MJ_STATUS_DEFAULT,
-    "/api/v1/mj/record-info",
+    "/api/v1/mj/recordInfo",
     "/api/v1/mj/status",
     "/api/v1/mj/recordinfo",
 )
+if KIE_MJ_STATUS_BASE_PATHS:
+    KIE_MJ_STATUS_PATHS = mj_status_candidates(KIE_MJ_STATUS_BASE_PATHS)
+else:
+    KIE_MJ_STATUS_BASE_PATHS = [_KIE_MJ_STATUS_DEFAULT]
+    KIE_MJ_STATUS_PATHS = list(KIE_MJ_STATUS_BASE_PATHS)
 if KIE_MJ_STATUS_PATHS:
     KIE_MJ_STATUS = KIE_MJ_STATUS_PATHS[0]
 else:
@@ -8545,9 +8554,30 @@ async def handle_profile_back(callback: HubCallbackContext) -> None:
     await profile_handlers.on_profile_back(callback.update, callback.application_context)
 
 
-@register_callback_action("payments", "stars_buy", module="payments")
-async def handle_payments_stars_buy(callback: HubCallbackContext) -> None:
-    await payments_handlers.stars_buy(callback.update, callback.application_context)
+@register_callback_action("stars", "buy", module="stars")
+async def handle_stars_buy(callback: HubCallbackContext) -> None:
+    payload = getattr(callback.update, "_ui_router_payload", {})
+    amount = None
+    if isinstance(payload, dict):
+        raw = payload.get("amount")
+        try:
+            amount = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            amount = None
+    if amount is None:
+        data = getattr(getattr(callback.update, "callback_query", None), "data", "")
+        match = re.search(r"stars:buy:(\d+)", data or "")
+        if match:
+            try:
+                amount = int(match.group(1))
+            except (TypeError, ValueError):
+                amount = None
+    await stars_buy_handler(
+        callback.application_context,
+        amount=amount or 0,
+        update=callback.update,
+        source="callback",
+    )
 
 
 async def _build_balance_menu_with_referral(
@@ -13491,22 +13521,31 @@ def _remember_endpoint(service: str, kind: str, path: str):
             KIE_MJ_GENERATE = path
         elif kind == "status":
             KIE_MJ_STATUS = path
+            remember_mj_status_path(path)
 
 
 def _endpoint_candidates(service: str, kind: str, base_paths: List[str]) -> List[str]:
     cached = app_cache.get(_endpoint_cache_key(service, kind))
+    if service == "mj" and kind == "status":
+        ordered = mj_status_candidates(base_paths)
+    else:
+        ordered = list(base_paths)
     if cached:
-        return _normalize_endpoint_values(cached, base_paths)
-    return list(base_paths)
+        return _normalize_endpoint_values(cached, ordered)
+    return ordered
 
 def _is_not_found_response(status: int, payload: Dict[str, Any]) -> bool:
-    if status == 404:
+    if status in {404, 405}:
         return True
     for key in ("code", "status"):
         val = payload.get(key)
         if isinstance(val, int) and val == 404:
             return True
+        if isinstance(val, int) and val == 405:
+            return True
         if isinstance(val, str) and val.strip() == "404":
+            return True
+        if isinstance(val, str) and val.strip() == "405":
             return True
     message = payload.get("message") or payload.get("error")
     if isinstance(message, str) and "not found" in message.lower():
@@ -21285,6 +21324,23 @@ async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_T
         return
 
     _set_cached_balance(ctx, new_balance)
+
+    profile_chat_id = getattr(message, "chat_id", None)
+    if profile_chat_id is None and update.effective_chat is not None:
+        profile_chat_id = getattr(update.effective_chat, "id", None)
+    try:
+        await profile_handlers.refresh(
+            ctx,
+            chat_id=int(profile_chat_id) if profile_chat_id is not None else int(user_id),
+            user_id=int(user_id),
+            source="payment",
+        )
+    except Exception:
+        log.debug(
+            "profile.refresh.after_payment_failed",
+            exc_info=True,
+            extra={"user": user_id, "chat_id": profile_chat_id},
+        )
 
     log.info(
         "stars_payment_success | user=%s charge_id=%s stars=%s diamonds=%s balance=%s",

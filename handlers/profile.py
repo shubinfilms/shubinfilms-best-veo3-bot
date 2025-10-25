@@ -5,12 +5,14 @@ import inspect
 import logging
 import os
 import time
+import uuid
+from threading import Lock
 from types import SimpleNamespace
 from collections.abc import MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, cast
 
 from html import escape
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -20,19 +22,28 @@ from telegram.ext import ContextTypes
 
 from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
 from telegram_utils import safe_answer, safe_send
-from .stars import build_stars_kb, open_stars_menu, render_stars_text
+from .stars import build_stars_kb, open as open_stars, render_stars_text
 from ui.card import build_card
 from utils.input_state import (
     WaitInputState,
     WaitKind,
     clear_wait_state,
+    clear_wait_states,
     force_clear_user_state,
     get_wait_state,
     input_state,
     set_wait_state,
 )
-from metrics import profile_first_paint_ms, profile_open_total, profile_render_ms
+from metrics import lbl_safe, profile_first_paint_ms, profile_open_total
 import settings as app_settings
+from redis_utils import rds as redis_client
+
+try:  # pragma: no cover - optional dependency during tests
+    import redis  # type: ignore
+except Exception:  # pragma: no cover - fallback when redis is unavailable
+    redis = None
+
+RedisError = getattr(redis, "RedisError", Exception)
 log = logging.getLogger(__name__)
 
 try:
@@ -41,6 +52,25 @@ except ValueError:
     _DEBOUNCE_MS = 400
 _DEBOUNCE_MS = max(_DEBOUNCE_MS, 0)
 _DEBOUNCE_SEC = _DEBOUNCE_MS / 1000 if _DEBOUNCE_MS else 0.0
+
+
+_PROFILE_REDIS_PREFIX = getattr(app_settings, "REDIS_PREFIX", "bot")
+_PROFILE_LOCK_KEY_TMPL = f"{_PROFILE_REDIS_PREFIX}:prof:lock:{{user_id}}"
+_PROFILE_LAST_KEY_TMPL = f"{_PROFILE_REDIS_PREFIX}:prof:last:{{user_id}}"
+_PROFILE_MSG_KEY_TMPL = f"{_PROFILE_REDIS_PREFIX}:prof:msg:{{chat_id}}"
+
+_PROFILE_LOCK_TTL_SECONDS = 5
+_PROFILE_DEBOUNCE_WINDOW = 0.6
+_PROFILE_LAST_TTL_SECONDS = 30
+_PROFILE_MSG_TTL_SECONDS = 24 * 60 * 60
+
+_PROFILE_LOCK_MEMORY: dict[int, tuple[float, str]] = {}
+_PROFILE_LAST_MEMORY: dict[int, tuple[float, float]] = {}
+_PROFILE_MSG_MEMORY: dict[int, tuple[float, int]] = {}
+
+_PROFILE_LOCK_GUARD = Lock()
+_PROFILE_LAST_GUARD = Lock()
+_PROFILE_MSG_GUARD = Lock()
 
 
 def _simple_profile_enabled() -> bool:
@@ -63,6 +93,150 @@ _HISTORY_TYPE_LABELS = {
     "refund": "Возврат",
 }
 
+
+def _profile_lock_key(user_id: int) -> str:
+    return _PROFILE_LOCK_KEY_TMPL.format(user_id=int(user_id))
+
+
+def _profile_last_key(user_id: int) -> str:
+    return _PROFILE_LAST_KEY_TMPL.format(user_id=int(user_id))
+
+
+def _profile_msg_key(chat_id: int) -> str:
+    return _PROFILE_MSG_KEY_TMPL.format(chat_id=int(chat_id))
+
+
+def _acquire_profile_lock(user_id: int) -> tuple[bool, Optional[str]]:
+    token = uuid.uuid4().hex
+    if redis_client is not None:
+        try:
+            if redis_client.set(_profile_lock_key(user_id), token, ex=_PROFILE_LOCK_TTL_SECONDS, nx=True):
+                return True, token
+        except RedisError:  # pragma: no cover - best effort guard
+            log.debug("profile.lock.redis_failed", exc_info=True, extra={"user_id": user_id})
+
+    now = time.monotonic()
+    with _PROFILE_LOCK_GUARD:
+        entry = _PROFILE_LOCK_MEMORY.get(int(user_id))
+        if entry and entry[0] > now:
+            return False, None
+        _PROFILE_LOCK_MEMORY[int(user_id)] = (now + _PROFILE_LOCK_TTL_SECONDS, token)
+        return True, token
+
+
+def _release_profile_lock(user_id: int, token: Optional[str]) -> None:
+    if not token:
+        return
+
+    key = _profile_lock_key(user_id)
+    if redis_client is not None:
+        try:
+            stored = redis_client.get(key)
+        except RedisError:  # pragma: no cover - best effort guard
+            log.debug("profile.lock.redis_get_failed", exc_info=True, extra={"user_id": user_id})
+        else:
+            if stored == token:
+                try:
+                    redis_client.delete(key)
+                except RedisError:
+                    log.debug("profile.lock.redis_delete_failed", exc_info=True, extra={"user_id": user_id})
+
+    with _PROFILE_LOCK_GUARD:
+        entry = _PROFILE_LOCK_MEMORY.get(int(user_id))
+        if entry and entry[1] == token:
+            _PROFILE_LOCK_MEMORY.pop(int(user_id), None)
+
+
+def _load_last_open_ts(user_id: int) -> Optional[float]:
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(_profile_last_key(user_id))
+        except RedisError:  # pragma: no cover - best effort guard
+            log.debug("profile.last.redis_get_failed", exc_info=True, extra={"user_id": user_id})
+        else:
+            if raw is not None:
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return None
+
+    now = time.monotonic()
+    with _PROFILE_LAST_GUARD:
+        entry = _PROFILE_LAST_MEMORY.get(int(user_id))
+        if not entry:
+            return None
+        expires_at, stored = entry
+        if expires_at <= now:
+            _PROFILE_LAST_MEMORY.pop(int(user_id), None)
+            return None
+        return stored
+
+
+def _store_last_open_ts(user_id: int, timestamp: float) -> None:
+    if redis_client is not None:
+        try:
+            redis_client.setex(_profile_last_key(user_id), _PROFILE_LAST_TTL_SECONDS, str(timestamp))
+        except RedisError:  # pragma: no cover - best effort guard
+            log.debug("profile.last.redis_set_failed", exc_info=True, extra={"user_id": user_id})
+
+    expires_at = time.monotonic() + _PROFILE_LAST_TTL_SECONDS
+    with _PROFILE_LAST_GUARD:
+        _PROFILE_LAST_MEMORY[int(user_id)] = (expires_at, float(timestamp))
+
+
+def _load_profile_message_id(chat_id: Optional[int]) -> Optional[int]:
+    if chat_id is None:
+        return None
+
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(_profile_msg_key(chat_id))
+        except RedisError:  # pragma: no cover - best effort guard
+            log.debug("profile.msg.redis_get_failed", exc_info=True, extra={"chat_id": chat_id})
+        else:
+            if raw is not None:
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return None
+
+    now = time.time()
+    with _PROFILE_MSG_GUARD:
+        entry = _PROFILE_MSG_MEMORY.get(int(chat_id))
+        if not entry:
+            return None
+        expires_at, stored = entry
+        if expires_at <= now:
+            _PROFILE_MSG_MEMORY.pop(int(chat_id), None)
+            return None
+        return stored
+
+
+def _store_profile_message_id(chat_id: Optional[int], message_id: Optional[int]) -> None:
+    if chat_id is None:
+        return
+
+    key = _profile_msg_key(chat_id)
+    if message_id is None:
+        if redis_client is not None:
+            try:
+                redis_client.delete(key)
+            except RedisError:  # pragma: no cover - best effort guard
+                log.debug("profile.msg.redis_delete_failed", exc_info=True, extra={"chat_id": chat_id})
+        with _PROFILE_MSG_GUARD:
+            _PROFILE_MSG_MEMORY.pop(int(chat_id), None)
+        return
+
+    payload = int(message_id)
+    if redis_client is not None:
+        try:
+            redis_client.setex(key, _PROFILE_MSG_TTL_SECONDS, payload)
+        except RedisError:  # pragma: no cover - best effort guard
+            log.debug("profile.msg.redis_set_failed", exc_info=True, extra={"chat_id": chat_id})
+
+    expires_at = time.time() + _PROFILE_MSG_TTL_SECONDS
+    with _PROFILE_MSG_GUARD:
+        _PROFILE_MSG_MEMORY[int(chat_id)] = (expires_at, payload)
 
 def _resolve_callback_started_at(
     update: Update,
@@ -133,13 +307,11 @@ class _FirstPaintTracker:
         if self.started_at is None:
             return
         latency_ms = max((time.perf_counter() - float(self.started_at)) * 1000.0, 0.0)
-        try:
-            profile_first_paint_ms.labels(
-                force_refresh="true" if self.force_refresh else "false",
-                source=_normalize_source_label(self.source),
-            ).observe(latency_ms)
-        except Exception:
-            log.debug("profile.metrics.first_paint_failed", exc_info=True)
+        observer = lbl_safe(profile_first_paint_ms, source=_normalize_source_label(self.source))
+        if observer is None:
+            log.debug("profile.metrics.first_paint_failed", extra={"source": self.source})
+            return
+        observer.observe(latency_ms)
 
 
 @dataclass(slots=True)
@@ -461,7 +633,12 @@ async def profile_update_or_send(
                     return SimpleNamespace(message_id=msg_id_cached)
                 return None
 
-    msg_id = _get_profile_msg_id(chat_data)
+    redis_msg_id = _load_profile_message_id(chat_id)
+    if redis_msg_id is not None and isinstance(chat_data, MutableMapping):
+        stored_mid = _get_profile_msg_id(chat_data)
+        if stored_mid != redis_msg_id:
+            _store_profile_msg_id(chat_data, redis_msg_id)
+    msg_id = redis_msg_id if redis_msg_id is not None else _get_profile_msg_id(chat_data)
 
     safe_source = tg_html_safe(text)
     safe_text, safe_mode = sanitize_profile_html(safe_source)
@@ -495,6 +672,7 @@ async def profile_update_or_send(
                         "error": str(exc),
                     },
                 )
+            _store_profile_message_id(chat_id, None)
             msg_id = None
         else:
             if result is None:
@@ -505,6 +683,8 @@ async def profile_update_or_send(
                 if isinstance(chat_data, MutableMapping) and isinstance(new_id, int):
                     chat_data[PROFILE_MSG_ID] = new_id
                     chat_data["profile_last_msg_id"] = new_id
+                if isinstance(new_id, int):
+                    _store_profile_message_id(chat_id, int(new_id))
             if token_store is not None:
                 token_store["profile_last_result"] = response
             return response
@@ -517,6 +697,8 @@ async def profile_update_or_send(
         parse_mode=parse_mode,
         log_context=log_context,
     )
+    if isinstance(getattr(response, "message_id", None), int):
+        _store_profile_message_id(chat_id, int(getattr(response, "message_id")))
     if token_store is not None:
         token_store["profile_last_result"] = response
     return response
@@ -668,24 +850,7 @@ async def handle_profile_view(
             root_payload = await _prepare_root_payload(update, ctx)
             data = dict(root_payload.payload)
         elif normalized == "topup":
-            message_obj = getattr(update, "effective_message", None)
-            if query is not None and getattr(query, "message", None) is not None:
-                message_obj = query.message
-
-            chat_obj = getattr(update, "effective_chat", None)
-            chat_id = getattr(chat_obj, "id", None)
-            if chat_id is None and message_obj is not None:
-                chat_id = getattr(message_obj, "chat_id", None)
-
-            message_id = getattr(message_obj, "message_id", None)
-
-            result = await open_stars_menu(
-                ctx,
-                chat_id=chat_id,
-                message_id=message_id,
-                edit_message=True,
-                source="profile",
-            )
+            result = await open_stars(ctx, update=update, source="profile")
 
             if query is not None:
                 with suppress(BadRequest):
@@ -960,6 +1125,8 @@ async def profile_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
     chat = getattr(update, "effective_chat", None)
     chat_id = getattr(chat, "id", None)
+    if chat_id is not None:
+        _store_profile_message_id(int(chat_id), None)
     log.info(
         "profile.cache.cleared",
         extra={"chat_id": chat_id, "keys": cleared_keys},
@@ -977,6 +1144,7 @@ async def profile_reset_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 class OpenedProfile:
     msg_id: Optional[int]
     reused: bool
+    status: str = "ok"
 
 
 def _get_profile_msg_id(chat_data: MutableMapping[str, Any] | None) -> Optional[int]:
@@ -1014,21 +1182,16 @@ async def open_profile(
         await profile_simple.profile_open(update, ctx)
         return
 
+    user_id = _resolve_profile_user_id(update, ctx)
+    source_label = _normalize_source_label(source)
     chat_data, flag, previous_nav = _set_nav_event(ctx, source=source)
+    started_perf = time.perf_counter()
+    first_paint_ms: Optional[float] = None
+    result_label = "ok"
+    lock_token: Optional[str] = None
     try:
         now = time.monotonic()
         if isinstance(chat_data, MutableMapping):
-            raw_open_at = chat_data.get(PROFILE_OPEN_AT)
-            try:
-                last_open = float(raw_open_at)
-            except (TypeError, ValueError):
-                last_open = 0.0
-            if now - last_open < 0.5:
-                log.debug(
-                    "profile.open.debounced",
-                    extra={"source": source, "delta": now - last_open},
-                )
-                return
             chat_data[PROFILE_OPEN_AT] = now
             chat_data.pop("wait_kind", None)
             try:
@@ -1038,43 +1201,45 @@ async def open_profile(
             chat_data[NAV_UNTIL] = max(previous_deadline, now + 2.0)
             chat_data["suppress_dialog_notice"] = True
 
-        started = time.perf_counter()
-        metrics_result = "ok"
-        reused = False
-        try:
-            result = await open_profile_card(
-                update,
-                ctx,
-                source=source,
-                suppress_nav=suppress_nav,
-                force_refresh=force_refresh,
-            )
-            reused = bool(result.reused) if isinstance(result, OpenedProfile) else False
-            log.debug(
-                "profile.open",
-                extra={"source": source, "reused_msg": reused, "force_refresh": force_refresh},
-            )
-        except Exception:
-            metrics_result = "error"
-            raise
-        finally:
-            elapsed_ms = max((time.perf_counter() - started) * 1000.0, 0.0)
+        if user_id is not None:
+            acquired, token = _acquire_profile_lock(user_id)
+            if not acquired:
+                result_label = "skip_inflight"
+                return
+            lock_token = token
+            last_open = _load_last_open_ts(user_id)
+            if last_open is not None and (now - last_open) < _PROFILE_DEBOUNCE_WINDOW:
+                result_label = "debounce"
+                return
+            _store_last_open_ts(user_id, now)
             try:
-                profile_render_ms.labels(
-                    force_refresh="true" if force_refresh else "false",
-                    source=_normalize_source_label(source),
-                ).observe(elapsed_ms)
+                clear_wait_states(user_id, exclude={WaitKind.PROMO_CODE.value}, reason="profile_open")
             except Exception:
-                log.debug("profile.metrics.render_failed", exc_info=True)
-            try:
-                profile_open_total.labels(
-                    force_refresh="true" if force_refresh else "false",
-                    source=_normalize_source_label(source),
-                    result=metrics_result,
-                ).inc()
-            except Exception:
-                log.debug("profile.metrics.open_failed", exc_info=True)
+                log.debug("profile.wait_states.clear_failed", exc_info=True, extra={"user_id": user_id})
+
+        result = await open_profile_card(
+            update,
+            ctx,
+            source=source,
+            suppress_nav=suppress_nav,
+            force_refresh=force_refresh,
+        )
+        if isinstance(result, OpenedProfile) and result.status == "repair":
+            result_label = "repair"
+        log.debug(
+            "profile.open",
+            extra={"source": source, "force_refresh": force_refresh, "result": result_label},
+        )
+        first_paint_ms = max((time.perf_counter() - started_perf) * 1000.0, 0.0)
     finally:
+        if first_paint_ms is not None:
+            observer = lbl_safe(profile_first_paint_ms, source=source_label)
+            observer and observer.observe(first_paint_ms)
+        counter = lbl_safe(profile_open_total, source=source_label, result=result_label)
+        counter and counter.inc()
+        log.info("profile.open", extra={"source": source_label, "result": result_label})
+        if user_id is not None:
+            _release_profile_lock(user_id, lock_token)
         _clear_nav_event(chat_data, flag, ctx, previous_nav)
 
 
@@ -1133,6 +1298,8 @@ async def open(
         chat_data = _chat_data(ctx)
         if isinstance(chat_data, MutableMapping):
             chat_data.pop(PROFILE_MSG_ID, None)
+        if chat_id is not None:
+            _store_profile_message_id(int(chat_id), None)
 
     await open_profile(
         update,
@@ -1141,6 +1308,41 @@ async def open(
         suppress_nav=suppress_nav,
         force_refresh=bool(force_refresh),
     )
+
+
+async def refresh(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: Optional[int] = None,
+    source: str = "payment",
+) -> None:
+    """Refresh the profile card in ``chat_id`` using the cached message pointer."""
+
+    fake_chat = SimpleNamespace(id=int(chat_id))
+    fake_message = SimpleNamespace(chat=fake_chat, chat_id=int(chat_id))
+    fake_user = SimpleNamespace(id=int(user_id)) if user_id is not None else None
+    placeholder = SimpleNamespace(
+        effective_chat=fake_chat,
+        effective_message=fake_message,
+        effective_user=fake_user,
+    )
+    try:
+        await _open_profile_card_impl(
+            int(chat_id),
+            int(user_id) if user_id is not None else None,
+            update=cast(Update, placeholder),
+            ctx=ctx,
+            suppress_nav=True,
+            source=source,
+            force_refresh=False,
+        )
+    except Exception:
+        log.debug(
+            "profile.refresh.failed",
+            exc_info=True,
+            extra={"chat_id": chat_id, "user_id": user_id, "source": source},
+        )
 
 
 async def _open_profile_card_impl(
@@ -1180,7 +1382,10 @@ async def _open_profile_card_impl(
         resolved_chat_id = getattr(chat, "id", None)
 
     chat_data = _chat_data(ctx)
-    previous_mid = _get_profile_msg_id(chat_data)
+    redis_mid = _load_profile_message_id(resolved_chat_id)
+    if redis_mid is not None and isinstance(chat_data, MutableMapping):
+        _store_profile_msg_id(chat_data, redis_mid)
+    previous_mid = redis_mid if redis_mid is not None else _get_profile_msg_id(chat_data)
     reuse_existing = previous_mid is not None and not force_refresh
 
     if isinstance(chat_data, MutableMapping):
@@ -1191,7 +1396,7 @@ async def _open_profile_card_impl(
                 "profile.open.skip_duplicate",
                 extra={"chat_id": resolved_chat_id, "user_id": user_id},
             )
-            return OpenedProfile(msg_id=previous_mid, reused=True)
+            return OpenedProfile(msg_id=previous_mid, reused=True, status="ok")
         chat_data[_PROFILE_LOCK_KEY] = True
 
     try:
@@ -1217,12 +1422,21 @@ async def _open_profile_card_impl(
         and message_id == previous_mid
     )
 
+    status = "ok"
+    if previous_mid is not None and isinstance(previous_mid, int):
+        if not isinstance(message_id, int) or message_id != previous_mid:
+            status = "repair"
+
     log.debug(
         "profile.opened reused=%s msg_id=%s",
         reused_actual,
         message_id,
     )
-    return OpenedProfile(msg_id=message_id if isinstance(message_id, int) else None, reused=reused_actual)
+    return OpenedProfile(
+        msg_id=message_id if isinstance(message_id, int) else None,
+        reused=reused_actual,
+        status=status,
+    )
 
 
 async def open_profile_card(
@@ -1316,25 +1530,13 @@ async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     log.info("profile.click", extra={"action": "topup"})
-    message = getattr(update, "effective_message", None)
     query = getattr(update, "callback_query", None)
-    if query is not None and getattr(query, "message", None) is not None:
-        message = query.message
 
-    chat_obj = getattr(update, "effective_chat", None)
-    chat_id = getattr(chat_obj, "id", None)
-    if chat_id is None and message is not None:
-        chat_id = getattr(message, "chat_id", None)
+    await open_stars(ctx, update=update, source="profile")
 
-    message_id = getattr(message, "message_id", None)
-
-    await open_stars_menu(
-        ctx,
-        chat_id=chat_id,
-        message_id=message_id,
-        edit_message=True,
-        source="profile",
-    )
+    if query is not None:
+        with suppress(BadRequest):
+            await safe_answer(query)
 
 
 async def _billing_history(user_id: int) -> list[dict[str, Any]]:
@@ -1698,6 +1900,7 @@ __all__ = [
     "open",
     "open_profile",
     "open_profile_card",
+    "refresh",
     "on_profile_history",
     "on_profile_invite",
     "on_profile_menu",

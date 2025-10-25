@@ -11,7 +11,9 @@ from typing import Mapping, Optional
 from metrics import (
     callback_ack_latency_ms,
     inc as metrics_inc,
+    lbl_safe,
     router_callback_legacy_total,
+    router_callback_unmatched_total,
     ui_ack_latency_ms,
     ui_callback_ack_latency_ms,
     ui_callback_ack_total,
@@ -40,6 +42,11 @@ _BOT_LABELS = {"env": _ENV, "service": "bot"}
 
 
 def _legacy_bridge_enabled() -> bool:
+    try:
+        if getattr(app_settings, "ROUTER_LEGACY_OFF", False):
+            return False
+    except Exception:  # pragma: no cover - defensive
+        pass
     try:
         return bool(getattr(app_settings, "ROUTER_LEGACY_BRIDGE"))
     except Exception:  # pragma: no cover - defensive
@@ -83,6 +90,7 @@ _LEGACY_PROFILE_ALIASES: dict[str, tuple[str, str]] = {
 }
 
 _STARS_BUY_PATTERN = re.compile(r"^stars:buy:(\d+)$", re.IGNORECASE)
+_PROFILE_ROUTE_PATTERN = re.compile(r"^profile:(invite|promo)$", re.IGNORECASE)
 
 
 def _parse_params(parts: list[str]) -> dict[str, str]:
@@ -106,6 +114,30 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
 
     lowered = stripped.lower()
 
+    if lowered == "nav:back":
+        return NormalizedCallback(
+            raw=stripped,
+            normalized="nav:back",
+            namespace="nav",
+            action="back",
+            payload=payload,
+            legacy=False,
+            dedupe_key="nav:back",
+        )
+
+    profile_direct = _PROFILE_ROUTE_PATTERN.match(stripped)
+    if profile_direct:
+        action_name = profile_direct.group(1).lower()
+        return NormalizedCallback(
+            raw=stripped,
+            normalized=stripped,
+            namespace="profile",
+            action=action_name,
+            payload=payload,
+            legacy=False,
+            dedupe_key=f"profile:{action_name}",
+        )
+
     stars_match = _STARS_BUY_PATTERN.match(stripped)
     if stars_match:
         try:
@@ -113,14 +145,14 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
         except (TypeError, ValueError):
             amount = None
         if amount is not None:
-            payload = {"amount": amount, "legacy": True}
+            payload = {"amount": amount}
             return NormalizedCallback(
                 raw=stripped,
                 normalized="stars:buy",
-                namespace="payments",
-                action="stars_buy",
+                namespace="stars",
+                action="buy",
                 payload=payload,
-                legacy=True,
+                legacy=False,
                 dedupe_key=f"stars:buy:{amount}",
             )
 
@@ -138,8 +170,11 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
         if action == "profile":
             view_raw = payload.pop("view", None)
             view = str(view_raw or "").strip().lower()
-            if view and view != "open":
-                namespace = "profile"
+            namespace = "profile"
+            if not view or view == "open":
+                action = "open"
+                dedupe_key = "btn:profile"
+            else:
                 action = view
                 dedupe_key = f"{base}|view={view}"
         return NormalizedCallback(
@@ -461,7 +496,7 @@ async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> 
     user_id = getattr(user, "id", None)
     chat_id = getattr(chat, "id", None)
 
-    log.info(
+    log.warning(
         "ui.callback.unmatched data=%r user_id=%s chat_id=%s legacy=%s",
         data,
         user_id,
@@ -475,6 +510,8 @@ async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> 
         )
     except Exception:  # pragma: no cover - metrics guard
         log.debug("ui.callback.unmatched.metric_failed", exc_info=True)
+    counter = lbl_safe(router_callback_unmatched_total, data=str(data))
+    counter and counter.inc()
     increment_ui_callback_counter("callback", "unmatched")
 
 
