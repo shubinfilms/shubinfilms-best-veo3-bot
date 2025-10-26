@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Iterable
 
@@ -379,6 +380,13 @@ def render_metrics() -> bytes:
     return generate_latest(REGISTRY)
 
 
+def safe_label(value: str) -> str:
+    """Return a sanitized label value suitable for Prometheus."""
+
+    normalized = re.sub(r"[^a-zA-Z0-9:_\-\|\.]", "_", str(value))
+    return normalized[:64]
+
+
 def lbl_safe(metric, /, **labels):
     """Return a labelled child instance without propagating errors."""
 
@@ -397,6 +405,7 @@ __all__: Iterable[str] = [
     "REGISTRY",
     "inc",
     "lbl_safe",
+    "safe_label",
     "suno_requests_total",
     "suno_callback_download_fail_total",
     "suno_task_store_total",

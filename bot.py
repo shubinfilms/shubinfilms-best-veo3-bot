@@ -81,7 +81,7 @@ from aiohttp import ClientError, ClientResponseError, ClientTimeout
 import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, InputMediaVideo, LabeledPrice, ReplyKeyboardMarkup,
+    InputFile, InputMediaDocument, InputMediaVideo, LabeledPrice, ReplyKeyboardMarkup,
     KeyboardButton, BotCommand, User, Message, CallbackQuery
 )
 from telegram.constants import ParseMode, ChatAction
@@ -13502,6 +13502,146 @@ def veo_kb(s: Dict[str, Any]) -> InlineKeyboardMarkup:
 # ==========================
 #   VEO
 # ==========================
+_VEO_PROGRESS_KEY_TMPL = f"{REDIS_PREFIX}:veo:progress_msg:{{chat_id}}"
+_VEO_PROGRESS_TTL_SECONDS = 60 * 60
+_VEO_PROGRESS_CACHE: Dict[int, tuple[float, int]] = {}
+_VEO_PROGRESS_LOCK = threading.Lock()
+
+
+def _veo_progress_key(chat_id: int) -> str:
+    return _VEO_PROGRESS_KEY_TMPL.format(chat_id=int(chat_id))
+
+
+def _store_veo_progress_message(chat_id: int, message_id: int) -> None:
+    expires_at = time.monotonic() + _VEO_PROGRESS_TTL_SECONDS
+    with _VEO_PROGRESS_LOCK:
+        _VEO_PROGRESS_CACHE[int(chat_id)] = (expires_at, int(message_id))
+    if rds is None:
+        return
+    try:
+        rds.setex(_veo_progress_key(chat_id), _VEO_PROGRESS_TTL_SECONDS, int(message_id))
+    except Exception:  # pragma: no cover - defensive guard
+        log.debug(
+            "veo.progress.redis_set_failed",
+            exc_info=True,
+            extra={"chat_id": chat_id},
+        )
+
+
+def _load_veo_progress_message(chat_id: int) -> Optional[int]:
+    now = time.monotonic()
+    with _VEO_PROGRESS_LOCK:
+        entry = _VEO_PROGRESS_CACHE.get(int(chat_id))
+        if entry:
+            expires_at, stored = entry
+            if expires_at > now:
+                return stored
+            _VEO_PROGRESS_CACHE.pop(int(chat_id), None)
+    if rds is None:
+        return None
+    try:
+        raw = rds.get(_veo_progress_key(chat_id))
+    except Exception:  # pragma: no cover - defensive guard
+        log.debug(
+            "veo.progress.redis_get_failed",
+            exc_info=True,
+            extra={"chat_id": chat_id},
+        )
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    try:
+        value = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        value = None
+    if value is not None:
+        with _VEO_PROGRESS_LOCK:
+            _VEO_PROGRESS_CACHE[int(chat_id)] = (
+                time.monotonic() + _VEO_PROGRESS_TTL_SECONDS,
+                int(value),
+            )
+    return value
+
+
+def _clear_veo_progress_message(chat_id: int) -> None:
+    with _VEO_PROGRESS_LOCK:
+        _VEO_PROGRESS_CACHE.pop(int(chat_id), None)
+    if rds is None:
+        return
+    try:
+        rds.delete(_veo_progress_key(chat_id))
+    except Exception:  # pragma: no cover - defensive guard
+        log.debug(
+            "veo.progress.redis_del_failed",
+            exc_info=True,
+            extra={"chat_id": chat_id},
+        )
+
+
+_ENDPOINT_CACHE_TTL_SECONDS = 10 * 60
+_ENDPOINT_MEMORY_CACHE: Dict[tuple[str, str], tuple[float, str]] = {}
+_ENDPOINT_MEMORY_LOCK = threading.Lock()
+
+
+def _endpoint_cache_storage_key(service: str, kind: str) -> str:
+    normalized_service = (service or "svc").strip() or "svc"
+    normalized_kind = (kind or "kind").strip() or "kind"
+    return f"{REDIS_PREFIX}:endpoint:{normalized_service}:{normalized_kind}"
+
+
+def _load_endpoint_cache(service: str, kind: str) -> Optional[str]:
+    now = time.monotonic()
+    cache_key = (service, kind)
+    with _ENDPOINT_MEMORY_LOCK:
+        entry = _ENDPOINT_MEMORY_CACHE.get(cache_key)
+        if entry:
+            expires_at, path = entry
+            if expires_at > now:
+                return path
+            _ENDPOINT_MEMORY_CACHE.pop(cache_key, None)
+    if rds is None:
+        return None
+    redis_key = _endpoint_cache_storage_key(service, kind)
+    try:
+        raw = rds.get(redis_key)
+    except Exception:  # pragma: no cover - defensive guard
+        log.debug(
+            "endpoint.cache.redis_get_failed",
+            exc_info=True,
+            extra={"service": service, "kind": kind},
+        )
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    with _ENDPOINT_MEMORY_LOCK:
+        _ENDPOINT_MEMORY_CACHE[cache_key] = (now + 60.0, candidate)
+    return candidate
+
+
+def _store_endpoint_cache(service: str, kind: str, path: str) -> None:
+    normalized = (path or "").strip()
+    if not normalized:
+        return
+    expires_at = time.monotonic() + _ENDPOINT_CACHE_TTL_SECONDS
+    cache_key = (service, kind)
+    with _ENDPOINT_MEMORY_LOCK:
+        _ENDPOINT_MEMORY_CACHE[cache_key] = (expires_at, normalized)
+    if rds is None:
+        return
+    redis_key = _endpoint_cache_storage_key(service, kind)
+    try:
+        rds.setex(redis_key, _ENDPOINT_CACHE_TTL_SECONDS, normalized)
+    except Exception:  # pragma: no cover - defensive guard
+        log.debug(
+            "endpoint.cache.redis_set_failed",
+            exc_info=True,
+            extra={"service": service, "kind": kind},
+        )
+
+
 def _endpoint_cache_key(service: str, kind: str) -> str:
     return f"{service}:endpoint:{kind}"
 
@@ -13511,6 +13651,7 @@ def _remember_endpoint(service: str, kind: str, path: str):
         return
     global KIE_VEO_STATUS_PATH, KIE_VEO_1080_PATH, KIE_MJ_GENERATE, KIE_MJ_STATUS
     app_cache[_endpoint_cache_key(service, kind)] = path
+    _store_endpoint_cache(service, kind, path)
     if service == "veo":
         if kind == "status":
             KIE_VEO_STATUS_PATH = path
@@ -13526,6 +13667,10 @@ def _remember_endpoint(service: str, kind: str, path: str):
 
 def _endpoint_candidates(service: str, kind: str, base_paths: List[str]) -> List[str]:
     cached = app_cache.get(_endpoint_cache_key(service, kind))
+    if not cached:
+        cached = _load_endpoint_cache(service, kind)
+        if cached:
+            app_cache[_endpoint_cache_key(service, kind)] = cached
     if service == "mj" and kind == "status":
         ordered = mj_status_candidates(base_paths)
     else:
@@ -15405,8 +15550,14 @@ async def poll_veo_and_send(
         file_size: int,
         *,
         reply_to: Optional[int] = None,
+        caption: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
     ):
         params: Dict[str, Any] = {}
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
+        if caption is not None:
+            params["caption"] = caption
         if reply_to:
             params["reply_to_message_id"] = reply_to
             params["allow_sending_without_reply"] = True
@@ -15438,19 +15589,150 @@ async def poll_veo_and_send(
                     continue
                 raise
 
-    async def _poll_record_info() -> str:
-        delay = 2.0
-        max_delay = 60.0
-        deadline = time.monotonic() + 15 * 60
-        attempt = 0
+    progress_message_id: Optional[int] = None
+
+    def _progress_mid() -> Optional[int]:
+        nonlocal progress_message_id
+        if progress_message_id is not None:
+            return progress_message_id
+        loaded = _load_veo_progress_message(original_chat_id)
+        if loaded is not None:
+            progress_message_id = int(loaded)
+        return progress_message_id
+
+    async def _ensure_progress_message() -> None:
+        nonlocal progress_message_id
+        if progress_message_id is not None:
+            return
+        try:
+            message = await ctx.bot.send_message(
+                chat_id=original_chat_id,
+                text="⌛ Готовим анимацию… Обычно ~1–2 мин.\nСтатус: ожидание 0/12",
+                disable_notification=True,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            log.debug(
+                "veo.progress.send_failed",
+                exc_info=True,
+                extra={"chat_id": original_chat_id, "task_id": task_id},
+            )
+            return
+        mid = getattr(message, "message_id", None)
+        if isinstance(mid, int):
+            progress_message_id = int(mid)
+            _store_veo_progress_message(original_chat_id, int(mid))
+
+    async def _set_progress_text(text: str) -> None:
+        mid = _progress_mid()
+        if mid is None:
+            return
+        attempts = 0
+        while attempts < 3:
+            attempts += 1
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=original_chat_id,
+                    message_id=mid,
+                    text=text,
+                )
+                _store_veo_progress_message(original_chat_id, mid)
+                return
+            except RetryAfter as exc:
+                delay = getattr(exc, "retry_after", None)
+                await asyncio.sleep(max(1, int(delay) if delay else 1))
+            except BadRequest as exc:
+                lowered = str(exc).lower()
+                if "message is not modified" in lowered:
+                    return
+                log.debug(
+                    "veo.progress.edit_failed",
+                    exc_info=True,
+                    extra={"chat_id": original_chat_id, "message_id": mid},
+                )
+                return
+            except TelegramError:
+                log.debug(
+                    "veo.progress.edit_error",
+                    exc_info=True,
+                    extra={"chat_id": original_chat_id, "message_id": mid},
+                )
+                return
+
+    async def _update_progress_counter(attempt: int) -> None:
+        total = 12
+        bounded = max(0, min(total, attempt))
+        await _set_progress_text(
+            f"⌛ Готовим анимацию… Обычно ~1–2 мин.\nСтатус: ожидание {bounded}/{total}"
+        )
+
+    async def _set_queue_notice() -> None:
+        await _set_progress_text(
+            "⚠️ Сервис занят, оставил задачу в очереди. Я пришлю видео, как только будет готово."
+        )
+
+    async def _set_failure_notice() -> None:
+        await _set_progress_text(RENDER_FAIL_MESSAGE)
+
+    async def _edit_progress_media(
+        path: Path,
+        file_size: int,
+        caption: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> Optional[int]:
+        mid = _progress_mid()
+        if mid is None or target_chat_id != original_chat_id:
+            return None
+        limit_bytes = 48 * 1024 * 1024
+        attempts = 0
+        while attempts < 3:
+            attempts += 1
+            try:
+                with path.open("rb") as fh:
+                    if file_size <= limit_bytes:
+                        media = InputMediaVideo(fh, caption=caption, supports_streaming=True)
+                    else:
+                        media = InputMediaDocument(fh, filename=path.name, caption=caption)
+                    await ctx.bot.edit_message_media(
+                        chat_id=original_chat_id,
+                        message_id=mid,
+                        media=media,
+                        reply_markup=reply_markup,
+                    )
+                _store_veo_progress_message(original_chat_id, mid)
+                return mid
+            except RetryAfter as exc:
+                delay = getattr(exc, "retry_after", None)
+                await asyncio.sleep(max(1, int(delay) if delay else 1))
+            except BadRequest as exc:
+                log.warning(
+                    "veo.progress.edit_media_failed | chat=%s mid=%s err=%s",
+                    original_chat_id,
+                    mid,
+                    exc,
+                )
+                return None
+            except TelegramError as exc:
+                log.warning(
+                    "veo.progress.edit_media_error | chat=%s mid=%s err=%s",
+                    original_chat_id,
+                    mid,
+                    exc,
+                )
+                return None
+        return None
+
+    async def _poll_video_url() -> str:
+        await _ensure_progress_message()
+        active_attempts = 12
+        attempts = 0
+        lazy_started = False
+        lazy_deadline: Optional[float] = None
         while True:
-            if time.monotonic() > deadline:
-                raise TimeoutError("KIE polling timeout after 900s")
+            attempts += 1
             try:
                 ok, flag, message, url = await asyncio.to_thread(get_kie_veo_status, task_id)
             except Exception as exc:
                 ok, flag, message, url = False, None, str(exc), None
-            attempt += 1
             if ok:
                 if flag == 1:
                     status_label = "success"
@@ -15464,22 +15746,46 @@ async def poll_veo_and_send(
                     status_label = str(flag)
             else:
                 status_label = "error"
-            log.info("KIE_STATUS task_id=%s status=%s msg=%s", task_id, status_label, (message or ""))
+            log.info(
+                "KIE_STATUS task_id=%s status=%s msg=%s",
+                task_id,
+                status_label,
+                (message or ""),
+            )
             if ok and flag == 1:
                 if url:
                     return url
                 raise RuntimeError("KIE success without result url")
             if ok and flag in (2, 3):
                 raise RuntimeError(f"KIE task failed: {message or flag}")
+
+            mode = "lazy" if lazy_started else "active"
             log.info(
-                "[VEO] poll retry %s | task_id=%s status=%s message=%s",
-                attempt,
-                task_id,
-                status_label,
-                (message or ""),
+                "veo.poll.retry",
+                extra={
+                    "task_id": task_id,
+                    "attempt": attempts,
+                    "mode": mode,
+                    "status": status_label,
+                },
             )
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, max_delay)
+
+            if not lazy_started:
+                await _update_progress_counter(attempts)
+                if attempts >= active_attempts:
+                    lazy_started = True
+                    lazy_deadline = time.monotonic() + 10 * 60
+                    await _set_queue_notice()
+                    log.warning(
+                        "veo.poll.timeout",
+                        extra={"task_id": task_id, "attempts": attempts},
+                    )
+                await asyncio.sleep(12)
+                continue
+
+            if lazy_deadline is not None and time.monotonic() > lazy_deadline:
+                raise TimeoutError("VEO polling timeout after escalation")
+            await asyncio.sleep(60)
 
     async def _download_video(session: aiohttp.ClientSession, url: str) -> Tuple[Path, int]:
         target_path = Path(f"/tmp/{task_id}.mp4")
@@ -15514,17 +15820,19 @@ async def poll_veo_and_send(
 
         async with aiohttp.ClientSession(timeout=ClientTimeout(total=600)) as session:
             try:
-                video_url = await _poll_record_info()
+                video_url = await _poll_video_url()
             except TimeoutError as exc:
                 log_evt("KIE_TIMEOUT", task_id=task_id, reason="poll_exception", message=str(exc))
                 await _refund("timeout", str(exc))
                 await _clear_wait()
+                await _set_failure_notice()
                 await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
                 return
             except Exception as exc:
                 log.exception("VEO status polling failed: %s", exc)
                 await _refund("poll_exception", str(exc))
                 await _clear_wait()
+                await _set_failure_notice()
                 await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
                 return
 
@@ -15557,44 +15865,72 @@ async def poll_veo_and_send(
             temp_file, file_size = await _download_video(session, video_url)
 
             await _clear_wait(target_chat_id)
-            await _send_message_with_retry(target_chat_id, "🎞️ Рендер завершён — отправляю файл…", reply_to=reply_to_id)
-            sent_message = await _send_media_with_retry(target_chat_id, temp_file, file_size, reply_to=reply_to_id)
-            media_kind = "video" if file_size <= 48 * 1024 * 1024 else "document"
+            final_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
+            )
+            caption = "✅ Готово"
+            sent_mode = "edit"
+            message_id_sent: Optional[int] = None
+            if target_chat_id == original_chat_id:
+                message_id_sent = await _edit_progress_media(temp_file, file_size, caption, final_markup)
+            if message_id_sent is None:
+                sent_mode = "send"
+                sent_message = await _send_media_with_retry(
+                    target_chat_id,
+                    temp_file,
+                    file_size,
+                    reply_to=reply_to_id,
+                    caption=caption,
+                    reply_markup=final_markup,
+                )
+                message_id_sent = getattr(sent_message, "message_id", None)
+                await _set_progress_text(caption)
+            if sent_mode == "send":
+                if file_size <= 48 * 1024 * 1024:
+                    log.info(
+                        "TG_SENT video: chat_id=%s, message_id=%s",
+                        target_chat_id,
+                        message_id_sent,
+                    )
+                else:
+                    log.info(
+                        "TG_SENT document: chat_id=%s, message_id=%s",
+                        target_chat_id,
+                        message_id_sent,
+                    )
             log.info(
-                "TG_SENT %s: chat_id=%s, message_id=%s",
-                media_kind,
-                target_chat_id,
-                getattr(sent_message, "message_id", None),
+                "veo.final.sent",
+                extra={
+                    "task_id": task_id,
+                    "chat_id": target_chat_id,
+                    "message_id": message_id_sent,
+                    "mode": sent_mode,
+                },
             )
             log.info(
                 "[VEO] task success | task_id=%s chat_id=%s message_id=%s size=%s",
                 task_id,
                 target_chat_id,
-                getattr(sent_message, "message_id", None),
+                message_id_sent,
                 file_size,
-            )
-
-            await _send_message_with_retry(
-                target_chat_id,
-                "✅ Готово!",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🚀 Сгенерировать ещё видео", callback_data="start_new_cycle")]]
-                ),
             )
     except TimeoutError as exc:
         log_evt("KIE_TIMEOUT", task_id=task_id, reason="timeout", message=str(exc))
         await _refund("timeout_final", str(exc))
         await _clear_wait()
+        await _set_failure_notice()
         await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     except Exception as exc:
         log.exception("VEO render failed: %s", exc)
         await _refund("exception", str(exc))
         await _clear_wait()
+        await _set_failure_notice()
         await _send_message_with_retry(original_chat_id, RENDER_FAIL_MESSAGE)
     finally:
         if temp_file and temp_file.exists():
             with suppress(Exception):
                 temp_file.unlink()
+        _clear_veo_progress_message(original_chat_id)
         _cleanup()
 
 # ==========================
