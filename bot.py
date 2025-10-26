@@ -216,6 +216,9 @@ from utils.suno_modes import (
     default_style_text as suno_default_style_text,
     get_mode_config as get_suno_mode_config,
 )
+from utils.errors import notify_admin
+
+BANANA_SENSITIVE_MARKERS = ("code=422", "E005")
 from utils.input_state import (
     WaitInputState,
     WaitKind,
@@ -21074,18 +21077,32 @@ async def _banana_run_and_send(
                 "❌ Не удалось отправить изображение Banana. Попробуйте позже.",
             )
     except KieBananaError as e:
-        new_balance = await _refund("error", str(e))
-        msg = f"❌ Banana ошибка: {e}\nПроизошла ошибка, 5💎 возвращены."
+        error_text = str(e)
+        new_balance = await _refund("error", error_text)
+        if any(marker in error_text for marker in BANANA_SENSITIVE_MARKERS):
+            base_msg = "❌ Нельзя обработать этот запрос. Попробуйте заменить входные данные."
+        else:
+            base_msg = "❌ Произошла ошибка. Попробуйте ещё раз позже."
+        refund_note = " Произошла ошибка, 5💎 возвращены."
         if new_balance is not None:
-            msg += f" Текущий баланс: {new_balance}."
-        await ctx.bot.send_message(chat_id, msg)
+            refund_note += f" Текущий баланс: {new_balance}💎."
+        await ctx.bot.send_message(chat_id, base_msg + refund_note)
+        await notify_admin(
+            ctx.bot,
+            f"Banana fail | task_id={task_info.get('id')} error={error_text}",
+        )
     except Exception as e:
-        new_balance = await _refund("exception", str(e))
+        error_text = str(e)
+        new_balance = await _refund("exception", error_text)
         log.exception("BANANA unexpected: %s", e)
         msg = "💥 Внутренняя ошибка Banana. Произошла ошибка, 5💎 возвращены."
         if new_balance is not None:
-            msg += f" Текущий баланс: {new_balance}."
+            msg += f" Текущий баланс: {new_balance}💎."
         await ctx.bot.send_message(chat_id, msg)
+        await notify_admin(
+            ctx.bot,
+            f"Banana exception | task_id={task_info.get('id')} error={error_text}",
+        )
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_user_record(update)

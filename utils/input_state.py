@@ -297,6 +297,10 @@ def get_wait(user_id: int) -> Optional[WaitInputState]:
     return get_wait_state(user_id)
 
 
+def is_sum_prompt(state: Optional[WaitInputState]) -> bool:
+    return bool(state and state.kind == WaitKind.SUM_PROMPT)
+
+
 def is_waiting(user_id: int) -> bool:
     return get_wait_state(user_id) is not None
 

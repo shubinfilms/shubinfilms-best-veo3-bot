@@ -41,6 +41,13 @@ log = logging.getLogger(__name__)
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
 
+try:
+    DEBOUNCE_SEC = float(os.getenv("DEBOUNCE_SEC", "0.6") or "0")
+except ValueError:
+    DEBOUNCE_SEC = 0.6
+DEBOUNCE_SEC = max(DEBOUNCE_SEC, 0.0)
+_LAST_CALLBACK_AT: dict[tuple[int, str], float] = {}
+
 
 def _legacy_bridge_enabled() -> bool:
     try:
@@ -591,6 +598,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     normalized = normalize_callback_data(raw_data)
     if not normalized.raw:
         return
+
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+    dedupe_key = normalized.dedupe_key
+    if (
+        DEBOUNCE_SEC > 0.0
+        and user_id is not None
+        and isinstance(dedupe_key, str)
+        and dedupe_key
+    ):
+        now = time.monotonic()
+        key = (int(user_id), dedupe_key)
+        last_at = _LAST_CALLBACK_AT.get(key)
+        if last_at is not None and now - last_at < DEBOUNCE_SEC:
+            log.debug(
+                "ui.callback.debounced",
+                extra={"user_id": user_id, "data": dedupe_key, "elapsed": round(now - last_at, 3)},
+            )
+            return
+        _LAST_CALLBACK_AT[key] = now
 
     payload = dict(normalized.payload)
     payload.setdefault("callback_started_at", started)
