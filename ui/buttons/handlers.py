@@ -15,6 +15,12 @@ def _bot():  # pragma: no cover - helper for lazy import
     return bot_module
 
 
+def _sum_handlers():  # pragma: no cover - helper for lazy import
+    from handlers import sum as sum_module
+
+    return sum_module
+
+
 async def _open_menu_item(context: ButtonContext, item: str) -> UIResult:
     bot_module = _bot()
     ctx = context.app_context
@@ -87,3 +93,9 @@ async def open_sora2(context: ButtonContext) -> UIResult:
     handlers = _bot()
     await handlers.sora2_open_cb(context.update, context.app_context)
     return show_dialog(context.spec.id, "sora2", message_id=None)
+
+
+async def open_sum(context: ButtonContext) -> UIResult:
+    sum_module = _sum_handlers()
+    message_id = await sum_module.open_from_button(context)
+    return show_dialog(context.spec.id, "sum", message_id=message_id)

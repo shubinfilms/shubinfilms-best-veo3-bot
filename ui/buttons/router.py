@@ -94,6 +94,9 @@ _STARS_BUY_PATTERN = re.compile(r"^stars:buy:(\d+)$", re.IGNORECASE)
 _PROFILE_ROUTE_PATTERN = re.compile(r"^profile:(invite|promo)$", re.IGNORECASE)
 
 
+_SUM_CALLBACK_BASE = "btn:sum"
+
+
 def _parse_params(parts: list[str]) -> dict[str, str]:
     params: dict[str, str] = {}
     for part in parts:
@@ -105,6 +108,26 @@ def _parse_params(parts: list[str]) -> dict[str, str]:
         key, value = chunk.split("=", 1)
         params[key] = value
     return params
+
+
+def _resolve_sum_callback(
+    raw: str,
+    base: str,
+    params: Mapping[str, str],
+) -> tuple[str, str, str, dict[str, object]] | None:
+    lowered_base = base.lower()
+    lowered_raw = raw.lower()
+    if lowered_base == _SUM_CALLBACK_BASE:
+        view_raw = params.get("view")
+        view = str(view_raw or "").strip().lower()
+        if view:
+            return "sum", "view", f"{_SUM_CALLBACK_BASE}|view={view}", {"view": view}
+        return "sum", "open", _SUM_CALLBACK_BASE, {}
+    if lowered_raw == "sum:start":
+        return "sum", "start", "sum:start", {}
+    if lowered_raw == "sum:back":
+        return "sum", "back", "sum:back", {}
+    return None
 
 
 def normalize_callback_data(data: str) -> NormalizedCallback:
@@ -168,6 +191,10 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
         action = base.split(":", 1)[1].strip() if ":" in base else None
         namespace: str | None = None
         dedupe_key = base
+        sum_resolution = _resolve_sum_callback(stripped, base, params)
+        if sum_resolution:
+            namespace, action, dedupe_key, overrides = sum_resolution
+            payload.update(overrides)
         if action == "profile":
             view_raw = payload.pop("view", None)
             view = str(view_raw or "").strip().lower()
@@ -201,6 +228,20 @@ def normalize_callback_data(data: str) -> NormalizedCallback:
             payload=payload,
             legacy=True,
             dedupe_key=f"legacy:profile:{action}",
+        )
+
+    sum_resolution = _resolve_sum_callback(stripped, stripped, {})
+    if sum_resolution:
+        namespace, action, dedupe_key, overrides = sum_resolution
+        payload.update(overrides)
+        return NormalizedCallback(
+            raw=stripped,
+            normalized=stripped,
+            namespace=namespace,
+            action=action,
+            payload=payload,
+            legacy=False,
+            dedupe_key=dedupe_key,
         )
 
     legacy = ":" in stripped and not stripped.startswith("btn:")

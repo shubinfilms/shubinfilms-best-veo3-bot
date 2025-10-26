@@ -21,6 +21,7 @@ ButtonId = Literal[
     "kb",
     "help",
     "dialog",
+    "sum",
 ]
 
 AccessLevel = Literal["all", "admin", "paid"]

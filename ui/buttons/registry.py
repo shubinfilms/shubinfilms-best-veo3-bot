@@ -10,6 +10,7 @@ from .handlers import (
     open_photo,
     open_profile,
     open_sora2,
+    open_sum,
     open_video,
 )
 from .types import ButtonAction, ButtonId, ButtonSpec
@@ -26,6 +27,12 @@ REGISTRY: Dict[str, ButtonAction] = {
     "profile": ButtonAction(
         action_id="profile",
         handler="handlers.profile:open",
+        feature_flag=None,
+        acl=None,
+    ),
+    "sum": ButtonAction(
+        action_id="sum",
+        handler="handlers.sum:open_via_registry",
         feature_flag=None,
         acl=None,
     ),
@@ -89,6 +96,13 @@ BUTTONS: Dict[ButtonId, ButtonSpec] = {
         handler=open_sora2,
         open_telemetry_event="ui.button.open",
         feature_flag="FEATURE_SORA2_ENABLED",
+    ),
+    "sum": ButtonSpec(
+        id="sum",
+        title_i18n_key="button.sum",
+        access=("all",),
+        handler=open_sum,
+        open_telemetry_event="ui.button.open",
     ),
 }
 

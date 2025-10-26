@@ -123,6 +123,7 @@ from handlers import (
     veo_animate,
     veo_animate_command,
 )
+import handlers.sum as sum_handlers
 
 from prompt_master import (
     legacy_build_animate_prompt as build_animate_prompt,
@@ -4366,6 +4367,7 @@ _WAIT_LIMITS = {
     WaitKind.BANANA_PROMPT: 2000,
     WaitKind.SORA2: 1200,
     WaitKind.SORA2_PROMPT: 5000,
+    WaitKind.SUM_PROMPT: 5000,
 }
 
 _WAIT_ALLOW_NEWLINES = {
@@ -4375,6 +4377,7 @@ _WAIT_ALLOW_NEWLINES = {
     WaitKind.MJ_PROMPT,
     WaitKind.BANANA_PROMPT,
     WaitKind.SORA2_PROMPT,
+    WaitKind.SUM_PROMPT,
 }
 
 _WAIT_CLEAR_VALUES = {"-", "—"}
@@ -5049,6 +5052,14 @@ async def _apply_wait_state_input(
             if isinstance(card_id, int):
                 refresh_card_pointer(user_id, card_id)
         handled = True
+    elif wait_state.kind == WaitKind.SUM_PROMPT:
+        handled = await sum_handlers.handle_wait_input(
+            ctx,
+            message,
+            cleaned,
+            wait_state,
+            user_id=user_id,
+        )
 
     return handled
 
@@ -8395,6 +8406,26 @@ async def handle_menu_kb(callback: HubCallbackContext) -> None:
         query=callback.query,
         log_click=False,
     )
+
+
+@register_callback_action("sum", "open", module="sum")
+async def handle_sum_open(callback: HubCallbackContext) -> None:
+    await sum_handlers.open_from_callback(callback)
+
+
+@register_callback_action("sum", "view", module="sum")
+async def handle_sum_view(callback: HubCallbackContext) -> None:
+    await sum_handlers.view_from_callback(callback)
+
+
+@register_callback_action("sum", "start", module="sum")
+async def handle_sum_start(callback: HubCallbackContext) -> None:
+    await sum_handlers.start_from_callback(callback)
+
+
+@register_callback_action("sum", "back", module="sum")
+async def handle_sum_back(callback: HubCallbackContext) -> None:
+    await sum_handlers.back_from_callback(callback)
 
 
 @register_callback_action("menu", "profile", module="profile")
