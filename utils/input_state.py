@@ -34,6 +34,7 @@ class WaitKind(str, Enum):
     SORA2_PROMPT = "sora2_prompt"
     SORA2 = "sora2"
     PROMO_CODE = "promo_code"
+    SUM_PROMPT = "sum_prompt"
 
 
 def classify_wait_input(text: Optional[str]) -> Tuple[bool, Optional[str]]:
@@ -263,6 +264,7 @@ def set_wait(
         "suno_lyrics",
         "banana_prompt",
         "sora2_prompt",
+        "sum_prompt",
     ],
     card_msg_id: Optional[int],
     *,

@@ -184,6 +184,20 @@ ui_wait_clear_all_total = Counter(
     registry=REGISTRY,
 )
 
+sum_open_total = Counter(
+    "sum_open_total",
+    "Summary card open attempts grouped by result.",
+    labelnames=("result", "env", "service"),
+    registry=REGISTRY,
+)
+
+sum_start_total = Counter(
+    "sum_start_total",
+    "Summary generation attempts grouped by outcome.",
+    labelnames=("result", "env", "service"),
+    registry=REGISTRY,
+)
+
 faq_root_views_total = Counter(
     "faq_root_views_total",
     "Total number of FAQ root menu views",
