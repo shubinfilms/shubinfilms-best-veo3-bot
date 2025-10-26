@@ -23,6 +23,8 @@ from telegram.ext import ContextTypes
 from helpers.telegram_html import sanitize_profile_html, strip_telegram_html, tg_html_safe
 from telegram_utils import safe_answer, safe_send
 from .stars import build_stars_kb, open as open_stars, render_stars_text
+
+open_stars_menu = open_stars
 from ui.card import build_card
 from utils.input_state import (
     WaitInputState,
@@ -850,7 +852,7 @@ async def handle_profile_view(
             root_payload = await _prepare_root_payload(update, ctx)
             data = dict(root_payload.payload)
         elif normalized == "topup":
-            result = await open_stars(ctx, update=update, source="profile")
+            result = await open_stars_menu(ctx, update=update, source="profile")
 
             if query is not None:
                 with suppress(BadRequest):
@@ -1208,7 +1210,11 @@ async def open_profile(
                 return
             lock_token = token
             last_open = _load_last_open_ts(user_id)
-            if last_open is not None and (now - last_open) < _PROFILE_DEBOUNCE_WINDOW:
+            if (
+                source_label != "quick"
+                and last_open is not None
+                and (now - last_open) < _PROFILE_DEBOUNCE_WINDOW
+            ):
                 result_label = "debounce"
                 return
             _store_last_open_ts(user_id, now)
@@ -1532,7 +1538,7 @@ async def on_profile_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     log.info("profile.click", extra={"action": "topup"})
     query = getattr(update, "callback_query", None)
 
-    await open_stars(ctx, update=update, source="profile")
+    await open_stars_menu(ctx, update=update, source="profile")
 
     if query is not None:
         with suppress(BadRequest):
@@ -1908,6 +1914,7 @@ __all__ = [
     "on_profile_promo_apply",
     "on_profile_promo_start",
     "on_profile_topup",
+    "open_stars_menu",
     "profile_reset_command",
     "render_profile_root",
     "render_profile_view",

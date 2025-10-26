@@ -12,6 +12,7 @@ from metrics import (
     callback_ack_latency_ms,
     inc as metrics_inc,
     lbl_safe,
+    safe_label,
     router_callback_legacy_total,
     router_callback_unmatched_total,
     ui_ack_latency_ms,
@@ -497,11 +498,13 @@ async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> 
     chat_id = getattr(chat, "id", None)
 
     log.warning(
-        "ui.callback.unmatched data=%r user_id=%s chat_id=%s legacy=%s",
-        data,
-        user_id,
-        chat_id,
-        legacy,
+        "ui.callback.unmatched",
+        extra={
+            "data": data,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "legacy": bool(legacy),
+        },
     )
     try:
         metrics_inc(
@@ -510,8 +513,10 @@ async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> 
         )
     except Exception:  # pragma: no cover - metrics guard
         log.debug("ui.callback.unmatched.metric_failed", exc_info=True)
-    counter = lbl_safe(router_callback_unmatched_total, data=str(data))
-    counter and counter.inc()
+    try:
+        router_callback_unmatched_total.labels(data=safe_label(str(data))).inc()
+    except Exception:  # pragma: no cover - metrics guard
+        log.debug("router.callback.unmatched.metric_failed", exc_info=True)
     increment_ui_callback_counter("callback", "unmatched")
 
 
