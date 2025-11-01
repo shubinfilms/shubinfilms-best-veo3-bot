@@ -1,6 +1,7 @@
 import logging
-from functools import lru_cache
+import os
 import re
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from telegram import (
@@ -13,6 +14,8 @@ from telegram import (
 
 from utils.text_normalizer import normalize_btn_text
 
+
+FEATURE_PM_ENABLED = os.getenv("FEATURE_PM_ENABLED", "0") == "1"
 
 log = logging.getLogger(__name__)
 
@@ -226,14 +229,10 @@ def build_main_reply_kb() -> ReplyKeyboardMarkup:
 
 
 def dialog_picker_inline() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("💬 Обычный чат", callback_data=DIALOG_PICK_REGULAR),
-                InlineKeyboardButton("📝 Prompt-Master", callback_data=DIALOG_PICK_PM),
-            ]
-        ]
-    )
+    buttons = [InlineKeyboardButton("💬 Обычный чат", callback_data=DIALOG_PICK_REGULAR)]
+    if FEATURE_PM_ENABLED:
+        buttons.append(InlineKeyboardButton("📝 Prompt-Master", callback_data=DIALOG_PICK_PM))
+    return InlineKeyboardMarkup([buttons])
 
 
 def build_empty_reply_kb() -> ReplyKeyboardRemove:
@@ -445,15 +444,17 @@ def faq_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("💎 Баланс и оплата", callback_data=f"{CB_FAQ_PREFIX}billing"),
             InlineKeyboardButton("⚡ Токены и возвраты", callback_data=f"{CB_FAQ_PREFIX}tokens"),
         ],
-        [
-            InlineKeyboardButton("💬 Обычный чат", callback_data=f"{CB_FAQ_PREFIX}chat"),
-            InlineKeyboardButton("🧠 Prompt-Master", callback_data=f"{CB_FAQ_PREFIX}pm"),
-        ],
+    ]
+    chat_row = [InlineKeyboardButton("💬 Обычный чат", callback_data=f"{CB_FAQ_PREFIX}chat")]
+    if FEATURE_PM_ENABLED:
+        chat_row.append(InlineKeyboardButton("🧠 Prompt-Master", callback_data=f"{CB_FAQ_PREFIX}pm"))
+    rows.append(chat_row)
+    rows.append(
         [
             InlineKeyboardButton("ℹ️ Общие вопросы", callback_data=f"{CB_FAQ_PREFIX}common"),
             InlineKeyboardButton("⬅️ Назад (в главное)", callback_data=f"{CB_FAQ_PREFIX}back"),
-        ],
-    ]
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -490,16 +491,20 @@ def menu_main_like() -> InlineKeyboardMarkup:
 def menu_bottom_unified() -> InlineKeyboardMarkup:
     """Единое меню для перехода между режимами внутри карточек."""
 
-    return build_menu(
+    rows: list[list[tuple[str, str]]] = [
+        [(f"{EMOJI['video']} Генерация видео", "nav_video")],
+        [(f"{EMOJI['image']} Генерация изображений", "nav_image")],
+        [(f"{EMOJI['music']} Генерация музыки", "nav_music")],
+    ]
+    if FEATURE_PM_ENABLED:
+        rows.append([(f"{EMOJI['prompt']} Prompt-Master", "nav_prompt")])
+    rows.extend(
         [
-            [(f"{EMOJI['video']} Генерация видео", "nav_video")],
-            [(f"{EMOJI['image']} Генерация изображений", "nav_image")],
-            [(f"{EMOJI['music']} Генерация музыки", "nav_music")],
-            [(f"{EMOJI['prompt']} Prompt-Master", "nav_prompt")],
             [(f"{EMOJI['chat']} Обычный чат", "nav_chat")],
             [(f"{EMOJI['profile']} Профиль", "btn:profile|src=nav")],
         ]
     )
+    return build_menu(rows)
 
 
 def menu_pay_unified() -> InlineKeyboardMarkup:

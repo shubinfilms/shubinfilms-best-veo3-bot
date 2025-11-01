@@ -137,3 +137,12 @@ async def safe_send_text(
 
     message_id = getattr(message, "message_id", None)
     return SafeSendResult(ok=True, message=message, error=None, message_id=message_id)
+
+
+async def safe_reply_text(message: Any, text: str, **kwargs: Any) -> Any:
+    """Reply to a Telegram message, swallowing permission-related errors."""
+
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception:  # pragma: no cover - defensive wrapper
+        return None
