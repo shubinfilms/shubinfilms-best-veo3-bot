@@ -174,6 +174,10 @@ from ui_helpers import (
     pm_result_kb,
     sync_suno_start_message,
 )
+from ui.renderers.banana import (
+    banana_card_kb as render_banana_card_kb,
+    banana_card_text as render_banana_card_text,
+)
 from stickers import delete_wait_sticker, send_ok_sticker, send_wait_sticker
 
 from core.constants import (
@@ -182,6 +186,7 @@ from core.constants import (
     SORA2_MODEL_IMAGE_TO_VIDEO,
     SORA2_MODEL_TEXT_TO_VIDEO,
 )
+from utils.banana_state import BananaState
 from utils.suno_state import (
     LYRICS_MAX_LENGTH,
     LyricsSource,
@@ -9170,38 +9175,44 @@ MJ_MODE_HINT_TEXT = (
     "🖼 Midjourney включён. Введите промпт сообщением и нажмите «Подтвердить»."
 )
 
-def banana_card_text(s: Dict[str, Any]) -> str:
-    n = len(s.get("banana_images") or [])
-    prompt = (s.get("last_prompt") or "").strip()
-    has_prompt = "есть" if prompt else "нет"
-    snippet = html.escape(_short_prompt(prompt, 200)) if prompt else ""
-    lines = ["🍌 <b>Карточка Banana</b>"]
-    balance = s.get("banana_balance")
-    if balance is not None:
-        lines.insert(1, f"💎 Баланс: <b>{balance}</b>")
-    lines.append(f"📸 Фото: <b>{n}/4</b> • Промпт: <b>{has_prompt}</b>")
-    if prompt:
-        lines.append(f"✏️ Промпт: \"{snippet}\"")
-    else:
-        lines.append("✏️ Промпт: —")
-    return "\n".join(lines)
+def _state_to_banana_state(state: Dict[str, Any]) -> BananaState:
+    images_raw = state.get("banana_images")
+    images: list[str] = []
+    if isinstance(images_raw, list):
+        for entry in images_raw:
+            file_id: Optional[str] = None
+            if isinstance(entry, dict):
+                file_id = (
+                    entry.get("file_id")
+                    or entry.get("url")
+                    or entry.get("file_path")
+                )
+            elif isinstance(entry, str):
+                file_id = entry
+            if file_id:
+                images.append(str(file_id))
+    prompt_raw = (state.get("last_prompt") or "").strip()
+    prompt = prompt_raw or None
+    last_result = state.get("last_banana_result_id")
+    if last_result is not None:
+        last_result = str(last_result)
+    return BananaState(images=images, prompt=prompt, last_result_id=last_result)
 
-def banana_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ Добавить фото", callback_data="banana:add_more"),
-                InlineKeyboardButton("✏️ Промпт", callback_data="banana:prompt"),
-                InlineKeyboardButton("🧹 Очистить", callback_data="banana:reset_all"),
-            ],
-            [InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana:templates")],
-            [InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")],
-            [
-                InlineKeyboardButton("🔄 Движок", callback_data="banana:switch_engine"),
-                InlineKeyboardButton("↩️ Назад", callback_data="back"),
-            ],
-        ]
-    )
+
+def banana_card_text(s: Dict[str, Any]) -> str:
+    banana_state = _state_to_banana_state(s)
+    balance_value = 0
+    balance_raw = s.get("banana_balance")
+    if isinstance(balance_raw, (int, float)):
+        balance_value = int(balance_raw)
+    elif isinstance(balance_raw, str) and balance_raw.strip().isdigit():
+        balance_value = int(balance_raw.strip())
+    return render_banana_card_text(balance_value, banana_state)
+
+
+def banana_kb(s: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
+    banana_state = _state_to_banana_state(s or {})
+    return render_banana_card_kb(banana_state)
 
 
 def banana_generating_markup() -> InlineKeyboardMarkup:
@@ -19002,7 +19013,7 @@ async def show_banana_card(
     text = banana_card_text(s)
     if not force_new and text == s.get("_last_text_banana"):
         return
-    kb = banana_kb()
+    kb = banana_kb(s)
     mid = await upsert_card(
         ctx,
         chat_id,
@@ -20904,7 +20915,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ):
         if state_mode == "banana":
             if len(_get_banana_images(s)) >= 4:
-                await msg.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
+                await msg.reply_text(
+                    "⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb(s)
+                )
                 return
             await on_banana_photo_received(chat_id, ctx, text.strip())
             await msg.reply_text(f"📸 Фото принято ({len(s['banana_images'])}/4).")
@@ -21147,7 +21160,9 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if s.get("mode") == "banana":
         images = _get_banana_images(s)
         if len(images) >= 4:
-            await message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
+            await message.reply_text(
+                "⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb(s)
+            )
             return
         caption = (message.caption or "").strip()
         if caption:
@@ -21218,7 +21233,9 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if s.get("mode") == "banana":
         images = _get_banana_images(s)
         if len(images) >= 4:
-            await message.reply_text("⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb())
+            await message.reply_text(
+                "⚠️ Достигнут лимит 4 фото.", reply_markup=banana_kb(s)
+            )
             return
         caption = (message.caption or "").strip()
         if caption:
