@@ -4,7 +4,7 @@ from typing import Sequence
 
 from telegram import InlineKeyboardButton
 
-from keyboards import CB, kb_main
+from keyboards import CB, FEATURE_PM_ENABLED, kb_main
 from texts import (
     TXT_AI_DIALOG_CHOOSE,
     TXT_AI_DIALOG_NORMAL,
@@ -18,7 +18,27 @@ from texts import (
 )
 from ui.card import build_card
 
+from logging_utils import get_logger
+
+log = get_logger("handlers.menu")
+
 _MAIN_MENU_SUBTITLE = "Выберите раздел:"
+
+
+async def on_menu_dialog(update, context) -> None:
+    """Switch the user into chat mode immediately."""
+
+    chat = getattr(update, "effective_chat", None)
+    if chat is None:
+        return
+    chat_id = chat.id
+    await context.bot.send_message(chat_id, "Напиши запрос — это обычный чат с ИИ.")
+    try:
+        context.user_data["mode"] = "chat"
+    except Exception:
+        log.debug("menu.dialog.set_mode.failed", exc_info=True)
+    else:
+        log.debug("menu.dialog.mode_set", extra={"chat_id": chat_id})
 
 
 def build_main_menu_card() -> dict:
@@ -84,17 +104,22 @@ def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int, sora2_cost: int
 
 
 def build_dialog_card() -> dict:
-    rows = [
-        [
-            InlineKeyboardButton(TXT_AI_DIALOG_NORMAL, callback_data="mode:chat"),
-            InlineKeyboardButton(TXT_AI_DIALOG_PM, callback_data="mode:prompt_master"),
-        ],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-    ]
-    return build_card(TXT_KB_AI_DIALOG, TXT_AI_DIALOG_CHOOSE, rows)
+    subtitle = TXT_AI_DIALOG_CHOOSE if FEATURE_PM_ENABLED else "Напиши запрос — это обычный чат с ИИ."
+    if FEATURE_PM_ENABLED:
+        rows = [
+            [
+                InlineKeyboardButton(TXT_AI_DIALOG_NORMAL, callback_data="mode:chat"),
+                InlineKeyboardButton(TXT_AI_DIALOG_PM, callback_data="mode:prompt_master"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    else:
+        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data="back")]]
+    return build_card(TXT_KB_AI_DIALOG, subtitle, rows)
 
 
 __all__ = [
+    "on_menu_dialog",
     "build_dialog_card",
     "build_main_menu_card",
     "build_music_card",

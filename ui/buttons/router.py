@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import logging
-import re
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -35,9 +34,11 @@ from .types import ButtonContext, ButtonId, ButtonSpec
 from .registry import REGISTRY
 from telegram_utils import safe_answer
 
+from logging_utils import get_logger
+
 import settings as app_settings
 
-log = logging.getLogger(__name__)
+log = get_logger("ui.buttons.router")
 _ENV = (os.getenv("APP_ENV") or "prod").strip() or "prod"
 _BOT_LABELS = {"env": _ENV, "service": "bot"}
 
@@ -545,7 +546,7 @@ async def _log_unmatched(data: str, update: Update, *, legacy: bool = False) -> 
     user_id = getattr(user, "id", None)
     chat_id = getattr(chat, "id", None)
 
-    log.warning(
+    log.debug(
         "ui.callback.unmatched",
         extra={
             "data": data,

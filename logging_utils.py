@@ -11,6 +11,8 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Mapping, MutableMapping
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 RESERVED = {
     "name",
     "msg",
@@ -35,6 +37,18 @@ RESERVED = {
     "message",
     "asctime",
 }
+
+
+class SubstringFilter(logging.Filter):
+    """Filter log records that contain noisy substrings."""
+
+    def __init__(self, patterns: list[str]):
+        super().__init__()
+        self._patterns = [re.compile(p) for p in patterns]
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        message = record.getMessage()
+        return not any(pattern.search(message) for pattern in self._patterns)
 
 
 def _ensure_mapping(value: Any) -> dict[str, Any]:
@@ -124,10 +138,39 @@ class SafeLoggerAdapter(logging.LoggerAdapter):
         return msg, kwargs
 
 
+def setup_logging() -> None:
+    """Initialise the root logger with sensible defaults."""
+
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    handler = logging.StreamHandler()
+    fmt = os.getenv("LOG_FORMAT", "%(levelname)s • %(name)s :: %(message)s")
+    handler.setFormatter(logging.Formatter(fmt))
+
+    noisy_patterns = [
+        r"leader: heartbeat ok",
+        r"EVT_LOCK_HEARTBEAT",
+        r"WAIT_SET ",
+        r"WAIT_CLEAR ",
+        r"invite\.url",
+        r"profile\.invite_link",
+        r"ui\.callback\.unmatched",
+        r"card_edit_noop",
+    ]
+    handler.addFilter(SubstringFilter(noisy_patterns))
+    root.addHandler(handler)
+
+
 def get_logger(name: str) -> SafeLoggerAdapter:
     """Return a sanitizing adapter for the named logger."""
 
+    setup_logging()
     base = logging.getLogger(name)
+    if name in {"ui.buttons.router"}:
+        base.setLevel(logging.DEBUG)
     return SafeLoggerAdapter(base, {})
 
 
@@ -157,6 +200,9 @@ def log_error(logger: logging.Logger, msg: str, *args: Any, **kwargs: Any) -> No
 
     _wrap_extra(kwargs)
     logger.error(msg, *args, **kwargs)
+
+
+setup_logging()
 
 
 logging.setLoggerClass(SanitizingLogger)
