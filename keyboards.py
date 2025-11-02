@@ -314,16 +314,22 @@ def build_menu(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(markup_rows)
 
 
-def banana_card_kb(has_inputs: bool) -> InlineKeyboardMarkup:
+def banana_card_kb(can_start: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    if has_inputs:
+    if can_start:
         rows.append([InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")])
-        rows.append([InlineKeyboardButton("🔁 Повторить генерацию", callback_data="banana:restart")])
-        rows.append([InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")])
     rows.append([InlineKeyboardButton("🧹 Очистить карточку", callback_data="banana:clear")])
-    rows.append([InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana:templates")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
+
+
+def banana_result_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔁 Повторить генерацию", callback_data="banana:restart")],
+            [InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")],
+        ]
+    )
 
 
 def photo_engine_menu() -> InlineKeyboardMarkup:

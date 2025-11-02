@@ -55,7 +55,7 @@ def test_banana_deliver_photo_and_document(monkeypatch, tmp_path, bot_module):
         )
     )
 
-    assert delivered is True
+    assert delivered == 202
     assert not path.exists()
     assert len(bot.photo_calls) == 1
     assert bot.photo_calls[0]["caption"] == caption
@@ -97,7 +97,7 @@ def test_banana_deliver_skips_document(monkeypatch, tmp_path, bot_module):
         )
     )
 
-    assert delivered is True
+    assert delivered == 303
     assert not path.exists()
     assert len(bot.photo_calls) == 1
     assert bot.document_called is False

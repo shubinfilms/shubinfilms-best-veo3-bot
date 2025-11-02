@@ -245,6 +245,7 @@ from keyboards import (
     AI_TO_PROMPTMASTER_CB,
     AI_TO_SIMPLE_CB,
     kb_banana_templates,
+    banana_result_kb,
     CB,
     CB_FAQ_PREFIX,
     CB_MAIN_BACK,
@@ -3898,7 +3899,7 @@ async def _deliver_banana_media(
     photo_reply_markup: Optional[Any] = None,
     document_reply_markup: Optional[Any] = None,
     send_document: bool = True,
-) -> bool:
+) -> Optional[int]:
     try:
         file_size = file_path.stat().st_size
     except OSError:
@@ -3960,6 +3961,7 @@ async def _deliver_banana_media(
         )
 
     doc_sent = False
+    doc_message_id: Optional[int] = None
     if send_document:
         doc_start = time.monotonic()
         suffix = file_path.suffix.lower() or ".jpg"
@@ -4044,7 +4046,12 @@ async def _deliver_banana_media(
         )
 
     cleanup_temp([file_path])
-    return sent_any or doc_sent
+
+    if doc_message_id is not None:
+        return doc_message_id
+    if photo_message_id is not None:
+        return photo_message_id if sent_any else None
+    return None
 
 
 
@@ -9226,7 +9233,25 @@ def _state_to_banana_state(state: Dict[str, Any]) -> BananaState:
     last_result = state.get("last_banana_result_id")
     if last_result is not None:
         last_result = str(last_result)
-    return BananaState(images=images, prompt=prompt, last_result_id=last_result)
+    last_job = state.get("banana_last_job_id")
+    if last_job is not None:
+        last_job = str(last_job)
+    last_payload = state.get("banana_last_payload")
+    if not isinstance(last_payload, dict):
+        last_payload = None
+    last_result_msg = state.get("banana_last_result_msg_id")
+    if isinstance(last_result_msg, str) and last_result_msg.isdigit():
+        last_result_msg = int(last_result_msg)
+    elif not isinstance(last_result_msg, int):
+        last_result_msg = None
+    return BananaState(
+        photos=images,
+        prompt=prompt,
+        last_job_id=last_job,
+        last_payload=last_payload,
+        last_result_msg_id=last_result_msg,
+        last_result_id=last_result,
+    )
 
 
 def banana_card_text(s: Dict[str, Any]) -> str:
@@ -9252,12 +9277,7 @@ def banana_generating_markup() -> InlineKeyboardMarkup:
 
 
 def banana_result_inline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔁 Повторить генерацию", callback_data="banana:restart")],
-            [InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")],
-        ]
-    )
+    return banana_result_kb()
 
 
 # --------- Suno Helpers ----------
@@ -19161,8 +19181,21 @@ async def _banana_initiate_generation(
     if query is None:
         return
     s = state(ctx)
-    images = list(_get_banana_images(s))
-    prompt = (s.get("last_prompt") or "").strip()
+    if action == "restart":
+        payload = s.get("banana_last_payload")
+        if not isinstance(payload, dict):
+            await query.answer("Нет данных для повтора", show_alert=True)
+            return
+        payload_images_raw = payload.get("images") or []
+        images = []
+        for item in payload_images_raw:
+            entry = _normalize_banana_image(item)
+            if entry is not None:
+                images.append(entry)
+        prompt = str(payload.get("prompt") or "").strip()
+    else:
+        images = list(_get_banana_images(s))
+        prompt = (s.get("last_prompt") or "").strip()
 
     if not images and not prompt:
         await query.answer("Добавь фото или промпт", show_alert=True)
@@ -19226,6 +19259,11 @@ async def _banana_initiate_generation(
     ack_text = "Повторяю…" if action == "restart" else "Запускаю…"
     with suppress(BadRequest):
         await query.answer(ack_text)
+
+    s["banana_last_payload"] = {
+        "images": [dict(item) for item in images],
+        "prompt": prompt,
+    }
 
     log.info(
         "[BANANA] %s_generate | chat_id=%s user_id=%s images=%s",
@@ -19510,6 +19548,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["banana_images"] = []
         s["last_prompt"] = None
         s["_last_text_banana"] = None
+        s["last_banana_result_id"] = None
+        s["banana_last_payload"] = None
+        s["banana_last_job_id"] = None
+        s["banana_last_result_msg_id"] = None
         if chat_id is not None:
             await show_banana_card(chat_id, ctx, force_new=True)
         await q.answer("Новая карточка Banana ✨")
@@ -20041,6 +20083,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s["last_prompt"] = None
             s["_last_text_banana"] = None
             s["last_banana_result_id"] = None
+            s["banana_last_payload"] = None
+            s["banana_last_job_id"] = None
+            s["banana_last_result_msg_id"] = None
             chat_ctx = update.effective_chat
             chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
             if chat_id_val is not None:
@@ -21133,6 +21178,7 @@ async def _banana_run_and_send(
             create_banana_task, prompt, src_urls, "png", "auto", None, None, 60
         )
         task_info["id"] = str(task_id)
+        s["banana_last_job_id"] = task_info["id"]
         await ctx.bot.send_message(
             chat_id,
             f"🍌 Задача Banana создана.\n🆔 taskId={task_id}\nЖдём результат…",
@@ -21152,21 +21198,24 @@ async def _banana_run_and_send(
         suffix = _banana_guess_suffix(u0, content_type)
         temp_path = save_bytes_to_temp(data, suffix=suffix)
         caption = _banana_caption(prompt)
-        delivered = await _deliver_banana_media(
+        result_message_id = await _deliver_banana_media(
             ctx.bot,
             chat_id=chat_id,
             user_id=user_id,
             file_path=temp_path,
             caption=caption,
-            photo_reply_markup=banana_result_inline_keyboard(),
-            document_reply_markup=None,
+            photo_reply_markup=None,
+            document_reply_markup=banana_result_inline_keyboard(),
             send_document=BANANA_SEND_AS_DOCUMENT,
         )
-        if not delivered:
+        if result_message_id is None:
             await ctx.bot.send_message(
                 chat_id,
                 "❌ Не удалось отправить изображение Banana. Попробуйте позже.",
             )
+        else:
+            s["last_banana_result_id"] = result_message_id
+            s["banana_last_result_msg_id"] = result_message_id
     except KieBananaError as e:
         error_text = str(e)
         new_balance = await _refund("error", error_text)

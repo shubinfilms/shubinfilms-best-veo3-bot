@@ -85,7 +85,9 @@ def test_banana_generate_flow(monkeypatch, tmp_path, bot_module):
     first_message = fake_bot.messages[0]
     assert first_message["text"].startswith("🍌 Задача Banana")
     photo_call = fake_bot.photo_calls[0]
-    markup = photo_call.get("reply_markup")
+    assert photo_call.get("reply_markup") is None
+    doc_call = fake_bot.document_calls[0]
+    markup = doc_call.get("reply_markup")
     assert isinstance(markup, InlineKeyboardMarkup)
     buttons = markup.inline_keyboard
     assert buttons and buttons[0][0].text == "🔁 Повторить генерацию"
