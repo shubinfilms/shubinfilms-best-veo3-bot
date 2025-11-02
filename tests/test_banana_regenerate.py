@@ -74,6 +74,10 @@ def test_banana_regenerate_clears_state(monkeypatch, bot_module):
     assert state_dict["banana_images"] == []
     assert state_dict.get("last_prompt") is None
     assert not state_dict.get("_last_text_banana")
+    assert state_dict.get("last_banana_result_id") is None
+    assert state_dict.get("banana_last_payload") is None
+    assert state_dict.get("banana_last_job_id") is None
+    assert state_dict.get("banana_last_result_msg_id") is None
     assert calls and calls[-1][0] == update.effective_chat.id
     assert calls[-1][1]["force_new"] is True
     assert update._answers and update._answers[-1]["text"] == "Новая карточка Banana ✨"

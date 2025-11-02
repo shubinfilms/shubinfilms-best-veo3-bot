@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(slots=True)
 class BananaState:
     """Store Banana inputs awaiting generation."""
 
-    images: List[str]
+    photos: List[str]
     prompt: Optional[str]
-    last_result_id: Optional[str] = None
+    last_job_id: Optional[str] = None
+    last_payload: Optional[Dict[str, Any]] = None
+    last_result_msg_id: Optional[int] = None
+    last_result_id: Optional[str] = None  # legacy alias for stored message id
 
     def _normalized_prompt(self) -> Optional[str]:
         if self.prompt is None:
@@ -30,7 +33,7 @@ class BananaState:
     def has_photos_or_prompt(self) -> bool:
         """Return ``True`` when the card has photos or text prompt."""
 
-        return bool(self.images) or bool(self._normalized_prompt())
+        return bool(self.photos) or bool(self._normalized_prompt())
 
     def can_start(self) -> bool:
         """Determine whether generation can be started."""
@@ -40,9 +43,22 @@ class BananaState:
     def reset(self) -> None:
         """Clear inputs while keeping the instance reusable."""
 
-        self.images.clear()
+        self.photos.clear()
         self.prompt = None
+        self.last_job_id = None
+        self.last_payload = None
+        self.last_result_msg_id = None
         self.last_result_id = None
+
+    # ---- Legacy aliases ----
+
+    @property
+    def images(self) -> List[str]:  # pragma: no cover - backwards compatibility
+        return self.photos
+
+    @images.setter
+    def images(self, value: List[str]) -> None:  # pragma: no cover - backwards compatibility
+        self.photos = value
 
 
 _KEY_TMPL = "banana:state:{user_id}"
@@ -58,8 +74,17 @@ async def load(redis, user_id: int) -> BananaState:
 
     raw = await redis.get(_key_for(user_id))
     if not raw:
-        return BananaState(images=[], prompt=None)
+        return BananaState(photos=[], prompt=None)
     data = json.loads(raw)
+    if "photos" not in data:
+        photos = data.get("images") or []
+        data["photos"] = photos
+    data.pop("images", None)
+    data.setdefault("prompt", None)
+    data.setdefault("last_job_id", None)
+    data.setdefault("last_payload", None)
+    data.setdefault("last_result_msg_id", None)
+    data.setdefault("last_result_id", None)
     return BananaState(**data)
 
 

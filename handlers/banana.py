@@ -47,7 +47,9 @@ async def open_banana_card(update, context) -> None:
     state = await load(redis, user_id)
     balance_value = await _get_balance_value(user_id)
     text = banana_card_text(balance_value, state)
-    await context.bot.send_message(user_id, text, reply_markup=banana_card_kb(state))
+    await context.bot.send_message(
+        user_id, text, reply_markup=banana_card_kb(state.can_start())
+    )
 
 
 async def on_banana_photo(update, context) -> None:
@@ -82,7 +84,8 @@ async def on_banana_photo(update, context) -> None:
     await save(redis, user_id, state)
     balance_value = await _get_balance_value(user_id)
     await message.reply_text(
-        banana_card_text(balance_value, state), reply_markup=banana_card_kb(state)
+        banana_card_text(balance_value, state),
+        reply_markup=banana_card_kb(state.can_start()),
     )
 
 
@@ -97,7 +100,8 @@ async def on_banana_text(update, context) -> None:
     await save(redis, user_id, state)
     balance_value = await _get_balance_value(user_id)
     await message.reply_text(
-        banana_card_text(balance_value, state), reply_markup=banana_card_kb(state)
+        banana_card_text(balance_value, state),
+        reply_markup=banana_card_kb(state.can_start()),
     )
 
 
@@ -143,6 +147,8 @@ async def on_banana_start(update, context) -> None:
         return
 
     payload = {"upload_ids": uploads, "prompt": state.prompt}
+    state.last_payload = {"photos": list(state.photos), "prompt": state.prompt}
+    await save(redis, user_id, state)
     try:
         result = await banana_process(MODEL_NAME, payload)
         result_bytes = result.get("result_bytes")
@@ -155,6 +161,7 @@ async def on_banana_start(update, context) -> None:
         return
 
     state.last_result_id = str(message.message_id)
+    state.last_result_msg_id = message.message_id
     await save(redis, user_id, state)
 
     keyboard = InlineKeyboardMarkup(
@@ -182,13 +189,13 @@ async def on_banana_new(update, context) -> None:
     user_id = query.from_user.id
     redis = await _require_redis(context)
     await clear(redis, user_id)
-    state = BananaState(images=[], prompt=None)
+    state = BananaState(photos=[], prompt=None)
     await save(redis, user_id, state)
     balance_value = await _get_balance_value(user_id)
     await context.bot.send_message(
         user_id,
         "Новая карточка 🆕 Отправьте фото и промпт.",
-        reply_markup=banana_card_kb(state),
+        reply_markup=banana_card_kb(state.can_start()),
     )
 
 
