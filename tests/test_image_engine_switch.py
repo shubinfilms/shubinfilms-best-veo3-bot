@@ -101,7 +101,7 @@ def test_first_entry_shows_engine_selection() -> None:
     assert state["image_engine"] is None
     assert isinstance(state.get("last_ui_msg_id_image_engine"), int)
     assert ctx.bot.sent, "selector message not sent"
-    assert "Выберите движок" in str(ctx.bot.sent[-1]["text"])
+    assert "движок" in str(ctx.bot.sent[-1]["text"]).lower()
 
 
 def test_persist_engine_and_open_directly_next_time() -> None:

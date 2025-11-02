@@ -4,7 +4,7 @@ from typing import Sequence
 
 from telegram import InlineKeyboardButton
 
-from keyboards import CB, FEATURE_PM_ENABLED, kb_main
+from keyboards import CB, FEATURE_PM_ENABLED, kb_main, photo_engine_menu
 from texts import (
     TXT_AI_DIALOG_CHOOSE,
     TXT_AI_DIALOG_NORMAL,
@@ -61,12 +61,8 @@ def build_profile_card(balance: str, warning: str | None = None) -> dict:
 
 
 def build_photo_card() -> dict:
-    rows = [
-        [InlineKeyboardButton("Midjourney", callback_data="mode:mj_txt")],
-        [InlineKeyboardButton("Banana", callback_data="mode:banana")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-    ]
-    return build_card(TXT_KB_PHOTO, "Выберите инструмент:", rows)
+    markup = photo_engine_menu()
+    return build_card(TXT_KB_PHOTO, "Выбери движок для фото:", markup.inline_keyboard)
 
 
 def build_music_card() -> dict:

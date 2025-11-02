@@ -15,11 +15,34 @@ class BananaState:
     prompt: Optional[str]
     last_result_id: Optional[str] = None
 
+    def _normalized_prompt(self) -> Optional[str]:
+        if self.prompt is None:
+            return None
+        stripped = self.prompt.strip()
+        return stripped or None
+
     @property
     def ready(self) -> bool:
-        """Return ``True`` when both prompt and at least one image are present."""
+        """Return ``True`` when at least one input is present."""
 
-        return bool(self.prompt) and len(self.images) >= 1
+        return self.can_start()
+
+    def has_photos_or_prompt(self) -> bool:
+        """Return ``True`` when the card has photos or text prompt."""
+
+        return bool(self.images) or bool(self._normalized_prompt())
+
+    def can_start(self) -> bool:
+        """Determine whether generation can be started."""
+
+        return self.has_photos_or_prompt()
+
+    def reset(self) -> None:
+        """Clear inputs while keeping the instance reusable."""
+
+        self.images.clear()
+        self.prompt = None
+        self.last_result_id = None
 
 
 _KEY_TMPL = "banana:state:{user_id}"
@@ -52,4 +75,19 @@ async def clear(redis, user_id: int) -> None:
     await redis.delete(_key_for(user_id))
 
 
-__all__ = ["BananaState", "load", "save", "clear"]
+async def ensure(redis, user_id: int) -> BananaState:
+    """Ensure there is a Banana state stored for ``user_id``."""
+
+    state = await load(redis, user_id)
+    if not state.has_photos_or_prompt() and state.last_result_id is None:
+        await save(redis, user_id, state)
+    return state
+
+
+async def get(redis, user_id: int) -> BananaState:
+    """Alias of :func:`load` for compatibility with higher-level handlers."""
+
+    return await load(redis, user_id)
+
+
+__all__ = ["BananaState", "load", "save", "clear", "ensure", "get"]
