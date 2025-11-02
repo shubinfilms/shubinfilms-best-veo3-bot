@@ -7108,6 +7108,25 @@ def _should_process_callback(chat_id: Optional[int], data: str) -> bool:
     return True
 
 
+def _reset_callback_debounce(chat_id: int, data: str) -> None:
+    normalized = (data or "").strip()
+    if not normalized:
+        return
+    key = _callback_debounce_key(int(chat_id), normalized)
+    _callback_debounce_memory.pop(key, None)
+    if rds is None or not REDIS_PREFIX:
+        return
+    try:
+        digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    except TypeError:  # pragma: no cover - Python <3.9 fallback
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+    redis_key = f"{REDIS_PREFIX}:cb:debounce:{int(chat_id)}:{digest}"
+    try:
+        rds.delete(redis_key)
+    except Exception:
+        pass
+
+
 def _profile_card_key(chat_id: int) -> str:
     return _PROFILE_CARD_KEY_TMPL.format(chat_id=int(chat_id))
 
@@ -9011,6 +9030,8 @@ async def show_image_engine_selector(
         state_key="last_ui_msg_id_banana",
         cache_key="_last_text_banana",
     )
+    for payload in ("img_engine:mj", "img_engine:banana", "img_engine:kling"):
+        _reset_callback_debounce(chat_id, payload)
     text = _image_engine_card_text(s.get("image_engine"))
     if not force_new and text == s.get("_last_text_image_engine"):
         return
@@ -9091,6 +9112,15 @@ async def _open_image_engine(
             kind=WaitKind.BANANA_PROMPT,
             meta={"engine": "banana", "source": source or "image_engine"},
         )
+        return
+    if engine == "kling":
+        s["image_engine"] = "kling"
+        s["mode"] = "kling"
+        await ctx.bot.send_message(
+            chat_id,
+            "🎞️ Kling скоро будет доступен. Мы сообщим, когда запуск откроется.",
+        )
+        return
 
 async def _update_mj_card(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: str,
                                 reply_markup: Optional[InlineKeyboardMarkup], *, force: bool = False) -> None:
@@ -9223,7 +9253,10 @@ def banana_generating_markup() -> InlineKeyboardMarkup:
 
 def banana_result_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔁 Сгенерировать ещё", callback_data="banana:restart")]]
+        [
+            [InlineKeyboardButton("🔁 Повторить генерацию", callback_data="banana:restart")],
+            [InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")],
+        ]
     )
 
 
@@ -19117,6 +19150,107 @@ async def on_banana_prompt_saved(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, t
     s["_last_text_banana"] = None
     await show_banana_card(chat_id, ctx)
 
+
+async def _banana_initiate_generation(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    action: str,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    s = state(ctx)
+    images = list(_get_banana_images(s))
+    prompt = (s.get("last_prompt") or "").strip()
+
+    if not images and not prompt:
+        await query.answer("Добавь фото или промпт", show_alert=True)
+        return
+    if not images:
+        if query.message is not None:
+            await query.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото.")
+        return
+    if not prompt:
+        if query.message is not None:
+            await query.message.reply_text("⚠️ Добавьте текст-промпт (что изменить).")
+        return
+
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid:
+        if query.message is not None:
+            await query.message.reply_text(
+                "⚠️ Не удалось определить пользователя. Попробуйте позже."
+            )
+        return
+
+    try:
+        ledger_storage.ensure_user(uid)
+    except Exception as exc:
+        log.exception("Banana ensure_user failed for %s: %s", uid, exc)
+        if query.message is not None:
+            await query.message.reply_text(
+                "⚠️ Не удалось проверить баланс. Попробуйте позже."
+            )
+        return
+
+    chat = update.effective_chat
+    if chat is None:
+        return
+    chat_id = chat.id
+    if not await ensure_tokens(ctx, chat_id, uid, PRICE_BANANA):
+        return
+
+    ok, balance_after = debit_try(
+        uid,
+        PRICE_BANANA,
+        reason="service:start",
+        meta={"service": "BANANA", "images": len(images)},
+    )
+    if not ok:
+        await ensure_tokens(ctx, chat_id, uid, PRICE_BANANA)
+        return
+
+    new_balance = balance_after
+    s["banana_balance"] = new_balance
+    s["_last_text_banana"] = None
+    clear_wait_state(uid, reason="banana_confirm")
+
+    if action == "start" and query.message is not None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=banana_generating_markup())
+        except Exception:
+            pass
+
+    ack_text = "Повторяю…" if action == "restart" else "Запускаю…"
+    with suppress(BadRequest):
+        await query.answer(ack_text)
+
+    log.info(
+        "[BANANA] %s_generate | chat_id=%s user_id=%s images=%s",
+        action,
+        chat_id,
+        uid,
+        len(images),
+    )
+    await show_balance_notification(
+        chat_id,
+        ctx,
+        uid,
+        f"✅ Списано {PRICE_BANANA}💎. Текущий баланс: {new_balance}💎 — запускаю…",
+    )
+    asyncio.create_task(
+        _banana_run_and_send(
+            chat_id,
+            ctx,
+            images,
+            prompt,
+            PRICE_BANANA,
+            uid,
+        )
+    )
+
 async def show_veo_card(
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -19372,7 +19506,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Шаблон подставлен ✅")
         return
 
-    if data in {"banana_regenerate_fresh", "banana:restart"}:
+    if data in {"banana_regenerate_fresh", "banana:new"}:
         s["banana_images"] = []
         s["last_prompt"] = None
         s["_last_text_banana"] = None
@@ -19625,11 +19759,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         user_obj = update.effective_user
         uid_val = user_obj.id if user_obj else None
-        if choice not in {"mj", "banana"}:
+        if choice not in {"mj", "banana", "kling"}:
             await q.answer()
             return
         try:
-            await q.answer("Midjourney" if choice == "mj" else "Banana")
+            label = "Midjourney" if choice == "mj" else ("Banana" if choice == "banana" else "Kling")
+            await q.answer(label)
         except Exception:
             pass
         await _open_image_engine(
@@ -19641,6 +19776,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         if choice == "banana" and q.message is not None:
             await q.message.reply_text(BANANA_MODE_HINT_MD, parse_mode=ParseMode.MARKDOWN)
+        if choice == "kling" and q.message is not None:
+            await q.message.reply_text("🎞️ Kling скоро будет доступен. Пока можно выбрать другой движок.")
         return
 
     if data.startswith("mj_upscale:"):
@@ -19895,18 +20032,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Banana callbacks
     if data.startswith("banana:"):
-        act = data.split(":",1)[1]
+        act = data.split(":", 1)[1]
         if act == "add_more":
             await q.message.reply_text("➕ Пришлите ещё фото (всего до 4).")
             return
-        if act == "reset_all":
+        if act in {"reset_all", "clear"}:
             s["banana_images"] = []
             s["last_prompt"] = None
             s["_last_text_banana"] = None
+            s["last_banana_result_id"] = None
             chat_ctx = update.effective_chat
             chat_id_val = chat_ctx.id if chat_ctx else (q.message.chat_id if q.message else None)
             if chat_id_val is not None:
-                await show_banana_card(chat_id_val, ctx)
+                await show_banana_card(chat_id_val, ctx, force_new=True)
             await q.answer("Карточка очищена ✅")
             return
         if act == "prompt":
@@ -19977,71 +20115,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             await show_image_engine_selector(chat_id_val, ctx, force_new=True)
             return
+        if act == "restart":
+            await _banana_initiate_generation(update, ctx, action="restart")
+            return
         if act == "start":
-            imgs = list(_get_banana_images(s))
-            prompt = (s.get("last_prompt") or "").strip()
-            if not imgs:
-                await q.message.reply_text("⚠️ Сначала добавьте хотя бы одно фото.")
-                return
-            if not prompt:
-                await q.message.reply_text("⚠️ Добавьте текст-промпт (что изменить).")
-                return
-            user = update.effective_user
-            uid = user.id if user else None
-            if not uid:
-                await q.message.reply_text("⚠️ Не удалось определить пользователя. Попробуйте позже.")
-                return
-            try:
-                ledger_storage.ensure_user(uid)
-            except Exception as exc:
-                log.exception("Banana ensure_user failed for %s: %s", uid, exc)
-                await q.message.reply_text("⚠️ Не удалось проверить баланс. Попробуйте позже.")
-                return
-            chat_id = update.effective_chat.id
-            if not await ensure_tokens(ctx, chat_id, uid, PRICE_BANANA):
-                return
-            ok, balance_after = debit_try(
-                uid,
-                PRICE_BANANA,
-                reason="service:start",
-                meta={"service": "BANANA", "images": len(imgs)},
-            )
-            if not ok:
-                await ensure_tokens(ctx, chat_id, uid, PRICE_BANANA)
-                return
-            new_balance = balance_after
-            s["banana_balance"] = new_balance
-            s["_last_text_banana"] = None
-            clear_wait_state(uid, reason="banana_confirm")
-            if q.message is not None:
-                try:
-                    await q.edit_message_reply_markup(reply_markup=banana_generating_markup())
-                except Exception:
-                    pass
-            with suppress(BadRequest):
-                await q.answer("Запускаю…")
-            log.info(
-                "[BANANA] start_generate | chat_id=%s user_id=%s images=%s",
-                chat_id,
-                uid,
-                len(imgs),
-            )
-            await show_balance_notification(
-                chat_id,
-                ctx,
-                uid,
-                f"✅ Списано {PRICE_BANANA}💎. Текущий баланс: {new_balance}💎 — запускаю…",
-            )
-            asyncio.create_task(
-                _banana_run_and_send(
-                    update.effective_chat.id,
-                    ctx,
-                    imgs,
-                    prompt,
-                    PRICE_BANANA,
-                    uid,
-                )
-            );
+            await _banana_initiate_generation(update, ctx, action="start")
             return
 
     if normalized_data.startswith("suno:"):

@@ -169,8 +169,10 @@ def get_logger(name: str) -> SafeLoggerAdapter:
 
     setup_logging()
     base = logging.getLogger(name)
-    if name in {"ui.buttons.router"}:
-        base.setLevel(logging.DEBUG)
+    if name == "ui.buttons.router":
+        base.setLevel(logging.WARNING)
+    if name == "input-state":
+        base.setLevel(logging.WARNING)
     return SafeLoggerAdapter(base, {})
 
 

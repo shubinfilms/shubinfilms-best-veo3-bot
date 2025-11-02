@@ -1,6 +1,8 @@
 """Helpers to render Banana card UI."""
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardMarkup
+
+from keyboards import banana_card_kb as build_banana_card_kb
 
 
 def banana_card_text(balance: int, state) -> str:
@@ -14,19 +16,7 @@ def banana_card_text(balance: int, state) -> str:
 def banana_card_kb(state) -> InlineKeyboardMarkup:
     """Return inline keyboard for Banana card based on readiness."""
 
-    rows: list[list[InlineKeyboardButton]] = []
-    if state.ready:
-        rows.append(
-            [InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")]
-        )
-    rows.append([InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana:templates")])
-    rows.append(
-        [
-            InlineKeyboardButton("⚙️ Движок", callback_data="img_engine:banana"),
-            InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
+    return build_banana_card_kb(state.has_photos_or_prompt())
 
 
 __all__ = ["banana_card_text", "banana_card_kb"]

@@ -314,6 +314,28 @@ def build_menu(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(markup_rows)
 
 
+def banana_card_kb(has_inputs: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_inputs:
+        rows.append([InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")])
+        rows.append([InlineKeyboardButton("🔁 Повторить генерацию", callback_data="banana:restart")])
+        rows.append([InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")])
+    rows.append([InlineKeyboardButton("🧹 Очистить карточку", callback_data="banana:clear")])
+    rows.append([InlineKeyboardButton("✨ Готовые шаблоны", callback_data="banana:templates")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def photo_engine_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🍌 Nana Banana", callback_data="img_engine:banana")],
+        [InlineKeyboardButton("🎞️ Kling", callback_data="img_engine:kling")],
+        [InlineKeyboardButton("🖼️ Midjourney", callback_data="img_engine:mj")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def kb_banana_templates() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🧼 Удалить фон", callback_data="banana:tpl:bg_remove")],
