@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional
 
 from telegram.ext import ContextTypes
 
+from error_utils import handle_async_error
 from helpers.errors import send_user_error
 from helpers.progress import PROGRESS_STORAGE_KEY, send_progress_message
 
@@ -173,9 +174,13 @@ async def trigger_retry_callback(
     handler = storage.pop(retry_id, None)
     if handler is None:
         return False
-    result = handler()
-    if inspect.isawaitable(result):
-        await result
+    try:
+        result = handler()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        await handle_async_error(exc, "VEOFast.retry_handler")
+        return False
     return True
 
 

@@ -25,6 +25,7 @@ from ui.renderers.banana import banana_card_kb, banana_card_text
 from utils.banana_state import BananaState, clear, load, save
 from utils.files import validate_image
 
+from error_utils import handle_async_error
 from logging_utils import get_logger
 
 log = get_logger("handlers.banana")
@@ -303,8 +304,8 @@ async def _send_cached_result(
                 ]
             ),
         )
-    except Exception:  # pragma: no cover - defensive guard
-        log.exception("banana.send_cached_fail", extra={"user_id": user_id})
+    except Exception as exc:  # pragma: no cover - defensive guard
+        await handle_async_error(exc, "Banana.send_cached_result")
 
 
 async def _prepare_image_urls(bot, file_ids: Sequence[str]) -> list[str]:
