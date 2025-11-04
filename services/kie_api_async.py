@@ -169,3 +169,28 @@ class KieAPIAsync:
             return payload
         return {"value": payload}
 
+    async def poll_job(
+        self,
+        path: str,
+        *,
+        task_id: Optional[str] = None,
+        params: Optional[Mapping[str, Any]] = None,
+        interval: float = 4.0,
+        timeout: float = 8 * 60.0,
+    ):
+        """Yield status payloads for ``task_id`` until cancelled."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout)
+        query = dict(params or {})
+        if task_id is not None:
+            query.setdefault("taskId", task_id)
+
+        while True:
+            if loop.time() >= deadline:
+                raise KieAPITimeoutError("KIE polling timed out")
+            payload = await self.request_json("GET", path, params=query)
+            yield payload
+            if interval > 0:
+                await asyncio.sleep(float(interval))
+

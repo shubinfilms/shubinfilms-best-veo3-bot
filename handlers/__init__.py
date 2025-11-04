@@ -1,5 +1,6 @@
 """Public handler shortcuts."""
 
+from .banana_async_handler import BananaAsyncHandler
 from .faq_handler import configure_faq, faq_callback, faq_command
 from .help_handler import help_command, support_command
 from .prompt_master_handler import (
@@ -29,4 +30,5 @@ __all__ = [
     "veo_animate",
     "veo_animate_command",
     "handle_veo_animate_photo",
+    "BananaAsyncHandler",
 ]

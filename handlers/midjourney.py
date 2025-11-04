@@ -9,6 +9,7 @@ from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from error_utils import handle_async_error
 from helpers.errors import send_user_error
 from services.db_async import get_user_balance_async
 from services.kie_api_async import (
@@ -261,8 +262,8 @@ async def _send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, urls: 
             await context.bot.send_photo(chat_id=chat_id, photo=media[0], caption=caption, parse_mode="HTML")
         else:
             await context.bot.send_message(chat_id=chat_id, text=f"✅ Midjourney: {media[0]}")
-    except Exception:  # pragma: no cover - Telegram edge cases
-        logger.exception("midjourney.send_result_failed", extra={"chat_id": chat_id})
+    except Exception as exc:  # pragma: no cover - Telegram edge cases
+        await handle_async_error(exc, "Midjourney.send_result")
         await context.bot.send_message(chat_id=chat_id, text=f"✅ Midjourney: {urls[0]}")
 
 
