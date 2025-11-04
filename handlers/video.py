@@ -178,6 +178,9 @@ _MAX_VIDEO_BYTES = 50 * 1024 * 1024
 _WAIT_FLAG = "veo_animate_waiting_photo"
 _RETRY_STORAGE_KEY = "veo_anim_retries"
 
+MAX_CONCURRENT_VEO_TASKS = 3
+_veo_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VEO_TASKS)
+
 
 _kie_client = KieAPIAsync()
 
@@ -756,7 +759,7 @@ async def veo_animate(
             logger.debug("veo.anim.ack_failed", exc_info=True, extra={"chat_id": chat_id})
 
     task = asyncio.create_task(
-        _process_animation_job(
+        _run_limited_animation_job(
             context=context,
             chat_id=chat_id,
             user_id=user_id,
@@ -768,6 +771,56 @@ async def veo_animate(
         name=f"veo-anim:{job_id}",
     )
     task.add_done_callback(_log_task_exception)
+
+
+async def _run_limited_animation_job(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    user_id: Optional[int],
+    job_id: str,
+    source_url: Optional[str],
+    prompt: Optional[str],
+    progress: Optional[MutableMapping[str, Any]],
+) -> None:
+    queued_notice = False
+    if chat_id is not None and _veo_job_semaphore.locked():
+        queued_notice = True
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "⏳ Все генерации заняты, ваш запрос в очереди.",
+            )
+        except Exception:  # pragma: no cover - acknowledgement best-effort
+            logger.debug(
+                "veo.anim.queue_notice_failed",
+                exc_info=True,
+                extra={"chat_id": chat_id, "job_id": job_id},
+            )
+
+    async with _veo_job_semaphore:
+        if queued_notice and chat_id is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "🚀 Освободилось место — запускаю обработку.",
+                )
+            except Exception:  # pragma: no cover - acknowledgement best-effort
+                logger.debug(
+                    "veo.anim.queue_start_notice_failed",
+                    exc_info=True,
+                    extra={"chat_id": chat_id, "job_id": job_id},
+                )
+
+        await _process_animation_job(
+            context=context,
+            chat_id=chat_id,
+            user_id=user_id,
+            job_id=job_id,
+            source_url=source_url,
+            prompt=prompt,
+            progress=progress,
+        )
 
 
 async def veo_animate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

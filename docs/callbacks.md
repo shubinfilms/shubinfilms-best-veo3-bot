@@ -15,3 +15,10 @@ lists the primary actions exposed in the UI.
 Legacy callback payloads are mapped to the new format inside
 `hub_router.LEGACY_ALIASES`, ensuring backward compatibility for older
 clients.
+
+## Async video queue
+
+* VEO-анимация управляется обработчиком из `handlers.video`. После обновления
+  там используется семафор `MAX_CONCURRENT_VEO_TASKS`, который ограничивает
+  количество фоновых задач и рассылает уведомления «⏳ … в очереди» / «🚀 …» при
+  переходе из ожидания в работу.
