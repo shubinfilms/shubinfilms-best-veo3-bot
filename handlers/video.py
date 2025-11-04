@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Sequence
 from urllib.parse import urlparse
 
-import httpx
+import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -18,12 +18,15 @@ from telegram.ext import ContextTypes
 from handlers.menu import build_video_card
 from helpers.errors import send_user_error
 from helpers.progress import PROGRESS_STORAGE_KEY, send_progress_message
+from services.db_async import get_user_balance_async
+from services.kie_api_async import (
+    KieAPIAsync,
+    KieAPIHTTPError,
+    KieAPITimeoutError,
+    KieAPITransportError,
+)
 from settings import (
-    HTTP_TIMEOUT_CONNECT,
-    HTTP_TIMEOUT_READ,
-    HTTP_TIMEOUT_TOTAL,
     KIE_API_KEY,
-    KIE_BASE_URL,
     KIE_GEN_PATH,
     KIE_HD_PATH,
     KIE_STATUS_PATH,
@@ -176,6 +179,9 @@ _WAIT_FLAG = "veo_animate_waiting_photo"
 _RETRY_STORAGE_KEY = "veo_anim_retries"
 
 
+_kie_client = KieAPIAsync()
+
+
 class VeoAnimateError(RuntimeError):
     """Base class for VEO animate errors."""
 
@@ -197,11 +203,11 @@ class VeoAnimateHTTPError(VeoAnimateError):
         self.payload = payload
 
 
-def _http_timeout() -> httpx.Timeout:
-    total = float(HTTP_TIMEOUT_TOTAL or 75.0)
-    connect = float(HTTP_TIMEOUT_CONNECT or 10.0)
-    read = float(HTTP_TIMEOUT_READ or 60.0)
-    return httpx.Timeout(timeout=total, connect=connect, read=read)
+def _log_task_exception(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except Exception:  # pragma: no cover - background diagnostics
+        logger.exception("veo.anim.background_fail")
 
 
 def _headers(method: str) -> Mapping[str, str]:
@@ -220,36 +226,21 @@ async def _request_json(
     *,
     json_payload: Optional[Mapping[str, Any]] = None,
     params: Optional[Mapping[str, Any]] = None,
-    client: Optional[httpx.AsyncClient] = None,
 ) -> Mapping[str, Any]:
-    own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(base_url=KIE_BASE_URL, timeout=_http_timeout())
     try:
-        response = await client.request(
+        return await _kie_client.request_json(
             method,
             path,
-            json=json_payload,
+            json_payload=json_payload,
             params=params,
             headers=_headers(method),
-            follow_redirects=True,
         )
-    except httpx.TimeoutException as exc:  # pragma: no cover - network guard
+    except KieAPIHTTPError as exc:
+        raise VeoAnimateHTTPError(exc.status, exc.payload) from exc
+    except KieAPITimeoutError as exc:  # pragma: no cover - network guard
         raise VeoAnimateError("timeout") from exc
-    except httpx.RequestError as exc:  # pragma: no cover - network guard
+    except KieAPITransportError as exc:  # pragma: no cover - network guard
         raise VeoAnimateError("network") from exc
-    finally:
-        if own_client:
-            await client.aclose()
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"raw": response.text}
-    if response.status_code >= 400:
-        raise VeoAnimateHTTPError(response.status_code, payload)
-    if not isinstance(payload, Mapping):
-        return {"value": payload}
-    return payload
 
 
 def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> MutableMapping[str, Any]:
@@ -383,12 +374,9 @@ def _extract_hd_task_id(payload: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-async def _fetch_hd_urls(
-    client: httpx.AsyncClient,
-    task_id: str,
-) -> list[str]:
+async def _fetch_hd_urls(task_id: str) -> list[str]:
     try:
-        payload = await _request_json("GET", KIE_HD_PATH, params={"taskId": task_id}, client=client)
+        payload = await _request_json("GET", KIE_HD_PATH, params={"taskId": task_id})
     except VeoAnimateHTTPError:
         return []
     except VeoAnimateError:  # pragma: no cover - defensive fallback
@@ -424,52 +412,51 @@ async def _wait_for_result(
     job_id: str, *, context: Optional[ContextTypes.DEFAULT_TYPE] = None
 ) -> tuple[list[str], Mapping[str, Any]]:
     deadline = time.monotonic() + _POLL_TIMEOUT
-    async with httpx.AsyncClient(base_url=KIE_BASE_URL, timeout=_http_timeout()) as client:
-        while time.monotonic() < deadline:
-            try:
-                payload = await _request_json(
-                    "GET",
-                    KIE_STATUS_PATH,
-                    params={"taskId": job_id},
-                    client=client,
-                )
-            except VeoAnimateHTTPError as exc:
-                if 400 <= exc.status_code < 500:
-                    raise VeoAnimateBadRequest("status rejected") from exc
-                raise VeoAnimateError("status failed") from exc
-            status = _extract_status(payload)
-            normalized = status or "pending"
-            if normalized in {"pending", "queue", "waiting"}:
-                await asyncio.sleep(_POLL_INTERVAL)
-                continue
-            if normalized == "processing":
-                if context is not None:
-                    await send_progress_message(context, "render")
-                await asyncio.sleep(_POLL_INTERVAL)
-                continue
-            if normalized in {"done", "success", "succeed", "completed"}:
-                urls = _extract_result_candidates(payload)
-                if urls:
-                    return urls, payload
-                hd_task = _extract_hd_task_id(payload)
-                if hd_task:
-                    hd_urls = await _fetch_hd_urls(client, hd_task)
-                    if hd_urls:
-                        return hd_urls, payload
-                raise VeoAnimateError("result missing")
-            if normalized in {"failed", "error", "blocked", "rejected"}:
-                raise VeoAnimateBadRequest("generation rejected")
+    while time.monotonic() < deadline:
+        try:
+            payload = await _request_json(
+                "GET",
+                KIE_STATUS_PATH,
+                params={"taskId": job_id},
+            )
+        except VeoAnimateHTTPError as exc:
+            if 400 <= exc.status_code < 500:
+                raise VeoAnimateBadRequest("status rejected") from exc
+            raise VeoAnimateError("status failed") from exc
+        status = _extract_status(payload)
+        normalized = status or "pending"
+        if normalized in {"pending", "queue", "waiting"}:
             await asyncio.sleep(_POLL_INTERVAL)
+            continue
+        if normalized == "processing":
+            if context is not None:
+                await send_progress_message(context, "render")
+            await asyncio.sleep(_POLL_INTERVAL)
+            continue
+        if normalized in {"done", "success", "succeed", "completed"}:
+            urls = _extract_result_candidates(payload)
+            if urls:
+                return urls, payload
+            hd_task = _extract_hd_task_id(payload)
+            if hd_task:
+                hd_urls = await _fetch_hd_urls(hd_task)
+                if hd_urls:
+                    return hd_urls, payload
+            raise VeoAnimateError("result missing")
+        if normalized in {"failed", "error", "blocked", "rejected"}:
+            raise VeoAnimateBadRequest("generation rejected")
+        await asyncio.sleep(_POLL_INTERVAL)
     raise VeoAnimateTimeout("poll timeout")
 
 
 async def _fetch_content_length(url: str) -> Optional[int]:
+    timeout = aiohttp.ClientTimeout(total=10.0)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            response = await client.head(url, follow_redirects=True)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, allow_redirects=True) as response:
+                value = response.headers.get("Content-Length") or response.headers.get("content-length")
     except Exception:  # pragma: no cover - network guard
         return None
-    value = response.headers.get("Content-Length") or response.headers.get("content-length")
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):  # pragma: no cover - defensive guard
@@ -557,90 +544,16 @@ async def _emit_user_error(
     )
 
 
-async def veo_animate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+async def _process_animation_job(
     *,
-    image_url: Optional[str] = None,
-    auto_started: bool = False,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    user_id: Optional[int],
+    job_id: str,
+    source_url: str,
+    prompt: Optional[str],
+    progress: Optional[MutableMapping[str, Any]],
 ) -> None:
-    chat = update.effective_chat
-    chat_id = chat.id if chat else None
-    user = update.effective_user
-    user_id = user.id if user else None
-    state = _ensure_state(context)
-    source_url = image_url or state.get("last_image_url")
-    prompt = state.get("last_prompt") if isinstance(state.get("last_prompt"), str) else None
-
-    if not source_url:
-        state[_WAIT_FLAG] = True
-        if not auto_started:
-            await _emit_user_error(
-                context,
-                chat_id=chat_id,
-                user_id=user_id,
-                kind="invalid_input",
-                reason="missing_image",
-            )
-        return
-
-    state[_WAIT_FLAG] = False
-
-    progress: Optional[MutableMapping[str, Any]] = None
-    chat_data = getattr(context, "chat_data", None)
-    message = update.effective_message
-    reply_to = message.message_id if message else None
-    if (
-        isinstance(chat_data, MutableMapping)
-        and chat_id is not None
-        and reply_to is not None
-    ):
-        progress = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "mode": "veo_animate",
-            "reply_to_message_id": reply_to,
-            "success": False,
-        }
-        chat_data[PROGRESS_STORAGE_KEY] = progress
-        await send_progress_message(context, "start")
-
-    try:
-        job_id = await _start_animation(source_url, prompt)
-    except VeoAnimateBadRequest:
-        logger.info("veo.anim.fail user=%s reason=bad_request", user_id)
-        if progress is not None:
-            progress["success"] = False
-            await send_progress_message(context, "finish")
-        await _emit_user_error(
-            context,
-            chat_id=chat_id,
-            user_id=user_id,
-            kind="content_policy",
-            reason="start_bad_request",
-        )
-        return
-    except VeoAnimateError:
-        logger.info("veo.anim.fail user=%s reason=error", user_id)
-        if progress is not None:
-            progress["success"] = False
-            await send_progress_message(context, "finish")
-        await _emit_user_error(
-            context,
-            chat_id=chat_id,
-            user_id=user_id,
-            kind="backend_fail",
-            reason="start_error",
-            retry_payload={"image_url": source_url, "prompt": prompt},
-        )
-        return
-
-    if user_id is not None:
-        remember_veo_anim_job(user_id, job_id)
-    logger.info("veo.anim.request user=%s job=%s", user_id, job_id)
-    if progress is not None:
-        progress["job_id"] = job_id
-
     try:
         urls, _payload = await _wait_for_result(job_id, context=context)
     except VeoAnimateTimeout:
@@ -689,7 +602,7 @@ async def veo_animate(
         return
 
     if not urls:
-        logger.info("veo.anim.fail user=%s reason=error", user_id)
+        logger.info("veo.anim.fail user=%s reason=empty", user_id)
         if progress is not None:
             progress["success"] = False
             await send_progress_message(context, "finish")
@@ -707,6 +620,9 @@ async def veo_animate(
     result_url = urls[0]
     logger.info("veo.anim.done user=%s url=%s", user_id, _shorten_url(result_url))
     if chat_id is None:
+        if progress is not None:
+            progress["success"] = True
+            await send_progress_message(context, "finish")
         return
 
     size = await _fetch_content_length(result_url)
@@ -732,6 +648,126 @@ async def veo_animate(
             retry_payload={"image_url": source_url, "prompt": prompt},
             req_id=job_id,
         )
+
+
+async def veo_animate(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    image_url: Optional[str] = None,
+    auto_started: bool = False,
+) -> None:
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    user = update.effective_user
+    user_id = user.id if user else None
+    state = _ensure_state(context)
+    source_url = image_url or state.get("last_image_url")
+    prompt = state.get("last_prompt") if isinstance(state.get("last_prompt"), str) else None
+
+    if not source_url:
+        state[_WAIT_FLAG] = True
+        if not auto_started:
+            await _emit_user_error(
+                context,
+                chat_id=chat_id,
+                user_id=user_id,
+                kind="invalid_input",
+                reason="missing_image",
+            )
+        return
+
+    state[_WAIT_FLAG] = False
+
+    progress: Optional[MutableMapping[str, Any]] = None
+    chat_data = getattr(context, "chat_data", None)
+    message = update.effective_message
+    reply_to = message.message_id if message else None
+    if (
+        isinstance(chat_data, MutableMapping)
+        and chat_id is not None
+        and reply_to is not None
+    ):
+        progress = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "mode": "veo_animate",
+            "reply_to_message_id": reply_to,
+            "success": False,
+        }
+        chat_data[PROGRESS_STORAGE_KEY] = progress
+        await send_progress_message(context, "start")
+
+    db_balance: Optional[int] = None
+    if user_id is not None:
+        try:
+            db_balance = await get_user_balance_async(int(user_id))
+        except Exception:  # pragma: no cover - diagnostics only
+            logger.debug("veo.anim.db_balance_failed", exc_info=True, extra={"user_id": user_id})
+
+    try:
+        job_id = await _start_animation(source_url, prompt)
+    except VeoAnimateBadRequest:
+        logger.info("veo.anim.fail user=%s reason=bad_request", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="content_policy",
+            reason="start_bad_request",
+        )
+        return
+    except VeoAnimateError:
+        logger.info("veo.anim.fail user=%s reason=error", user_id)
+        if progress is not None:
+            progress["success"] = False
+            await send_progress_message(context, "finish")
+        await _emit_user_error(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            kind="backend_fail",
+            reason="start_error",
+            retry_payload={"image_url": source_url, "prompt": prompt},
+        )
+        return
+
+    if user_id is not None:
+        remember_veo_anim_job(user_id, job_id)
+    logger.info(
+        "veo.anim.request",
+        extra={"user": user_id, "job": job_id, "db_balance": db_balance},
+    )
+    if progress is not None:
+        progress["job_id"] = job_id
+
+    if chat_id is not None:
+        ack_text = "🎬 Запрос принят! Я пришлю видео, как только будет готово."
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=ack_text,
+                reply_to_message_id=reply_to,
+            )
+        except Exception:  # pragma: no cover - best effort acknowledgement
+            logger.debug("veo.anim.ack_failed", exc_info=True, extra={"chat_id": chat_id})
+
+    task = asyncio.create_task(
+        _process_animation_job(
+            context=context,
+            chat_id=chat_id,
+            user_id=user_id,
+            job_id=job_id,
+            source_url=source_url,
+            prompt=prompt,
+            progress=progress,
+        ),
+        name=f"veo-anim:{job_id}",
+    )
+    task.add_done_callback(_log_task_exception)
 
 
 async def veo_animate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
