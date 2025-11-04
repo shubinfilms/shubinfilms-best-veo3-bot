@@ -171,8 +171,11 @@ def get_logger(name: str) -> SafeLoggerAdapter:
     base = logging.getLogger(name)
     if name == "ui.buttons.router":
         base.setLevel(logging.WARNING)
-    if name == "input-state":
+    if name in {"wait-input", "input-state"}:
         base.setLevel(logging.WARNING)
+    if name == "veo3-bot.singleton":
+        level = logging.DEBUG if os.getenv("HEARTBEAT_VERBOSE") == "1" else logging.WARNING
+        base.setLevel(level)
     return SafeLoggerAdapter(base, {})
 
 

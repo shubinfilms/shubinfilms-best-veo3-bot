@@ -321,6 +321,7 @@ from handlers.menu import (
     build_photo_card,
     build_profile_card,
     build_video_card,
+    open_main_menu,
 )
 from handlers.music import configure as configure_music_menu, open_menu as music_open_menu
 from handlers.photo import configure as configure_photo_menu, open_menu as photo_open_menu
@@ -1552,7 +1553,7 @@ class _LeaderContext:
                 ok = False
             if ok:
                 self._failures = 0
-                singleton_log.info("leader: heartbeat ok")
+                singleton_log.debug("leader: heartbeat ok")
             else:
                 self._failures += 1
                 if self._failures >= 3:
@@ -4328,7 +4329,8 @@ def log_evt(name: str, **kw) -> None:
         payload = json.dumps(kw, ensure_ascii=False, sort_keys=True)
     except Exception:
         payload = str(kw)
-    log.info("EVT_%s | %s", name, payload)
+    level = logging.DEBUG if name == "LOCK_HEARTBEAT" else logging.INFO
+    log.log(level, "EVT_%s | %s", name, payload)
 
 
 def event(tag: str, **kw):
@@ -22425,7 +22427,6 @@ class RedisRunnerLock:
 
 PRIORITY_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("start",), start),
-    (("menu",), menu_command),
     (("cancel",), cancel_command),
     (("faq",), faq_command_entry),
     (("prompt_master",), prompt_master_command),
@@ -22492,7 +22493,6 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
 ]
 
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
-    (r"^kb_open$", knowledge_base_open_handler),
     (r"^dialog_default$", dialog_mode_callback),
     (r"^prompt_master$", prompt_master_mode_callback),
     (r"^dialog:choose_regular$", dialog_choose_regular_callback),
@@ -22512,10 +22512,9 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^mj\.gallery\.back$", handle_mj_gallery_back),
     (r"^mj\.upscale\.menu:", handle_mj_upscale_menu),
     (r"^mj\.upscale:", handle_mj_upscale_choice),
-    (r"^menu:(profile|kb|photo|music|video|dialog)$", handle_main_menu_callback),
     (r"^(hub:open:(profile|kb|photo|music|video|dialog))$", handle_hub_open_callback),
     (
-        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|menu:|back_main$|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
+        r"^(?:mnu:|home:|hub:|main_|profile_|pay_|nav_|nav:|ai_modes$|chat_(?:normal|promptmaster)$|(?:ai|video|image|music|profile|kb):)",
         hub_router,
     ),
     (r"^go:", main_suggest_router),
@@ -22605,6 +22604,17 @@ def register_handlers(application: Any) -> None:
     )
     kb_text_handler.block = False
     application.add_handler(kb_text_handler, group=0)
+
+    application.add_handler(CommandHandler("menu", open_main_menu))
+
+    from ui.buttons.router import route_callback  # local import to avoid cycles
+
+    menu_router = CallbackQueryHandler(
+        route_callback,
+        pattern=r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|back_main)$",
+    )
+    menu_router.block = False
+    application.add_handler(menu_router, group=0)
 
     for names, callback in PRIORITY_COMMAND_SPECS:
         application.add_handler(CommandHandler(list(names), callback))

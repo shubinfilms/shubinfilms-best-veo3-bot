@@ -203,7 +203,15 @@ def kb_main() -> InlineKeyboardMarkup:
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-    return kb_main()
+    rows = []
+    for raw_row in _get_home_menu_layout():
+        buttons = [InlineKeyboardButton(text, callback_data=callback) for text, callback in raw_row]
+        rows.append(buttons)
+    if len(rows) == 4:
+        merged = rows[:2]
+        merged.append(rows[2] + rows[3])
+        rows = merged
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_home_menu() -> InlineKeyboardMarkup:
@@ -340,6 +348,16 @@ def photo_engine_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def photo_engines_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🍌 Nana Banana", callback_data="img_engine:banana")],
+            [InlineKeyboardButton("🖼 Midjourney (WIP)", callback_data="img_engine:mj")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
+        ]
+    )
 
 
 def kb_banana_templates() -> InlineKeyboardMarkup:
