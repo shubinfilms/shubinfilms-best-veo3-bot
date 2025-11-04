@@ -313,12 +313,24 @@ async def _prepare_image_urls(bot, file_ids: Sequence[str]) -> list[str]:
     for idx, file_id in enumerate(file_ids):
         try:
             data = await _fetch_file_bytes(bot, file_id)
-            validate_image(data)
-        except Exception:  # pragma: no cover - validation or fetch failure
+        except Exception:  # pragma: no cover - fetch failure
             log.warning(
                 "banana.upload_prepare_fail",
                 exc_info=True,
                 extra={"file_id": file_id},
+            )
+            continue
+
+        ok, fmt, mime = validate_image(data)
+        if not ok:
+            log.warning(
+                "banana.upload_prepare_invalid_image",
+                extra={
+                    "file_id": file_id,
+                    "format": fmt,
+                    "mime": mime,
+                    "size": len(data),
+                },
             )
             continue
         filename = f"banana_input_{idx + 1}.png"

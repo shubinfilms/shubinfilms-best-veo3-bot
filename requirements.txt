@@ -16,7 +16,8 @@ openai==0.28.1
 redis==5.0.7
 aiohttp>=3.9.5,<4.0
 mutagen>=1.47.0
-Pillow>=10.0
+Pillow>=10.4.0
+pillow-heif>=0.15.0
 
 # Database toolkit for admin features
 SQLAlchemy>=2.0.30,<3.0

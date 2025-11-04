@@ -83,7 +83,9 @@ def test_banana_generation_success(monkeypatch):
 
         monkeypatch.setattr(banana, "_fetch_file_bytes", fake_fetch)
         monkeypatch.setattr(banana, "_upload_image_bytes", fake_upload)
-        monkeypatch.setattr(banana, "validate_image", lambda data: None)
+        monkeypatch.setattr(
+            banana, "validate_image", lambda data: (True, "PNG", "image/png")
+        )
         monkeypatch.setattr(banana, "get_user_balance_async", fake_balance)
         monkeypatch.setattr(banana._client, "request_json", fake_request_json)
 
