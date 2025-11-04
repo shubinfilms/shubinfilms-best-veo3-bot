@@ -50,6 +50,10 @@ DEBOUNCE_SEC = max(DEBOUNCE_SEC, 0.0)
 _LAST_CALLBACK_AT: dict[tuple[int, str], float] = {}
 
 
+# Allowed menu callback payloads handled by ``route_callback`` below.
+MENU_PAT = re.compile(r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|back_main)$")
+
+
 def _legacy_bridge_enabled() -> bool:
     try:
         if getattr(app_settings, "ROUTER_LEGACY_OFF", False):
@@ -644,3 +648,86 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_unmatched_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await on_callback(update, ctx)
+
+
+async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    def _mark_handled() -> None:
+        try:
+            setattr(update, "_ui_button_handled", True)
+        except Exception:
+            pass
+        try:
+            setattr(query, "_ui_button_handled", True)
+        except Exception:
+            pass
+
+    if not MENU_PAT.match(data):
+        if log.isEnabledFor(10):  # DEBUG
+            log.debug("ui.callback.unmatched", extra={"data": data})
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        message = query.message
+        if message is not None:
+            await message.reply_text("Кнопка устарела. Откройте /menu.")
+        return
+
+    if data == "btn:profile":
+        from handlers.menu import show_profile
+
+        _mark_handled()
+        await show_profile(update, context)
+        return
+
+    if data == "kb_open":
+        from handlers.menu import show_kb
+
+        _mark_handled()
+        await show_kb(update, context)
+        return
+
+    if data == "menu:photo":
+        from handlers.menu import open_photo_mode
+
+        _mark_handled()
+        await open_photo_mode(update, context)
+        return
+
+    if data == "menu:music":
+        from handlers.menu import open_music_mode
+
+        _mark_handled()
+        await open_music_mode(update, context)
+        return
+
+    if data == "menu:video":
+        from handlers.menu import open_video_mode
+
+        _mark_handled()
+        await open_video_mode(update, context)
+        return
+
+    if data == "menu:dialog":
+        from handlers.menu import open_dialog_mode
+
+        _mark_handled()
+        await open_dialog_mode(update, context)
+        return
+
+    if data == "back_main":
+        from handlers.menu import open_main_menu
+
+        _mark_handled()
+        await open_main_menu(update, context)
+        return

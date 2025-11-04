@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from telegram import InlineKeyboardButton
+from telegram import InlineKeyboardButton, Update
+from telegram.ext import ContextTypes
 
-from keyboards import CB, FEATURE_PM_ENABLED, kb_main, photo_engine_menu
+from keyboards import CB, FEATURE_PM_ENABLED, kb_main, main_menu_kb, photo_engines_kb
 from texts import (
     TXT_AI_DIALOG_CHOOSE,
     TXT_AI_DIALOG_NORMAL,
@@ -23,6 +24,68 @@ from logging_utils import get_logger
 log = get_logger("handlers.menu")
 
 _MAIN_MENU_SUBTITLE = "Выберите раздел:"
+
+
+async def open_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "📋 *Главное меню*\n_Выберите раздел:_"
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
+
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    target = query.message if query else update.effective_message
+    if target is None:
+        return
+    await target.reply_text("👤 Профиль\nБаланс: …\nТариф: …")
+
+
+async def show_kb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    target = query.message if query else update.effective_message
+    if target is None:
+        return
+    await target.reply_text("📚 База знаний (в разработке)")
+
+
+async def open_photo_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    target = query.message if query else update.effective_message
+    if target is None:
+        return
+    await target.reply_text(
+        "📸 Выберите нейросеть для фотографий:",
+        reply_markup=photo_engines_kb(),
+    )
+
+
+async def open_music_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    target = query.message if query else update.effective_message
+    if target is None:
+        return
+    await target.reply_text("🎧 Музыка: Suno / загрузка каппеллы / инструкции (скоро).")
+
+
+async def open_video_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    target = query.message if query else update.effective_message
+    if target is None:
+        return
+    await target.reply_text("📹 Видео: Kling / VEO (скоро выбор).")
+
+
+async def open_dialog_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    target = query.message if query else update.effective_message
+    if target is None:
+        return
+    context.user_data["dialog_mode"] = "plain"
+    await target.reply_text(
+        "🧠 Обычный диалог включён. Пишите текст — отвечу без дополнительных меню."
+    )
 
 
 async def on_menu_dialog(update, context) -> None:
@@ -61,7 +124,7 @@ def build_profile_card(balance: str, warning: str | None = None) -> dict:
 
 
 def build_photo_card() -> dict:
-    markup = photo_engine_menu()
+    markup = photo_engines_kb()
     return build_card(TXT_KB_PHOTO, "Выбери движок для фото:", markup.inline_keyboard)
 
 
@@ -115,6 +178,13 @@ def build_dialog_card() -> dict:
 
 
 __all__ = [
+    "open_main_menu",
+    "show_profile",
+    "show_kb",
+    "open_photo_mode",
+    "open_music_mode",
+    "open_video_mode",
+    "open_dialog_mode",
     "on_menu_dialog",
     "build_dialog_card",
     "build_main_menu_card",
