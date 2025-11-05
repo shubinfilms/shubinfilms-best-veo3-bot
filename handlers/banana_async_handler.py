@@ -26,6 +26,8 @@ from keyboards import banana_result_kb
 from utils.banana_state import BananaState, load, save
 from utils.files import validate_image
 
+from ui.renderers.banana import banana_card_kb as build_banana_card_kb, banana_card_text
+
 from handlers.banana import (
     BananaBackendError,
     BananaBadRequest,
@@ -33,6 +35,10 @@ from handlers.banana import (
 )
 
 log = logging.getLogger("handlers.banana_async")
+
+
+_MAX_CARD_IMAGES = 4
+_DEFAULT_HANDLER: Optional["BananaAsyncHandler"] = None
 
 _ACK_TEXT = "🟡 Processing your Banana edit... please wait."
 _SUCCESS_CAPTION = "✅ Banana edit ready!"
@@ -247,6 +253,7 @@ class BananaAsyncHandler:
                 chat_id=chat.id,
                 message_id=ack_message.message_id,
                 payload=result,
+                user_id=user.id,
             )
 
         try:
@@ -326,6 +333,7 @@ class BananaAsyncHandler:
                     message_id=ack_message_id,
                     media=url,
                     prompt=prompt,
+                    user_id=user_id,
                 )
                 file_id = self._extract_file_id(message) or url
                 result = BananaResult(file_id=file_id, task_id=task_id, caption=caption, url=url)
@@ -403,6 +411,7 @@ class BananaAsyncHandler:
         message_id: int,
         media: str,
         prompt: str,
+        user_id: int,
     ) -> tuple[Any, str]:
         caption = _SUCCESS_CAPTION if not prompt else f"{_SUCCESS_CAPTION}\n{prompt}"
         try:
@@ -412,10 +421,18 @@ class BananaAsyncHandler:
                 media=InputMediaDocument(media=media, caption=caption),
                 reply_markup=banana_result_kb(),
             )
+            log.info(
+                "banana.result.sent",
+                extra={"chat_id": chat_id, "user_id": user_id, "cached": False},
+            )
             return message, caption
         except Exception as exc:
             await handle_async_error(exc, "BananaAsync.publish_result")
             await context.bot.send_message(chat_id, caption)
+            log.info(
+                "banana.result.sent",
+                extra={"chat_id": chat_id, "user_id": user_id, "cached": False, "fallback": True},
+            )
             return None, caption
 
     async def _send_cached_result(
@@ -425,6 +442,7 @@ class BananaAsyncHandler:
         chat_id: int,
         message_id: int,
         payload: Mapping[str, Any],
+        user_id: int,
     ) -> None:
         file_id = payload.get("file_id") if isinstance(payload, Mapping) else None
         caption = payload.get("caption") if isinstance(payload, Mapping) else None
@@ -438,9 +456,17 @@ class BananaAsyncHandler:
                 media=InputMediaDocument(media=file_id, caption=caption or _SUCCESS_CAPTION),
                 reply_markup=banana_result_kb(),
             )
+            log.info(
+                "banana.result.sent",
+                extra={"chat_id": chat_id, "user_id": user_id, "cached": True},
+            )
         except Exception as exc:
             await handle_async_error(exc, "BananaAsync.cached_edit")
             await context.bot.send_message(chat_id, caption or _SUCCESS_CAPTION)
+            log.info(
+                "banana.result.sent",
+                extra={"chat_id": chat_id, "user_id": user_id, "cached": True, "fallback": True},
+            )
 
     async def _handle_failure(
         self,
@@ -494,4 +520,248 @@ class BananaAsyncHandler:
         return None
 
 
-__all__ = ["BananaAsyncHandler"]
+def _get_default_handler() -> "BananaAsyncHandler":
+    global _DEFAULT_HANDLER
+    if _DEFAULT_HANDLER is None:
+        _DEFAULT_HANDLER = BananaAsyncHandler()
+    return _DEFAULT_HANDLER
+
+
+def _resolve_redis(context: ContextTypes.DEFAULT_TYPE):
+    redis = getattr(context, "redis", None)
+    if redis is None:
+        raise RuntimeError("Redis client is not configured")
+    return redis
+
+
+async def _load_state(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> BananaState:
+    redis = _resolve_redis(context)
+    return await load(redis, user_id)
+
+
+async def _save_state(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, state: BananaState
+) -> None:
+    redis = _resolve_redis(context)
+    await save(redis, user_id, state)
+
+
+def _extract_photo_file_id(message) -> Optional[str]:
+    photos = getattr(message, "photo", None)
+    if photos:
+        try:
+            candidate = photos[-1]
+        except Exception:
+            candidate = None
+        if candidate is not None:
+            file_id = getattr(candidate, "file_id", None)
+            if isinstance(file_id, str) and file_id:
+                return file_id
+    document = getattr(message, "document", None)
+    if document is not None:
+        mime = getattr(document, "mime_type", "") or ""
+        if mime.startswith("image/"):
+            file_id = getattr(document, "file_id", None)
+            if isinstance(file_id, str) and file_id:
+                return file_id
+    return None
+
+
+async def _render_card(
+    *,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state: BananaState,
+    user_id: Optional[int],
+    message=None,
+) -> None:
+    text = banana_card_text(0, state)
+    markup = build_banana_card_kb(state)
+    edited = False
+    if message is not None and getattr(message, "text", None):
+        try:
+            await message.edit_text(text, reply_markup=markup)
+            edited = True
+        except Exception as exc:
+            await handle_async_error(exc, "BananaAsync.card_edit")
+    if not edited:
+        try:
+            await ctx.bot.send_message(chat_id, text, reply_markup=markup)
+        except Exception as exc:
+            await handle_async_error(exc, "BananaAsync.card_send")
+            return
+    log.info(
+        "banana.card.update",
+        extra={
+            "user_id": user_id,
+            "photos": len(state.photos),
+            "has_prompt": bool(state.prompt),
+        },
+    )
+
+
+async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user = update.effective_user
+    message = query.message
+    chat = getattr(message, "chat", None) or update.effective_chat
+    if user is None or chat is None:
+        return
+    try:
+        state = await _load_state(ctx, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_load")
+        return
+    await _render_card(
+        ctx=ctx,
+        chat_id=chat.id,
+        state=state,
+        user_id=user.id,
+        message=message,
+    )
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if message is None or chat is None or user is None:
+        return
+    file_id = _extract_photo_file_id(message)
+    if not file_id:
+        return
+    try:
+        state = await _load_state(ctx, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.photo_load")
+        return
+    if len(state.photos) >= _MAX_CARD_IMAGES:
+        await message.reply_text("Максимум 4 фото. Удалите лишнее или начните новую генерацию.")
+        return
+    state.photos.append(file_id)
+    try:
+        await _save_state(ctx, user.id, state)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.photo_save")
+    await _render_card(ctx=ctx, chat_id=chat.id, state=state, user_id=user.id)
+
+
+async def on_text_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    text = getattr(message, "text", None)
+    if message is None or chat is None or user is None or text is None:
+        return
+    prompt = text.strip()
+    try:
+        state = await _load_state(ctx, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.text_load")
+        return
+    state.prompt = prompt or None
+    try:
+        await _save_state(ctx, user.id, state)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.text_save")
+    try:
+        await ctx.bot.delete_message(chat.id, message.message_id)
+    except Exception:
+        pass
+    await _render_card(ctx=ctx, chat_id=chat.id, state=state, user_id=user.id)
+
+
+async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    try:
+        state = await _load_state(ctx, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.start_load")
+        return
+    if not state.has_photos_or_prompt():
+        await query.answer("Добавьте фото или промпт", show_alert=True)
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    log.info("banana.start", extra={"user_id": user.id, "action": "start"})
+    handler = _get_default_handler()
+    await handler.run(update, ctx)
+
+
+async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    try:
+        state = await _load_state(ctx, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.restart_load")
+        return
+    if not state.has_photos_or_prompt():
+        await query.answer("Карточка пуста. Добавьте фото или промпт.", show_alert=True)
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    log.info("banana.start", extra={"user_id": user.id, "action": "restart"})
+    handler = _get_default_handler()
+    await handler.run(update, ctx)
+
+
+async def new_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    chat = update.effective_chat
+    message = query.message if query else None
+    if query is None or user is None or chat is None:
+        return
+    try:
+        state = await _load_state(ctx, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.new_load")
+        return
+    state.reset()
+    try:
+        await _save_state(ctx, user.id, state)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.new_save")
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    editable_message = message if getattr(message, "text", None) else None
+    await _render_card(
+        ctx=ctx,
+        chat_id=chat.id,
+        state=state,
+        user_id=user.id,
+        message=editable_message,
+    )
+
+
+__all__ = [
+    "BananaAsyncHandler",
+    "open_card",
+    "on_photo",
+    "on_text_prompt",
+    "start_generation",
+    "restart_generation",
+    "new_card",
+]

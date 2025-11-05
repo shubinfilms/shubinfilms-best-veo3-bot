@@ -326,15 +326,14 @@ def banana_card_kb(can_start: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if can_start:
         rows.append([InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")])
-    rows.append([InlineKeyboardButton("🧹 Очистить карточку", callback_data="banana:clear")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="banana:back_photo")])
     return InlineKeyboardMarkup(rows)
 
 
 def banana_result_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔁 Повторить генерацию", callback_data="banana:restart")],
+            [InlineKeyboardButton("↪️ Повторить генерацию", callback_data="banana:restart")],
             [InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")],
         ]
     )

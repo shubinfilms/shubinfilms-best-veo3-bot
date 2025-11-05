@@ -156,6 +156,12 @@ from hub_router import (
     set_fallback as set_hub_fallback,
 )
 from handlers import profile as profile_handlers
+from handlers.banana_async_handler import (
+    new_card as banana_new_card,
+    restart_generation as banana_restart_generation,
+    start_generation as banana_start_generation,
+)
+from handlers.photo_modes import open_menu as photo_modes_open_menu
 from handlers.stars import buy as stars_buy_handler, open_stars_menu
 from mj_client import (
     build_status_candidates as mj_status_candidates,
@@ -22499,6 +22505,10 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
     (r"^noop$", on_noop_callback),
     (r"^music:(inst|vocal)$", on_music_callback),
+    (r"^banana:start$", banana_start_generation),
+    (r"^banana:restart$", banana_restart_generation),
+    (r"^banana:new$", banana_new_card),
+    (r"^banana:back_photo$", photo_modes_open_menu),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),

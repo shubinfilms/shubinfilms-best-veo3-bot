@@ -725,6 +725,13 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await open_dialog_mode(update, context)
         return
 
+    if data == "img_engine:banana":
+        from handlers.banana_async_handler import open_card as open_banana_card
+
+        _mark_handled()
+        await open_banana_card(update, context)
+        return
+
     if data == "back_main":
         from handlers.menu import open_main_menu
 

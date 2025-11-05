@@ -61,7 +61,7 @@ class BananaState:
         self.photos = value
 
 
-_KEY_TMPL = "banana:state:{user_id}"
+_KEY_TMPL = "banana:{user_id}"
 _TTL_SECONDS = 60 * 60 * 24
 
 
