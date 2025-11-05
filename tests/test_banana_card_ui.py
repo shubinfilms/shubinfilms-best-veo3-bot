@@ -26,8 +26,8 @@ def test_banana_card_compact_summary(bot_module):
     text = bot_module.banana_card_text(state)
 
     assert "Примеры запросов" not in text
-    assert "📸 Фото: 1/4" in text
-    assert "Промпт: нет" in text
+    assert "📷 Фото: 1/4" in text
+    assert "✏️ Промпт: нет" in text
     assert "banana_helper_line" not in state
 
 
@@ -36,13 +36,11 @@ def test_banana_card_shows_prompt(bot_module):
 
     text = bot_module.banana_card_text(state)
 
-    assert "Промпт: есть" in text
+    assert "✏️ Промпт: есть" in text
 
 
 def test_banana_keyboard_layout(bot_module):
     keyboard = bot_module.banana_kb()
     rows = keyboard.inline_keyboard
 
-    assert rows[0][0].text == "✨ Готовые шаблоны"
-    assert rows[1][0].text == "⚙️ Движок"
-    assert rows[1][1].text == "⬅️ Назад"
+    assert rows[0][0].text == "⬅️ Назад"

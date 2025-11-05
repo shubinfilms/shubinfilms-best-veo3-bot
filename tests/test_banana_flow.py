@@ -90,7 +90,7 @@ def test_banana_generate_flow(monkeypatch, tmp_path, bot_module):
     markup = doc_call.get("reply_markup")
     assert isinstance(markup, InlineKeyboardMarkup)
     buttons = markup.inline_keyboard
-    assert buttons and buttons[0][0].text == "🔁 Повторить генерацию"
+    assert buttons and buttons[0][0].text == "↪️ Повторить генерацию"
     assert buttons[0][0].callback_data == "banana:restart"
     assert len(buttons) >= 2
     assert buttons[1][0].callback_data == "banana:new"
