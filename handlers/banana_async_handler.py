@@ -23,8 +23,9 @@ from services.kie_api_async import (
     KieAPITransportError,
 )
 from keyboards import banana_result_kb
-from utils.banana_state import BananaState, load, save
+from utils.banana_state import BananaState, ensure, load, save
 from utils.files import validate_image
+from utils.redis_client import get_redis
 
 from ui.renderers.banana import banana_card_kb as build_banana_card_kb, banana_card_text
 
@@ -530,7 +531,11 @@ def _get_default_handler() -> "BananaAsyncHandler":
 def _resolve_redis(context: ContextTypes.DEFAULT_TYPE):
     redis = getattr(context, "redis", None)
     if redis is None:
-        raise RuntimeError("Redis client is not configured")
+        redis = get_redis()
+        try:
+            setattr(context, "redis", redis)
+        except Exception:
+            pass
     return redis
 
 
@@ -613,6 +618,12 @@ async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
     chat = getattr(message, "chat", None) or update.effective_chat
     if user is None or chat is None:
         return
+    redis = _resolve_redis(ctx)
+    try:
+        await ensure(redis, user.id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_init")
+        return
     try:
         state = await _load_state(ctx, user.id)
     except Exception as exc:
@@ -624,6 +635,14 @@ async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
         state=state,
         user_id=user.id,
         message=message,
+    )
+    log.info(
+        "banana.card.opened",
+        extra={
+            "user_id": user.id,
+            "photos": len(state.photos),
+            "has_prompt": bool(state.prompt),
+        },
     )
 
 

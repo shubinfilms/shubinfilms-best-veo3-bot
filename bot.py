@@ -23,6 +23,7 @@ log_environment(logging.getLogger("bot"))
 # Configure Telegram log forwarding as early as possible.
 import logger_to_telegram  # noqa: F401,E402
 import runtime_metrics
+from utils.redis_client import get_redis as _get_shared_redis
 
 try:
     from core.codex_logger import setup_codex_logger
@@ -45,6 +46,9 @@ logging.getLogger("bot").info(
     _codex_max_retry,
     _codex_silent,
 )
+
+# Warm up Redis client (falls back to in-memory store when unavailable).
+_bot_redis = _get_shared_redis()
 
 import json, time, uuid, asyncio, tempfile, subprocess, re, signal, socket, hashlib, html, sys, math, random, copy, io, unicodedata, traceback
 import threading
