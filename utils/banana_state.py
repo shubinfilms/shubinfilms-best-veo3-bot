@@ -80,7 +80,11 @@ async def load(redis, user_id: int) -> BananaState:
         photos = data.get("images") or []
         data["photos"] = photos
     data.pop("images", None)
-    data.setdefault("prompt", None)
+    prompt = data.get("prompt", None)
+    if isinstance(prompt, str) and not prompt.strip():
+        data["prompt"] = None
+    else:
+        data.setdefault("prompt", None)
     data.setdefault("last_job_id", None)
     data.setdefault("last_payload", None)
     data.setdefault("last_result_msg_id", None)
@@ -91,7 +95,12 @@ async def load(redis, user_id: int) -> BananaState:
 async def save(redis, user_id: int, state: BananaState) -> None:
     """Persist ``state`` for ``user_id`` with a one-day TTL."""
 
-    await redis.set(_key_for(user_id), json.dumps(asdict(state)), ex=_TTL_SECONDS)
+    payload = asdict(state)
+    payload["images"] = list(payload.get("photos", []))
+    prompt = payload.get("prompt")
+    if prompt is None:
+        payload["prompt"] = ""
+    await redis.set(_key_for(user_id), json.dumps(payload), ex=_TTL_SECONDS)
 
 
 async def clear(redis, user_id: int) -> None:

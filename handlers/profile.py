@@ -1174,7 +1174,7 @@ async def open_profile(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
-    source: str,
+    source: str = "button",
     suppress_nav: bool = True,
     force_refresh: bool = False,
 ) -> None:
@@ -1243,6 +1243,7 @@ async def open_profile(
             observer and observer.observe(first_paint_ms)
         counter = lbl_safe(profile_open_total, source=source_label, result=result_label)
         counter and counter.inc()
+        log.info("profile.opened", extra={"source": source_label, "result": result_label})
         log.info("profile.open", extra={"source": source_label, "result": result_label})
         if user_id is not None:
             _release_profile_lock(user_id, lock_token)

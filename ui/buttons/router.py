@@ -51,7 +51,9 @@ _LAST_CALLBACK_AT: dict[tuple[int, str], float] = {}
 
 
 # Allowed menu callback payloads handled by ``route_callback`` below.
-MENU_PAT = re.compile(r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|back_main)$")
+MENU_PAT = re.compile(
+    r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|banana:back_photo|back_main)$"
+)
 
 
 def _legacy_bridge_enabled() -> bool:
@@ -684,10 +686,11 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "btn:profile":
-        from handlers.menu import show_profile
+        from handlers.profile import open_profile as open_profile_card
 
         _mark_handled()
-        await show_profile(update, context)
+        await open_profile_card(update, context)
+        log.info("profile.opened")
         return
 
     if data == "kb_open":
@@ -730,6 +733,12 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         _mark_handled()
         await open_banana_card(update, context)
+        return
+    if data == "banana:back_photo":
+        from handlers.photo_modes import open_menu as open_photo_modes
+
+        _mark_handled()
+        await open_photo_modes(update, context)
         return
 
     if data == "back_main":
