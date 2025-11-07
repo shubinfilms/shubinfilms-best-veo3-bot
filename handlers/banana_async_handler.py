@@ -7,9 +7,12 @@ import base64
 import hashlib
 import json
 import logging
+import mimetypes
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
+import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -25,6 +28,7 @@ from services.kie_api_async import (
 from keyboards import banana_result_kb
 from utils.async_input_state import input_state as async_input_state
 from utils.banana_state import BananaState, ensure, load, save
+from settings import UPLOAD_BASE64_PATH, UPLOAD_BASE_URL, UPLOAD_STREAM_PATH
 from utils.files import validate_image
 from utils.redis_client import get_redis
 
@@ -50,6 +54,13 @@ _BANANA_MODEL = "google/nano-banana-edit"
 _BANANA_CREATE_PATH = "/api/v1/jobs/createTask"
 _BANANA_STATUS_PATH = "/api/v1/jobs/recordInfo"
 _UPLOAD_PATH = "/api/v1/upload/base64"
+
+_CARD_MESSAGE_KEY = "banana:card_msg_id:{user_id}"
+_CARD_SNAPSHOT_KEY = "banana:card_snapshot:{user_id}"
+_CARD_STORAGE_TTL = 60 * 60 * 24
+_UPLOAD_TIMEOUT = httpx.Timeout(20.0, connect=20.0)
+_UPLOAD_RETRIES = (5, 10, 20)
+_EXTENSION_MAP = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}
 
 _WAIT_STATES = {"waiting", "queuing", "queued", "generating", "processing", "running", "pending", "0", 0}
 _SUCCESS_STATES = {"success", "1", 1, "done", "finished", "completed", "ready"}
@@ -179,6 +190,42 @@ def _build_cache_key(user_id: int, prompt: str, images: Sequence[str]) -> str:
     return f"banana:result:{digest}"
 
 
+def _build_upload_url(path: Optional[str]) -> Optional[str]:
+    base = (UPLOAD_BASE_URL or "").strip()
+    normalized_path = (path or "").strip()
+    if normalized_path.startswith("http://") or normalized_path.startswith("https://"):
+        return normalized_path
+    if not base and not normalized_path:
+        return None
+    if not base:
+        return None
+    if not normalized_path.startswith("/"):
+        normalized_path = f"/{normalized_path}"
+    return f"{base}{normalized_path}" if normalized_path else None
+
+
+def _extract_upload_url(payload: Mapping[str, Any]) -> Optional[str]:
+    for key in ("public_url", "publicUrl", "url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    data = payload.get("data") if isinstance(payload.get("data"), Mapping) else None
+    if isinstance(data, Mapping):
+        return _extract_upload_url(data)
+    return None
+
+
+def _resolve_extension(filename: str, fmt: Optional[str]) -> str:
+    path_ext = Path(filename).suffix.lower().lstrip(".")
+    if path_ext:
+        return path_ext
+    if fmt:
+        mapped = _EXTENSION_MAP.get(fmt.upper())
+        if mapped:
+            return mapped
+    return "png"
+
+
 class BananaAsyncHandler:
     """Asynchronous Banana pipeline orchestrator."""
 
@@ -226,6 +273,18 @@ class BananaAsyncHandler:
 
         prompt = state.prompt or ""
         photos = list(state.photos)
+        uploads: list[str] = []
+        payload_snapshot = state.last_payload if isinstance(state.last_payload, Mapping) else {}
+        if isinstance(payload_snapshot, Mapping):
+            snapshot_prompt = str(payload_snapshot.get("prompt") or "").strip()
+            snapshot_images = [str(img) for img in (payload_snapshot.get("images") or payload_snapshot.get("photos") or [])]
+            stored_uploads = [
+                str(url).strip()
+                for url in (payload_snapshot.get("uploads") or [])
+                if str(url or "").strip()
+            ]
+            if snapshot_images == photos and snapshot_prompt == (prompt or "").strip():
+                uploads = stored_uploads
         cache_key = _build_cache_key(user.id, prompt, photos)
 
         try:
@@ -237,6 +296,7 @@ class BananaAsyncHandler:
                     user_id=user.id,
                     prompt=prompt,
                     photos=photos,
+                    uploads=uploads,
                     ack_message_id=ack_message.message_id,
                 ),
                 redis=redis,
@@ -289,9 +349,14 @@ class BananaAsyncHandler:
         user_id: int,
         prompt: str,
         photos: Sequence[str],
+        uploads: Sequence[str],
         ack_message_id: int,
     ) -> MutableMapping[str, Any]:
-        image_urls = await self._prepare_image_urls(context.bot, photos)
+        upload_candidates = [str(url).strip() for url in uploads if str(url or "").strip()]
+        if upload_candidates:
+            image_urls = upload_candidates
+        else:
+            image_urls = await self.prepare_uploads(context.bot, photos, user_id=user_id)
         if not image_urls:
             raise BananaBackendError("no_uploads")
 
@@ -302,6 +367,15 @@ class BananaAsyncHandler:
             "enableTranslation": True,
             "input": {"prompt": prompt, "images": image_urls},
         }
+
+        log.info(
+            "banana.gen.start",
+            extra={
+                "user_id": user_id,
+                "payload": {"images": len(image_urls), "has_prompt": bool(prompt)},
+                "source": "worker",
+            },
+        )
 
         try:
             response = await self._client.request_json("POST", _BANANA_CREATE_PATH, json_payload=payload)
@@ -355,13 +429,20 @@ class BananaAsyncHandler:
 
         raise BananaTimeout("Banana polling timed out")
 
-    async def _prepare_image_urls(self, bot, file_ids: Sequence[str]) -> list[str]:
+    async def _prepare_image_urls(
+        self, bot, file_ids: Sequence[str], *, user_id: Optional[int] = None
+    ) -> list[str]:
         uploads: list[str] = []
         for idx, file_id in enumerate(file_ids):
             try:
-                data = await self._fetch_file_bytes(bot, file_id)
+                tg_file = await bot.get_file(file_id)
             except Exception as exc:
-                await handle_async_error(exc, "BananaAsync.prepare_image")
+                await handle_async_error(exc, "BananaAsync.prepare_image_get")
+                continue
+            try:
+                data = await tg_file.download_as_bytearray()
+            except Exception as exc:
+                await handle_async_error(exc, "BananaAsync.prepare_image_download")
                 continue
 
             ok, fmt, mime = validate_image(data)
@@ -369,6 +450,7 @@ class BananaAsyncHandler:
                 log.warning(
                     "banana_async.image_validation_failed",
                     extra={
+                        "user_id": user_id,
                         "file_id": file_id,
                         "format": fmt,
                         "mime": mime,
@@ -376,42 +458,210 @@ class BananaAsyncHandler:
                     },
                 )
                 continue
-            filename = f"banana_input_{idx + 1}.png"
+
+            source_name = getattr(tg_file, "file_path", "") or ""
+            extension = _resolve_extension(source_name, fmt)
+            filename = f"banana_input_{idx + 1}.{extension}"
+            mime_type = mime or mimetypes.guess_type(filename)[0] or "application/octet-stream"
             try:
-                url = await self._upload_image_bytes(bytes(data), filename=filename)
+                url = await self._upload_image_bytes(
+                    bytes(data),
+                    filename=filename,
+                    mime_type=mime_type,
+                    ext=extension,
+                    size=len(data),
+                    user_id=user_id,
+                )
             except BananaBackendError as exc:
                 await handle_async_error(exc, "BananaAsync.upload_image")
                 continue
             uploads.append(url)
         return uploads
 
+    async def prepare_uploads(
+        self, bot, file_ids: Sequence[str], *, user_id: Optional[int] = None
+    ) -> list[str]:
+        try:
+            return await self._prepare_image_urls(bot, file_ids, user_id=user_id)
+        except TypeError as exc:
+            if "user_id" not in str(exc):
+                raise
+            return await self._prepare_image_urls(bot, file_ids)
+
     async def _fetch_file_bytes(self, bot, file_id: str) -> bytes:
         tg_file = await bot.get_file(file_id)
         return await tg_file.download_as_bytearray()
 
-    async def _upload_image_bytes(self, data: bytes, *, filename: str) -> str:
+    async def _upload_image_bytes(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        ext: str,
+        size: int,
+        user_id: Optional[int] = None,
+    ) -> str:
+        last_error: Optional[BananaBackendError] = None
+        stream_endpoint = _build_upload_url(UPLOAD_STREAM_PATH or "/api/file-stream-upload")
+        if stream_endpoint:
+            try:
+                url = await self._upload_via_stream(
+                    data,
+                    filename=filename,
+                    mime_type=mime_type,
+                    endpoint=stream_endpoint,
+                    user_id=user_id,
+                )
+            except BananaBackendError as exc:
+                last_error = exc
+            else:
+                log.info(
+                    "banana.upload.ok",
+                    extra={"user_id": user_id, "ext": ext.lower(), "size": size},
+                )
+                return url
+
+        base64_endpoint = _build_upload_url(UPLOAD_BASE64_PATH or _UPLOAD_PATH)
+        if base64_endpoint:
+            try:
+                url = await self._upload_via_base64(
+                    data,
+                    filename=filename,
+                    endpoint=base64_endpoint,
+                    user_id=user_id,
+                )
+            except BananaBackendError as exc:
+                last_error = exc
+            else:
+                log.info(
+                    "banana.upload.ok",
+                    extra={"user_id": user_id, "ext": ext.lower(), "size": size, "fallback": True},
+                )
+                return url
+
+        if last_error is not None:
+            raise last_error
+        raise BananaBackendError("upload_failed")
+
+    async def _upload_via_stream(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        endpoint: str,
+        user_id: Optional[int] = None,
+    ) -> str:
+        for attempt, delay in enumerate(_UPLOAD_RETRIES, start=1):
+            try:
+                async with httpx.AsyncClient(timeout=_UPLOAD_TIMEOUT) as client:
+                    response = await client.post(
+                        endpoint,
+                        files={"file": (filename, data, mime_type)},
+                    )
+            except httpx.RequestError as exc:
+                log.warning(
+                    "banana.upload.err",
+                    extra={
+                        "user_id": user_id,
+                        "status": 0,
+                        "path": endpoint,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    },
+                )
+            else:
+                status = response.status_code
+                if 200 <= status < 300:
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = {}
+                    url = _extract_upload_url(payload if isinstance(payload, Mapping) else {})
+                    if url:
+                        return url
+                    log.warning(
+                        "banana.upload.err",
+                        extra={
+                            "user_id": user_id,
+                            "status": status,
+                            "path": endpoint,
+                            "attempt": attempt,
+                            "reason": "missing-url",
+                        },
+                    )
+                else:
+                    log.warning(
+                        "banana.upload.err",
+                        extra={
+                            "user_id": user_id,
+                            "status": status,
+                            "path": endpoint,
+                            "attempt": attempt,
+                        },
+                    )
+                    if 400 <= status < 500 and status not in {429}:
+                        break
+            if attempt < len(_UPLOAD_RETRIES):
+                await asyncio.sleep(delay)
+        raise BananaBackendError("upload_failed")
+
+    async def _upload_via_base64(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        endpoint: str,
+        user_id: Optional[int] = None,
+    ) -> str:
         payload = {
             "fileName": filename,
             "base64": base64.b64encode(data).decode("ascii"),
         }
         try:
-            response = await self._client.request_json("POST", _UPLOAD_PATH, json_payload=payload)
-        except (KieAPITimeoutError, KieAPITransportError) as exc:
-            raise BananaBackendError(str(exc)) from exc
-        except KieAPIHTTPError as exc:
-            raise BananaBackendError(f"HTTP {exc.status}") from exc
-
-        if isinstance(response, Mapping):
-            for key in ("public_url", "publicUrl", "url"):
-                value = response.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-            data = response.get("data")
-            if isinstance(data, Mapping):
-                for key in ("public_url", "publicUrl", "url"):
-                    value = data.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()
+            async with httpx.AsyncClient(timeout=_UPLOAD_TIMEOUT) as client:
+                response = await client.post(endpoint, json=payload)
+        except httpx.RequestError as exc:
+            log.warning(
+                "banana.upload.err",
+                extra={
+                    "user_id": user_id,
+                    "status": 0,
+                    "path": endpoint,
+                    "error": str(exc),
+                },
+            )
+            raise BananaBackendError("upload_failed") from exc
+        if 200 <= response.status_code < 300:
+            try:
+                payload_json: Any = response.json()
+            except ValueError as exc:
+                raise BananaBackendError("upload_failed") from exc
+            if isinstance(payload_json, Mapping):
+                url = _extract_upload_url(payload_json)
+            else:
+                url = None
+            if url:
+                return url
+            log.warning(
+                "banana.upload.err",
+                extra={
+                    "user_id": user_id,
+                    "status": response.status_code,
+                    "path": endpoint,
+                    "reason": "missing-url",
+                },
+            )
+            raise BananaBackendError("upload_failed")
+        log.warning(
+            "banana.upload.err",
+            extra={
+                "user_id": user_id,
+                "status": response.status_code,
+                "path": endpoint,
+            },
+        )
         raise BananaBackendError("upload_failed")
 
     async def _publish_result(
@@ -431,7 +681,13 @@ class BananaAsyncHandler:
         except Exception:
             pass
         try:
-            filename = _guess_filename(media)
+            raw_filename = _guess_filename(media)
+            suffix = Path(raw_filename).suffix or ".png"
+            safe_task = (task_id or "").strip()
+            if safe_task:
+                filename = f"banana_result_{safe_task[:8]}{suffix}"
+            else:
+                filename = raw_filename
             message = await context.bot.send_document(
                 chat_id,
                 media,
@@ -509,6 +765,14 @@ class BananaAsyncHandler:
         await self._logger.error(
             f"[BananaAsync] error      | message: {exc}",
             user_id=user_id,
+        )
+        log.info(
+            "banana.gen.fail",
+            extra={
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "error": str(exc),
+            },
         )
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=_FAILURE_TEXT)
@@ -600,6 +864,117 @@ def _extract_photo_file_id(message) -> Optional[str]:
     return None
 
 
+async def _store_card_message_id(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int, message_id: int
+) -> None:
+    try:
+        redis = _resolve_redis(ctx)
+        await redis.set(
+            _CARD_MESSAGE_KEY.format(user_id=int(user_id)),
+            int(message_id),
+            ex=_CARD_STORAGE_TTL,
+        )
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_store_id")
+
+
+async def _load_card_message_id(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> Optional[int]:
+    try:
+        redis = _resolve_redis(ctx)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_load_id_redis")
+        return None
+    try:
+        raw = await redis.get(_CARD_MESSAGE_KEY.format(user_id=int(user_id)))
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_load_id")
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _clear_card_storage(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    try:
+        redis = _resolve_redis(ctx)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_clear_id_redis")
+        return
+    try:
+        await redis.delete(
+            _CARD_MESSAGE_KEY.format(user_id=int(user_id)),
+            _CARD_SNAPSHOT_KEY.format(user_id=int(user_id)),
+        )
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_clear_id")
+
+
+def _serialize_markup(markup) -> str:
+    if markup is None:
+        return "null"
+    try:
+        payload = markup.to_dict()
+    except Exception:
+        payload = None
+    if not payload:
+        return "null"
+    try:
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return str(payload)
+
+
+def _snapshot_payload(text: str, markup_repr: str, generating: bool) -> str:
+    return json.dumps(
+        {
+            "text": text,
+            "markup": markup_repr,
+            "generating": bool(generating),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+async def _load_card_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> Optional[str]:
+    try:
+        redis = _resolve_redis(ctx)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_snapshot_load_redis")
+        return None
+    try:
+        raw = await redis.get(_CARD_SNAPSHOT_KEY.format(user_id=int(user_id)))
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_snapshot_load")
+        return None
+    if not raw:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "ignore")
+    return str(raw)
+
+
+async def _store_card_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int, snapshot: str
+) -> None:
+    try:
+        redis = _resolve_redis(ctx)
+        await redis.set(
+            _CARD_SNAPSHOT_KEY.format(user_id=int(user_id)),
+            snapshot,
+            ex=_CARD_STORAGE_TTL,
+        )
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_snapshot_store")
+
+
 async def _render_card(
     *,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -607,30 +982,73 @@ async def _render_card(
     state: BananaState,
     user_id: Optional[int],
     message=None,
-) -> None:
+    generating: bool = False,
+) -> Optional[int]:
     text = banana_card_text(0, state)
-    markup = build_banana_card_kb(state)
-    edited = False
-    if message is not None and getattr(message, "text", None):
+    markup = build_banana_card_kb(state, generating=generating)
+    markup_repr = _serialize_markup(markup)
+    snapshot = _snapshot_payload(text, markup_repr, generating)
+
+    message_id = None
+    if message is not None and getattr(message, "message_id", None):
+        message_id = message.message_id
+    elif user_id is not None:
+        message_id = await _load_card_message_id(ctx, user_id)
+
+    if user_id is not None:
+        previous_snapshot = await _load_card_snapshot(ctx, user_id)
+        if previous_snapshot == snapshot and message_id is not None:
+            return message_id
+
+    if message_id is not None:
         try:
-            await message.edit_text(text, reply_markup=markup)
-            edited = True
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=markup,
+            )
+            if user_id is not None:
+                await _store_card_message_id(ctx, user_id, message_id)
+                await _store_card_snapshot(ctx, user_id, snapshot)
+            log.info(
+                "banana.card.update",
+                extra={
+                    "user_id": user_id,
+                    "photos": len(state.photos),
+                    "has_prompt": bool(state.prompt),
+                    "generating": generating,
+                    "message_id": message_id,
+                },
+            )
+            return message_id
         except Exception as exc:
             await handle_async_error(exc, "BananaAsync.card_edit")
-    if not edited:
-        try:
-            await ctx.bot.send_message(chat_id, text, reply_markup=markup)
-        except Exception as exc:
-            await handle_async_error(exc, "BananaAsync.card_send")
-            return
+            if user_id is not None:
+                await _clear_card_storage(ctx, user_id)
+            message_id = None
+
+    try:
+        sent = await ctx.bot.send_message(chat_id, text, reply_markup=markup)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.card_send")
+        return None
+
+    if user_id is not None:
+        await _store_card_message_id(ctx, user_id, sent.message_id)
+        await _store_card_snapshot(ctx, user_id, snapshot)
+
     log.info(
         "banana.card.update",
         extra={
             "user_id": user_id,
             "photos": len(state.photos),
             "has_prompt": bool(state.prompt),
+            "generating": generating,
+            "message_id": getattr(sent, "message_id", None),
         },
     )
+    return getattr(sent, "message_id", None)
 
 
 async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
@@ -657,6 +1075,8 @@ async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.card_load")
         return
+    if message is not None and getattr(message, "message_id", None):
+        await _store_card_message_id(ctx, user.id, message.message_id)
     await _render_card(
         ctx=ctx,
         chat_id=chat.id,
@@ -778,7 +1198,9 @@ async def clear_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=Non
 async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
     query = update.callback_query
     user = update.effective_user
-    if query is None or user is None:
+    message = query.message if query else None
+    chat = getattr(message, "chat", None) or update.effective_chat
+    if query is None or user is None or chat is None:
         return
     try:
         state = await _load_state(ctx, user.id)
@@ -788,6 +1210,16 @@ async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, paylo
     if not state.has_photos_or_prompt():
         await query.answer("Добавьте фото или промпт", show_alert=True)
         return
+    handler = _get_default_handler()
+    try:
+        uploads = await handler.prepare_uploads(ctx.bot, state.photos, user_id=user.id)
+    except BananaBackendError as exc:
+        await handle_async_error(exc, "BananaAsync.start_uploads")
+        await query.answer("Не удалось загрузить фото. Попробуйте снова.", show_alert=True)
+        return
+    if not uploads:
+        await query.answer("Добавьте фото или промпт", show_alert=True)
+        return
     try:
         await query.answer()
     except Exception:
@@ -795,6 +1227,7 @@ async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, paylo
     state.last_payload = {
         "images": list(state.photos),
         "prompt": state.prompt or "",
+        "uploads": list(uploads),
     }
     try:
         await _save_state(ctx, user.id, state)
@@ -804,23 +1237,57 @@ async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, paylo
         await async_input_state.set(user.id, mode="banana")
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.start_input_state")
+
+    await _render_card(
+        ctx=ctx,
+        chat_id=chat.id,
+        state=state,
+        user_id=user.id,
+        message=message if getattr(message, "text", None) else None,
+        generating=True,
+    )
+
     log.info(
         "banana.gen.start",
         extra={
             "user_id": user.id,
-            "photos": len(state.photos),
-            "has_prompt": bool(state.prompt),
+            "payload": {"images": len(uploads), "has_prompt": bool(state.prompt)},
             "source": "start",
         },
     )
-    handler = _get_default_handler()
-    await handler.run(update, ctx)
+
+    try:
+        await handler.run(update, ctx)
+    finally:
+        try:
+            refreshed_state = await _load_state(ctx, user.id)
+        except Exception as exc:
+            await handle_async_error(exc, "BananaAsync.start_reload_state")
+            refreshed_state = state
+        await _render_card(
+            ctx=ctx,
+            chat_id=chat.id,
+            state=refreshed_state,
+            user_id=user.id,
+        )
+
+
+async def generation_busy(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer("Генерация уже идёт")
+    except Exception:
+        pass
 
 
 async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
     query = update.callback_query
     user = update.effective_user
-    if query is None or user is None:
+    message = query.message if query else None
+    chat = getattr(message, "chat", None) or update.effective_chat
+    if query is None or user is None or chat is None:
         return
     try:
         state = await _load_state(ctx, user.id)
@@ -830,7 +1297,9 @@ async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pay
     payload_snapshot = state.last_payload or {}
     photos = payload_snapshot.get("images") or payload_snapshot.get("photos") or []
     prompt = payload_snapshot.get("prompt") or ""
-    if not photos and not (prompt.strip()):
+    uploads = payload_snapshot.get("uploads") or []
+    uploads_list = [str(item) for item in uploads if str(item or "").strip()]
+    if not uploads_list and not photos:
         await query.answer("Нет сохранённого запроса для повторной генерации.", show_alert=True)
         return
     try:
@@ -838,11 +1307,13 @@ async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pay
     except Exception:
         pass
     state.photos = list(map(str, photos))[:_MAX_CARD_IMAGES]
+    uploads_list = uploads_list[: len(state.photos)]
     normalized_prompt = (prompt or "").strip()
     state.prompt = normalized_prompt or None
     state.last_payload = {
         "images": list(state.photos),
         "prompt": normalized_prompt,
+        "uploads": uploads_list,
     }
     try:
         await _save_state(ctx, user.id, state)
@@ -865,7 +1336,38 @@ async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pay
         },
     )
     handler = _get_default_handler()
-    await handler.run(update, ctx)
+    await _render_card(
+        ctx=ctx,
+        chat_id=chat.id,
+        state=state,
+        user_id=user.id,
+        message=message if getattr(message, "text", None) else None,
+        generating=True,
+    )
+
+    log.info(
+        "banana.gen.start",
+        extra={
+            "user_id": user.id,
+            "payload": {"images": len(uploads_list), "has_prompt": bool(state.prompt)},
+            "source": "restart",
+        },
+    )
+
+    try:
+        await handler.run(update, ctx)
+    finally:
+        try:
+            refreshed_state = await _load_state(ctx, user.id)
+        except Exception as exc:
+            await handle_async_error(exc, "BananaAsync.restart_reload_state")
+            refreshed_state = state
+        await _render_card(
+            ctx=ctx,
+            chat_id=chat.id,
+            state=refreshed_state,
+            user_id=user.id,
+        )
 
 
 async def new_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None) -> None:
@@ -918,6 +1420,7 @@ __all__ = [
     "on_prompt",
     "clear_card",
     "start_generation",
+    "generation_busy",
     "restart_generation",
     "new_card",
 ]

@@ -13,10 +13,10 @@ def banana_card_text(balance: int, state) -> str:
     return f"🍌 Карточка Banana\n{photos} • ✏️ Промпт: {prompt_state}"
 
 
-def banana_card_kb(state) -> InlineKeyboardMarkup:
+def banana_card_kb(state, *, generating: bool = False) -> InlineKeyboardMarkup:
     """Return inline keyboard for Banana card."""
 
-    return build_banana_card_kb(state)
+    return build_banana_card_kb(state, generating=generating)
 
 
 __all__ = ["banana_card_text", "banana_card_kb"]
