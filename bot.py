@@ -162,6 +162,7 @@ from hub_router import (
 from handlers import profile as profile_handlers
 from handlers.banana_async_handler import (
     clear_card as banana_clear_card,
+    generation_busy as banana_generation_busy,
     new_card as banana_new_card,
     on_photo as banana_on_photo,
     on_prompt as banana_on_prompt,
@@ -22546,6 +22547,7 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^noop$", on_noop_callback),
     (r"^music:(inst|vocal)$", on_music_callback),
     (r"^banana:clear$", banana_clear_card),
+    (r"^banana:busy$", banana_generation_busy),
     (r"^banana:start$", banana_start_generation),
     (r"^banana:restart(?::.+)?$", banana_restart_generation),
     (r"^banana:new$", banana_new_card),
