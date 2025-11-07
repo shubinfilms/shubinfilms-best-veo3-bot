@@ -32,10 +32,25 @@ class DummyBot:
         self.messages: list[dict[str, object]] = []
         self.media_edits: list[dict[str, object]] = []
         self.text_edits: list[dict[str, object]] = []
+        self.documents: list[dict[str, object]] = []
 
     async def send_message(self, chat_id, text, **kwargs):
         self.messages.append({"chat_id": chat_id, "text": text, "kwargs": kwargs})
         return SimpleNamespace(message_id=len(self.messages))
+
+    async def send_document(self, chat_id, document, **kwargs):
+        entry = {
+            "chat_id": chat_id,
+            "document": document,
+            "kwargs": kwargs,
+        }
+        message = SimpleNamespace(
+            message_id=len(self.documents) + 100,
+            document=SimpleNamespace(file_id="banana-file"),
+            photo=[],
+        )
+        self.documents.append(entry)
+        return message
 
     async def edit_message_media(self, chat_id, message_id, media, reply_markup=None):
         entry = {
@@ -113,9 +128,8 @@ def test_successful_async_generation_flow(monkeypatch):
         await handler.run(update, context)
 
         assert bot.messages and bot.messages[0]["text"] == _ACK
-        assert bot.media_edits, "expected result edit"
-        media = bot.media_edits[0]["media"]
-        assert getattr(media, "media", None) == "https://cdn.example/result.png"
+        assert bot.documents, "expected result document"
+        assert bot.documents[0]["document"] == "https://cdn.example/result.png"
 
         cache_key = _build_cache_key(user_id, state.prompt or "", state.photos)
         cached_raw = redis.store.get(cache_key)
@@ -155,7 +169,7 @@ def test_cache_hit_reuses_file(monkeypatch):
         await handler.run(update, context)
 
         assert client.create_calls == [], "backend should not be invoked on cache hit"
-        assert bot.media_edits and bot.media_edits[0]["media"].media == "cached-file"
+        assert bot.documents and bot.documents[0]["document"] == "cached-file"
         assert bot.messages and bot.messages[0]["text"] == _ACK
 
     asyncio.run(scenario())
