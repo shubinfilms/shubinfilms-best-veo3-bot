@@ -354,7 +354,7 @@ async def open_banana_card(update, context) -> None:
     balance_value = await _get_balance_value(user_id)
     text = banana_card_text(balance_value, state)
     await context.bot.send_message(
-        user_id, text, reply_markup=banana_card_kb(state.can_start())
+        user_id, text, reply_markup=banana_card_kb(state)
     )
 
 
@@ -389,7 +389,7 @@ async def on_banana_photo(update, context) -> None:
     balance_value = await _get_balance_value(user_id)
     await message.reply_text(
         banana_card_text(balance_value, state),
-        reply_markup=banana_card_kb(state.can_start()),
+        reply_markup=banana_card_kb(state),
     )
 
 
@@ -405,7 +405,7 @@ async def on_banana_text(update, context) -> None:
     balance_value = await _get_balance_value(user_id)
     await message.reply_text(
         banana_card_text(balance_value, state),
-        reply_markup=banana_card_kb(state.can_start()),
+        reply_markup=banana_card_kb(state),
     )
 
 
@@ -650,7 +650,7 @@ async def on_banana_new(update, context) -> None:
     await context.bot.send_message(
         user_id,
         "Новая карточка 🆕 Отправьте фото и промпт.",
-        reply_markup=banana_card_kb(state.can_start()),
+        reply_markup=banana_card_kb(state),
     )
 
 

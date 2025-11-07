@@ -322,18 +322,26 @@ def build_menu(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(markup_rows)
 
 
-def banana_card_kb(can_start: bool) -> InlineKeyboardMarkup:
+def banana_card_kb(state) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    if can_start:
+    rows.append([InlineKeyboardButton("🧽 Очистить карточку", callback_data="banana:clear")])
+    try:
+        ready = bool(state.has_photos_or_prompt())
+    except AttributeError:
+        ready = bool(getattr(state, "ready", False))
+    if ready:
         rows.append([InlineKeyboardButton("🚀 Начать генерацию", callback_data="banana:start")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="banana:back_photo")])
     return InlineKeyboardMarkup(rows)
 
 
-def banana_result_kb() -> InlineKeyboardMarkup:
+def banana_result_kb(job_id: Optional[str] = None) -> InlineKeyboardMarkup:
+    restart_data = "banana:restart"
+    if job_id:
+        restart_data = f"banana:restart:{job_id}"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("↪️ Повторить генерацию", callback_data="banana:restart")],
+            [InlineKeyboardButton("🔁 Повторить генерацию", callback_data=restart_data)],
             [InlineKeyboardButton("🆕 Новая генерация", callback_data="banana:new")],
         ]
     )

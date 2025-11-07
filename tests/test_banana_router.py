@@ -48,20 +48,26 @@ def test_route_callback_dispatches_banana(monkeypatch):
 
 def test_banana_callback_patterns_registered():
     specs = bot_module.CALLBACK_HANDLER_SPECS
+    assert any(pattern == r"^banana:clear$" and callback is bot_module.banana_clear_card for pattern, callback in specs)
     assert any(pattern == r"^banana:start$" and callback is bot_module.banana_start_generation for pattern, callback in specs)
-    assert any(pattern == r"^banana:restart$" and callback is bot_module.banana_restart_generation for pattern, callback in specs)
+    assert any(
+        pattern == r"^banana:restart(?::.+)?$" and callback is bot_module.banana_restart_generation
+        for pattern, callback in specs
+    )
     assert any(pattern == r"^banana:new$" and callback is bot_module.banana_new_card for pattern, callback in specs)
-    assert any(pattern == r"^banana:back_photo$" and callback is bot_module.photo_modes_open_menu for pattern, callback in specs)
+    assert any(pattern == r"^banana:back_photo$" and callback is bot_module.banana_back_to_photo_menu for pattern, callback in specs)
 
 
 def test_banana_card_keyboard_rendering():
-    without_inputs = banana_card_kb(False)
+    without_inputs = banana_card_kb(SimpleNamespace(has_photos_or_prompt=lambda: False))
     rows = without_inputs.inline_keyboard
-    assert len(rows) == 1
-    assert rows[0][0].text == "⬅️ Назад"
-    assert rows[0][0].callback_data == "banana:back_photo"
-
-    with_inputs = banana_card_kb(True)
-    rows = with_inputs.inline_keyboard
-    assert rows[0][0].callback_data == "banana:start"
+    assert len(rows) == 2
+    assert rows[0][0].text == "🧽 Очистить карточку"
+    assert rows[0][0].callback_data == "banana:clear"
     assert rows[1][0].callback_data == "banana:back_photo"
+
+    with_inputs = banana_card_kb(SimpleNamespace(has_photos_or_prompt=lambda: True))
+    rows = with_inputs.inline_keyboard
+    assert rows[0][0].callback_data == "banana:clear"
+    assert rows[1][0].callback_data == "banana:start"
+    assert rows[2][0].callback_data == "banana:back_photo"

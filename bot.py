@@ -161,7 +161,10 @@ from hub_router import (
 )
 from handlers import profile as profile_handlers
 from handlers.banana_async_handler import (
+    clear_card as banana_clear_card,
     new_card as banana_new_card,
+    on_photo as banana_on_photo,
+    on_prompt as banana_on_prompt,
     restart_generation as banana_restart_generation,
     start_generation as banana_start_generation,
 )
@@ -246,6 +249,7 @@ from utils.input_state import (
     set_wait,
     touch_wait,
 )
+from utils.async_input_state import input_state as async_input_state
 from utils.telegram_utils import build_photo_album_media, label_to_command, should_capture_to_prompt
 from utils.text_normalizer import normalize_btn_text
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
@@ -20887,6 +20891,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id if user else None
 
+    if user_id is not None and await async_input_state.is_mode(user_id, "banana"):
+        await banana_on_prompt(update, ctx)
+        return
+
     if user_id is not None and get_wait(user_id) is not None:
         log.debug(
             "wait.skip_text",
@@ -21264,6 +21272,11 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat = update.effective_chat
     chat_id = chat.id if chat else None
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is not None and await async_input_state.is_mode(user_id, "banana"):
+        await banana_on_photo(update, ctx)
+        return
     s = state(ctx)
 
     try:
@@ -21342,6 +21355,12 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     doc = message.document
     if doc is None:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is not None and await async_input_state.is_mode(user_id, "banana"):
+        await banana_on_photo(update, ctx)
         return
 
     s = state(ctx)
@@ -22502,6 +22521,23 @@ ADDITIONAL_COMMAND_SPECS: List[tuple[tuple[str, ...], Any]] = [
     (("profile_reset",), profile_handlers.profile_reset_command),
 ]
 
+
+async def banana_back_to_photo_menu(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
+) -> None:
+    user = update.effective_user
+    if user is not None:
+        try:
+            await async_input_state.clear(user.id, reason="banana_exit")
+        except Exception:
+            log.debug(
+                "banana.input_state_clear_failed",
+                extra={"user_id": user.id, "source": "back"},
+                exc_info=True,
+            )
+    await photo_modes_open_menu(update, ctx, payload=payload)
+
+
 CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog_default$", dialog_mode_callback),
     (r"^prompt_master$", prompt_master_mode_callback),
@@ -22509,10 +22545,11 @@ CALLBACK_HANDLER_SPECS: List[tuple[Optional[str], Any]] = [
     (r"^dialog:choose_promptmaster$", dialog_choose_promptmaster_callback),
     (r"^noop$", on_noop_callback),
     (r"^music:(inst|vocal)$", on_music_callback),
+    (r"^banana:clear$", banana_clear_card),
     (r"^banana:start$", banana_start_generation),
-    (r"^banana:restart$", banana_restart_generation),
+    (r"^banana:restart(?::.+)?$", banana_restart_generation),
     (r"^banana:new$", banana_new_card),
-    (r"^banana:back_photo$", photo_modes_open_menu),
+    (r"^banana:back_photo$", banana_back_to_photo_menu),
     (rf"^{CB_PM_INSERT_PREFIX}(veo|mj|banana|animate|suno)$", prompt_master_insert_callback_entry),
     (rf"^{CB_PM_PREFIX}", prompt_master_callback_entry),
     (rf"^{CB_FAQ_PREFIX}", faq_callback_entry),

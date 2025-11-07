@@ -14,9 +14,9 @@ def banana_card_text(balance: int, state) -> str:
 
 
 def banana_card_kb(state) -> InlineKeyboardMarkup:
-    """Return inline keyboard for Banana card based on readiness."""
+    """Return inline keyboard for Banana card."""
 
-    return build_banana_card_kb(state.can_start())
+    return build_banana_card_kb(state)
 
 
 __all__ = ["banana_card_text", "banana_card_kb"]
