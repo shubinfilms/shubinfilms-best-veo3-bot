@@ -58,8 +58,8 @@ _BANANA_CREATE_PATH = "/api/v1/jobs/createTask"
 _BANANA_STATUS_PATH = "/api/v1/jobs/recordInfo"
 _UPLOAD_PATH = "/api/v1/upload/base64"
 
-_CARD_MESSAGE_KEY = "banana:card_msg_id:{user_id}"
-_CARD_SNAPSHOT_KEY = "banana:card_snapshot:{user_id}"
+_CARD_MESSAGE_KEY = "banana:card_msg_id:{chat_id}:{user_id}"
+_CARD_SNAPSHOT_KEY = "banana:card_snapshot:{chat_id}:{user_id}"
 _SESSION_KEY = "banana:session:{user_id}"
 _CARD_STORAGE_TTL = 60 * 60 * 24
 _SESSION_TTL = 60 * 60 * 24
@@ -1048,13 +1048,17 @@ async def _acknowledge_callback(query, ctx, *, text: str = "✓", show_alert: bo
         pass
 
 
+def _card_key(key_tmpl: str, *, chat_id: int, user_id: int) -> str:
+    return key_tmpl.format(chat_id=int(chat_id), user_id=int(user_id))
+
+
 async def _store_card_message_id(
-    ctx: ContextTypes.DEFAULT_TYPE, user_id: int, message_id: int
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, message_id: int
 ) -> None:
     try:
         redis = _resolve_redis(ctx)
         await redis.set(
-            _CARD_MESSAGE_KEY.format(user_id=int(user_id)),
+            _card_key(_CARD_MESSAGE_KEY, chat_id=chat_id, user_id=user_id),
             int(message_id),
             ex=_CARD_STORAGE_TTL,
         )
@@ -1063,7 +1067,7 @@ async def _store_card_message_id(
 
 
 async def _load_card_message_id(
-    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
 ) -> Optional[int]:
     try:
         redis = _resolve_redis(ctx)
@@ -1071,7 +1075,9 @@ async def _load_card_message_id(
         await handle_async_error(exc, "BananaAsync.card_load_id_redis")
         return None
     try:
-        raw = await redis.get(_CARD_MESSAGE_KEY.format(user_id=int(user_id)))
+        raw = await redis.get(
+            _card_key(_CARD_MESSAGE_KEY, chat_id=chat_id, user_id=user_id)
+        )
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.card_load_id")
         return None
@@ -1083,7 +1089,9 @@ async def _load_card_message_id(
         return None
 
 
-async def _clear_card_storage(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+async def _clear_card_storage(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
+) -> None:
     try:
         redis = _resolve_redis(ctx)
     except Exception as exc:
@@ -1091,8 +1099,8 @@ async def _clear_card_storage(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> N
         return
     try:
         await redis.delete(
-            _CARD_MESSAGE_KEY.format(user_id=int(user_id)),
-            _CARD_SNAPSHOT_KEY.format(user_id=int(user_id)),
+            _card_key(_CARD_MESSAGE_KEY, chat_id=chat_id, user_id=user_id),
+            _card_key(_CARD_SNAPSHOT_KEY, chat_id=chat_id, user_id=user_id),
         )
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.card_clear_id")
@@ -1126,7 +1134,7 @@ def _snapshot_payload(text: str, markup_repr: str, generating: bool) -> str:
 
 
 async def _load_card_snapshot(
-    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
 ) -> Optional[str]:
     try:
         redis = _resolve_redis(ctx)
@@ -1134,7 +1142,9 @@ async def _load_card_snapshot(
         await handle_async_error(exc, "BananaAsync.card_snapshot_load_redis")
         return None
     try:
-        raw = await redis.get(_CARD_SNAPSHOT_KEY.format(user_id=int(user_id)))
+        raw = await redis.get(
+            _card_key(_CARD_SNAPSHOT_KEY, chat_id=chat_id, user_id=user_id)
+        )
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.card_snapshot_load")
         return None
@@ -1146,12 +1156,12 @@ async def _load_card_snapshot(
 
 
 async def _store_card_snapshot(
-    ctx: ContextTypes.DEFAULT_TYPE, user_id: int, snapshot: str
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, snapshot: str
 ) -> None:
     try:
         redis = _resolve_redis(ctx)
         await redis.set(
-            _CARD_SNAPSHOT_KEY.format(user_id=int(user_id)),
+            _card_key(_CARD_SNAPSHOT_KEY, chat_id=chat_id, user_id=user_id),
             snapshot,
             ex=_CARD_STORAGE_TTL,
         )
@@ -1178,10 +1188,10 @@ async def _render_card(
     if message is not None and getattr(message, "message_id", None):
         message_id = message.message_id
     elif user_id is not None:
-        message_id = await _load_card_message_id(ctx, user_id)
+        message_id = await _load_card_message_id(ctx, chat_id, user_id)
 
     if user_id is not None:
-        previous_snapshot = await _load_card_snapshot(ctx, user_id)
+        previous_snapshot = await _load_card_snapshot(ctx, chat_id, user_id)
         if previous_snapshot == snapshot and message_id is not None:
             return message_id
 
@@ -1194,8 +1204,8 @@ async def _render_card(
                 reply_markup=markup,
             )
             if user_id is not None:
-                await _store_card_message_id(ctx, user_id, message_id)
-                await _store_card_snapshot(ctx, user_id, snapshot)
+                await _store_card_message_id(ctx, chat_id, user_id, message_id)
+                await _store_card_snapshot(ctx, chat_id, user_id, snapshot)
             log.info(
                 "banana.card.update",
                 extra={
@@ -1210,7 +1220,7 @@ async def _render_card(
         except Exception as exc:
             await handle_async_error(exc, "BananaAsync.card_edit")
             if user_id is not None:
-                await _clear_card_storage(ctx, user_id)
+                await _clear_card_storage(ctx, chat_id, user_id)
             message_id = None
 
     try:
@@ -1220,8 +1230,8 @@ async def _render_card(
         return None
 
     if user_id is not None:
-        await _store_card_message_id(ctx, user_id, sent.message_id)
-        await _store_card_snapshot(ctx, user_id, snapshot)
+        await _store_card_message_id(ctx, chat_id, user_id, sent.message_id)
+        await _store_card_snapshot(ctx, chat_id, user_id, snapshot)
 
     log.info(
         "banana.card.update",
@@ -1260,8 +1270,15 @@ async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.card_load")
         return
+    stored_message_id: Optional[int] = None
+    reused = False
+    if user is not None:
+        stored_message_id = await _load_card_message_id(ctx, chat.id, user.id)
+        reused = stored_message_id is not None
     if message is not None and getattr(message, "message_id", None):
-        await _store_card_message_id(ctx, user.id, message.message_id)
+        await _store_card_message_id(ctx, chat.id, user.id, message.message_id)
+        if stored_message_id == message.message_id:
+            reused = True
     await _render_card(
         ctx=ctx,
         chat_id=chat.id,
@@ -1279,6 +1296,7 @@ async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
             "user_id": user.id,
             "photos": len(state.photos),
             "has_prompt": bool(state.prompt),
+            "reused_msg": reused,
         },
     )
 
@@ -1398,7 +1416,7 @@ async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, paylo
     chat = getattr(message, "chat", None) or update.effective_chat
     if query is None or user is None or chat is None:
         return
-    await _acknowledge_callback(query, ctx)
+    await _acknowledge_callback(query, ctx, text="Стартуем…")
     try:
         state = await _load_state(ctx, user.id)
     except Exception as exc:
@@ -1539,7 +1557,7 @@ async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pay
             show_alert=True,
         )
         return
-    await _acknowledge_callback(query, ctx)
+    await _acknowledge_callback(query, ctx, text="Стартуем…")
     state.photos = list(map(str, photos))[:_MAX_CARD_IMAGES]
     uploads_list = uploads_list[: len(state.photos)]
     normalized_prompt = (prompt or "").strip()
