@@ -1191,6 +1191,7 @@ async def open_profile(
     first_paint_ms: Optional[float] = None
     result_label = "ok"
     lock_token: Optional[str] = None
+    reused_flag = False
     try:
         now = time.monotonic()
         if isinstance(chat_data, MutableMapping):
@@ -1230,11 +1231,18 @@ async def open_profile(
             suppress_nav=suppress_nav,
             force_refresh=force_refresh,
         )
+        if isinstance(result, OpenedProfile):
+            reused_flag = bool(result.reused)
         if isinstance(result, OpenedProfile) and result.status == "repair":
             result_label = "repair"
         log.debug(
             "profile.open",
-            extra={"source": source, "force_refresh": force_refresh, "result": result_label},
+            extra={
+                "source": source,
+                "force_refresh": force_refresh,
+                "result": result_label,
+                "reused": reused_flag,
+            },
         )
         first_paint_ms = max((time.perf_counter() - started_perf) * 1000.0, 0.0)
     finally:
@@ -1243,8 +1251,14 @@ async def open_profile(
             observer and observer.observe(first_paint_ms)
         counter = lbl_safe(profile_open_total, source=source_label, result=result_label)
         counter and counter.inc()
-        log.info("profile.opened", extra={"source": source_label, "result": result_label})
-        log.info("profile.open", extra={"source": source_label, "result": result_label})
+        log.info(
+            "profile.opened",
+            extra={"source": source_label, "result": result_label, "reused": reused_flag},
+        )
+        log.info(
+            "profile.open",
+            extra={"source": source_label, "result": result_label, "reused": reused_flag},
+        )
         if user_id is not None:
             _release_profile_lock(user_id, lock_token)
         _clear_nav_event(chat_data, flag, ctx, previous_nav)

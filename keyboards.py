@@ -229,11 +229,12 @@ def main_menu_buttons() -> List[InlineKeyboardButton]:
 
 
 def build_main_reply_kb() -> ReplyKeyboardMarkup:
-    layout = _get_home_menu_layout()
-    rows: List[List[KeyboardButton]] = []
-    for layout_row in layout:
-        rows.append([KeyboardButton(text=label) for label, _ in layout_row])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+    button = KeyboardButton(text="🧭 МЕНЮ")
+    return ReplyKeyboardMarkup(
+        keyboard=[[button]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def dialog_picker_inline() -> InlineKeyboardMarkup:
