@@ -85,8 +85,8 @@ from aiohttp import ClientError, ClientResponseError, ClientTimeout
 import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, InputMediaDocument, InputMediaVideo, LabeledPrice, ReplyKeyboardMarkup,
-    KeyboardButton, BotCommand, User, Message, CallbackQuery
+    InputFile, InputMediaDocument, InputMediaVideo, LabeledPrice, ReplyKeyboardRemove,
+    BotCommand, User, Message, CallbackQuery
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -255,6 +255,8 @@ from utils.telegram_utils import build_photo_album_media, label_to_command, shou
 from utils.text_normalizer import normalize_btn_text
 from utils.sanitize import collapse_spaces, normalize_input, truncate_text
 
+import keyboards as keyboards_module
+
 from keyboards import (
     AI_MENU_CB,
     AI_TO_PROMPTMASTER_CB,
@@ -288,8 +290,6 @@ from keyboards import (
     PROFILE_MENU_CB,
     VIDEO_MENU_CB,
     TEXT_ACTION_VARIANTS,
-    build_empty_reply_kb,
-    build_main_reply_kb,
     iter_home_menu_buttons,
     mj_upscale_root_keyboard,
     mj_upscale_select_keyboard,
@@ -5582,7 +5582,7 @@ async def safe_send(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     text: str,
-    reply_markup: Optional[Union[ReplyKeyboardMarkup, InlineKeyboardMarkup]] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> Optional[Message]:
     """Safely deliver text to the chat, falling back to send_message on edit errors."""
 
@@ -5853,24 +5853,6 @@ MENU_BTN_PM = "🧠 Prompt-Master"
 MENU_BTN_CHAT = "💬 Обычный чат"
 MENU_BTN_BALANCE = TXT_KB_PROFILE
 MENU_BTN_SUPPORT = "🆘 ПОДДЕРЖКА"
-
-# --- Reply keyboard (нижнее меню)
-REPLY_BUTTONS = [
-    [KeyboardButton(TXT_KB_PROFILE), KeyboardButton(TXT_KB_KNOWLEDGE)],
-    [KeyboardButton(TXT_KB_PHOTO), KeyboardButton(TXT_KB_MUSIC)],
-    [KeyboardButton(TXT_KB_VIDEO)],
-    [KeyboardButton(TXT_KB_AI_DIALOG)],
-]
-
-
-def reply_main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        REPLY_BUTTONS,
-        resize_keyboard=True,
-        one_time_keyboard=False,
-        is_persistent=True,
-    )
-
 
 def _norm_btn_text(t: Optional[str]) -> str:
     return normalize_btn_text(t)
@@ -6358,24 +6340,75 @@ async def show_emoji_hub_for_chat(
             await ctx.bot.delete_message(chat_id=chat_id, message_id=hub_msg_id)
         ctx.user_data["hub_msg_id"] = None
 
+    removal_kwargs = {
+        "chat_id": chat_id,
+        "text": card["text"],
+        "reply_markup": ReplyKeyboardRemove(),
+        "parse_mode": card.get("parse_mode", ParseMode.HTML),
+        "disable_web_page_preview": card.get("disable_web_page_preview", True),
+        "disable_notification": True,
+    }
+
     try:
-        message = await tg_safe_send(
+        removal_message = await tg_safe_send(
             ctx.bot.send_message,
             method_name="sendMessage",
             kind="message",
-            chat_id=chat_id,
-            **card,
+            **removal_kwargs,
         )
     except Exception as exc:  # pragma: no cover - network issues
         log.warning("hub.send_failed | user_id=%s err=%s", resolved_uid, exc)
         return None
 
-    message_id = getattr(message, "message_id", None)
-    if isinstance(message_id, int):
-        ctx.user_data["hub_msg_id"] = message_id
+    message_id = getattr(removal_message, "message_id", None)
+    effective_message_id: Optional[int] = None
 
     if isinstance(message_id, int):
-        return message_id
+        try:
+            await safe_edit_message(
+                ctx,
+                chat_id,
+                message_id,
+                card["text"],
+                card["reply_markup"],
+                parse_mode=card.get("parse_mode", ParseMode.HTML),
+                disable_web_page_preview=card.get("disable_web_page_preview", True),
+            )
+        except Exception as exc:
+            log.warning(
+                "hub.edit_failed",
+                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
+            try:
+                fallback = await tg_safe_send(
+                    ctx.bot.send_message,
+                    method_name="sendMessage",
+                    kind="message",
+                    chat_id=chat_id,
+                    text=card["text"],
+                    reply_markup=card["reply_markup"],
+                    parse_mode=card.get("parse_mode", ParseMode.HTML),
+                    disable_web_page_preview=card.get("disable_web_page_preview", True),
+                )
+            except Exception as send_exc:  # pragma: no cover - network issues
+                log.warning(
+                    "hub.fallback_failed",
+                    extra={"chat_id": chat_id, "error": str(send_exc)},
+                )
+                fallback = None
+
+            fallback_id = getattr(fallback, "message_id", None)
+            if isinstance(fallback_id, int):
+                effective_message_id = fallback_id
+            with suppress(Exception):
+                await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        else:
+            effective_message_id = message_id
+
+    if effective_message_id is not None:
+        ctx.user_data["hub_msg_id"] = effective_message_id
+        return effective_message_id
+
     return None
 
 
@@ -23038,8 +23071,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    """Compatibility helper exposing the reply keyboard layout."""
+def main_menu_kb() -> InlineKeyboardMarkup:
+    """Compatibility helper exposing the inline keyboard layout."""
 
-    return build_main_reply_kb()
+    return keyboards_module.main_menu_kb()
 

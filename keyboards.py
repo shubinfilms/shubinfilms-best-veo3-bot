@@ -4,13 +4,7 @@ import re
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from utils.text_normalizer import normalize_btn_text
 
@@ -218,23 +212,10 @@ def kb_home_menu() -> InlineKeyboardMarkup:
     return kb_main()
 
 
-def reply_kb_home() -> ReplyKeyboardMarkup:
-    return build_main_reply_kb()
-
-
 def main_menu_buttons() -> List[InlineKeyboardButton]:
     """Return a flat list of inline buttons displayed in the main menu."""
 
     return [button for row in _build_inline_home_rows() for button in row]
-
-
-def build_main_reply_kb() -> ReplyKeyboardMarkup:
-    button = KeyboardButton(text="🧭 МЕНЮ")
-    return ReplyKeyboardMarkup(
-        keyboard=[[button]],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
 
 
 def dialog_picker_inline() -> InlineKeyboardMarkup:
@@ -242,10 +223,6 @@ def dialog_picker_inline() -> InlineKeyboardMarkup:
     if FEATURE_PM_ENABLED:
         buttons.append(InlineKeyboardButton("📝 Prompt-Master", callback_data=DIALOG_PICK_PM))
     return InlineKeyboardMarkup([buttons])
-
-
-def build_empty_reply_kb() -> ReplyKeyboardRemove:
-    return ReplyKeyboardRemove()
 
 
 def _build_inline_home_rows() -> List[List[InlineKeyboardButton]]:

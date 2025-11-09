@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from telegram import InlineKeyboardButton, Update
+from telegram import InlineKeyboardButton, ReplyKeyboardRemove, Update
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from keyboards import CB, FEATURE_PM_ENABLED, kb_main, main_menu_kb, photo_engines_kb
@@ -20,6 +21,7 @@ from texts import (
 from ui.card import build_card
 
 from logging_utils import get_logger
+from utils.telegram_safe import safe_edit_message
 
 log = get_logger("handlers.menu")
 
@@ -31,7 +33,54 @@ async def open_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = update.effective_message
     if message is None:
         return
-    await message.reply_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
+    markup = main_menu_kb()
+    removal = await message.reply_text(
+        text,
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="Markdown",
+        disable_notification=True,
+    )
+
+    message_id = getattr(removal, "message_id", None)
+    chat_obj = getattr(removal, "chat", getattr(message, "chat", None))
+    chat_id = getattr(chat_obj, "id", getattr(message, "chat_id", None))
+
+    if isinstance(message_id, int) and chat_id is not None:
+        try:
+            await safe_edit_message(
+                context,
+                chat_id,
+                message_id,
+                text,
+                markup,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            log.warning(
+                "menu.open_main_menu.edit_failed",
+                extra={"chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode="Markdown",
+            )
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                log.debug(
+                    "menu.open_main_menu.delete_failed",
+                    extra={"chat_id": chat_id, "message_id": message_id},
+                )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

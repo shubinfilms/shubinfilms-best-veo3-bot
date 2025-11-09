@@ -69,7 +69,8 @@ HELP_I18N = {
             "Напишите нам, если что-то не работает, есть идея или нужен совет.\n"
             "Ответим как можно скорее.\n\n"
             "• Чат поддержки: @{support_username}\n"
-            "• Язык: автоматически — по языку профиля Telegram"
+            "• Язык: автоматически — по языку профиля Telegram\n"
+            "• Нажмите /menu, если потеряли навигацию"
         ),
         "button": "Написать в поддержку",
     },
@@ -79,7 +80,8 @@ HELP_I18N = {
             "Message us if something breaks, you have an idea, or need guidance.\n"
             "We’ll reply as soon as possible.\n\n"
             "• Support chat: @{support_username}\n"
-            "• Language: auto — from your Telegram profile"
+            "• Language: auto — from your Telegram profile\n"
+            "• Type /menu if you lose navigation"
         ),
         "button": "Message Support",
     },
