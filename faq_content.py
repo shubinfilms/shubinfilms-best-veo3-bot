@@ -7,7 +7,7 @@ from telegram import InlineKeyboardMarkup
 
 from telegram_utils import build_inline_kb
 
-FAQ_ROOT_TEXT = "🧾 FAQ\nВыберите раздел:"
+FAQ_ROOT_TEXT = "🧾 FAQ\nВыберите раздел:\n\n💡 Нажмите /menu, если потеряли навигацию."
 
 _FAQ_BACK_ROWS = (
     (("⬅️ Назад", "faq:root"), ("🏠 Меню бота", "faq:home")),

@@ -33,12 +33,19 @@ class FakeBot:
         self.edited: list[dict[str, object]] = []
         self.deleted: list[dict[str, object]] = []
         self._next_message_id = 100
+        self._messages: dict[int, dict[str, object]] = {}
 
     async def send_message(self, **kwargs):  # type: ignore[override]
-        self.sent.append(kwargs)
+        payload = dict(kwargs)
+        chat_id = payload.get("chat_id")
         message_id = self._next_message_id
         self._next_message_id += 1
-        return SimpleNamespace(message_id=message_id)
+        payload["message_id"] = message_id
+        if chat_id is not None:
+            payload.setdefault("chat_id", chat_id)
+        self.sent.append(payload)
+        self._messages[message_id] = payload
+        return SimpleNamespace(message_id=message_id, chat=SimpleNamespace(id=chat_id))
 
     async def send_sticker(self, **kwargs):  # type: ignore[override]
         payload = dict(kwargs)
@@ -50,7 +57,15 @@ class FakeBot:
 
     async def edit_message_text(self, **kwargs):  # type: ignore[override]
         self.edited.append(kwargs)
-        return SimpleNamespace(message_id=kwargs.get("message_id"))
+        message_id = kwargs.get("message_id")
+        if isinstance(message_id, int):
+            entry = self._messages.get(message_id)
+            if entry is not None:
+                if "text" in kwargs:
+                    entry["text"] = kwargs["text"]
+                if "reply_markup" in kwargs:
+                    entry["reply_markup"] = kwargs["reply_markup"]
+        return SimpleNamespace(message_id=message_id)
 
     async def delete_message(self, *args, **kwargs):  # type: ignore[override]
         if args:
@@ -60,6 +75,9 @@ class FakeBot:
         else:
             payload = kwargs
         self.deleted.append(payload)
+        message_id = payload.get("message_id")
+        if isinstance(message_id, int):
+            self._messages.pop(message_id, None)
         return True
 
     async def send_chat_action(self, **_kwargs):  # type: ignore[override]

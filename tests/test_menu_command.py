@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-from telegram import ReplyKeyboardMarkup
+from telegram import InlineKeyboardMarkup
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,16 +30,15 @@ def _build_update(chat_id: int = 123, user_id: int = 555):
 
 def test_main_menu_keyboard_layout():
     markup = bot_module.main_menu_kb()
-    assert isinstance(markup, ReplyKeyboardMarkup)
+    assert isinstance(markup, InlineKeyboardMarkup)
 
-    rows = markup.keyboard
+    rows = markup.inline_keyboard
     labels = [[button.text for button in row] for row in rows]
 
     assert labels == [
         ["👤 Профиль", "📚 База знаний"],
         ["📸 Режим фото", "🎧 Режим музыки"],
-        ["📹 Режим видео"],
-        ["🧠 Диалог с ИИ"],
+        ["📹 Режим видео", "🧠 Диалог с ИИ"],
     ]
 
 
