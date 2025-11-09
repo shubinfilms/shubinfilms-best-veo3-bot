@@ -112,6 +112,8 @@ def _populate_from_settings() -> None:
     g["PURCHASE_OK_STICKER_ID"] = int(settings.PURCHASE_OK_STICKER_ID)
 
     g["BANANA_SEND_AS_DOCUMENT"] = bool(settings.BANANA_SEND_AS_DOCUMENT)
+    g["BANANA_CARD_REUSE"] = bool(settings.BANANA_CARD_REUSE)
+    g["TG_FILE_DIRECT_URL"] = bool(settings.TG_FILE_DIRECT_URL)
     g["MJ_SEND_AS_ALBUM"] = bool(settings.MJ_SEND_AS_ALBUM)
 
     g["DIALOG_ENABLED"] = settings.DIALOG_ENABLED

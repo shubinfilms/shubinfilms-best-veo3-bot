@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import time
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,13 @@ from utils.async_input_state import input_state as async_input_state
 from utils.banana_state import BananaState, ensure, load, save
 from PIL import Image
 
-from settings import UPLOAD_BASE64_PATH, UPLOAD_BASE_URL, UPLOAD_STREAM_PATH
+from settings import (
+    BANANA_CARD_REUSE,
+    TG_FILE_DIRECT_URL,
+    UPLOAD_BASE64_PATH,
+    UPLOAD_BASE_URL,
+    UPLOAD_STREAM_PATH,
+)
 from utils.files import identify_image, validate_image
 from utils.redis_client import get_redis
 
@@ -79,6 +86,15 @@ _ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "HEIC", "HEIF"}
 _WAIT_STATES = {"waiting", "queuing", "queued", "generating", "processing", "running", "pending", "0", 0}
 _SUCCESS_STATES = {"success", "1", 1, "done", "finished", "completed", "ready"}
 _FAIL_STATES = {"fail", "failed", "error", "2", 2, "3", 3, "canceled", "cancelled", "timeout"}
+
+
+_CARD_REUSE_ENABLED = bool(BANANA_CARD_REUSE)
+_TG_DIRECT_URL_ALLOWED = bool(TG_FILE_DIRECT_URL)
+
+_ALBUM_BUFFER_KEY = "banana:album:{media_group_id}:{user_id}"
+_ALBUM_LOCK_KEY = "banana:album:lock:{media_group_id}:{user_id}"
+_ALBUM_BUFFER_TTL = 60
+_ALBUM_DEBOUNCE_SECONDS = 0.9
 
 
 def _guess_filename(url: str) -> str:
@@ -468,6 +484,12 @@ class BananaAsyncHandler:
             await handle_async_error(exc, "BananaAsync.upload_get_file")
             return None
         file_path = getattr(tg_file, "file_path", "") or ""
+        if (
+            file_path
+            and not _TG_DIRECT_URL_ALLOWED
+            and str(file_path).startswith(("http://", "https://"))
+        ):
+            file_path = Path(file_path).name
         try:
             data = await tg_file.download_as_bytearray()
         except Exception as exc:
@@ -1052,6 +1074,14 @@ def _card_key(key_tmpl: str, *, chat_id: int, user_id: int) -> str:
     return key_tmpl.format(chat_id=int(chat_id), user_id=int(user_id))
 
 
+def _album_buffer_key_for(media_group_id: str, user_id: int) -> str:
+    return _ALBUM_BUFFER_KEY.format(media_group_id=media_group_id, user_id=int(user_id))
+
+
+def _album_lock_key_for(media_group_id: str, user_id: int) -> str:
+    return _ALBUM_LOCK_KEY.format(media_group_id=media_group_id, user_id=int(user_id))
+
+
 async def _store_card_message_id(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, message_id: int
 ) -> None:
@@ -1104,6 +1134,188 @@ async def _clear_card_storage(
         )
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.card_clear_id")
+
+
+async def _schedule_album_finalize(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: int,
+    media_group_id: str,
+) -> None:
+    await asyncio.sleep(_ALBUM_DEBOUNCE_SECONDS)
+    try:
+        redis = _resolve_redis(ctx)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_redis")
+        return
+    lock_key = _album_lock_key_for(media_group_id, user_id)
+    try:
+        acquired = await redis.set(lock_key, "1", ex=5, nx=True)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_lock")
+        return
+    if not acquired:
+        return
+    buffer_key = _album_buffer_key_for(media_group_id, user_id)
+    try:
+        payload_raw = await redis.get(buffer_key)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_fetch")
+        payload_raw = None
+    try:
+        payload = json.loads(payload_raw) if payload_raw else {}
+    except Exception:
+        payload = {}
+    updated_at = float(payload.get("updated_at") or 0.0)
+    wait_for = (updated_at + _ALBUM_DEBOUNCE_SECONDS) - time.monotonic()
+    if wait_for and wait_for > 0:
+        await asyncio.sleep(min(wait_for, _ALBUM_DEBOUNCE_SECONDS))
+        try:
+            payload_raw = await redis.get(buffer_key)
+        except Exception as exc:
+            await handle_async_error(exc, "BananaAsync.album_fetch")
+            payload_raw = None
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except Exception:
+            payload = {}
+    try:
+        await redis.delete(buffer_key)
+    except Exception:
+        pass
+    try:
+        await redis.delete(lock_key)
+    except Exception:
+        pass
+    if not payload:
+        return
+    await _apply_album_payload(ctx, chat_id=chat_id, user_id=user_id, payload=payload)
+
+
+async def _apply_album_payload(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: int,
+    payload: Mapping[str, Any],
+) -> None:
+    raw_photos = payload.get("photos") or []
+    photos: list[str] = []
+    if isinstance(raw_photos, Sequence):
+        for item in raw_photos:
+            if isinstance(item, str):
+                stripped = item.strip()
+            else:
+                stripped = str(item or "").strip()
+            if stripped:
+                photos.append(stripped)
+    prompt_raw = payload.get("prompt")
+    prompt_text = prompt_raw.strip() if isinstance(prompt_raw, str) else ""
+    if not photos and not prompt_text:
+        return
+    try:
+        state = await _load_state(ctx, user_id)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_state_load")
+        return
+    added = 0
+    overflow = False
+    for fid in photos:
+        if fid in state.photos:
+            continue
+        if len(state.photos) >= _MAX_CARD_IMAGES:
+            overflow = True
+            break
+        state.photos.append(fid)
+        added += 1
+    prompt_updated = False
+    if prompt_text:
+        if (state.prompt or "").strip() != prompt_text:
+            state.prompt = prompt_text
+            prompt_updated = True
+    if not added and not prompt_updated:
+        return
+    try:
+        await _save_state(ctx, user_id, state)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_state_save")
+    await _render_card(ctx=ctx, chat_id=chat_id, state=state, user_id=user_id)
+    if overflow:
+        try:
+            await ctx.bot.send_message(chat_id, "Можно до 4 фото.")
+        except Exception:
+            pass
+    log.info(
+        "banana.album.flushed",
+        extra={
+            "user_id": user_id,
+            "added": added,
+            "total": len(state.photos),
+            "prompt": bool(prompt_text),
+            "overflow": overflow,
+        },
+    )
+
+
+async def _buffer_media_group_message(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: int,
+    media_group_id: str,
+    file_id: Optional[str],
+    prompt_text: Optional[str],
+) -> bool:
+    if not media_group_id or not file_id:
+        return False
+    try:
+        redis = _resolve_redis(ctx)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_redis")
+        return False
+    buffer_key = _album_buffer_key_for(media_group_id, user_id)
+    try:
+        payload_raw = await redis.get(buffer_key)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_fetch")
+        payload_raw = None
+    try:
+        payload = json.loads(payload_raw) if payload_raw else {}
+    except Exception:
+        payload = {}
+    photos = payload.get("photos")
+    if not isinstance(photos, list):
+        photos = []
+    if file_id not in photos:
+        photos.append(file_id)
+    payload["photos"] = photos
+    if prompt_text and not payload.get("prompt"):
+        payload["prompt"] = prompt_text
+    payload["updated_at"] = time.monotonic()
+    try:
+        await redis.set(buffer_key, json.dumps(payload), ex=_ALBUM_BUFFER_TTL)
+    except Exception as exc:
+        await handle_async_error(exc, "BananaAsync.album_store")
+        return False
+    asyncio.create_task(
+        _schedule_album_finalize(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            media_group_id=media_group_id,
+        )
+    )
+    log.info(
+        "banana.album.buffered",
+        extra={
+            "user_id": user_id,
+            "media_group_id": media_group_id,
+            "count": len(photos),
+            "prompt": bool(prompt_text),
+        },
+    )
+    return True
 
 
 def _serialize_markup(markup) -> str:
@@ -1185,17 +1397,18 @@ async def _render_card(
     snapshot = _snapshot_payload(text, markup_repr, generating)
 
     message_id = None
-    if message is not None and getattr(message, "message_id", None):
+    reuse_enabled = _CARD_REUSE_ENABLED
+    if reuse_enabled and message is not None and getattr(message, "message_id", None):
         message_id = message.message_id
-    elif user_id is not None:
+    elif reuse_enabled and user_id is not None:
         message_id = await _load_card_message_id(ctx, chat_id, user_id)
 
-    if user_id is not None:
+    if reuse_enabled and user_id is not None:
         previous_snapshot = await _load_card_snapshot(ctx, chat_id, user_id)
         if previous_snapshot == snapshot and message_id is not None:
             return message_id
 
-    if message_id is not None:
+    if reuse_enabled and message_id is not None:
         try:
             await ctx.bot.edit_message_text(
                 chat_id=chat_id,
@@ -1229,7 +1442,7 @@ async def _render_card(
         await handle_async_error(exc, "BananaAsync.card_send")
         return None
 
-    if user_id is not None:
+    if reuse_enabled and user_id is not None:
         await _store_card_message_id(ctx, chat_id, user_id, sent.message_id)
         await _store_card_snapshot(ctx, chat_id, user_id, snapshot)
 
@@ -1272,10 +1485,14 @@ async def open_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, payload=None
         return
     stored_message_id: Optional[int] = None
     reused = False
-    if user is not None:
+    if _CARD_REUSE_ENABLED and user is not None:
         stored_message_id = await _load_card_message_id(ctx, chat.id, user.id)
         reused = stored_message_id is not None
-    if message is not None and getattr(message, "message_id", None):
+    if (
+        _CARD_REUSE_ENABLED
+        and message is not None
+        and getattr(message, "message_id", None)
+    ):
         await _store_card_message_id(ctx, chat.id, user.id, message.message_id)
         if stored_message_id == message.message_id:
             reused = True
@@ -1309,12 +1526,28 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     file_id = _extract_photo_file_id(message)
     prompt_text = _extract_prompt_text(message)
+    media_group_id = getattr(message, "media_group_id", None)
     has_updates = False
     try:
         state = await _load_state(ctx, user.id)
     except Exception as exc:
         await handle_async_error(exc, "BananaAsync.photo_load")
         return
+    if media_group_id and file_id:
+        buffered = await _buffer_media_group_message(
+            ctx,
+            chat_id=chat.id,
+            user_id=user.id,
+            media_group_id=str(media_group_id),
+            file_id=file_id,
+            prompt_text=prompt_text,
+        )
+        if buffered:
+            try:
+                await ctx.bot.delete_message(chat.id, message.message_id)
+            except Exception:
+                pass
+            return
     if file_id:
         if len(state.photos) >= _MAX_CARD_IMAGES:
             if prompt_text is not None:
@@ -1326,7 +1559,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await _render_card(ctx=ctx, chat_id=chat.id, state=state, user_id=user.id)
             await ctx.bot.send_message(
                 chat.id,
-                "Максимум 4 фото. Удалите лишнее или начните новую генерацию.",
+                "Можно до 4 фото.",
             )
             try:
                 await ctx.bot.delete_message(chat.id, message.message_id)
@@ -1416,7 +1649,7 @@ async def start_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, paylo
     chat = getattr(message, "chat", None) or update.effective_chat
     if query is None or user is None or chat is None:
         return
-    await _acknowledge_callback(query, ctx, text="Стартуем…")
+    await _acknowledge_callback(query, ctx, text="Запускаю…")
     try:
         state = await _load_state(ctx, user.id)
     except Exception as exc:
@@ -1557,7 +1790,7 @@ async def restart_generation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pay
             show_alert=True,
         )
         return
-    await _acknowledge_callback(query, ctx, text="Стартуем…")
+    await _acknowledge_callback(query, ctx, text="Запускаю…")
     state.photos = list(map(str, photos))[:_MAX_CARD_IMAGES]
     uploads_list = uploads_list[: len(state.photos)]
     normalized_prompt = (prompt or "").strip()

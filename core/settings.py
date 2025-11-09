@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     TMP_CLEANUP_HOURS: int = Field(default=24, ge=1, le=240)
 
     BANANA_SEND_AS_DOCUMENT: bool = Field(default=True)
+    BANANA_CARD_REUSE: bool = Field(default=True)
+    TG_FILE_DIRECT_URL: bool = Field(default=False)
     MJ_SEND_AS_ALBUM: bool = Field(default=True)
 
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
