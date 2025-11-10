@@ -53,7 +53,7 @@ _LAST_CALLBACK_AT: dict[tuple[int, str], float] = {}
 # Allowed menu callback payloads handled by ``route_callback`` below.
 MENU_PAT = re.compile(
     r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|"
-    r"banana:back_photo|back_main|back|dialog:off|video:kling|suno:(start|attach))$"
+    r"banana:back_photo|back_main|back|home:open|dialog:(?:off|toggle)|video:kling|suno:(start|attach))$"
 )
 
 
@@ -778,7 +778,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await open_dialog_mode(update, context)
         return
 
-    if data == "dialog:off":
+    if data in {"dialog:off", "dialog:toggle"}:
         from handlers.menu import close_dialog_mode
 
         _mark_handled()
@@ -817,4 +817,10 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         _mark_handled()
         await open_main_menu(update, context)
+        return
+    if data == "home:open":
+        from handlers.home import cb_open as home_open
+
+        _mark_handled()
+        await home_open(update, context)
         return

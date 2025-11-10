@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import MutableMapping, Optional, Sequence
 
 from telegram import InlineKeyboardButton, Update
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from telegram.error import BadRequest, Forbidden, TelegramError
 
@@ -20,6 +21,9 @@ from ui.card_store import load_card_message_id, store_card_message_id
 
 from logging_utils import get_logger
 from settings import FEATURE_BANANA, FEATURE_SUNO, FEATURE_VIDEO
+
+from . import chat_free
+from . import home as home_handler
 
 log = get_logger("handlers.menu")
 
@@ -255,24 +259,8 @@ async def open_main_menu(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     skip_ack: bool = False,
-) -> None:
-    query = update.callback_query if not skip_ack else None
-    await _answer_callback(query)
-
-    card = build_main_menu_card()
-    message_id = await _ensure_card(update, context, namespace=_MENU_NAMESPACE, card=card)
-
-    chat = getattr(update, "effective_chat", None)
-    chat_id = getattr(chat, "id", None)
-    if message_id is not None and chat_id is not None:
-        log.debug(
-            "menu.card.rendered",
-            extra={
-                "namespace": _MENU_NAMESPACE,
-                "chat_id": chat_id,
-                "message_id": message_id,
-            },
-        )
+) -> Optional[int]:
+    return await home_handler.open_from_update(update, context, skip_ack=skip_ack)
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -379,26 +367,12 @@ async def open_dialog_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     chat = getattr(update, "effective_chat", None)
     chat_id = getattr(chat, "id", None)
-    user = getattr(update, "effective_user", None)
-    user_id = getattr(user, "id", None)
+    if not isinstance(chat_id, int):
+        return
 
-    try:
-        from bot import enable_chat_mode  # type: ignore
-    except Exception as exc:  # pragma: no cover - fallback when bot not initialized
-        log.debug(
-            "menu.dialog.enable_import_failed",
-            extra={"chat_id": chat_id, "user_id": user_id, "error": str(exc)},
-        )
-    else:
-        try:
-            await enable_chat_mode(update, context, "normal")
-        except Exception as exc:  # pragma: no cover - diagnostics
-            log.warning(
-                "menu.dialog.enable_failed",
-                extra={"chat_id": chat_id, "user_id": user_id, "error": str(exc)},
-            )
+    enabled = await chat_free.is_enabled(chat_id)
 
-    card = build_dialog_card()
+    card = build_dialog_card(enabled=enabled)
     message_id = await _ensure_card(update, context, namespace=_DIALOG_NAMESPACE, card=card)
 
     if message_id is not None and chat_id is not None:
@@ -420,29 +394,41 @@ async def close_dialog_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_id = getattr(chat, "id", None)
     user = getattr(update, "effective_user", None)
     user_id = getattr(user, "id", None)
+    if not isinstance(chat_id, int):
+        return
+
+    current_state = await chat_free.is_enabled(chat_id)
+    new_state = not current_state
+    await chat_free.set_enabled(chat_id, new_state)
 
     try:
-        from bot import disable_chat_mode  # type: ignore
-    except Exception as exc:  # pragma: no cover - diagnostics only
-        log.debug(
-            "menu.dialog.disable_import_failed",
-            extra={"chat_id": chat_id, "user_id": user_id, "error": str(exc)},
-        )
-    else:
-        try:
+        if new_state:
+            from bot import enable_chat_mode  # type: ignore
+
+            await enable_chat_mode(update, context, "normal")
+        else:
+            from bot import disable_chat_mode  # type: ignore
+
             await disable_chat_mode(
                 context,
                 chat_id=chat_id,
                 user_id=user_id,
                 notify=False,
             )
-        except Exception as exc:  # pragma: no cover - diagnostics only
-            log.warning(
-                "menu.dialog.disable_failed",
-                extra={"chat_id": chat_id, "user_id": user_id, "error": str(exc)},
-            )
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        log.warning(
+            "menu.dialog.toggle_failed",
+            extra={"chat_id": chat_id, "user_id": user_id, "error": str(exc)},
+        )
 
-    await open_main_menu(update, context, skip_ack=True)
+    card = build_dialog_card(enabled=new_state)
+    message_id = await _ensure_card(update, context, namespace=_DIALOG_NAMESPACE, card=card)
+
+    log.info(
+        "chat.free.state %s",
+        "on" if new_state else "off",
+        extra={"chat_id": chat_id, "user_id": user_id, "msg_id": message_id},
+    )
 
 
 async def on_menu_dialog(update, context) -> None:
@@ -490,7 +476,7 @@ def build_music_card() -> dict:
     rows = [
         [InlineKeyboardButton("🚀 Начать генерацию", callback_data="suno:start")],
         [InlineKeyboardButton("🎙 Прикрепить аудио", callback_data="suno:attach")],
-        [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="home:open")],
     ]
     body = [
         "1. Опишите трек: жанр, настроение, длительность.",
@@ -525,7 +511,7 @@ def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int, sora2_cost: int
                 callback_data="video:type:sora2",
             )
         ],
-        [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="home:open")],
     ]
     body = [
         "Kling в разработке — скоро откроем доступ.",
@@ -539,21 +525,8 @@ def build_video_card(*, veo_fast_cost: int, veo_photo_cost: int, sora2_cost: int
     )
 
 
-def build_dialog_card() -> dict:
-    rows = [
-        [InlineKeyboardButton("✖️ Выкл диалог", callback_data="dialog:off")],
-        [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
-    ]
-    body = [
-        "Диалог включён. Пишите сообщения — я отвечу сразу, без карточек.",
-        "Команда /reset очищает историю переписки.",
-    ]
-    return build_card(
-        TXT_KB_AI_DIALOG,
-        "Свободный чат активирован.",
-        rows,
-        body_lines=body,
-    )
+def build_dialog_card(*, enabled: bool) -> dict:
+    return chat_free.render_status_card(enabled=enabled)
 
 
 __all__ = [

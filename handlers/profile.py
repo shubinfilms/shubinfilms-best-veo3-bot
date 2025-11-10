@@ -461,20 +461,17 @@ def _render_root_view(
         state_payload = None
 
     if snapshot is None:
-        from bot import _resolve_balance_snapshot, get_user_id
+        from bot import get_user_id
 
         target = payload.get("snapshot_target")
         if target is None and state_payload is not None:
             target = state_payload.get("snapshot_target")
         if target is None:
             target = get_user_id(ctx)
-        chat_id = payload.get("chat_id")
-        if chat_id is None and state_payload is not None:
-            chat_id = state_payload.get("chat_id")
-        if target is None and chat_id is not None:
-            target = chat_id
+        if target is None and payload.get("chat_id") is not None:
+            target = payload.get("chat_id")
         if target is not None:
-            snapshot = _resolve_balance_snapshot(ctx, int(target), prefer_cached=True)
+            payload["snapshot_target"] = int(target)
 
     if snapshot is not None:
         from bot import _profile_balance_text
@@ -1004,9 +1001,9 @@ async def _prepare_root_payload(
 
     snapshot = None
     if snapshot_target is not None:
-        from bot import _resolve_balance_snapshot
+        from bot import _fetch_profile_snapshot
 
-        snapshot = _resolve_balance_snapshot(ctx, snapshot_target, prefer_cached=True)
+        snapshot = await _fetch_profile_snapshot(ctx, snapshot_target)
 
     chat_state = _chat_data(ctx)
     state_payload: dict[str, Any]
@@ -1507,7 +1504,7 @@ async def on_profile_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         with suppress(BadRequest):
             await safe_answer(query)
 
-    await open_profile(update, ctx, source="menu", suppress_nav=True)
+    await open_profile(update, ctx, source="menu", suppress_nav=False)
 
 
 def _topup_url() -> Optional[str]:

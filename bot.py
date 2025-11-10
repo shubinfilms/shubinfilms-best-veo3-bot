@@ -160,6 +160,8 @@ from hub_router import (
     set_fallback as set_hub_fallback,
 )
 from handlers import profile as profile_handlers
+from handlers import chat_free as chat_free_handlers
+from handlers import home as home_handler
 from handlers.banana_async_handler import (
     clear_card as banana_clear_card,
     generation_busy as banana_generation_busy,
@@ -3222,6 +3224,63 @@ def _set_cached_balance(ctx: ContextTypes.DEFAULT_TYPE, value: Optional[int]) ->
 _BALANCE_MEMO_KEY = "balance_snapshot"
 _BALANCE_MEMO_TTL = 5.0
 
+_PROFILE_FRESH_CACHE_KEY = "profile_fresh_snapshot"
+_PROFILE_FRESH_CACHE_TTL = 30.0
+
+
+def _store_fresh_profile_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int, snapshot: BalanceSnapshot
+) -> None:
+    state_dict = state(ctx)
+    state_dict[_PROFILE_FRESH_CACHE_KEY] = {
+        "user_id": int(user_id),
+        "ts": time.time(),
+        "value": snapshot.value,
+        "display": snapshot.display,
+        "warning": snapshot.warning,
+    }
+
+
+def _load_fresh_profile_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> Optional[BalanceSnapshot]:
+    state_dict = state(ctx)
+    payload = state_dict.get(_PROFILE_FRESH_CACHE_KEY)
+    if not isinstance(payload, dict):
+        return None
+
+    try:
+        cached_user = int(payload.get("user_id", 0))
+        ts_value = float(payload.get("ts", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+    if cached_user != int(user_id):
+        return None
+    if (time.time() - ts_value) > _PROFILE_FRESH_CACHE_TTL:
+        return None
+
+    raw_value = payload.get("value")
+    value: Optional[int]
+    if raw_value is None:
+        value = None
+    else:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = None
+
+    display_raw = payload.get("display")
+    if isinstance(display_raw, str) and display_raw:
+        display = display_raw
+    else:
+        display = str(value) if value is not None else BALANCE_PLACEHOLDER
+
+    warning_raw = payload.get("warning")
+    warning = warning_raw if isinstance(warning_raw, str) and warning_raw.strip() else None
+
+    return BalanceSnapshot(value=value, display=display, warning=warning)
+
 
 def _cache_balance_snapshot(
     ctx: ContextTypes.DEFAULT_TYPE, user_id: int, snapshot: BalanceSnapshot
@@ -3292,6 +3351,43 @@ def _resolve_balance_snapshot(
     snapshot = get_balance_snapshot(user_id)
     _cache_balance_snapshot(ctx, user_id, snapshot)
     _set_cached_balance(ctx, snapshot.value)
+    return snapshot
+
+
+async def _fetch_profile_snapshot(
+    ctx: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> BalanceSnapshot:
+    cached = _load_fresh_profile_snapshot(ctx, user_id)
+    if cached is not None:
+        return cached
+
+    snapshot: BalanceSnapshot
+    if hasattr(ledger_storage, "get_balance"):
+        try:
+            balance_value = await asyncio.to_thread(
+                ledger_storage.get_balance, int(user_id)
+            )
+        except Exception as exc:
+            log.warning(
+                "profile.balance.postgres_failed",
+                extra={"user_id": user_id, "error": str(exc)},
+            )
+        else:
+            if balance_value is None:
+                snapshot = BalanceSnapshot(value=None, display=BALANCE_PLACEHOLDER, warning=None)
+            else:
+                try:
+                    normalized = int(balance_value)
+                except (TypeError, ValueError):
+                    normalized = 0
+                snapshot = BalanceSnapshot(value=normalized, display=str(normalized), warning=None)
+            _store_fresh_profile_snapshot(ctx, user_id, snapshot)
+            _cache_balance_snapshot(ctx, user_id, snapshot)
+            _set_cached_balance(ctx, snapshot.value)
+            return snapshot
+
+    snapshot = _resolve_balance_snapshot(ctx, user_id, prefer_cached=False)
+    _store_fresh_profile_snapshot(ctx, user_id, snapshot)
     return snapshot
 
 
@@ -7009,7 +7105,11 @@ async def show_music_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def show_dialog_menu(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("[Dialog] chooser opened", extra={"chat_id": chat_id})
-    await ctx.bot.send_message(chat_id, **build_dialog_card())
+    try:
+        enabled = await chat_free_handlers.is_enabled(chat_id)
+    except Exception:
+        enabled = False
+    await ctx.bot.send_message(chat_id, **build_dialog_card(enabled=enabled))
 
 
 MAIN_MENU_GUARD_TTL = 3
@@ -7405,7 +7505,11 @@ async def _dispatch_home_action(
     if action == "ai_modes":
         if message is None or chat_id is None:
             return
-        card = build_dialog_card()
+        try:
+            enabled = await chat_free_handlers.is_enabled(chat_id)
+        except Exception:
+            enabled = False
+        card = build_dialog_card(enabled=enabled)
         text = card["text"]
         session_disable_chat(ctx)
         keyboard = card.get("reply_markup") or dialog_picker_inline()
@@ -9781,7 +9885,7 @@ def _suno_result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔁 Повторить", callback_data="suno:repeat")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="back")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="home:open")],
         ]
     )
 
@@ -21024,6 +21128,41 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ):
         chat_autoswitch_total.labels(outcome="skip_active").inc()
 
+    free_chat_enabled = False
+    if chat_id is not None:
+        try:
+            free_chat_enabled = await chat_free_handlers.is_enabled(int(chat_id))
+        except Exception:
+            free_chat_enabled = False
+    waiting_card_input = chat_free_handlers.is_waiting_card_input(user_id)
+
+    if free_chat_enabled and user_id:
+        if waiting_for_input or waiting_card_input:
+            log.info(
+                "router.text", extra={"route": "card", "chat_id": chat_id, "user_id": user_id}
+            )
+        else:
+            log.info(
+                "router.text", extra={"route": "free", "chat_id": chat_id, "user_id": user_id}
+            )
+            if not chat_mode_is_on(user_id):
+                chat_mode_turn_on(user_id)
+            if chat_id is not None:
+                _mode_set(chat_id, MODE_CHAT)
+            s["mode"] = None
+            await _ensure_active_mode(user_id, "dialog_default")
+            await _handle_chat_message(
+                ctx=ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                state_dict=s,
+                raw_text=raw_text,
+                text=text,
+                send_typing_action=True,
+                send_hint=False,
+            )
+            return
+
     mapped_command = label_to_command(text)
     if mapped_command:
         handler = LABEL_COMMAND_ROUTES.get(mapped_command)
@@ -22691,13 +22830,13 @@ def register_handlers(application: Any) -> None:
     kb_text_handler.block = False
     application.add_handler(kb_text_handler, group=0)
 
-    application.add_handler(CommandHandler("menu", open_main_menu))
+    application.add_handler(CommandHandler("menu", home_handler.open_handler))
 
     from ui.buttons.router import route_callback  # local import to avoid cycles
 
     menu_router = CallbackQueryHandler(
         route_callback,
-        pattern=r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|back_main)$",
+        pattern=r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|back_main|home:open)$",
     )
     menu_router.block = False
     application.add_handler(menu_router, group=0)
