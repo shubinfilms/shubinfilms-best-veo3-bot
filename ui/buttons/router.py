@@ -52,7 +52,8 @@ _LAST_CALLBACK_AT: dict[tuple[int, str], float] = {}
 
 # Allowed menu callback payloads handled by ``route_callback`` below.
 MENU_PAT = re.compile(
-    r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|banana:back_photo|back_main)$"
+    r"^(btn:profile|kb_open|menu:(photo|music|video|dialog)|img_engine:.+|"
+    r"banana:back_photo|back_main|back|dialog:off|video:kling|suno:(start|attach))$"
 )
 
 
@@ -693,6 +694,13 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         log.info("profile.opened")
         return
 
+    if data == "back":
+        from handlers.menu import open_main_menu
+
+        _mark_handled()
+        await open_main_menu(update, context)
+        return
+
     if data == "kb_open":
         from handlers.menu import show_kb
 
@@ -714,11 +722,53 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await open_music_mode(update, context)
         return
 
+    if data == "suno:start":
+        _mark_handled()
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "Опишите трек: жанр, настроение, длительность. После текста можно приложить аудио.",
+                )
+            except Exception:
+                log.debug("ui.suno.start.notify_failed", exc_info=True)
+        return
+
+    if data == "suno:attach":
+        _mark_handled()
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "Пришлите voice или аудио-файл (до 15 МБ) — добавим в заявку Suno.",
+                )
+            except Exception:
+                log.debug("ui.suno.attach.notify_failed", exc_info=True)
+        return
+
     if data == "menu:video":
         from handlers.menu import open_video_mode
 
         _mark_handled()
         await open_video_mode(update, context)
+        return
+
+    if data == "video:kling":
+        _mark_handled()
+        chat = getattr(update, "effective_chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "Kling в разработке — уведомим, когда раздел откроется.",
+                )
+            except Exception:
+                log.debug("ui.video.kling.notify_failed", exc_info=True)
         return
 
     if data == "menu:dialog":
@@ -728,7 +778,28 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await open_dialog_mode(update, context)
         return
 
+    if data == "dialog:off":
+        from handlers.menu import close_dialog_mode
+
+        _mark_handled()
+        await close_dialog_mode(update, context)
+        return
+
     if data == "img_engine:banana":
+        if not getattr(app_settings, "FEATURE_BANANA", True):
+            _mark_handled()
+            chat = getattr(update, "effective_chat", None)
+            chat_id = getattr(chat, "id", None)
+            if chat_id is not None:
+                try:
+                    await context.bot.send_message(
+                        chat_id,
+                        "Режим Banana временно недоступен.",
+                    )
+                except Exception:
+                    log.debug("ui.banana.disabled.notify_failed", exc_info=True)
+            return
+
         from handlers.banana_async_handler import open_card as open_banana_card
 
         _mark_handled()

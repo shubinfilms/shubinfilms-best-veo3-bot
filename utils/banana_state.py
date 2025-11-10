@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ class BananaState:
     last_payload: Optional[Dict[str, Any]] = None
     last_result_msg_id: Optional[int] = None
     last_result_id: Optional[str] = None  # legacy alias for stored message id
+    updated_at: Optional[float] = None
 
     def _normalized_prompt(self) -> Optional[str]:
         if self.prompt is None:
@@ -49,6 +51,12 @@ class BananaState:
         self.last_payload = None
         self.last_result_msg_id = None
         self.last_result_id = None
+        self.updated_at = time.time()
+
+    def touch(self) -> None:
+        """Update ``updated_at`` timestamp to the current time."""
+
+        self.updated_at = time.time()
 
     # ---- Legacy aliases ----
 
@@ -89,12 +97,14 @@ async def load(redis, user_id: int) -> BananaState:
     data.setdefault("last_payload", None)
     data.setdefault("last_result_msg_id", None)
     data.setdefault("last_result_id", None)
+    data.setdefault("updated_at", None)
     return BananaState(**data)
 
 
 async def save(redis, user_id: int, state: BananaState) -> None:
     """Persist ``state`` for ``user_id`` with a one-day TTL."""
 
+    state.touch()
     payload = asdict(state)
     payload["images"] = list(payload.get("photos", []))
     prompt = payload.get("prompt")

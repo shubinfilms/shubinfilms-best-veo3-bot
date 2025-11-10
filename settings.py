@@ -114,6 +114,9 @@ def _populate_from_settings() -> None:
     g["BANANA_SEND_AS_DOCUMENT"] = bool(settings.BANANA_SEND_AS_DOCUMENT)
     g["BANANA_CARD_REUSE"] = bool(settings.BANANA_CARD_REUSE)
     g["TG_FILE_DIRECT_URL"] = bool(settings.TG_FILE_DIRECT_URL)
+    g["FEATURE_BANANA"] = bool(settings.FEATURE_BANANA)
+    g["FEATURE_SUNO"] = bool(settings.FEATURE_SUNO)
+    g["FEATURE_VIDEO"] = bool(settings.FEATURE_VIDEO)
     g["MJ_SEND_AS_ALBUM"] = bool(settings.MJ_SEND_AS_ALBUM)
 
     g["DIALOG_ENABLED"] = settings.DIALOG_ENABLED

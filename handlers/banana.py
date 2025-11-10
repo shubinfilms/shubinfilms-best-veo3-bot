@@ -62,6 +62,10 @@ class BananaBackendError(BananaError):
     """Raised for unexpected backend failures."""
 
 
+class BananaUploadRetry(BananaBackendError):
+    """Raised when an upload attempt should be retried with a new URL."""
+
+
 def _log_task_exception(task: asyncio.Task[Any]) -> None:
     try:
         exc = task.exception()
