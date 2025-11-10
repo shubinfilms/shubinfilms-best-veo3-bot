@@ -23,7 +23,7 @@ __all__ = [
 
 _LOGGER = logging.getLogger("banana.uploader")
 _RETRY_DELAYS = (0.8, 2.0)
-_TIMEOUT = httpx.Timeout(20.0, connect=20.0)
+_TIMEOUT = httpx.Timeout(15.0, connect=15.0)
 
 
 class BananaUploadError(RuntimeError):
@@ -225,12 +225,30 @@ class BananaUploader:
         )
 
         attempt = 0
+        refreshes_left = 1
         while True:
             attempt += 1
             try:
                 await self._put_bytes(ticket.upload_url, data, content_type)
-            except BananaUploadExpiredError:
-                raise
+            except BananaUploadExpiredError as exc:
+                if refreshes_left <= 0:
+                    raise
+                refreshes_left -= 1
+                _LOGGER.info(
+                    "ns=banana action=upload_refresh file=%s attempt=%s reason=%s",
+                    filename,
+                    attempt,
+                    str(exc),
+                    extra={"user_id": user_id},
+                )
+                ticket = await self._request_ticket(
+                    filename=filename,
+                    content_type=content_type,
+                    size=size,
+                    user_id=user_id,
+                )
+                attempt = 0
+                continue
             except BananaUploadFailedError as exc:
                 if attempt > len(_RETRY_DELAYS) + 1:
                     raise
