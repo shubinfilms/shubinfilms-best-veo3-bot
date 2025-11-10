@@ -16,7 +16,7 @@ def banana_card_text(balance: int, state) -> str:
         f"📷 Фото: {count}/4 • ✏️ Промпт: {prompt_state}",
     ]
     if count == 0 and not prompt_value:
-        lines.append("— Пришлите 1–4 фото (JPEG/PNG) или текст-промпт.")
+        lines.append("Пришлите 1–4 фото (JPEG/PNG до 15 МБ) или текст-промпт.")
     return "\n".join(lines)
 
 

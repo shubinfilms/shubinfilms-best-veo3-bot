@@ -494,120 +494,170 @@ class BananaAsyncHandler:
         *,
         user_id: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
-        try:
-            tg_file = await bot.get_file(file_id)
-        except Exception as exc:
-            await handle_async_error(exc, "BananaAsync.upload_get_file")
-            return None
-
-        file_path = getattr(tg_file, "file_path", "") or ""
-        if (
-            file_path
-            and not _TG_DIRECT_URL_ALLOWED
-            and str(file_path).startswith(("http://", "https://"))
-        ):
-            file_path = Path(file_path).name
-
-        try:
-            raw_bytes = bytes(await tg_file.download_as_bytearray())
-        except Exception as exc:
-            await handle_async_error(exc, "BananaAsync.upload_download")
-            return None
-
-        source_name = Path(file_path or file_id).name or f"banana_{file_id}"
-        temp_dir = Path("/tmp/banana") / str(user_id or "anon")
-        try:
-            temp_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            temp_dir = Path("/tmp")
-        original_path = temp_dir / f"{Path(source_name).stem or 'banana_input'}_orig"
-        try:
-            original_path.write_bytes(raw_bytes)
-        except Exception:
-            pass
-
-        ok, fmt, mime = validate_image(raw_bytes, allowed=_ALLOWED_IMAGE_FORMATS)
-        if not ok:
-            detected_fmt, detected_mime = identify_image(raw_bytes)
-            log.warning(
-                "banana.upload.err",
-                extra={
-                    "user_id": user_id,
-                    "status": 0,
-                    "reason": "invalid-image",
-                    "format": detected_fmt or fmt,
-                    "mime": detected_mime or mime,
-                },
-            )
-            return None
-
-        fmt_upper = (fmt or "").upper()
-        target_ext = _resolve_extension(source_name, fmt_upper)
-        target_mime = mime or mimetypes.guess_type(source_name)[0] or "application/octet-stream"
-        upload_bytes = raw_bytes
-
-        if fmt_upper in {"WEBP", "HEIC", "HEIF"} or target_ext.lower() in {"webp", "heic", "heif"}:
+        lock_key: Optional[str] = None
+        lock_token: Optional[str] = None
+        lock_acquired = False
+        redis = None
+        if user_id is not None:
+            lock_key = f"banana:upload:{int(user_id)}:{file_id}"
+            lock_token = uuid.uuid4().hex
             try:
-                upload_bytes = _convert_to_jpeg(raw_bytes)
+                redis = get_redis()
             except Exception as exc:
-                await handle_async_error(exc, "BananaAsync.upload_convert")
+                await handle_async_error(exc, "BananaAsync.upload_lock_resolve")
+                redis = None
+            if redis is not None and lock_key:
+                for attempt, delay in enumerate((0.0, 0.2, 0.4), start=1):
+                    try:
+                        lock_acquired = await redis.set(lock_key, lock_token, ex=30, nx=True)
+                    except Exception as lock_exc:
+                        await handle_async_error(lock_exc, "BananaAsync.upload_lock_set")
+                        break
+                    if lock_acquired:
+                        break
+                    await asyncio.sleep(delay or 0.0)
+
+        try:
+            if lock_key and not lock_acquired:
+                log.info(
+                    "banana.upload.lock_busy",
+                    extra={"user_id": user_id, "file_id": file_id},
+                )
+                return None
+
+            try:
+                tg_file = await bot.get_file(file_id)
+            except Exception as exc:
+                await handle_async_error(exc, "BananaAsync.upload_get_file")
+                return None
+
+            file_path = getattr(tg_file, "file_path", "") or ""
+            if (
+                file_path
+                and not _TG_DIRECT_URL_ALLOWED
+                and str(file_path).startswith(("http://", "https://"))
+            ):
+                file_path = Path(file_path).name
+
+            try:
+                raw_bytes = bytes(await tg_file.download_as_bytearray())
+            except Exception as exc:
+                await handle_async_error(exc, "BananaAsync.upload_download")
+                return None
+
+            source_name = Path(file_path or file_id).name or f"banana_{file_id}"
+            temp_dir = Path("/tmp/banana") / str(user_id or "anon")
+            try:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                temp_dir = Path("/tmp")
+            original_path = temp_dir / f"{Path(source_name).stem or 'banana_input'}_orig"
+            try:
+                original_path.write_bytes(raw_bytes)
+            except Exception:
+                pass
+
+            ok, fmt, mime = validate_image(raw_bytes, allowed=_ALLOWED_IMAGE_FORMATS)
+            if not ok:
+                detected_fmt, detected_mime = identify_image(raw_bytes)
                 log.warning(
                     "banana.upload.err",
                     extra={
                         "user_id": user_id,
                         "status": 0,
-                        "reason": "convert-failed",
-                        "format": fmt_upper,
+                        "reason": "invalid-image",
+                        "format": detected_fmt or fmt,
+                        "mime": detected_mime or mime,
                     },
                 )
                 return None
-            target_ext = "jpg"
-            target_mime = "image/jpeg"
-        elif fmt_upper in {"JPEG", "JPG"}:
-            target_ext = "jpg"
-            target_mime = "image/jpeg"
-        elif fmt_upper == "PNG":
-            target_ext = "png"
-            target_mime = "image/png"
 
-        final_name = f"{Path(source_name).stem or 'banana_input'}.{target_ext}"
-        final_path = temp_dir / final_name
-        try:
-            final_path.write_bytes(upload_bytes)
-        except Exception:
-            pass
+            fmt_upper = (fmt or "").upper()
+            target_ext = _resolve_extension(source_name, fmt_upper)
+            target_mime = (
+                mime or mimetypes.guess_type(source_name)[0] or "application/octet-stream"
+            )
+            upload_bytes = raw_bytes
 
-        uploader = self._get_uploader()
-        for attempt, delay in enumerate((0.0, *_NETWORK_RETRY_DELAYS), start=1):
+            if fmt_upper in {"WEBP", "HEIC", "HEIF"} or target_ext.lower() in {
+                "webp",
+                "heic",
+                "heif",
+            }:
+                try:
+                    upload_bytes = _convert_to_jpeg(raw_bytes)
+                except Exception as exc:
+                    await handle_async_error(exc, "BananaAsync.upload_convert")
+                    log.warning(
+                        "banana.upload.err",
+                        extra={
+                            "user_id": user_id,
+                            "status": 0,
+                            "reason": "convert-failed",
+                            "format": fmt_upper,
+                        },
+                    )
+                    return None
+                target_ext = "jpg"
+                target_mime = "image/jpeg"
+            elif fmt_upper in {"JPEG", "JPG"}:
+                target_ext = "jpg"
+                target_mime = "image/jpeg"
+            elif fmt_upper == "PNG":
+                target_ext = "png"
+                target_mime = "image/png"
+
+            final_name = f"{Path(source_name).stem or 'banana_input'}.{target_ext}"
+            final_path = temp_dir / final_name
             try:
-                result = await uploader.upload(
-                    upload_bytes,
-                    filename=final_name,
-                    content_type=target_mime,
-                    user_id=user_id,
-                )
-            except BananaUploadExpiredError as exc:
-                raise BananaUploadRetry(str(exc)) from exc
-            except BananaUploadFailedError as exc:
-                if attempt >= len(_NETWORK_RETRY_DELAYS) + 1:
-                    raise BananaBackendError("upload_failed") from exc
-                await asyncio.sleep(delay)
-                continue
-            else:
-                log.info(
-                    "banana.upload.ok",
-                    extra={
-                        "user_id": user_id,
-                        "ext": target_ext.lower(),
-                        "size": len(upload_bytes),
-                    },
-                )
-                return {
-                    "type": "image",
-                    "url": result.public_url,
-                    "upload_id": result.upload_id,
-                }
-        return None
+                final_path.write_bytes(upload_bytes)
+            except Exception:
+                pass
+
+            uploader = self._get_uploader()
+            for attempt, delay in enumerate((0.0, *_NETWORK_RETRY_DELAYS), start=1):
+                try:
+                    result = await uploader.upload(
+                        upload_bytes,
+                        filename=final_name,
+                        content_type=target_mime,
+                        user_id=user_id,
+                    )
+                except BananaUploadExpiredError as exc:
+                    raise BananaUploadRetry(str(exc)) from exc
+                except BananaUploadFailedError as exc:
+                    if attempt >= len(_NETWORK_RETRY_DELAYS) + 1:
+                        raise BananaBackendError("upload_failed") from exc
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    log.info(
+                        "banana.upload.ok",
+                        extra={
+                            "user_id": user_id,
+                            "ext": target_ext.lower(),
+                            "size": len(upload_bytes),
+                        },
+                    )
+                    return {
+                        "type": "image",
+                        "url": result.public_url,
+                        "upload_id": result.upload_id,
+                    }
+
+            return None
+        finally:
+            if lock_acquired and redis is not None and lock_key and lock_token:
+                try:
+                    current = await redis.get(lock_key)
+                except Exception as get_exc:
+                    await handle_async_error(get_exc, "BananaAsync.upload_lock_get")
+                    current = None
+                if current == lock_token:
+                    try:
+                        await redis.delete(lock_key)
+                    except Exception as del_exc:
+                        await handle_async_error(del_exc, "BananaAsync.upload_lock_release")
 
     async def _prepare_image_urls(
         self, bot, file_ids: Sequence[str], *, user_id: Optional[int] = None
