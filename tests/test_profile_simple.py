@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from unittest.mock import AsyncMock
+
 from tests.suno_test_utils import FakeBot, bot_module  # noqa: E402
 import handlers.profile_simple as profile_simple  # noqa: E402
 
@@ -19,14 +21,13 @@ def _make_context(bot: FakeBot) -> SimpleNamespace:
 
 
 def test_open_profile_sends_message_without_html_and_callbacks(monkeypatch):
-    profile_simple._memory_last_ids.clear()
     bot = FakeBot()
     ctx = _make_context(bot)
 
     monkeypatch.setattr(
         profile_simple,
-        "get_balance_snapshot",
-        lambda _uid: SimpleNamespace(display="123", value=123),
+        "get_user_balance_async",
+        AsyncMock(return_value=123),
     )
 
     message = SimpleNamespace(chat=SimpleNamespace(id=101), chat_id=101)
@@ -48,14 +49,13 @@ def test_open_profile_sends_message_without_html_and_callbacks(monkeypatch):
 
 
 def test_history_empty(monkeypatch):
-    profile_simple._memory_last_ids.clear()
     bot = FakeBot()
     ctx = _make_context(bot)
 
     monkeypatch.setattr(profile_simple, "get_history", lambda _uid: [])
 
     chat_id = 202
-    profile_simple._store_last_message_id(chat_id, 555)
+    ctx.chat_data["profile_card_message_id"] = 555
 
     answered = {"value": False}
 
@@ -81,7 +81,6 @@ def test_history_empty(monkeypatch):
 
 
 def test_invite_without_botname_fallback(monkeypatch):
-    profile_simple._memory_last_ids.clear()
     bot = FakeBot()
     ctx = _make_context(bot)
 
@@ -103,6 +102,8 @@ def test_invite_without_botname_fallback(monkeypatch):
         effective_message=message,
     )
 
+    ctx.chat_data["profile_card_message_id"] = 10
+
     asyncio.run(profile_simple.profile_invite(update, ctx))
 
     assert answered["value"], "Callback query should be answered"
@@ -110,12 +111,22 @@ def test_invite_without_botname_fallback(monkeypatch):
     assert "Скоро включим приглашения." in payload["text"]
     keyboard = payload["reply_markup"].inline_keyboard
     assert keyboard[0][0].callback_data == "btn:profile"
+    assert "profile_card_message_id" not in ctx.chat_data
 
 
 def test_topup_stub(monkeypatch):
-    profile_simple._memory_last_ids.clear()
     bot = FakeBot()
     ctx = _make_context(bot)
+
+    async def fake_open(update, inner_ctx, *, edit_message, source):
+        assert edit_message is True
+        assert source == "profile"
+        await inner_ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="💎 Пополнение — скоро.",
+        )
+
+    monkeypatch.setattr(profile_simple, "open_stars_menu", fake_open)
 
     answered = {"value": False}
 
@@ -135,13 +146,10 @@ def test_topup_stub(monkeypatch):
     asyncio.run(profile_simple.profile_topup(update, ctx))
 
     assert answered["value"], "Callback query should be answered"
-    payload = bot.sent[-1]
-    assert payload["text"].startswith("💎 Пополнение — скоро.")
-    assert payload["reply_markup"].inline_keyboard[0][0].callback_data == "btn:profile"
+    assert bot.sent[-1]["text"].startswith("💎 Пополнение — скоро.")
 
 
 def test_back_returns_to_menu(monkeypatch):
-    profile_simple._memory_last_ids.clear()
     bot = FakeBot()
     ctx = _make_context(bot)
 
@@ -158,7 +166,7 @@ def test_back_returns_to_menu(monkeypatch):
         answered["value"] = True
 
     chat_id = 505
-    profile_simple._store_last_message_id(chat_id, 900)
+    ctx.chat_data["profile_card_message_id"] = 900
 
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), chat_id=chat_id, message_id=900)
     query = SimpleNamespace(data="btn:profile|view=back", message=message, answer=fake_answer)
@@ -174,4 +182,4 @@ def test_back_returns_to_menu(monkeypatch):
     assert answered["value"], "Callback query should be answered"
     assert called["value"] and called["value"][2] is False
     assert bot.deleted and bot.deleted[-1]["message_id"] == 900
-    assert profile_simple._load_last_message_id(chat_id) is None
+    assert "profile_card_message_id" not in ctx.chat_data

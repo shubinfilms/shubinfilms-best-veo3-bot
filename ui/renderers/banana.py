@@ -8,9 +8,16 @@ from keyboards import banana_card_kb as build_banana_card_kb
 def banana_card_text(balance: int, state) -> str:
     """Return the Banana card caption for ``state``."""
 
-    photos = f"📷 Фото: {len(state.images)}/4"
-    prompt_state = "есть" if state.prompt else "нет"
-    return f"🍌 Карточка Banana\n{photos} • ✏️ Промпт: {prompt_state}"
+    count = len(getattr(state, "images", getattr(state, "photos", [])))
+    prompt_value = (getattr(state, "prompt", None) or "").strip()
+    prompt_state = "есть" if prompt_value else "нет"
+    lines = [
+        "🍌 Карточка Banana",
+        f"📷 Фото: {count}/4 • ✏️ Промпт: {prompt_state}",
+    ]
+    if count == 0 and not prompt_value:
+        lines.append("— Пришлите 1–4 фото (JPEG/PNG) или текст-промпт.")
+    return "\n".join(lines)
 
 
 def banana_card_kb(state, *, generating: bool = False) -> InlineKeyboardMarkup:

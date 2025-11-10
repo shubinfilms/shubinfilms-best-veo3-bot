@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     BANANA_SEND_AS_DOCUMENT: bool = Field(default=True)
     BANANA_CARD_REUSE: bool = Field(default=True)
     TG_FILE_DIRECT_URL: bool = Field(default=False)
+    FEATURE_BANANA: bool = Field(default=True)
+    FEATURE_SUNO: bool = Field(default=True)
+    FEATURE_VIDEO: bool = Field(default=True)
     MJ_SEND_AS_ALBUM: bool = Field(default=True)
 
     KIE_BASE_URL: str = Field(default="https://api.kie.ai")
