@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Callable, MutableMapping, Optional
 
 from telegram.ext import ContextTypes
 
+from handlers import chat_free
 from handlers.menu import build_dialog_card
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,11 @@ async def open_menu(
         raise RuntimeError("dialog menu handler is not configured")
 
     state_dict = _state_getter(ctx)
-    card = build_dialog_card()
+    try:
+        enabled = await chat_free.is_enabled(chat_id)
+    except Exception:
+        enabled = False
+    card = build_dialog_card(enabled=enabled)
 
     message_id = await _send_menu(
         ctx,
