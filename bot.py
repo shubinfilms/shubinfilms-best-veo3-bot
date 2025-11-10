@@ -10,6 +10,8 @@ import logging
 import os
 import functools
 
+import hotfix_stability  # NEW
+
 import settings as _app_settings
 from logging_utils import init_logging, log_environment
 
@@ -22989,6 +22991,7 @@ async def run_bot_async() -> None:
                 "handlers.already_registered",
                 extra={"application": id(application)},
             )
+        hotfix_stability.apply(application)  # NEW
     except Exception:
         log.exception("handler registration failed")
         raise
