@@ -7,16 +7,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Normalize git workspace
 git config core.autocrlf input
 git config apply.whitespace nowarn
-# Avoid ownership warnings on GitHub-hosted runners
-if command -v git >/dev/null 2>&1; then
-  git config --global --add safe.directory "$(pwd)" || true
-fi
 git reset --hard
 git clean -xfd
 
-# Apply patches via git am if present
-if compgen -G "patches/*.patch" > /dev/null; then
-  git am --3way --whitespace=nowarn patches/*.patch
+# Optionally apply a patch from base64-encoded content
+if [[ -n "${PATCH_B64:-}" ]]; then
+  tmp_patch="$(mktemp)"
+  echo "$PATCH_B64" | base64 -d > "$tmp_patch"
+  if ! git am --3way "$tmp_patch"; then
+    git am --abort || true
+    echo "Patch application failed" >&2
+    exit 1
+  fi
+  rm -f "$tmp_patch"
 fi
 
 # Setup Python environment
