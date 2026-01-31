@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_URL="${REPO_URL:-git@github.com:org/project.git}"
+WORKDIR="${WORKDIR:-/tmp/project-clean}"
+PATCH_FILE="${PATCH_FILE:-/tmp/change.patch}"
+
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+git clone "$REPO_URL" .
+git config core.autocrlf input
+git config apply.whitespace nowarn
+
+if [ -f "$PATCH_FILE" ]; then
+  if ! git am --3way "$PATCH_FILE"; then
+    git am --abort || true
+    echo "git am failed"
+    exit 1
+  fi
+fi
+
+if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+if [ -d tests ] || [ -f pytest.ini ]; then pytest -q; else echo "No tests found"; fi
